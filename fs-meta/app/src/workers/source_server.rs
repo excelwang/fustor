@@ -113,6 +113,9 @@ enum SourceWorkerAction {
         source: Arc<FSMetaSource>,
         authoritative_roots: Vec<crate::source::config::RootSpec>,
     },
+    SyncRuntimeRootsAndStatusSnapshot {
+        source: Arc<FSMetaSource>,
+    },
     UpdateLogicalRoots {
         source: Arc<FSMetaSource>,
         roots: Vec<crate::source::config::RootSpec>,
@@ -1035,14 +1038,8 @@ fn plan_worker_request(
                         authoritative_roots,
                     }
                 }
-                Ok(None) => match source.status_snapshot_with_failure() {
-                    Ok(snapshot) => SourceWorkerAction::Immediate(
-                        SourceWorkerResponse::StatusSnapshot(snapshot),
-                        false,
-                    ),
-                    Err(err) => {
-                        SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
-                    }
+                Ok(None) => SourceWorkerAction::SyncRuntimeRootsAndStatusSnapshot {
+                    source: source.clone(),
                 },
                 Err(err) => SourceWorkerAction::Immediate(
                     SourceWorkerResponse::Error(err.to_string()),
@@ -1367,6 +1364,15 @@ async fn execute_worker_action(
             },
             Err(err) => (classify_source_worker_error(err), false, None),
         },
+        SourceWorkerAction::SyncRuntimeRootsAndStatusSnapshot { source } => {
+            match source.refresh_runtime_roots(false).await {
+                Ok(()) => match source.status_snapshot_with_failure() {
+                    Ok(snapshot) => (SourceWorkerResponse::StatusSnapshot(snapshot), false, None),
+                    Err(err) => (classify_source_worker_failure(err), false, None),
+                },
+                Err(err) => (classify_source_worker_error(err), false, None),
+            }
+        }
         SourceWorkerAction::UpdateLogicalRoots { source, roots } => {
             eprintln!(
                 "fs_meta_source_worker_server: update_logical_roots begin roots={}",

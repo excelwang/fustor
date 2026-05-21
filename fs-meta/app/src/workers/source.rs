@@ -32,6 +32,7 @@ const SOURCE_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_START_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const SOURCE_WORKER_START_MAX_RETRYABLE_RESETS: usize = 64;
 const SOURCE_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SOURCE_WORKER_FORCE_FIND_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 const SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -217,6 +218,7 @@ impl SourceControlFrameLane for RetainedTickFastPathLane {
 
 struct RetainedTickReplayLane {
     deadline: std::time::Instant,
+    signals: Vec<SourceControlSignal>,
 }
 
 #[async_trait]
@@ -232,6 +234,7 @@ impl SourceControlFrameLane for RetainedTickReplayLane {
         handle
             .replay_control_frame_retained_tick(self.deadline)
             .await?;
+        handle.apply_control_frame_retained_tick_replay_summary(&self.signals);
         Ok(SourceControlFrameEvent::RetainedTickReplayCompleted)
     }
 }
@@ -466,7 +469,7 @@ impl SourceControlFrameInitialStep {
 #[derive(Clone, Debug)]
 enum SourceControlFrameTickOnlyDisposition {
     RetainedTickFastPath { signals: Vec<SourceControlSignal> },
-    RetainedTickReplay,
+    RetainedTickReplay { signals: Vec<SourceControlSignal> },
 }
 
 #[derive(Clone, Debug)]
@@ -904,7 +907,10 @@ impl SourceControlFrameMachine {
         if matches!(
             self.bootstrap_disposition,
             SourceControlFrameBootstrapDisposition::FreshInitial
-        ) {
+        ) && self
+            .primed_local_schedule
+            .is_some_and(|summary| summary.saw_runtime_host_grant_change)
+        {
             return None;
         }
         self.post_ack_refresh_requirement
@@ -946,6 +952,7 @@ impl SourceControlFrameMachine {
             Some(SourceControlFrameReconnectResume::RetainedTickReplay) => {
                 Ok(SourceControlFrameStep::run(RetainedTickReplayLane {
                     deadline: self.operation_deadline,
+                    signals: Vec::new(),
                 }))
             }
             Some(SourceControlFrameReconnectResume::Fail(failure)) => {
@@ -1757,6 +1764,7 @@ struct SourceObservabilitySnapshotMachine {
 struct SourceStartMachine {
     deadline: std::time::Instant,
     pending_reconnect_wait_after: Option<SourceProgressState>,
+    retryable_reset_attempts: usize,
 }
 
 struct SourceReplayRetainedControlStateMachine {
@@ -2160,6 +2168,7 @@ impl SourceStartMachine {
         Self {
             deadline,
             pending_reconnect_wait_after: None,
+            retryable_reset_attempts: 0,
         }
     }
 
@@ -2184,19 +2193,31 @@ impl SourceStartMachine {
             SourceStartEvent::AttemptCompleted {
                 start_result: Err(err),
                 after,
-            } => Ok(
-                match SourceRetryMachine::new(self.deadline)
-                    .reconnect_after_update_roots_gap(err, after)
-                {
-                    SourceReconnectRetryDisposition::ReconnectAfter(after) => {
-                        self.pending_reconnect_wait_after = Some(after);
-                        SourceStartEffect::Reconnect
+            } => {
+                if classify_source_worker_control_reset(&err).is_some() {
+                    self.retryable_reset_attempts = self.retryable_reset_attempts.saturating_add(1);
+                    if self.retryable_reset_attempts > SOURCE_WORKER_START_MAX_RETRYABLE_RESETS {
+                        return Ok(SourceStartEffect::Fail(
+                            SourceFailure::retry_budget_exhausted(
+                                SourceRetryBudgetExhaustionKind::OperationWait,
+                            ),
+                        ));
                     }
-                    SourceReconnectRetryDisposition::Fail(failure) => {
-                        SourceStartEffect::Fail(failure)
-                    }
-                },
-            ),
+                }
+                Ok(
+                    match SourceRetryMachine::new(self.deadline)
+                        .reconnect_after_update_roots_gap(err, after)
+                    {
+                        SourceReconnectRetryDisposition::ReconnectAfter(after) => {
+                            self.pending_reconnect_wait_after = Some(after);
+                            SourceStartEffect::Reconnect
+                        }
+                        SourceReconnectRetryDisposition::Fail(failure) => {
+                            SourceStartEffect::Fail(failure)
+                        }
+                    },
+                )
+            }
             SourceStartEvent::ReconnectCompleted => Ok(SourceStartEffect::Wait {
                 after: take_pending_reconnect_wait_after(
                     &mut self.pending_reconnect_wait_after,
@@ -2771,6 +2792,7 @@ fn merge_cached_local_scheduled_groups(
 struct PrimedLocalScheduleSummary {
     saw_activate_with_bound_scopes: bool,
     has_local_runnable_groups: bool,
+    saw_runtime_host_grant_change: bool,
 }
 
 fn prime_cached_schedule_from_control_signals(
@@ -2806,6 +2828,7 @@ fn prime_cached_schedule_from_control_signals(
         )),
         _ => None,
     });
+    let saw_runtime_host_grant_change = changed_grants.is_some();
     if let Some((version, grants)) = changed_grants {
         cache.last_live_observability_snapshot_at = None;
         cache.host_object_grants_version = Some(version);
@@ -2903,6 +2926,7 @@ fn prime_cached_schedule_from_control_signals(
     PrimedLocalScheduleSummary {
         saw_activate_with_bound_scopes: saw_source_activate || saw_scan_activate,
         has_local_runnable_groups,
+        saw_runtime_host_grant_change,
     }
 }
 
@@ -4267,6 +4291,7 @@ impl SourceControlState {
             return None;
         }
         let mut current_or_forward_ticks = Vec::new();
+        let mut requires_replay = false;
         for signal in signals {
             let SourceControlSignal::Tick {
                 unit,
@@ -4290,11 +4315,11 @@ impl SourceControlState {
             else {
                 return None;
             };
-            if generation > retained_generation {
-                return Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay);
-            }
-            if generation == retained_generation {
+            if generation >= retained_generation {
                 current_or_forward_ticks.push(signal.clone());
+            }
+            if generation > retained_generation {
+                requires_replay = true;
             }
         }
         if current_or_forward_ticks.is_empty() {
@@ -4304,8 +4329,10 @@ impl SourceControlState {
                 },
             );
         }
-        if matches!(self.replay_state(), SourceControlReplayState::Required) {
-            Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay)
+        if requires_replay || matches!(self.replay_state(), SourceControlReplayState::Required) {
+            Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay {
+                signals: current_or_forward_ticks,
+            })
         } else {
             Some(
                 SourceControlFrameTickOnlyDisposition::RetainedTickFastPath {
@@ -4323,7 +4350,16 @@ impl SourceControlState {
         let mut signals = self
             .active_by_route
             .values()
-            .filter(|signal| matches!(signal, SourceControlSignal::Activate { .. }))
+            .filter(|signal| {
+                matches!(
+                    signal,
+                    SourceControlSignal::Activate {
+                        unit: SourceRuntimeUnit::Source,
+                        route_key,
+                        ..
+                    } if route_key.contains("source-manual-rescan.")
+                )
+            })
             .cloned()
             .collect::<Vec<_>>();
         signals.extend(ticks);
@@ -4515,6 +4551,12 @@ pub(crate) struct SourceWorkerControlFrameErrorHook {
 }
 
 #[cfg(test)]
+struct SourceWorkerControlFrameErrorHookState {
+    hook: SourceWorkerControlFrameErrorHook,
+    worker_instance_id: Option<u64>,
+}
+
+#[cfg(test)]
 pub(crate) struct SourceWorkerControlFrameErrorQueueHook {
     pub errs: std::collections::VecDeque<CnxError>,
     pub sticky_worker_instance_id: Option<u64>,
@@ -4694,8 +4736,8 @@ fn source_worker_logical_roots_snapshot_hook_cell()
 
 #[cfg(test)]
 fn source_worker_control_frame_error_hook_cell()
--> &'static Mutex<Option<SourceWorkerControlFrameErrorHook>> {
-    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerControlFrameErrorHook>>> =
+-> &'static Mutex<Option<SourceWorkerControlFrameErrorHookState>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerControlFrameErrorHookState>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
@@ -5069,11 +5111,30 @@ pub(crate) fn install_source_worker_logical_roots_snapshot_hook(
 pub(crate) fn install_source_worker_control_frame_error_hook(
     hook: SourceWorkerControlFrameErrorHook,
 ) {
+    install_source_worker_control_frame_error_hook_state(hook, None);
+}
+
+#[cfg(test)]
+pub(crate) fn install_source_worker_control_frame_error_hook_for_worker_instance(
+    worker_instance_id: u64,
+    hook: SourceWorkerControlFrameErrorHook,
+) {
+    install_source_worker_control_frame_error_hook_state(hook, Some(worker_instance_id));
+}
+
+#[cfg(test)]
+fn install_source_worker_control_frame_error_hook_state(
+    hook: SourceWorkerControlFrameErrorHook,
+    worker_instance_id: Option<u64>,
+) {
     let mut guard = match source_worker_control_frame_error_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    *guard = Some(hook);
+    *guard = Some(SourceWorkerControlFrameErrorHookState {
+        hook,
+        worker_instance_id,
+    });
 }
 
 #[cfg(test)]
@@ -5742,7 +5803,14 @@ fn take_on_control_frame_error_hook(current_worker_instance_id: u64) -> Option<C
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.take().map(|hook| hook.err)
+    if guard.as_ref().is_some_and(|state| {
+        state
+            .worker_instance_id
+            .is_none_or(|id| id == current_worker_instance_id)
+    }) {
+        return guard.take().map(|state| state.hook.err);
+    }
+    None
 }
 
 impl SourceWorkerClientHandle {
@@ -5885,6 +5953,19 @@ impl SourceWorkerClientHandle {
     }
 
     fn apply_control_frame_retained_tick_fast_path(&self, signals: &[SourceControlSignal]) {
+        self.with_cache_mut(|cache| {
+            prime_cached_control_summary_from_control_signals(
+                cache,
+                &self.node_id,
+                signals,
+                &self.config.host_object_grants,
+            );
+            cache.observability_control_summary_override_by_node =
+                cache.last_control_frame_signals_by_node.clone();
+        });
+    }
+
+    fn apply_control_frame_retained_tick_replay_summary(&self, signals: &[SourceControlSignal]) {
         self.with_cache_mut(|cache| {
             prime_cached_control_summary_from_control_signals(
                 cache,
@@ -7666,10 +7747,13 @@ impl SourceWorkerClientHandle {
                         let envelopes = envelopes.to_vec();
                         async move {
                             #[cfg(test)]
-                            if let Some(err) = take_on_control_frame_error_hook(
-                                self.worker_instance_id_for_tests().await,
-                            ) {
-                                return Err(SourceFailure::from(err));
+                            {
+                                maybe_pause_before_on_control_frame_rpc().await;
+                                if let Some(err) = take_on_control_frame_error_hook(
+                                    self.worker_instance_id_for_tests().await,
+                                ) {
+                                    return Err(SourceFailure::from(err));
+                                }
                             }
                             Self::call_worker_with_failure(
                                 &client,
@@ -7830,9 +7914,10 @@ impl SourceWorkerClientHandle {
                     }) => Some(SourceControlFrameInitialStep::run(
                         RetainedTickFastPathLane { signals },
                     )),
-                    Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay) => {
+                    Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay { signals }) => {
                         Some(SourceControlFrameInitialStep::run(RetainedTickReplayLane {
                             deadline: operation_deadline,
+                            signals,
                         }))
                     }
                     None => None,
@@ -8568,6 +8653,21 @@ impl SourceWorkerClientHandle {
     async fn source_state_pending_observability_snapshot_for_status_route(
         &self,
     ) -> (SourceObservabilitySnapshot, bool) {
+        if self.control_op_inflight() {
+            let mut snapshot = if let Some(snapshot) =
+                self.runtime_scope_control_cache_observability_snapshot()
+            {
+                self.log_observability_cache_fallback(
+                    "runtime_scope_control_cache_while_source_control_inflight",
+                    &snapshot,
+                );
+                snapshot
+            } else {
+                self.degraded_observability_snapshot_from_cache("source worker control in flight")
+            };
+            strip_delivery_truth_from_source_state_pending_observation(&mut snapshot);
+            return (snapshot, true);
+        }
         let retained_signals = self.control_state.lock().await.replay_signals();
         let mut snapshot =
             if let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot() {
@@ -10901,6 +11001,7 @@ impl SourceFacade {
             let _ = source
                 .sync_logical_roots_from_authoritative_cell_if_changed()
                 .await;
+            let _ = source.refresh_runtime_roots(false).await;
         }
         match self {
             Self::Local(source) => source.status_snapshot_with_failure(),
@@ -11222,6 +11323,7 @@ impl SourceFacade {
             let _ = source
                 .sync_logical_roots_from_authoritative_cell_if_changed()
                 .await;
+            let _ = source.refresh_runtime_roots(false).await;
         }
         match self {
             Self::Local(source) => source.observability_snapshot_nonblocking_for_status_route(),
@@ -11243,6 +11345,7 @@ impl SourceFacade {
             let _ = source
                 .sync_logical_roots_from_authoritative_cell_if_changed()
                 .await;
+            let _ = source.refresh_runtime_roots(false).await;
         }
         match self {
             Self::Local(source) => source.observability_snapshot_nonblocking_for_status_route(),
@@ -11263,6 +11366,7 @@ impl SourceFacade {
             let _ = source
                 .sync_logical_roots_from_authoritative_cell_if_changed()
                 .await;
+            let _ = source.refresh_runtime_roots(false).await;
         }
         match self {
             Self::Local(source) => {

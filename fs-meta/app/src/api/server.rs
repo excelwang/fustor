@@ -41,7 +41,8 @@ use super::handlers;
 use super::rollout_status::shared_rollout_status_cell;
 use super::rollout_status::{PublishedRolloutStatusReader, SharedRolloutStatusCell};
 use super::state::{
-    ApiControlGate, ApiRequestGuard, ApiRequestTracker, ApiState, ForceFindRunnerEvidence,
+    ApiControlGate, ApiRequestControlReadinessSnapshot, ApiRequestGuard, ApiRequestTracker,
+    ApiState, ForceFindRunnerEvidence,
 };
 
 enum ApiServerJoin {
@@ -402,7 +403,7 @@ impl ApiManagementReadinessGate {
         control_gate: &ApiControlGate,
     ) -> Option<super::state::ManagementWriteRecovery> {
         match self {
-            Self::FullManagementWrite => control_gate.management_write_recovery(),
+            Self::FullManagementWrite => None,
             Self::SourceRepair => control_gate.source_repair_recovery(),
         }
     }
@@ -522,12 +523,28 @@ async fn request_control_readiness_guard(
     response_with_owned_guards(next.run(request).await, None, facade_request_guard)
 }
 
-async fn request_logging(State(state): State<ApiState>, request: Request, next: Next) -> Response {
+async fn request_logging(
+    State(state): State<ApiState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    if matches!(
+        (&method, path.as_str()),
+        (&Method::GET, "/api/fs-meta/v1/status")
+    ) {
+        request
+            .extensions_mut()
+            .insert(ApiRequestControlReadinessSnapshot {
+                control_gate_fully_ready: state.control_gate.is_ready()
+                    && state.control_gate.is_management_write_ready()
+                    && state.control_gate.is_source_repair_ready(),
+            });
+    }
     let request_guard = api_request_route_policy(&method, &path)
         .counts_toward_control_drain
         .then(|| state.request_tracker.begin());

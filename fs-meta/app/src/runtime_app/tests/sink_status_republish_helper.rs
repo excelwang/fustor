@@ -4671,6 +4671,7 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
         app.runtime_state_changed.clone(),
         app.pending_fixed_bind_has_suppressed_dependent_routes
             .clone(),
+        app.control_failure_uninitialized.clone(),
     );
 
     tokio::time::timeout(Duration::from_secs(2), gate_reopen_entered.notified())
@@ -4960,6 +4961,7 @@ async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_f
         app.runtime_state_changed.clone(),
         app.pending_fixed_bind_has_suppressed_dependent_routes
             .clone(),
+        app.control_failure_uninitialized.clone(),
     );
 
     tokio::time::timeout(Duration::from_secs(2), gate_reopen_entered.notified())

@@ -676,6 +676,98 @@ impl ManagedEndpointTask {
         )
     }
 
+    pub(crate) fn spawn_with_recv_units_and_task_units_wait_receive_poll<F, Fut, I, S, J, T>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        recv_unit_ids: I,
+        task_unit_ids: J,
+        shutdown: CancellationToken,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        J: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let contexts = recv_unit_ids
+            .into_iter()
+            .map(|unit_id| BoundaryContext::for_unit(unit_id.into()))
+            .collect::<Vec<_>>();
+        assert!(
+            !contexts.is_empty(),
+            "spawn_with_recv_units_and_task_units_wait_receive_poll requires at least one recv unit id"
+        );
+        let mut task = Self::spawn_with_contexts(
+            boundary,
+            route,
+            name,
+            contexts,
+            shutdown,
+            handler,
+            EndpointStartWait::UntilReady,
+        );
+        let task_unit_ids = task_unit_ids
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        assert!(
+            !task_unit_ids.is_empty(),
+            "spawn_with_recv_units_and_task_units_wait_receive_poll requires at least one task unit id"
+        );
+        task.unit_ids = task_unit_ids;
+        task
+    }
+
+    pub(crate) fn spawn_with_recv_units_and_task_units_without_ready_wait<F, Fut, I, S, J, T>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        recv_unit_ids: I,
+        task_unit_ids: J,
+        shutdown: CancellationToken,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        J: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let contexts = recv_unit_ids
+            .into_iter()
+            .map(|unit_id| BoundaryContext::for_unit(unit_id.into()))
+            .collect::<Vec<_>>();
+        assert!(
+            !contexts.is_empty(),
+            "spawn_with_recv_units_and_task_units_without_ready_wait requires at least one recv unit id"
+        );
+        let mut task = Self::spawn_with_contexts(
+            boundary,
+            route,
+            name,
+            contexts,
+            shutdown,
+            handler,
+            EndpointStartWait::Detached,
+        );
+        let task_unit_ids = task_unit_ids
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        assert!(
+            !task_unit_ids.is_empty(),
+            "spawn_with_recv_units_and_task_units_without_ready_wait requires at least one task unit id"
+        );
+        task.unit_ids = task_unit_ids;
+        task
+    }
+
     fn spawn_with_context<F, Fut>(
         boundary: Arc<dyn ChannelIoSubset>,
         route: RouteKey,
@@ -836,6 +928,7 @@ impl ManagedEndpointTask {
             terminal_reason_for_runner.clone(),
             receivable_ready,
             receive_state_for_runner,
+            Some(ready_signal.clone()),
         );
         let runner = async move {
             let outcome = AssertUnwindSafe(runner).catch_unwind().await;
@@ -1118,6 +1211,7 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
         terminal_reason,
         None,
         Arc::new(EndpointReceiveState::default()),
+        None,
     )
     .await
 }
@@ -1132,6 +1226,7 @@ async fn run_endpoint_loop_with_contexts_and_ready_signal<F, Fut>(
     terminal_reason: Arc<StdMutex<Option<String>>>,
     receivable_ready: Option<EndpointReadySignal>,
     receive_state: Arc<EndpointReceiveState>,
+    terminal_ready: Option<EndpointReadySignal>,
 ) where
     F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
@@ -1440,6 +1535,9 @@ async fn run_endpoint_loop_with_contexts_and_ready_signal<F, Fut>(
     let final_reason = exit_reason.unwrap_or_else(|| "loop_returned".into());
     *terminal_reason.lock().expect("terminal_reason lock") = Some(final_reason.clone());
     if let Some(ready) = &receivable_ready {
+        ready.signal();
+    }
+    if let Some(ready) = &terminal_ready {
         ready.signal();
     }
     if debug_materialized_route {

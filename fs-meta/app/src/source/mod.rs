@@ -1788,6 +1788,76 @@ impl FSMetaSource {
         Ok(Some(groups))
     }
 
+    fn runtime_route_group_ids(
+        &self,
+        unit: SourceRuntimeUnit,
+        route_key: &str,
+    ) -> Result<Option<BTreeSet<String>>> {
+        if !self.unit_control.has_runtime_state() {
+            return Ok(None);
+        }
+        let Some((_, bound_scopes)) = self
+            .unit_control
+            .active_route_state(unit.unit_id(), route_key)?
+        else {
+            return Ok(Some(BTreeSet::new()));
+        };
+        Ok(Some(
+            bound_scopes
+                .into_iter()
+                .map(|scope| scope.scope_id)
+                .filter(|scope_id| !scope_id.trim().is_empty())
+                .collect(),
+        ))
+    }
+
+    fn runtime_route_accepts_status_request(
+        &self,
+        route_key: &str,
+        manual_rescan_delivery_evidence: bool,
+    ) -> Result<bool> {
+        if self
+            .runtime_route_group_ids(SourceRuntimeUnit::Source, route_key)?
+            .is_none_or(|groups| !groups.is_empty())
+        {
+            return Ok(true);
+        }
+        if manual_rescan_delivery_evidence
+            && route_key == source_status_request_route_for(&self.node_id.0).0
+        {
+            return Ok(self
+                .runtime_route_group_ids(
+                    SourceRuntimeUnit::Source,
+                    &source_rescan_request_route_for(&self.node_id.0).0,
+                )?
+                .is_none_or(|groups| !groups.is_empty()));
+        }
+        Ok(false)
+    }
+
+    fn should_start_source_status_endpoint_for_route(&self, route_key: &str) -> bool {
+        if self
+            .unit_control
+            .route_active(SOURCE_RUNTIME_UNIT_ID, route_key)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if route_key == source_status_request_route_for(&self.node_id.0).0
+            && self
+                .unit_control
+                .route_active(
+                    SOURCE_RUNTIME_UNIT_ID,
+                    &source_rescan_request_route_for(&self.node_id.0).0,
+                )
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        matches!(self.endpoint_runtime, SourceEndpointRuntime::Local)
+            && !self.unit_control.has_runtime_state()
+    }
+
     pub(crate) fn snapshot_scheduled_source_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
         self.scheduled_group_ids(SourceRuntimeUnit::Source)
     }
@@ -1812,7 +1882,7 @@ impl FSMetaSource {
         self.scheduled_scan_group_ids_snapshot()
     }
 
-    async fn refresh_runtime_roots(&self, trigger_rescan: bool) -> Result<()> {
+    pub(crate) async fn refresh_runtime_roots(&self, trigger_rescan: bool) -> Result<()> {
         let root_specs = self.logical_roots_snapshot();
         let host_object_grants = self.host_object_grants_snapshot();
         let source_rows = match self
@@ -1839,6 +1909,15 @@ impl FSMetaSource {
         ));
         let source_groups = self.scheduled_group_ids(SourceRuntimeUnit::Source)?;
         let scan_groups = self.scheduled_group_ids(SourceRuntimeUnit::Scan)?;
+        let effective_scan_groups = if self.unit_control.has_runtime_state()
+            && source_groups.is_some()
+            && scan_groups.is_none()
+            && scan_rows.is_empty()
+        {
+            source_groups.clone()
+        } else {
+            scan_groups.clone()
+        };
         let desired = Self::build_root_runtimes(
             &self.config,
             &self.node_id,
@@ -1846,7 +1925,7 @@ impl FSMetaSource {
             &root_specs,
             &effective_host_object_grants,
             source_groups.as_ref(),
-            scan_groups.as_ref(),
+            effective_scan_groups.as_ref(),
         );
         let current = lock_or_recover(
             &self.state_cell.roots,
@@ -3601,10 +3680,12 @@ impl FSMetaSource {
         }
 
         let scoped_route = source_rescan_request_route_for(&self.node_id.0);
-        if !self.endpoint_task_route_present(
-            &scoped_route.0,
-            "source.start_rescan_endpoints.route_present.scoped_rescan",
-        ) {
+        if self.endpoint_runtime.owns_external_scoped_rescan_routes()
+            && !self.endpoint_task_route_present(
+                &scoped_route.0,
+                "source.start_rescan_endpoints.route_present.scoped_rescan",
+            )
+        {
             let node_id_rescan_scoped = self.node_id.clone();
             let rescan_roots_scoped = self.state_cell.roots_handle();
             let rescan_root_tasks_scoped = rescan_root_tasks.clone();
@@ -3732,6 +3813,7 @@ impl FSMetaSource {
         let status_source = self.clone();
         let status_node_id = self.node_id.clone();
         let status_boundary = boundary.clone();
+        let status_route_key = route.0.clone();
         let endpoint_task = ManagedEndpointTask::spawn_with_unit(
             boundary,
             route,
@@ -3745,12 +3827,28 @@ impl FSMetaSource {
                 let status_source = status_source.clone();
                 let status_node_id = status_node_id.clone();
                 let status_boundary = status_boundary.clone();
+                let status_route_key = status_route_key.clone();
                 async move {
                     let manual_rescan_delivery_evidence = requests.iter().any(|req| {
                         crate::query::api::source_status_request_requires_manual_rescan_delivery_evidence(
                             req.payload_bytes(),
                         )
                     });
+                    match status_source.runtime_route_accepts_status_request(
+                        &status_route_key,
+                        manual_rescan_delivery_evidence,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => return Vec::new(),
+                        Err(err) => {
+                            log::warn!(
+                                "source status route scope check failed route={}: {:?}",
+                                status_route_key,
+                                err
+                            );
+                            return Vec::new();
+                        }
+                    }
                     let current_owner_health_evidence = requests.iter().any(|req| {
                         crate::query::api::source_status_request_requires_current_owner_health_evidence(
                             req.payload_bytes(),
@@ -3880,11 +3978,15 @@ impl FSMetaSource {
 
         if self.endpoint_runtime.owns_source_status_routes() {
             match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS) {
-                Ok(route) => self.start_source_status_endpoint_on_route(
-                    boundary.clone(),
-                    route,
-                    "source.start_runtime_endpoints.route_present.status",
-                ),
+                Ok(route) => {
+                    if self.should_start_source_status_endpoint_for_route(&route.0) {
+                        self.start_source_status_endpoint_on_route(
+                            boundary.clone(),
+                            route,
+                            "source.start_runtime_endpoints.route_present.status",
+                        );
+                    }
+                }
                 Err(err) => {
                     log::error!(
                         "failed to resolve source status route {}.{}: {:?}",
@@ -3894,11 +3996,14 @@ impl FSMetaSource {
                     );
                 }
             }
-            self.start_source_status_endpoint_on_route(
-                boundary.clone(),
-                source_status_request_route_for(&self.node_id.0),
-                "source.start_runtime_endpoints.route_present.scoped_status",
-            );
+            let scoped_status_route = source_status_request_route_for(&self.node_id.0);
+            if self.should_start_source_status_endpoint_for_route(&scoped_status_route.0) {
+                self.start_source_status_endpoint_on_route(
+                    boundary.clone(),
+                    scoped_status_route,
+                    "source.start_runtime_endpoints.route_present.scoped_status",
+                );
+            }
         }
 
         match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN) {
@@ -4563,7 +4668,8 @@ impl FSMetaSource {
                 .replace(root_specs.clone())
                 .await?;
         }
-        self.refresh_runtime_roots(true).await?;
+        self.refresh_runtime_roots(false).await?;
+        self.trigger_rescan();
         self.state_cell.record_authoritative_commit(
             commit_label,
             format!("roots={} host_object_grants={}", root_count, grant_count),

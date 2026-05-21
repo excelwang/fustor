@@ -272,6 +272,7 @@ struct SourceStatusMissingRouteStateThenReplyBoundary {
     first_retryable_gap_at: std::sync::Mutex<Option<std::time::Instant>>,
     second_send_at: std::sync::Mutex<Option<std::time::Instant>>,
     second_send_notifier: tokio::sync::Notify,
+    changed: Notify,
 }
 
 struct SourceStatusOkSinkStatusExplicitEmptyThenReadyBoundary {
@@ -923,6 +924,7 @@ impl SourceStatusMissingRouteStateThenReplyBoundary {
             first_retryable_gap_at: std::sync::Mutex::new(None),
             second_send_at: std::sync::Mutex::new(None),
             second_send_notifier: tokio::sync::Notify::new(),
+            changed: Notify::new(),
         }
     }
 
@@ -2125,6 +2127,7 @@ impl ChannelIoSubset for SourceStatusMissingRouteStateThenReplyBoundary {
                 Some(std::time::Instant::now());
             self.second_send_notifier.notify_waiters();
         }
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -2133,24 +2136,25 @@ impl ChannelIoSubset for SourceStatusMissingRouteStateThenReplyBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        let mut recv_batches = self
-            .recv_batches_by_channel
-            .lock()
-            .expect("source missing-route-state boundary recv batches lock");
-        *recv_batches
-            .entry(request.channel_key.0.clone())
-            .or_default() += 1;
-        drop(recv_batches);
+        {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("source missing-route-state boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
 
         if request.channel_key.0 == self.source_reply_channel {
             let request_channel = self.source_reply_channel.trim_end_matches(":reply");
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("source missing-route-state boundary correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
+            let correlation = wait_for_test_correlation(
+                &self.correlations_by_channel,
+                &self.changed,
+                request_channel,
+                "source missing-route-state boundary correlations lock",
+            )
+            .await?;
             let attempt = self
                 .source_reply_attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2178,13 +2182,13 @@ impl ChannelIoSubset for SourceStatusMissingRouteStateThenReplyBoundary {
                 .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             let request_channel = self.sink_reply_channel.trim_end_matches(":reply");
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("source missing-route-state boundary correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
+            let correlation = wait_for_test_correlation(
+                &self.correlations_by_channel,
+                &self.changed,
+                request_channel,
+                "source missing-route-state boundary correlations lock",
+            )
+            .await?;
             return Ok(vec![mk_event_with_correlation(
                 "node-a",
                 correlation,

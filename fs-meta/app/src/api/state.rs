@@ -59,6 +59,11 @@ pub struct ApiRequestTracker {
     changed: Notify,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ApiRequestControlReadinessSnapshot {
+    pub control_gate_fully_ready: bool,
+}
+
 pub struct ApiControlGate {
     ready: AtomicBool,
     management_write_ready: AtomicBool,
@@ -67,6 +72,7 @@ pub struct ApiControlGate {
     epoch: AtomicU64,
     changed: Notify,
     facade_request_tracker: Arc<ApiRequestTracker>,
+    status_remote_collection_tracker: Arc<ApiRequestTracker>,
     management_write_recovery: RwLock<Option<ManagementWriteRecovery>>,
     source_repair_recovery: RwLock<Option<ManagementWriteRecovery>>,
 }
@@ -107,6 +113,7 @@ impl ApiControlGate {
             epoch: AtomicU64::new(0),
             changed: Notify::new(),
             facade_request_tracker: Arc::new(ApiRequestTracker::default()),
+            status_remote_collection_tracker: Arc::new(ApiRequestTracker::default()),
             management_write_recovery: RwLock::new(None),
             source_repair_recovery: RwLock::new(None),
         }
@@ -251,6 +258,14 @@ impl ApiControlGate {
 
     pub async fn wait_for_facade_request_drain(&self) {
         self.facade_request_tracker.wait_for_drain().await;
+    }
+
+    pub fn begin_status_remote_collection(self: &Arc<Self>) -> ApiRequestGuard {
+        self.status_remote_collection_tracker.begin()
+    }
+
+    pub async fn wait_for_status_remote_collection_drain(&self) {
+        self.status_remote_collection_tracker.wait_for_drain().await;
     }
 }
 

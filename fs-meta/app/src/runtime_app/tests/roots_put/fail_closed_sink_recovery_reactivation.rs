@@ -1,3 +1,24 @@
+    async fn wait_for_deferred_sink_repair_to_quiesce(app: &FSMetaApp) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let deferred_repair = app
+                .deferred_sink_repair_recovery_scheduled
+                .load(std::sync::atomic::Ordering::Acquire);
+            let deferred_replay = app
+                .sink_generation_cutover_replay_deferred
+                .load(std::sync::atomic::Ordering::Acquire);
+            let sink_apply_inflight = app.sink.control_op_inflight().await;
+            if !deferred_repair && !deferred_replay && !sink_apply_inflight {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for initial deferred sink repair to quiesce before installing a sink control failure hook"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test]
     async fn stale_sink_events_tick_after_fail_closed_cleanup_and_later_reactivate_does_not_reenter_sink_worker()
      {
@@ -102,6 +123,7 @@
             .await
             .expect("initial source/sink wave should succeed");
         assert!(app.control_initialized());
+        wait_for_deferred_sink_repair_to_quiesce(&app).await;
 
         let _err_reset = SinkControlErrorHookReset;
         crate::workers::sink::install_sink_worker_control_frame_error_hook(
@@ -442,6 +464,7 @@
         app.on_control_frame(&initial)
             .await
             .expect("initial exact-shaped full wave should succeed");
+        wait_for_deferred_sink_repair_to_quiesce(&app).await;
 
         let _reset = SinkControlErrorHookReset;
         crate::workers::sink::install_sink_worker_control_frame_error_hook(
@@ -786,6 +809,7 @@
         app.on_control_frame(&initial)
             .await
             .expect("initial exact-shaped full wave should succeed");
+        wait_for_deferred_sink_repair_to_quiesce(&app).await;
 
         let _reset = SinkControlErrorHookReset;
         crate::workers::sink::install_sink_worker_control_frame_error_hook(
@@ -1223,11 +1247,14 @@
         app.on_control_frame(&initial)
             .await
             .expect("initial exact-shaped full wave should succeed");
+        wait_for_deferred_sink_repair_to_quiesce(&app).await;
 
         let _reset = SinkControlErrorHookReset;
         crate::workers::sink::install_sink_worker_control_frame_error_hook(
             crate::workers::sink::SinkWorkerControlFrameErrorHook {
-                err: CnxError::Timeout,
+                err: CnxError::ProtocolViolation(
+                    "simulated fail-closed sink-only events deactivate failure".to_string(),
+                ),
             },
         );
 
@@ -1346,4 +1373,3 @@
 
         app.close().await.expect("close app");
     }
-

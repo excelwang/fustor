@@ -97,6 +97,7 @@ const FORCE_FIND_RUNNER_BINDING_STATUS_IDLE_GRACE_MAX: Duration = Duration::from
 const FORCE_FIND_RUNNER_BINDING_NOT_READY_PREFIX: &str = "runner_binding_not_ready:";
 const TRUSTED_MATERIALIZED_READINESS_SETTLE_BUDGET: Duration = Duration::from_secs(5);
 const TRUSTED_MATERIALIZED_READINESS_SETTLE_BACKOFF: Duration = Duration::from_millis(250);
+const TRUSTED_MATERIALIZED_OWNER_STATUS_LOAD_BUDGET: Duration = Duration::from_millis(500);
 const LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE: Duration = Duration::from_millis(250);
 const STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP: Duration = Duration::from_secs(5);
 const STATUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(30);
@@ -1699,6 +1700,30 @@ impl Default for MaterializedStatusLoadPlan {
 }
 
 impl MaterializedStatusLoadPlan {
+    fn rebudget(self, route_timeout: Duration) -> Self {
+        Self {
+            source_route: self.source_route.rebudget(route_timeout),
+            sink_route: self.sink_route.rebudget(route_timeout),
+            explicit_empty_sink_recollect: self.explicit_empty_sink_recollect.rebudget(
+                std::cmp::min(
+                    route_timeout,
+                    self.explicit_empty_sink_recollect.route_timeout(),
+                ),
+            ),
+            owner_scoped_sink_route: self.owner_scoped_sink_route.rebudget(route_timeout),
+        }
+    }
+
+    fn trusted_readiness(self, route_timeout: Duration) -> Self {
+        Self {
+            owner_scoped_sink_route: self.owner_scoped_sink_route.rebudget(std::cmp::min(
+                route_timeout,
+                TRUSTED_MATERIALIZED_OWNER_STATUS_LOAD_BUDGET,
+            )),
+            ..self.rebudget(route_timeout)
+        }
+    }
+
     fn request_source_refresh_plan(self, caller_timeout: Duration) -> StatusRoutePlan {
         self.source_route.rebudget(
             StatusRoutePlan::caller_capped(caller_timeout, self.source_route.collect_idle_grace())
@@ -2491,7 +2516,13 @@ async fn augment_routed_sink_status_with_current_owner_evidence(
 async fn load_materialized_status_snapshots_with_failure(
     state: &ApiState,
 ) -> Result<(SourceStatusSnapshot, SinkStatusSnapshot), QueryWorkerObservationFailure> {
-    let status_load_plan = MaterializedStatusLoadPlan::default();
+    load_materialized_status_snapshots_with_plan(state, MaterializedStatusLoadPlan::default()).await
+}
+
+async fn load_materialized_status_snapshots_with_plan(
+    state: &ApiState,
+    status_load_plan: MaterializedStatusLoadPlan,
+) -> Result<(SourceStatusSnapshot, SinkStatusSnapshot), QueryWorkerObservationFailure> {
     let (Some(source), Some(sink)) = (&state.readiness_source, &state.readiness_sink) else {
         return Ok((
             SourceStatusSnapshot::default(),
@@ -2500,12 +2531,8 @@ async fn load_materialized_status_snapshots_with_failure(
     };
     let fallback_readiness_groups = scan_enabled_readiness_groups(state)?;
     let cache_signature = materialized_readiness_cache_signature(source)?;
-    if !matches!(&state.backend, QueryBackend::Route { .. })
-        && let Some(cached) = cached_materialized_status_snapshots(
-            state,
-            &fallback_readiness_groups,
-            &cache_signature,
-        )?
+    if let Some(cached) =
+        cached_materialized_status_snapshots(state, &fallback_readiness_groups, &cache_signature)?
     {
         return Ok(cached);
     }
@@ -2625,6 +2652,7 @@ async fn load_materialized_status_snapshots_with_failure(
     }
     let source_status = {
         let fresh = filter_source_status_snapshot(source_status, &readiness_groups);
+        let cache_signature = materialized_readiness_cache_signature(source)?;
         let mut cache = state.materialized_source_status_cache.lock().map_err(|_| {
             CnxError::Internal("materialized source status cache lock poisoned".into())
         })?;
@@ -3182,8 +3210,25 @@ async fn load_trusted_materialized_status_snapshots_with_settle(
     let readiness_groups = scan_enabled_readiness_groups(state)?;
     let deadline = Instant::now() + TRUSTED_MATERIALIZED_READINESS_SETTLE_BUDGET;
     loop {
-        let (source_status, sink_status) =
-            load_materialized_status_snapshots_with_failure(state).await?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let (source_status, sink_status) = load_materialized_status_snapshots_with_plan(
+                state,
+                MaterializedStatusLoadPlan::default().trusted_readiness(Duration::ZERO),
+            )
+            .await?;
+            let observation_status = materialized_observation_status_for_readiness_groups(
+                &source_status,
+                &sink_status,
+                &readiness_groups,
+            );
+            return Ok((source_status, sink_status, observation_status));
+        }
+        let (source_status, sink_status) = load_materialized_status_snapshots_with_plan(
+            state,
+            MaterializedStatusLoadPlan::default().trusted_readiness(remaining),
+        )
+        .await?;
         let observation_status = materialized_observation_status_for_readiness_groups(
             &source_status,
             &sink_status,
@@ -4321,6 +4366,20 @@ fn entry_window_is_complete(
         return returned_entries == 0;
     }
     entry_limit.is_none_or(|limit| returned_entries < limit)
+}
+
+fn entry_window_repeats_prior_position(
+    snapshot: &GroupPitSnapshot,
+    entry_offset: usize,
+    payload_entries: &[TreePageEntry],
+) -> bool {
+    if entry_offset == 0 || payload_entries.is_empty() {
+        return false;
+    }
+    snapshot
+        .entries
+        .get(entry_offset.saturating_sub(1))
+        .is_some_and(|prior| payload_entries[0].path <= prior.path)
 }
 
 fn remaining_timeout_from(started_at: Instant, timeout: Duration) -> Result<Duration, CnxError> {
@@ -7498,8 +7557,8 @@ fn tree_pit_group_plan_preserves_proxy_fallback_min_budget_for_middle_groups() {
 
     assert_eq!(
         plan.empty_response_proxy_retry_timeout(Duration::from_millis(1800)),
-        SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET,
-        "middle-ranked PIT groups should preserve enough proxy budget for delayed selected-group fallback replies"
+        Duration::from_millis(1800),
+        "middle-ranked PIT groups should preserve all remaining proxy budget for delayed selected-group fallback replies when less than the preferred proxy minimum remains"
     );
 }
 
@@ -8295,6 +8354,41 @@ fn materialized_status_load_plan_request_source_refresh_caps_and_preserves_calle
 }
 
 #[test]
+fn materialized_status_load_plan_trusted_readiness_caps_owner_status_route() {
+    let plan = MaterializedStatusLoadPlan::default().trusted_readiness(Duration::from_secs(5));
+
+    assert_eq!(
+        plan.source_route,
+        StatusRoutePlan::new(Duration::from_secs(5), STATUS_ROUTE_COLLECT_IDLE_GRACE),
+        "trusted-readiness source status fan-in should preserve the caller settle budget",
+    );
+    assert_eq!(
+        plan.sink_route,
+        StatusRoutePlan::new(
+            Duration::from_secs(5),
+            LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE
+        ),
+        "trusted-readiness generic sink status fan-in should preserve the caller settle budget",
+    );
+    assert_eq!(
+        plan.owner_scoped_sink_route,
+        StatusRoutePlan::new(
+            TRUSTED_MATERIALIZED_OWNER_STATUS_LOAD_BUDGET,
+            STATUS_ROUTE_COLLECT_IDLE_GRACE
+        ),
+        "trusted-readiness owner-scoped sink status fan-in should fail closed quickly instead of consuming the whole read settle budget",
+    );
+
+    let shorter =
+        MaterializedStatusLoadPlan::default().trusted_readiness(Duration::from_millis(250));
+    assert_eq!(
+        shorter.owner_scoped_sink_route,
+        StatusRoutePlan::new(Duration::from_millis(250), STATUS_ROUTE_COLLECT_IDLE_GRACE),
+        "trusted-readiness owner-scoped sink status fan-in should preserve smaller caller budgets",
+    );
+}
+
+#[test]
 fn tree_pit_group_plan_empty_response_proxy_route_plan_caps_small_timeout() {
     let plan = TreePitSessionPlan::new(Duration::from_millis(80), 1).selected_group_stage_plan(
         TreePitGroupPlanInput {
@@ -8392,7 +8486,7 @@ fn tree_pit_group_plan_owner_attempt_timeout_reserves_proxy_budget_for_non_fail_
 
     assert_eq!(
         plan.owner_attempt_timeout(Duration::from_millis(250)),
-        Duration::from_millis(125),
+        Duration::from_millis(100),
         "selected-group owner attempts should keep proxy reserve inside the planner for non-fail-closed ready-root lanes instead of helper-local timeout math",
     );
 }
@@ -8439,7 +8533,7 @@ fn tree_pit_group_plan_owner_route_plan_owns_owner_route_collect_idle_grace() {
     assert_eq!(
         plan.owner_route_plan(Duration::from_millis(250)),
         SelectedGroupOwnerRoutePlan {
-            route_timeout: Duration::from_millis(125),
+            route_timeout: Duration::from_millis(100),
             collect_idle_grace: SELECTED_GROUP_OWNER_ROUTE_COLLECT_IDLE_GRACE,
         },
         "selected-group owner route planning should own the owner attempt timeout and collect-idle-grace together instead of leaving the route helper to recalculate collect-idle-grace from a bare timeout",
@@ -13036,6 +13130,10 @@ fn merge_tree_pit_entry_window(
     if snapshot.root.is_none() {
         snapshot.root = Some(payload.root);
     }
+    if entry_window_repeats_prior_position(snapshot, entry_offset, &payload.entries) {
+        snapshot.entry_window_complete = true;
+        return Ok(());
+    }
     snapshot.entries.truncate(entry_offset);
     let returned_entries = payload.entries.len();
     snapshot.entries.extend(payload.entries);
@@ -13115,9 +13213,9 @@ async fn extend_tree_pit_session_entry_windows(
     request_source_status: Option<&SourceStatusSnapshot>,
     request_sink_status: Option<&SinkStatusSnapshot>,
 ) -> Result<Arc<PitSession>, CnxError> {
-    let PitScope::Tree(scope) = &session.scope else {
+    if !matches!(&session.scope, PitScope::Tree(_)) {
         return Ok(session);
-    };
+    }
     let selected_end = session
         .groups
         .len()
@@ -13126,36 +13224,52 @@ async fn extend_tree_pit_session_entry_windows(
     let mut groups = session.groups.clone();
     let mut changed = false;
 
-    for index in group_offset..selected_end {
-        let group_key = groups[index].group.clone();
-        let entry_offset = entry_offsets.get(&group_key).copied().unwrap_or(0);
-        while tree_pit_snapshot_needs_entry_window(&groups[index], entry_offset, entry_page_size) {
+    loop {
+        let mut pending = FuturesUnordered::new();
+        for index in group_offset..selected_end {
+            let group_key = groups[index].group.clone();
+            let entry_offset = entry_offsets.get(&group_key).copied().unwrap_or(0);
+            if !tree_pit_snapshot_needs_entry_window(&groups[index], entry_offset, entry_page_size)
+            {
+                continue;
+            }
             let chunk_offset = groups[index].entries.len();
             let target_len = entry_offset
                 .saturating_add(entry_page_size)
                 .saturating_add(1);
-            let remaining_entries = target_len.saturating_sub(chunk_offset);
-            if remaining_entries == 0 {
-                break;
+            let entry_limit = target_len.saturating_sub(chunk_offset);
+            if entry_limit == 0 {
+                continue;
             }
-            let entry_limit = remaining_entries;
             let remaining_timeout = remaining_timeout_from(started_at, timeout)?;
-            let payload = query_tree_pit_entry_window(
-                state,
-                policy,
-                &session,
-                scope,
-                &group_key,
-                chunk_offset,
-                entry_limit,
-                remaining_timeout,
-                request_source_status,
-                request_sink_status,
-            )
-            .await?;
+            let session_for_query = session.clone();
+            pending.push(async move {
+                let PitScope::Tree(scope) = &session_for_query.scope else {
+                    unreachable!("tree PIT entry extension only runs for tree sessions");
+                };
+                let payload = query_tree_pit_entry_window(
+                    state,
+                    policy,
+                    &session_for_query,
+                    scope,
+                    &group_key,
+                    chunk_offset,
+                    entry_limit,
+                    remaining_timeout,
+                    request_source_status,
+                    request_sink_status,
+                )
+                .await;
+                (index, chunk_offset, entry_limit, payload)
+            });
+        }
+        if pending.is_empty() {
+            break;
+        }
+        while let Some((index, chunk_offset, entry_limit, payload)) = pending.next().await {
             merge_tree_pit_entry_window(
                 &mut groups[index],
-                payload,
+                payload?,
                 chunk_offset,
                 Some(entry_limit),
                 Some(MATERIALIZED_TREE_ROUTE_PAYLOAD_BYTES_MAX),

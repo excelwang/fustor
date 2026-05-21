@@ -249,7 +249,9 @@
         predecessor
             .on_control_frame(&predecessor_second)
             .await
-            .expect_err("predecessor second exact-shaped wave should fail");
+            .expect(
+                "predecessor second exact-shaped wave should fail closed inside app boundary",
+            );
         crate::workers::source::clear_source_worker_control_frame_error_hook();
         assert!(
             !predecessor.control_initialized(),
@@ -579,7 +581,9 @@
         predecessor
             .on_control_frame(&predecessor_second)
             .await
-            .expect_err("predecessor second exact-shaped wave should fail");
+            .expect(
+                "predecessor second exact-shaped wave should fail closed inside app boundary",
+            );
         crate::workers::source::clear_source_worker_control_frame_error_hook();
         assert!(
             !predecessor.control_initialized(),
@@ -909,7 +913,9 @@
         predecessor
             .on_control_frame(&predecessor_second)
             .await
-            .expect_err("predecessor second exact-shaped wave should fail");
+            .expect(
+                "predecessor second exact-shaped wave should fail closed inside app boundary",
+            );
         crate::workers::source::clear_source_worker_control_frame_error_hook();
         assert!(
             !predecessor.control_initialized(),
@@ -1000,4 +1006,3 @@
         successor.close().await.expect("close successor app");
         predecessor.close().await.expect("close predecessor app");
     }
-

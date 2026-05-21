@@ -1132,9 +1132,14 @@
             app.control_initialized(),
             "generation-two source activate should leave runtime initialized before the fail-closed source-only lane"
         );
+        let source_worker_instance_id = match &*app.source {
+            SourceFacade::Worker(client) => client.worker_instance_id_for_tests().await,
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
 
         let _reset = SourceControlErrorHookReset;
-        crate::workers::source::install_source_worker_control_frame_error_hook(
+        crate::workers::source::install_source_worker_control_frame_error_hook_for_worker_instance(
+            source_worker_instance_id,
             crate::workers::source::SourceWorkerControlFrameErrorHook {
                 err: CnxError::ProtocolViolation(
                     "simulated fail-closed source-only roots deactivate failure".to_string(),

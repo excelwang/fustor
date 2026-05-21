@@ -735,6 +735,7 @@ pub(crate) struct SinkStatusSnapshotReadinessSummary {
     pub(crate) pending_materialization_groups: BTreeSet<String>,
     pub(crate) missing_scheduled_groups: BTreeSet<String>,
     pub(crate) has_stream_group_evidence: bool,
+    pub(crate) stream_evidence_groups: BTreeSet<String>,
 }
 
 #[cfg(test)]
@@ -812,8 +813,22 @@ impl SinkStatusSnapshot {
 
     pub(crate) fn readiness_summary(&self) -> SinkStatusSnapshotReadinessSummary {
         let scheduled_groups = self.scheduled_groups();
-        if scheduled_groups.is_empty() {
-            return SinkStatusSnapshotReadinessSummary::default();
+        let stream_evidence_groups = snapshot_stream_group_evidence_groups(self, &scheduled_groups);
+        let mut summary = SinkStatusSnapshotReadinessSummary {
+            has_stream_group_evidence: !stream_evidence_groups.is_empty(),
+            stream_evidence_groups,
+            scheduled_groups,
+            ..SinkStatusSnapshotReadinessSummary::default()
+        };
+        if summary.scheduled_groups.is_empty() {
+            for group in &self.groups {
+                if matches!(group.normalized_readiness(), GroupReadinessState::Ready)
+                    && group.materialized_service_live_ready()
+                {
+                    summary.ready_groups.insert(group.group_id.clone());
+                }
+            }
+            return summary;
         }
 
         let groups_by_id = self
@@ -821,11 +836,6 @@ impl SinkStatusSnapshot {
             .iter()
             .map(|group| (group.group_id.as_str(), group))
             .collect::<BTreeMap<_, _>>();
-        let mut summary = SinkStatusSnapshotReadinessSummary {
-            has_stream_group_evidence: snapshot_has_stream_group_evidence(self, &scheduled_groups),
-            scheduled_groups,
-            ..SinkStatusSnapshotReadinessSummary::default()
-        };
 
         for group_id in &summary.scheduled_groups {
             let Some(group) = groups_by_id.get(group_id.as_str()) else {
@@ -883,6 +893,10 @@ impl SinkStatusSnapshot {
             &summary, self,
         ) {
             Some(SinkStatusConcern::ReplayPending)
+        } else if readiness_summary_looks_scheduled_pending_materialization_after_delivery_evidence(
+            &summary, self,
+        ) {
+            Some(SinkStatusConcern::CoverageGap)
         } else if readiness_summary_looks_scheduled_waiting_for_materialized_root(&summary) {
             Some(SinkStatusConcern::WaitingForMaterializedRoot)
         } else if readiness_summary_looks_scheduled_mixed_ready_and_unready(&summary) {
@@ -931,10 +945,10 @@ pub(crate) fn sink_status_origin_entry_group_id(entry: &str) -> &str {
         .unwrap_or(scoped)
 }
 
-fn snapshot_has_stream_group_evidence(
+fn snapshot_stream_group_evidence_groups(
     snapshot: &SinkStatusSnapshot,
     scheduled_groups: &BTreeSet<String>,
-) -> bool {
+) -> BTreeSet<String> {
     [
         &snapshot.stream_received_origin_counts_by_node,
         &snapshot.stream_received_path_origin_counts_by_node,
@@ -946,7 +960,13 @@ fn snapshot_has_stream_group_evidence(
     .into_iter()
     .flat_map(|groups_by_node| groups_by_node.values())
     .flat_map(|entries| entries.iter())
-    .any(|entry| scheduled_groups.contains(sink_status_origin_entry_group_id(entry)))
+    .filter_map(|entry| {
+        let group_id = sink_status_origin_entry_group_id(entry);
+        scheduled_groups
+            .contains(group_id)
+            .then(|| group_id.to_string())
+    })
+    .collect()
 }
 
 fn readiness_summary_looks_scheduled_missing_group_rows_after_stream_evidence(
@@ -954,7 +974,9 @@ fn readiness_summary_looks_scheduled_missing_group_rows_after_stream_evidence(
 ) -> bool {
     !summary.scheduled_groups.is_empty()
         && !summary.missing_scheduled_groups.is_empty()
-        && summary.has_stream_group_evidence
+        && !summary
+            .missing_scheduled_groups
+            .is_disjoint(&summary.stream_evidence_groups)
 }
 
 fn readiness_summary_looks_scheduled_waiting_for_materialized_root(
@@ -1003,6 +1025,16 @@ fn readiness_summary_looks_scheduled_pending_materialization_without_stream_rece
         && snapshot.stream_last_applied_at_us_by_node.is_empty()
 }
 
+fn readiness_summary_looks_scheduled_pending_materialization_after_delivery_evidence(
+    summary: &SinkStatusSnapshotReadinessSummary,
+    snapshot: &SinkStatusSnapshot,
+) -> bool {
+    !summary.scheduled_groups.is_empty()
+        && summary.missing_scheduled_groups.is_empty()
+        && summary.pending_materialization_groups.len() == summary.scheduled_groups.len()
+        && sink_status_snapshot_has_delivery_evidence(snapshot)
+}
+
 fn readiness_summary_looks_scheduled_mixed_ready_and_unready(
     summary: &SinkStatusSnapshotReadinessSummary,
 ) -> bool {
@@ -1010,6 +1042,35 @@ fn readiness_summary_looks_scheduled_mixed_ready_and_unready(
         && !summary.ready_groups.is_empty()
         && (!summary.waiting_for_materialized_root_groups.is_empty()
             || !summary.pending_materialization_groups.is_empty())
+}
+
+fn sink_status_snapshot_has_delivery_evidence(snapshot: &SinkStatusSnapshot) -> bool {
+    !snapshot.received_batches_by_node.is_empty()
+        || !snapshot.received_events_by_node.is_empty()
+        || !snapshot.received_control_events_by_node.is_empty()
+        || !snapshot.received_data_events_by_node.is_empty()
+        || !snapshot.last_received_at_us_by_node.is_empty()
+        || !snapshot.last_received_origins_by_node.is_empty()
+        || !snapshot.received_origin_counts_by_node.is_empty()
+        || !snapshot.stream_received_batches_by_node.is_empty()
+        || !snapshot.stream_received_events_by_node.is_empty()
+        || !snapshot.stream_received_origin_counts_by_node.is_empty()
+        || !snapshot
+            .stream_received_path_origin_counts_by_node
+            .is_empty()
+        || !snapshot.stream_ready_origin_counts_by_node.is_empty()
+        || !snapshot.stream_ready_path_origin_counts_by_node.is_empty()
+        || !snapshot.stream_deferred_origin_counts_by_node.is_empty()
+        || !snapshot.stream_dropped_origin_counts_by_node.is_empty()
+        || !snapshot.stream_applied_batches_by_node.is_empty()
+        || !snapshot.stream_applied_events_by_node.is_empty()
+        || !snapshot.stream_applied_control_events_by_node.is_empty()
+        || !snapshot.stream_applied_data_events_by_node.is_empty()
+        || !snapshot.stream_applied_origin_counts_by_node.is_empty()
+        || !snapshot
+            .stream_applied_path_origin_counts_by_node
+            .is_empty()
+        || !snapshot.stream_last_applied_at_us_by_node.is_empty()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1961,7 +2022,7 @@ impl SinkFileMeta {
         let stream_receive_enabled = Arc::new(AtomicBool::new(false));
         let stream_recv_observer = Arc::new(StreamRecvObserver::default());
         let stream_recv_ready_notify = Arc::new(Notify::new());
-        let unit_control = Arc::new(if boundary.is_some() {
+        let unit_control = Arc::new(if boundary.is_some() || defer_authority_read {
             RuntimeUnitGate::new_runtime_managed("sink-file-meta", SINK_RUNTIME_UNITS)
         } else {
             RuntimeUnitGate::new("sink-file-meta", SINK_RUNTIME_UNITS)
@@ -2124,6 +2185,11 @@ impl SinkFileMeta {
             let internal_query_stream_receive_enabled = stream_receive_enabled.clone();
             let internal_query_unit_control = unit_control.clone();
             let mut internal_query_routes = Vec::<RouteKey>::new();
+            if let Ok(route) =
+                default_route_bindings().resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY)
+            {
+                internal_query_routes.push(route);
+            }
             if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY) {
                 internal_query_routes.push(route);
             } else {
@@ -2134,6 +2200,8 @@ impl SinkFileMeta {
                 );
             }
             internal_query_routes.push(sink_query_request_route_for(&node_id_cloned.0));
+            internal_query_routes.sort_by(|left, right| left.0.cmp(&right.0));
+            internal_query_routes.dedup_by(|left, right| left.0 == right.0);
             for route in internal_query_routes {
                 let internal_query_state_for_route = internal_query_state.clone();
                 let internal_query_root_specs_for_route = internal_query_root_specs.clone();
@@ -2653,10 +2721,17 @@ impl SinkFileMeta {
         let internal_query_stream_receive_enabled = self.stream_receive_enabled.clone();
         let internal_query_unit_control = self.unit_control.clone();
         let mut internal_query_routes = Vec::<RouteKey>::new();
+        if let Ok(route) =
+            default_route_bindings().resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY)
+        {
+            internal_query_routes.push(route);
+        }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY) {
             internal_query_routes.push(route);
         }
         internal_query_routes.push(sink_query_request_route_for(&node_id_cloned.0));
+        internal_query_routes.sort_by(|left, right| left.0.cmp(&right.0));
+        internal_query_routes.dedup_by(|left, right| left.0 == right.0);
         for route in internal_query_routes {
             if self.endpoint_task_route_present_on_boundary(
                 &route.0,
@@ -2837,6 +2912,9 @@ impl SinkFileMeta {
         }
         status_routes.push(sink_status_request_route_for(&node_id_cloned.0));
         for route in status_routes {
+            if !self.should_start_sink_status_endpoint_for_route(&route.0) {
+                continue;
+            }
             if self.endpoint_task_route_present_on_boundary(
                 &route.0,
                 &boundary,
@@ -3429,16 +3507,81 @@ impl SinkFileMeta {
     }
 
     fn scheduled_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
+        let roots = self
+            .root_specs
+            .read()
+            .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?
+            .clone();
+        let grants = self.logical_grants_snapshot()?;
+        self.scheduled_group_ids_for_roots_and_grants(&roots, &grants)
+    }
+
+    fn scheduled_group_ids_for_roots_and_grants(
+        &self,
+        roots: &[RootSpec],
+        grants: &[GrantedMountRoot],
+    ) -> Result<Option<BTreeSet<String>>> {
         let Some(bound_scopes) = self.scheduled_bound_scopes()? else {
             return Ok(None);
         };
-        Ok(Some(
-            bound_scopes
-                .into_iter()
-                .map(|scope| scope.scope_id)
-                .filter(|scope_id| !scope_id.trim().is_empty())
-                .collect(),
-        ))
+        Ok(Some(self.scheduled_group_ids_from_bound_scopes(
+            &bound_scopes,
+            roots,
+            grants,
+        )))
+    }
+
+    fn scheduled_group_ids_from_bound_scopes(
+        &self,
+        bound_scopes: &[RuntimeBoundScope],
+        roots: &[RootSpec],
+        grants: &[GrantedMountRoot],
+    ) -> BTreeSet<String> {
+        let roots_by_id = roots
+            .iter()
+            .map(|root| (root.id.as_str(), root))
+            .collect::<HashMap<_, _>>();
+        bound_scopes
+            .iter()
+            .filter_map(|scope| {
+                let scope_id = scope.scope_id.trim();
+                if scope_id.is_empty() {
+                    return None;
+                }
+                self.scheduled_scope_has_active_or_unknown_grant(
+                    scope,
+                    roots_by_id.get(scope_id).copied(),
+                    grants,
+                )
+                .then(|| scope_id.to_string())
+            })
+            .collect()
+    }
+
+    fn scheduled_scope_has_active_or_unknown_grant(
+        &self,
+        scope: &RuntimeBoundScope,
+        root: Option<&RootSpec>,
+        grants: &[GrantedMountRoot],
+    ) -> bool {
+        let resource_ids = scope
+            .resource_ids
+            .iter()
+            .map(|resource_id| resource_id.trim())
+            .filter(|resource_id| !resource_id.is_empty())
+            .collect::<BTreeSet<_>>();
+        let mut matched_any_grant = false;
+        for grant in grants {
+            let resource_match = resource_ids.contains(grant.object_ref.as_str());
+            let root_match = root.is_some_and(|root| root.selector.matches(grant));
+            if resource_match || root_match {
+                matched_any_grant = true;
+                if grant.active {
+                    return true;
+                }
+            }
+        }
+        !matched_any_grant
     }
 
     fn runtime_route_group_ids(&self, route_key: &str) -> Result<Option<BTreeSet<String>>> {
@@ -3482,6 +3625,17 @@ impl SinkFileMeta {
         Ok(self
             .runtime_route_group_ids(route_key)?
             .is_none_or(|groups| !groups.is_empty()))
+    }
+
+    fn should_start_sink_status_endpoint_for_route(&self, route_key: &str) -> bool {
+        if self
+            .unit_control
+            .route_active(SINK_RUNTIME_UNIT_ID, route_key)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        !self.unit_control.has_runtime_state()
     }
 
     pub(crate) fn snapshot_scheduled_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
@@ -3542,7 +3696,8 @@ impl SinkFileMeta {
             .read()
             .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?
             .clone();
-        let allowed_groups = self.scheduled_group_ids()?;
+        let allowed_groups =
+            self.scheduled_group_ids_for_roots_and_grants(&roots, host_object_grants)?;
         {
             let mut state = self.state.write()?;
             state.reconcile_host_object_grants(&roots, host_object_grants, allowed_groups.as_ref());
@@ -3905,7 +4060,8 @@ impl SinkFileMeta {
                 .map_err(|_| CnxError::Internal("Sink host_object_grants lock poisoned".into()))?;
             *grants = host_object_grants.to_vec();
         }
-        let allowed_groups = self.scheduled_group_ids()?;
+        let allowed_groups =
+            self.scheduled_group_ids_for_roots_and_grants(&roots, host_object_grants)?;
         let previous_root_specs = root_specs.clone();
         let mut state = self.state.write()?;
         state.reconcile_host_object_grants_with_previous_roots(

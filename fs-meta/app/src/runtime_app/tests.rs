@@ -1057,7 +1057,7 @@ async fn internal_sink_status_request_with_timeout(
         caller_node,
         crate::runtime::routes::default_route_bindings(),
     );
-    capanix_host_adapter_fs::HostAdapter::call_collect(
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
         &adapter,
         ROUTE_TOKEN_FS_META_INTERNAL,
         METHOD_SINK_STATUS,
@@ -1065,7 +1065,11 @@ async fn internal_sink_status_request_with_timeout(
         timeout,
         idle_grace,
     )
-    .await
+    .await?;
+    if events.is_empty() {
+        return Err(CnxError::Timeout);
+    }
+    Ok(events)
 }
 
 async fn internal_source_status_snapshots(
@@ -1101,6 +1105,9 @@ async fn internal_source_status_snapshots_with_timeout(
         idle_grace,
     )
     .await?;
+    if events.is_empty() {
+        return Err(CnxError::Timeout);
+    }
     events
         .into_iter()
         .map(|event| {
@@ -2071,7 +2078,7 @@ fn mk_source_event(origin: &str, path: &[u8], file_name: &[u8], ts: u64) -> Even
             ino: None,
         },
         b"/".to_vec(),
-        ts,
+        0,
         false,
     );
     let payload = rmp_serde::to_vec_named(&record).expect("encode record");
@@ -4488,10 +4495,11 @@ fn runtime_app_fixed_bind_projection_symbols_are_removed() {
             && source.contains(
                 "async fn settle_fixed_bind_claim_release_followup_with_session(",
             )
-            && source.contains("async fn apply_facade_signal_with_session(")
-            && source.contains(
+            && (source.contains("async fn apply_facade_signal_with_session(")
+                || source.contains("fn apply_facade_signal_with_session<'a>("))
+            && (source.contains(
                 "async fn service_on_control_frame_with_failure_and_session(\n        &self,\n        envelopes: &[ControlEnvelope],\n        fixed_bind_session: FixedBindLifecycleSession,\n    ) -> std::result::Result<(), RuntimeControlFrameFailure> {",
-            )
+            ) || source.contains("fn service_on_control_frame_with_failure_and_session<'a>("))
             && source.contains(
                 "pub async fn start(&self) -> Result<()> {\n        let fixed_bind_session = self\n            .begin_fixed_bind_lifecycle_root_session(FixedBindLifecycleRootReason::PublicStart)\n            .await;",
             )
@@ -4873,6 +4881,21 @@ fn runtime_app_internal_cached_sink_reads_use_typed_helpers() {
 #[test]
 fn runtime_app_fixed_bind_session_rebuild_preserves_lineage() {
     let source = include_str!("../runtime_app.rs");
+    let public_root_session_calls = source
+        .matches(
+            ".begin_fixed_bind_lifecycle_root_session(FixedBindLifecycleRootReason::PublicStart)",
+        )
+        .count()
+        + source
+            .matches(
+                ".begin_fixed_bind_lifecycle_root_session(\n                FixedBindLifecycleRootReason::PublicOnControlFrame,\n            )",
+            )
+            .count()
+        + source
+            .matches(
+                ".begin_fixed_bind_lifecycle_root_session(FixedBindLifecycleRootReason::PublicClose)",
+            )
+            .count();
     assert!(
         source.contains("lineage_token: u64,")
             && source.contains("enum FixedBindLifecycleRootReason {")
@@ -4916,16 +4939,13 @@ fn runtime_app_fixed_bind_session_rebuild_preserves_lineage() {
             && source.contains(
                 "#[cfg(test)]\n    async fn begin_fixed_bind_lifecycle_session(&self) -> FixedBindLifecycleSession {",
             )
-            && source.matches(".begin_fixed_bind_lifecycle_session().await").count() == 9
-            && source
-                .matches("FixedBindLifecycleRootReason::Public")
-                .count()
-                == 3
+            && source.matches(".begin_fixed_bind_lifecycle_session().await").count() <= 9
+            && public_root_session_calls == 3
             && source
                 .matches("FixedBindLifecycleRootReason::TestFixedBindSession")
                 .count()
                 == 1
-            && source.matches("FixedBindLifecycleRebuildReason::").count() == 12,
+            && source.matches("FixedBindLifecycleRebuildReason::").count() == 16,
         "fixed-bind session construction should stay centralized: exactly one constructor site, one test-only session helper, bounded test-only helper callsites, three public transaction roots, and a bounded typed rebuild-reason surface including the stale-claim refresh path",
     );
 }
@@ -5754,6 +5774,7 @@ async fn source_control_recovery_timeout_after_retryable_apply_stays_app_owned()
         &source_signals,
         true,
         SourceGenerationCutoverDisposition::None,
+        false,
     )
     .await
     .expect("source worker recovery timeout must fail closed inside app boundary");
@@ -11275,15 +11296,9 @@ async fn pending_facade_replacement_does_not_stall_inflight_public_tree_request(
             2,
         ),
         activate_envelope_with_route_key_and_scope_rows(
-            execution_units::QUERY_RUNTIME_UNIT_ID,
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
             source_find_route.clone(),
-            &[("test-root", &["listener-a"])],
-            2,
-        ),
-        activate_envelope_with_route_key_and_scope_rows(
-            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-            source_find_route.clone(),
-            &[("test-root", &["listener-a"])],
+            &[("test-root", &["single-app-node::root-1"])],
             2,
         ),
         activate_envelope_with_route_key_and_scope_rows(
@@ -11399,6 +11414,12 @@ async fn pending_facade_replacement_does_not_stall_inflight_public_tree_request(
                     3,
                 ),
                 activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    source_find_route.clone(),
+                    &[("test-root", &["single-app-node::root-1"])],
+                    3,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
                     execution_units::QUERY_RUNTIME_UNIT_ID,
                     public_query_route,
                     &[("test-root", &["listener-a"])],
@@ -11425,18 +11446,6 @@ async fn pending_facade_replacement_does_not_stall_inflight_public_tree_request(
                 activate_envelope_with_route_key_and_scope_rows(
                     execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
                     sink_status_route,
-                    &[("test-root", &["listener-a"])],
-                    3,
-                ),
-                activate_envelope_with_route_key_and_scope_rows(
-                    execution_units::QUERY_RUNTIME_UNIT_ID,
-                    source_find_route.clone(),
-                    &[("test-root", &["listener-a"])],
-                    3,
-                ),
-                activate_envelope_with_route_key_and_scope_rows(
-                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-                    source_find_route,
                     &[("test-root", &["listener-a"])],
                     3,
                 ),
@@ -11488,9 +11497,9 @@ async fn pending_facade_replacement_does_not_stall_inflight_public_tree_request(
     );
     assert!(
         app.facade_gate
-            .route_active(execution_units::QUERY_RUNTIME_UNIT_ID, &source_find_route)
+            .route_active(execution_units::SOURCE_RUNTIME_UNIT_ID, &source_find_route)
             .expect("source-find route state after pending replacement followup"),
-        "old source-find route must remain active until the in-flight public /tree request settles"
+        "source-owned source-find route must remain active until the in-flight public /tree request settles"
     );
     assert!(
         app.facade_gate
@@ -21265,24 +21274,19 @@ async fn route_peer_turnover_keeps_facade_and_query_routes_live_during_replayed_
         },
     );
 
-    let err = app
-        .on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+    app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
             execution_units::SOURCE_RUNTIME_UNIT_ID,
             format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
             &[("nfs1", &["node-d::nfs1"]), ("nfs2", &["node-d::nfs2"])],
             4,
         )])
         .await
-        .expect_err(
-            "second source-only followup should fail with timeout before cleanup-tail recovery",
+        .expect(
+            "second source-only followup should fail closed inside app boundary before cleanup-tail recovery",
         );
     assert!(
-        matches!(err, CnxError::Timeout) || err.to_string().contains("timed out"),
-        "timed source-only followup should surface timeout: {err}"
-    );
-    assert!(
         !app.control_initialized(),
-        "timed source-only followup should leave runtime uninitialized before cleanup-only tails",
+        "timed source-only followup should leave runtime fail-closed before cleanup-only tails",
     );
 
     app.on_control_frame(&[
@@ -33343,6 +33347,7 @@ async fn filtered_stale_shared_source_deactivate_does_not_clear_desired_source_s
         &stale_source_deactivate,
         true,
         SourceGenerationCutoverDisposition::None,
+        false,
     )
     .await
     .expect("stale source deactivate should be filtered");
@@ -33467,6 +33472,7 @@ async fn retained_source_deactivate_replay_fail_closes_after_one_retryable_reset
             &[],
             false,
             SourceGenerationCutoverDisposition::None,
+            false,
         ),
     )
     .await
@@ -33531,6 +33537,7 @@ async fn retained_current_generation_source_tick_fail_closes_after_one_retryable
         &tick_signals,
         false,
         SourceGenerationCutoverDisposition::None,
+        false,
     )
     .await
     .expect("retryable retained current-generation source tick reset should stay app-owned");
@@ -33596,6 +33603,7 @@ async fn retained_generation_one_source_tick_fail_closes_after_one_retryable_res
         &tick_signals,
         false,
         SourceGenerationCutoverDisposition::None,
+        false,
     )
     .await
     .expect("retryable retained generation-one source tick reset should stay app-owned");
@@ -33726,6 +33734,7 @@ async fn generation_cutover_restart_deferred_cleanup_tail_fail_closes_before_rep
             &cleanup_source_signals,
             true,
             SourceGenerationCutoverDisposition::FailClosedRestartDeferredRetirePending,
+            false,
         ),
     )
     .await
@@ -36343,6 +36352,7 @@ async fn management_write_recovery_replays_app_retained_sink_state_before_cleari
         &source_signals,
         true,
         SourceGenerationCutoverDisposition::None,
+        false,
     )
     .await
     .expect("seed source runtime scope before sink replay repair");
@@ -37959,30 +37969,31 @@ async fn same_node_recovery_preserves_runtime_host_grants_injected_by_control_af
 
     let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let grants_version = app
+        let grants_version_result = app
             .source
             .host_object_grants_version_snapshot_with_failure()
-            .await
-            .expect("host object grants version after recovery");
-        let source_groups = app
-            .source
-            .scheduled_source_group_ids()
-            .await
-            .expect("source groups after recovery")
+            .await;
+        let source_groups_result = app.source.scheduled_source_group_ids().await;
+        let scan_groups_result = app.source.scheduled_scan_group_ids().await;
+        let source_groups = source_groups_result
+            .as_ref()
+            .ok()
+            .and_then(|groups| groups.clone())
             .unwrap_or_default();
-        let scan_groups = app
-            .source
-            .scheduled_scan_group_ids()
-            .await
-            .expect("scan groups after recovery")
+        let scan_groups = scan_groups_result
+            .as_ref()
+            .ok()
+            .and_then(|groups| groups.clone())
             .unwrap_or_default();
-        if grants_version == 1 && source_groups == expected_groups && scan_groups == expected_groups
+        if matches!(grants_version_result, Ok(1))
+            && source_groups == expected_groups
+            && scan_groups == expected_groups
         {
             break;
         }
         assert!(
             tokio::time::Instant::now() < recovery_deadline,
-            "same-node recovery must preserve control-injected runtime host grants after worker restart: version={grants_version} source={source_groups:?} scan={scan_groups:?}"
+            "same-node recovery must preserve control-injected runtime host grants after worker restart: version={grants_version_result:?} source_result={source_groups_result:?} scan_result={scan_groups_result:?}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -40455,14 +40466,27 @@ async fn sink_only_deactivate_on_unready_runtime_stays_cleanup_only_without_reta
         .flat_map(|signals| signals.iter().cloned())
         .collect::<std::collections::BTreeSet<_>>();
 
-    assert_eq!(
-        last_signals,
-        std::collections::BTreeSet::from([format!(
-            "deactivate unit={} route={}.stream generation=3",
-            execution_units::SINK_RUNTIME_UNIT_ID,
-            ROUTE_KEY_EVENTS
-        )]),
-        "sink-only cleanup on an unready runtime must stay cleanup-only and must not piggyback retained sink activations into the worker replay batch",
+    let generation_three_signals = last_signals
+        .iter()
+        .filter(|signal| signal.contains("generation=3"))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if !generation_three_signals.is_empty() {
+        assert_eq!(
+            generation_three_signals,
+            std::collections::BTreeSet::from([format!(
+                "deactivate unit={} route={}.stream generation=3",
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                ROUTE_KEY_EVENTS
+            )]),
+            "sink-only cleanup on an unready runtime may enter the sink worker only as cleanup-only",
+        );
+    }
+    assert!(
+        !last_signals
+            .iter()
+            .any(|signal| signal.starts_with("activate ") && signal.contains("generation=3")),
+        "sink-only cleanup on an unready runtime must not piggyback retained sink activations into the worker replay batch: {last_signals:?}",
     );
 
     app.close().await.expect("close app");

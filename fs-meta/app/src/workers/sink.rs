@@ -50,6 +50,7 @@ enum SinkControlResetKind {
     GrantAttachmentsDrainedOrFenced,
     InvalidGrantAttachmentToken,
     MissingChannelBufferRouteState,
+    StateCellWriteFenced,
 }
 
 impl SinkControlResetKind {
@@ -242,6 +243,12 @@ fn classify_sink_control_reset(err: &CnxError) -> Option<SinkControlResetKind> {
             if message.contains("missing route state for channel_buffer") =>
         {
             Some(SinkControlResetKind::MissingChannelBufferRouteState)
+        }
+        CnxError::PeerError(message) | CnxError::Internal(message)
+            if message.contains("statecell_write returned non-committed status for sink state")
+                && message.contains("fenced") =>
+        {
+            Some(SinkControlResetKind::StateCellWriteFenced)
         }
         _ => None,
     }
@@ -439,6 +446,28 @@ fn snapshot_has_scheduled_zero_uninitialized_groups(snapshot: &SinkStatusSnapsho
             .all(|group| group.live_nodes == 0 && group.total_nodes == 0)
 }
 
+fn snapshot_has_zero_uninitialized_groups(snapshot: &SinkStatusSnapshot) -> bool {
+    !snapshot.groups.is_empty()
+        && snapshot
+            .groups
+            .iter()
+            .all(|group| group.live_nodes == 0 && group.total_nodes == 0)
+}
+
+fn snapshot_is_preactivate_unscheduled_cached_truth_for_live(
+    snapshot: &SinkStatusSnapshot,
+) -> bool {
+    !snapshot_has_delivery_evidence(snapshot)
+        && snapshot.scheduled_groups_by_node.is_empty()
+        && (snapshot.groups.is_empty() || snapshot_has_zero_uninitialized_groups(snapshot))
+}
+
+fn snapshot_is_preactivate_cached_status(snapshot: &SinkStatusSnapshot) -> bool {
+    !snapshot_has_delivery_evidence(snapshot)
+        && (snapshot.scheduled_groups_by_node.is_empty()
+            || snapshot_has_scheduled_zero_uninitialized_groups(snapshot))
+}
+
 fn snapshot_has_delivery_evidence(snapshot: &SinkStatusSnapshot) -> bool {
     !snapshot.received_batches_by_node.is_empty()
         || !snapshot.received_events_by_node.is_empty()
@@ -562,6 +591,7 @@ struct SinkStatusScenarioFacts {
     cached_concern: Option<SinkStatusConcern>,
     cached_ready_truth_covers_issue: bool,
     cached_preactivate_unscheduled: bool,
+    live_delivery_backed_pending_materialization: bool,
     worker_unavailable_delivery_backed_zero_uninitialized: bool,
 }
 
@@ -612,12 +642,22 @@ impl SinkStatusScenarioFacts {
             cached_concern,
             cached_ready_truth_covers_issue,
             cached_preactivate_unscheduled: false,
+            live_delivery_backed_pending_materialization: false,
             worker_unavailable_delivery_backed_zero_uninitialized: false,
         }
     }
 
     fn with_cached_preactivate_unscheduled(mut self, cached_preactivate_unscheduled: bool) -> Self {
         self.cached_preactivate_unscheduled = cached_preactivate_unscheduled;
+        self
+    }
+
+    fn with_live_delivery_backed_pending_materialization(
+        mut self,
+        live_delivery_backed_pending_materialization: bool,
+    ) -> Self {
+        self.live_delivery_backed_pending_materialization =
+            live_delivery_backed_pending_materialization;
         self
     }
 
@@ -788,6 +828,7 @@ struct SinkControlFrameMachine {
 
 #[derive(Debug)]
 enum SinkControlFrameFollowup {
+    RetrySameClient(SinkControlFrameMachine),
     RestartAndRetry(SinkControlFrameMachine),
     RestartAndFailFast(SinkFailure),
     Failed(SinkFailure),
@@ -795,6 +836,7 @@ enum SinkControlFrameFollowup {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SinkControlFrameFailureDisposition {
+    RetrySameClient,
     RetrySamePhase,
     RetryAfterMissingRouteState,
     RestartAndFailFast,
@@ -850,6 +892,12 @@ impl SinkControlFrameMachine {
             SinkFailureReason::ControlReset(reset_kind) => {
                 if self.retained_replay_fail_closed {
                     SinkControlFrameFailureDisposition::RestartAndFailFast
+                } else if matches!(
+                    reset_kind,
+                    SinkControlResetKind::GrantAttachmentsDrainedOrFenced
+                        | SinkControlResetKind::InvalidGrantAttachmentToken
+                ) {
+                    SinkControlFrameFailureDisposition::RetrySameClient
                 } else if self.restart_deferred_retire_pending_deactivate {
                     SinkControlFrameFailureDisposition::RestartAndFailFast
                 } else if matches!(
@@ -872,6 +920,9 @@ impl SinkControlFrameMachine {
 
     fn followup_after_failure(self, failure: SinkFailure) -> SinkControlFrameFollowup {
         match self.classify_failure_disposition(&failure) {
+            SinkControlFrameFailureDisposition::RetrySameClient => {
+                SinkControlFrameFollowup::RetrySameClient(self)
+            }
             SinkControlFrameFailureDisposition::RetrySamePhase => {
                 SinkControlFrameFollowup::RestartAndRetry(self)
             }
@@ -933,6 +984,9 @@ impl SinkStatusLiveScenario {
     ) -> SinkStatusOutcomeKind {
         match self {
             Self::Blocking | Self::ControlInflight => SinkStatusOutcomeKind::ReturnLive,
+            Self::SteadyAfterRetryReset if facts.cached_preactivate_unscheduled => {
+                SinkStatusOutcomeKind::ReturnLive
+            }
             Self::Steady | Self::SteadyAfterRetryReset => {
                 if matches!(facts.cached_concern, Some(SinkStatusConcern::CoverageGap)) {
                     SinkStatusOutcomeKind::ReturnCached
@@ -1012,6 +1066,9 @@ impl SinkStatusLiveScenario {
                 _ => self.replay_pending_outcome(facts.cached_ready_truth_covers_issue),
             },
             SinkStatusConcernLane::CoverageGap => match self {
+                Self::Blocking if facts.live_delivery_backed_pending_materialization => {
+                    SinkStatusOutcomeKind::ReturnLive
+                }
                 Self::Blocking => SinkStatusOutcomeKind::FailClosed,
                 Self::ControlInflight | Self::Steady | Self::SteadyAfterRetryReset => {
                     self.cached_truth_driven_outcome(facts.cached_ready_truth_covers_issue)
@@ -1138,9 +1195,15 @@ fn evaluate_live_sink_status_snapshot(
     let cached_ready_truth_covers_issue = live_concern.is_some_and(|concern| {
         cached_ready_truth_covers_live_concern(concern, &live_projection, &cached_projection)
     });
-    let cached_preactivate_unscheduled = !snapshot_has_delivery_evidence(cached_snapshot)
-        && (cached_snapshot.scheduled_groups_by_node.is_empty()
-            || snapshot_has_scheduled_zero_uninitialized_groups(cached_snapshot));
+    let cached_preactivate_unscheduled =
+        snapshot_is_preactivate_unscheduled_cached_truth_for_live(cached_snapshot);
+    let live_delivery_backed_pending_materialization =
+        matches!(live_concern, Some(SinkStatusConcern::CoverageGap))
+            && !live_projection.summary.scheduled_groups.is_empty()
+            && live_projection.summary.missing_scheduled_groups.is_empty()
+            && live_projection.summary.pending_materialization_groups.len()
+                == live_projection.summary.scheduled_groups.len()
+            && snapshot_has_delivery_evidence(live_snapshot);
     reduce_sink_status_scenario_outcome_with_facts(
         SinkStatusScenario::Live(scenario),
         SinkStatusScenarioFacts::new(
@@ -1148,7 +1211,10 @@ fn evaluate_live_sink_status_snapshot(
             cached_concern,
             cached_ready_truth_covers_issue,
         )
-        .with_cached_preactivate_unscheduled(cached_preactivate_unscheduled),
+        .with_cached_preactivate_unscheduled(cached_preactivate_unscheduled)
+        .with_live_delivery_backed_pending_materialization(
+            live_delivery_backed_pending_materialization,
+        ),
     )
 }
 
@@ -1168,12 +1234,15 @@ fn evaluate_cached_sink_status_snapshot(
                 Some(SinkStatusConcern::WaitingForMaterializedRoot)
             )
             && snapshot_has_delivery_evidence(cached_snapshot);
-    let cached_preactivate_unscheduled = !snapshot_has_delivery_evidence(cached_snapshot)
-        && (cached_snapshot.scheduled_groups_by_node.is_empty()
-            || snapshot_has_scheduled_zero_uninitialized_groups(cached_snapshot));
+    let cached_preactivate_unscheduled = snapshot_is_preactivate_cached_status(cached_snapshot);
+    let cached_concern = if delivery_backed_zero_uninitialized {
+        None
+    } else {
+        cached_projection.concern
+    };
     reduce_sink_status_scenario_outcome_with_facts(
         SinkStatusScenario::Cached(scenario),
-        SinkStatusScenarioFacts::new(cached_projection.concern, None, false)
+        SinkStatusScenarioFacts::new(cached_concern, None, false)
             .with_cached_preactivate_unscheduled(cached_preactivate_unscheduled)
             .with_worker_unavailable_delivery_backed_zero_uninitialized(
                 delivery_backed_zero_uninitialized,
@@ -1185,8 +1254,17 @@ fn apply_live_sink_status_snapshot_outcome_side_effects(
     sink: &SinkWorkerClientHandle,
     snapshot: &SinkStatusSnapshot,
     outcome: &SinkStatusSnapshotOutcome,
+    replay_required_for_attempt: bool,
 ) -> Result<()> {
-    if outcome.should_mark_replay_required {
+    let completed_retained_replay_should_not_rearm = replay_required_for_attempt
+        && outcome.should_mark_replay_required
+        && matches!(outcome.concern, Some(SinkStatusConcern::ReplayPending))
+        && sink
+            .retained_control_state
+            .try_lock()
+            .map(|retained| retained_sink_state_has_complete_materialized_replay_routes(&retained))
+            .unwrap_or(false);
+    if outcome.should_mark_replay_required && !completed_retained_replay_should_not_rearm {
         sink.control_state_replay_required
             .store(1, Ordering::Release);
     }
@@ -1398,6 +1476,25 @@ fn retained_scheduled_group_ids(
         .map(|scope_id| scope_id.to_string())
         .collect::<std::collections::BTreeSet<_>>();
     (!groups.is_empty()).then_some(groups)
+}
+
+fn retained_sink_state_has_complete_materialized_replay_routes(
+    retained: &RetainedSinkWorkerControlState,
+) -> bool {
+    let events_stream_route = format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS);
+    let roots_control_stream_route = format!(
+        "{}.stream",
+        crate::runtime::routes::ROUTE_KEY_SINK_ROOTS_CONTROL
+    );
+    let has_route = |route_key: &str| {
+        retained
+            .active_by_route
+            .keys()
+            .any(|(_, active_route_key)| active_route_key == route_key)
+    };
+    has_route(crate::runtime::routes::ROUTE_KEY_QUERY)
+        && has_route(&events_stream_route)
+        && has_route(&roots_control_stream_route)
 }
 
 fn retained_sink_state_after_signals(
@@ -2832,6 +2929,20 @@ impl SinkWorkerClientHandle {
         result
     }
 
+    async fn with_started_once_with_failure<T, F, Fut>(
+        &self,
+        op: F,
+    ) -> std::result::Result<T, SinkFailure>
+    where
+        F: FnOnce(TypedWorkerClient<SinkWorkerRpc>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, SinkFailure>>,
+    {
+        self.worker_client()
+            .await
+            .with_started_once_mapped(op, SinkFailure::into_error)
+            .await
+    }
+
     #[cfg(test)]
     async fn client_with_failure(
         &self,
@@ -2887,28 +2998,24 @@ impl SinkWorkerClientHandle {
             roots.len(),
             host_object_grants.len()
         );
-        let worker = self.worker_client().await;
-        let response = worker
-            .with_started_once_mapped(
-                |client| {
-                    let roots = roots.clone();
-                    let host_object_grants = host_object_grants.clone();
-                    async move {
-                        #[cfg(test)]
-                        maybe_pause_before_update_logical_roots_rpc().await;
-                        Self::call_worker_with_failure(
-                            &client,
-                            SinkWorkerRequest::UpdateLogicalRoots {
-                                roots: roots.clone(),
-                                host_object_grants: host_object_grants.clone(),
-                            },
-                            SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
-                        )
-                        .await
-                    }
-                },
-                SinkFailure::into_error,
-            )
+        let response = self
+            .with_started_retry_with_failure(|client| {
+                let roots = roots.clone();
+                let host_object_grants = host_object_grants.clone();
+                async move {
+                    #[cfg(test)]
+                    maybe_pause_before_update_logical_roots_rpc().await;
+                    Self::call_worker_with_failure(
+                        &client,
+                        SinkWorkerRequest::UpdateLogicalRoots {
+                            roots: roots.clone(),
+                            host_object_grants: host_object_grants.clone(),
+                        },
+                        SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
+                    )
+                    .await
+                }
+            })
             .await?;
         match response {
             SinkWorkerResponse::Ack => {
@@ -3309,7 +3416,7 @@ impl SinkWorkerClientHandle {
             cached_concern,
             plan.live_access_path(probe_outcome.recovered_after_retry_reset),
         );
-        apply_live_sink_status_snapshot_outcome_side_effects(self, &live_snapshot, &outcome)
+        apply_live_sink_status_snapshot_outcome_side_effects(self, &live_snapshot, &outcome, false)
             .map_err(SinkFailure::from)?;
         match outcome.kind {
             SinkStatusOutcomeKind::ReturnLive => {
@@ -3459,8 +3566,13 @@ impl SinkWorkerClientHandle {
             None,
             SinkStatusAccessPath::Blocking,
         );
-        apply_live_sink_status_snapshot_outcome_side_effects(self, &snapshot, &outcome)
-            .map_err(SinkFailure::from)?;
+        apply_live_sink_status_snapshot_outcome_side_effects(
+            self,
+            &snapshot,
+            &outcome,
+            replay_required,
+        )
+        .map_err(SinkFailure::from)?;
         match outcome.kind {
             SinkStatusOutcomeKind::ReturnLive => Ok(snapshot),
             SinkStatusOutcomeKind::FailClosed => {
@@ -3499,16 +3611,6 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    #[cfg(test)]
-    fn finalize_test_hooked_blocking_status_snapshot(
-        &self,
-        snapshot: SinkStatusSnapshot,
-    ) -> Result<SinkStatusSnapshot> {
-        let snapshot = self.prepare_status_snapshot_for_evaluation(snapshot)?;
-        self.update_cached_status_snapshot(snapshot.clone())?;
-        Ok(snapshot)
-    }
-
     pub(crate) async fn status_snapshot_with_failure(
         &self,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
@@ -3516,9 +3618,10 @@ impl SinkWorkerClientHandle {
         #[cfg(test)]
         if let Some(snapshot) = take_sink_worker_status_snapshot_hook(self.shared_worker().await.0)
         {
-            return self
-                .finalize_test_hooked_blocking_status_snapshot(snapshot)
-                .map_err(SinkFailure::from);
+            let snapshot = self.prepare_status_snapshot_for_evaluation_with_failure(snapshot)?;
+            self.update_cached_status_snapshot(snapshot.clone())
+                .map_err(SinkFailure::from)?;
+            return Ok(snapshot);
         }
         self.replay_retained_control_state_if_needed().await?;
         let snapshot = self
@@ -3594,6 +3697,13 @@ impl SinkWorkerClientHandle {
             .map(|(snapshot, _)| snapshot)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn cached_status_snapshot_for_tests(&self) -> Result<SinkStatusSnapshot> {
+        self.cached_status_snapshot_with_failure()
+            .map_err(SinkFailure::into_error)
+    }
+
     pub(crate) async fn status_snapshot_nonblocking_for_status_route(
         &self,
     ) -> (SinkStatusSnapshot, bool) {
@@ -3648,8 +3758,9 @@ impl SinkWorkerClientHandle {
                 }
             }
             Err(err) => {
+                let _ = self.republish_cached_scheduled_groups_into_empty_status_summary();
                 let snapshot = self
-                    .cached_status_snapshot_with_republished_scheduled_groups()
+                    .cached_status_snapshot_with_failure()
                     .unwrap_or_else(|_| SinkStatusSnapshot::default());
                 if debug_control_scope_capture_enabled() {
                     eprintln!(
@@ -3663,8 +3774,9 @@ impl SinkWorkerClientHandle {
             }
         };
         outcome.unwrap_or_else(|err| {
+            let _ = self.republish_cached_scheduled_groups_into_empty_status_summary();
             let snapshot = self
-                .cached_status_snapshot_with_republished_scheduled_groups()
+                .cached_status_snapshot_with_failure()
                 .unwrap_or_else(|_| SinkStatusSnapshot::default());
             if debug_control_scope_capture_enabled() {
                 eprintln!(
@@ -4296,7 +4408,7 @@ impl SinkWorkerClientHandle {
             } else {
                 tokio::time::timeout(
                     attempt_timeout,
-                    self.with_started_retry_with_failure(|client| {
+                    self.with_started_once_with_failure(|client| {
                         let envelopes = envelopes.clone();
                         async move {
                             #[cfg(test)]
@@ -4346,6 +4458,9 @@ impl SinkWorkerClientHandle {
                     ));
                 }
                 Err(err) => match machine.followup_after_failure(err) {
+                    SinkControlFrameFollowup::RetrySameClient(next_machine) => {
+                        machine = next_machine;
+                    }
                     SinkControlFrameFollowup::RestartAndRetry(next_machine) => {
                         self.restart_shared_worker_client_for_retry_until(
                             machine.deadline,

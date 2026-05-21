@@ -1045,8 +1045,8 @@ fn selected_group_owner_attempt_timeout_splits_sub_proxy_min_budget_evenly_for_l
 
     assert_eq!(
         timeout,
-        Duration::from_millis(900),
-        "later-ranked owner attempts should keep half of a sub-proxy-min shared PIT budget instead of collapsing to the 100ms owner minimum"
+        Duration::from_millis(720),
+        "later-ranked owner attempts should reserve most of a sub-proxy-min shared PIT budget for delayed proxy fallback instead of collapsing to the 100ms owner minimum"
     );
 }
 
@@ -1058,7 +1058,7 @@ fn selected_group_owner_attempt_timeout_reserves_proxy_for_fail_closed_root_budg
 
     assert_eq!(
         timeout,
-        Duration::from_millis(600),
+        Duration::from_millis(480),
         "fail-closed ready-root selected-group owner attempts should reserve bounded proxy rescue time while preserving the final non-empty root requirement"
     );
 }

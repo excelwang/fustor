@@ -136,6 +136,7 @@
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let root = tmp.path().join("root-a");
         fs::create_dir_all(&root).expect("create root");
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let cfg = FSMetaConfig {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("test-root", &root)],
@@ -156,8 +157,14 @@
                 },
             },
         };
-        let app =
-            Arc::new(FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app"));
+        let app = Arc::new(
+            FSMetaApp::with_boundaries(
+                cfg,
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+            )
+            .expect("init app"),
+        );
 
         if cfg!(target_os = "linux") {
             match app.start().await {
@@ -265,9 +272,9 @@
 
         let control_entered = Arc::new(Notify::new());
         let control_release = Arc::new(Notify::new());
-        let _control_pause_reset = SourceWorkerControlFramePauseHookReset;
-        crate::workers::source::install_source_worker_control_frame_pause_hook(
-            crate::workers::source::SourceWorkerControlFramePauseHook {
+        let _control_pause_reset = SourceApplyPauseHookReset;
+        install_source_apply_pause_hook(
+            SourceApplyPauseHook {
                 entered: control_entered.clone(),
                 release: control_release.clone(),
             },
@@ -344,4 +351,3 @@
         );
         app.close().await.expect("close app");
     }
-

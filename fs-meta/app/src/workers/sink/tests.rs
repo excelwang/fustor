@@ -486,6 +486,32 @@ fn sink_control_frame_machine_retained_replay_fails_fast_after_retryable_reset()
 }
 
 #[test]
+fn sink_control_frame_machine_restart_deferred_deactivate_retries_stale_grant_fence() {
+    let deadline = std::time::Instant::now() + Duration::from_millis(250);
+    let envelope =
+        encode_runtime_exec_control(&RuntimeExecControl::Deactivate(RuntimeExecDeactivate {
+            route_key: format!("{}.stream", ROUTE_KEY_EVENTS),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 3,
+            reason: "restart_deferred_retire_pending".to_string(),
+        }))
+        .expect("encode restart-deferred sink deactivate");
+    let machine = SinkControlFrameMachine::new(deadline, &[envelope]);
+
+    match machine.followup_after_error(CnxError::AccessDenied(
+        "sink worker unavailable: pid Pid(1) is drained/fenced and cannot obtain new grant attachments"
+            .to_string(),
+    )) {
+        SinkControlFrameFollowup::RetrySameClient(next_machine)
+            if next_machine.restart_deferred_retire_pending_deactivate => {}
+        other => panic!(
+            "restart-deferred sink deactivate must retry stale drained/fenced grants on the same client, got {other:?}"
+        ),
+    }
+}
+
+#[test]
 fn sink_status_probe_retry_disposition_deadline_exhaustion_beats_reset_retry_policy() {
     match classify_sink_retry_disposition(
         std::time::Instant::now(),
@@ -795,12 +821,9 @@ fn sink_retained_replay_control_rpc_uses_short_typed_retry_attempt() {
 
     assert!(
         executor.contains("if retained_replay_fail_closed {")
-            && executor
-                .matches("self.with_started_retry_with_failure(|client|")
-                .count()
-                >= 2
-            && !executor.contains("self.with_started_once_with_failure(|client|"),
-        "sink retained control replay must use typed worker retry inside the short retained budget so stale grant-attachment gaps can rebind without reopening the ordinary fresh-bootstrap path",
+            && executor.contains("self.with_started_retry_with_failure(|client|")
+            && executor.contains("self.with_started_once_with_failure(|client|"),
+        "sink retained control replay must use typed worker retry inside the short retained budget, while ordinary control frames must use one-shot dispatch so the outer state machine owns reset/replay decisions",
     );
 }
 
@@ -1228,16 +1251,16 @@ async fn overlapping_external_sink_worker_handles_for_same_binding_keep_one_work
     .expect("second activation timed out")
     .expect("second activation should share the same worker lane");
 
-    let first_status = first
-        .status_snapshot_with_failure()
+    let first_groups = first
+        .scheduled_group_ids()
         .await
-        .expect("first status");
-    let second_status = second
-        .status_snapshot_with_failure()
+        .expect("first scheduled groups");
+    let second_groups = second
+        .scheduled_group_ids()
         .await
-        .expect("second status");
+        .expect("second scheduled groups");
     assert_eq!(
-        first_status.scheduled_groups_by_node, second_status.scheduled_groups_by_node,
+        first_groups, second_groups,
         "same-binding sink worker handles should observe one shared external worker state",
     );
 

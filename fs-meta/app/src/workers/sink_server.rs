@@ -27,7 +27,7 @@ struct SinkWorkerState {
     node_id: Option<NodeId>,
     pending_init: Option<(NodeId, SinkWorkerInitConfig)>,
     endpoints_started: bool,
-    send_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Event>>>,
+    send_tx: Option<tokio::sync::mpsc::UnboundedSender<QueuedSendBatch>>,
     last_control_frame_signals: Vec<String>,
     received_stats: Arc<StdMutex<ReceivedBatchStats>>,
 }
@@ -36,7 +36,7 @@ enum SinkWorkerAction {
     Immediate(SinkWorkerResponse, bool),
     Send {
         sink: Arc<SinkFileMeta>,
-        send_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Event>>>,
+        send_tx: Option<tokio::sync::mpsc::UnboundedSender<QueuedSendBatch>>,
         events: Vec<Event>,
         received_stats: Arc<StdMutex<ReceivedBatchStats>>,
     },
@@ -70,6 +70,11 @@ struct ReceivedBatchUpdate {
     last_received_at_us: Option<u64>,
     last_received_origins: Vec<String>,
     received_origin_counts: std::collections::BTreeMap<String, u64>,
+}
+
+struct QueuedSendBatch {
+    events: Vec<Event>,
+    completion: tokio::sync::oneshot::Sender<std::result::Result<ReceivedBatchUpdate, SinkFailure>>,
 }
 
 fn classify_sink_worker_error(err: CnxError) -> SinkWorkerResponse {
@@ -359,21 +364,23 @@ fn bootstrap_start_sink_runtime_with_failure(
     sink.start_runtime_endpoints_with_failure(io_boundary, node_id)?;
     eprintln!("fs_meta_sink_worker_server: bootstrap_start endpoints ok");
     if state.send_tx.is_none() {
-        let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
+        let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<QueuedSendBatch>();
         let sink_for_send = sink.clone();
         tokio::spawn(async move {
-            while let Some(events) = send_rx.recv().await {
+            while let Some(QueuedSendBatch { events, completion }) = send_rx.recv().await {
                 if debug_sink_query_flow_enabled() {
                     eprintln!(
                         "fs_meta_sink_worker_server: async_send_apply begin origins={:?}",
                         summarize_event_origins(&events)
                     );
                 }
+                let update = summarize_received_batch(&events);
                 if let Err(err) = sink_for_send.send_with_failure(&events).await {
                     eprintln!(
                         "fs_meta_sink_worker: async Send apply failed: {}",
                         err.as_error()
                     );
+                    let _ = completion.send(Err(err));
                 } else if debug_sink_query_flow_enabled()
                     && let Ok(snapshot) = sink_for_send.status_snapshot_with_failure()
                 {
@@ -381,6 +388,9 @@ fn bootstrap_start_sink_runtime_with_failure(
                         "fs_meta_sink_worker_server: async_send_apply ok groups={:?}",
                         summarize_sink_snapshot_groups(&snapshot)
                     );
+                    let _ = completion.send(Ok(update));
+                } else {
+                    let _ = completion.send(Ok(update));
                 }
             }
         });
@@ -724,16 +734,29 @@ async fn execute_worker_action_with_runtime_boundary(
             received_stats,
         } => match send_tx {
             Some(send_tx) => {
-                let update = summarize_received_batch(&events);
-                match send_tx.send(events) {
-                    Ok(()) => {
-                        update_received_stats(&received_stats, &update);
-                        (SinkWorkerResponse::Ack, false)
-                    }
+                let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+                let event_count = events.len();
+                match send_tx.send(QueuedSendBatch {
+                    events,
+                    completion: completion_tx,
+                }) {
+                    Ok(()) => match completion_rx.await {
+                        Ok(Ok(update)) => {
+                            update_received_stats(&received_stats, &update);
+                            (SinkWorkerResponse::Ack, false)
+                        }
+                        Ok(Err(err)) => (classify_sink_worker_failure(err), false),
+                        Err(_) => (
+                            SinkWorkerResponse::Error(
+                                "sink worker send queue completion dropped".to_string(),
+                            ),
+                            false,
+                        ),
+                    },
                     Err(err) => (
                         SinkWorkerResponse::Error(format!(
                             "sink worker send queue unavailable: {} event(s) dropped",
-                            err.0.len()
+                            err.0.events.len().max(event_count)
                         )),
                         false,
                     ),
@@ -792,6 +815,13 @@ async fn execute_worker_action_with_runtime_boundary(
             }
             match sink.on_control_frame_with_failure(&envelopes).await {
                 Ok(_) => {
+                    if let (Some(boundary), Some(node_id)) =
+                        (runtime_io_boundary.as_ref(), node_id.as_ref())
+                        && let Err(err) = sink
+                            .start_runtime_endpoints_with_failure(boundary.clone(), node_id.clone())
+                    {
+                        return (classify_sink_worker_failure(err), false);
+                    }
                     if debug_sink_query_route_trace_enabled() && !traced_routes.is_empty() {
                         let route_states: Vec<String> = traced_routes
                             .iter()
@@ -887,13 +917,18 @@ impl TypedWorkerSession<SinkWorkerRpc> for SinkWorkerSession {
                 "worker runtime not initialized for runtime control frames".into(),
             ));
         };
-        if let Some(node_id) = node_id {
-            sink.start_runtime_endpoints_with_failure(_context.io_boundary(), node_id)
+        if let Some(node_id) = node_id.as_ref() {
+            sink.start_runtime_endpoints_with_failure(_context.io_boundary(), node_id.clone())
                 .map_err(SinkFailure::into_error)?;
         }
         sink.on_control_frame_with_failure(envelopes)
             .await
-            .map_err(SinkFailure::into_error)
+            .map_err(SinkFailure::into_error)?;
+        if let Some(node_id) = node_id.as_ref() {
+            sink.start_runtime_endpoints_with_failure(_context.io_boundary(), node_id.clone())
+                .map_err(SinkFailure::into_error)?;
+        }
+        Ok(())
     }
 }
 
@@ -956,6 +991,8 @@ mod tests {
         METHOD_STREAM, ROUTE_KEY_QUERY, ROUTE_TOKEN_FS_META_EVENTS, default_route_bindings,
     };
     use crate::source::config::{GrantedMountRoot, RootSpec};
+    use bytes::Bytes;
+    use capanix_app_sdk::runtime::EventMetadata;
     use capanix_runtime_entry_sdk::control::{
         RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
     };
@@ -1059,6 +1096,77 @@ mod tests {
             scope_id: scope_id.to_string(),
             resource_ids: resource_ids.iter().map(|id| (*id).to_string()).collect(),
         }
+    }
+
+    #[tokio::test]
+    async fn worker_send_ack_waits_for_queued_apply_result() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let node_id = NodeId("node-a".to_string());
+        let mut state = SinkWorkerState {
+            sink: None,
+            node_id: None,
+            pending_init: None,
+            endpoints_started: false,
+            send_tx: None,
+            last_control_frame_signals: Vec::new(),
+            received_stats: Arc::new(StdMutex::new(ReceivedBatchStats::default())),
+        };
+        bootstrap_init_sink_runtime(
+            node_id.clone(),
+            SinkWorkerInitConfig {
+                roots: vec![root("nfs1", &nfs1.display().to_string())],
+                host_object_grants: vec![granted_mount_root(
+                    "node-a::nfs1",
+                    "node-a",
+                    "10.0.0.11",
+                    nfs1,
+                    true,
+                )],
+                sink_tombstone_ttl_ms: 60_000,
+                sink_tombstone_tolerance_us: 0,
+            },
+            &mut state,
+        )
+        .await
+        .expect("bootstrap init sink runtime");
+        bootstrap_start_sink_runtime(
+            &mut state,
+            Arc::new(TimeoutBoundary),
+            capanix_app_sdk::runtime::in_memory_state_boundary(),
+        )
+        .expect("bootstrap start sink runtime");
+
+        let invalid_event = Event::new(
+            EventMetadata {
+                origin_id: NodeId("node-a::nfs1".to_string()),
+                timestamp_us: 1,
+                logical_ts: None,
+                correlation_id: None,
+                ingress_auth: None,
+                trace: None,
+            },
+            Bytes::from_static(b"\xc1"),
+        );
+        let action = plan_worker_request(
+            SinkWorkerRequest::Send {
+                events: vec![invalid_event],
+            },
+            &mut state,
+        );
+        let (response, stop) = execute_worker_action(action).await;
+
+        assert!(!stop, "send failure must not stop the worker session");
+        assert!(
+            matches!(
+                response,
+                SinkWorkerResponse::InvalidInput(_) | SinkWorkerResponse::Error(_)
+            ),
+            "queued worker Send must wait for apply result before ACK: {response:?}"
+        );
+        bootstrap_stop_sink_runtime(&mut state).await;
     }
 
     #[tokio::test]

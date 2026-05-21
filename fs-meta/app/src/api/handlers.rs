@@ -9,8 +9,8 @@ use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json,
-    extract::{Path, State},
-    http::{HeaderMap, header},
+    extract::{Extension, Path, State},
+    http::{HeaderMap, StatusCode, header},
 };
 use capanix_app_sdk::CnxError;
 use capanix_app_sdk::Event;
@@ -69,7 +69,7 @@ use super::facade_status::FacadePendingReason;
 use super::facade_status::PublishedFacadeStatusReader;
 #[cfg(test)]
 use super::facade_status::SharedFacadePendingStatus;
-use super::state::{ApiState, ForceFindRunnerEvidence};
+use super::state::{ApiRequestControlReadinessSnapshot, ApiState, ForceFindRunnerEvidence};
 use super::types::{
     AuthorityEpochEvidence, CreateQueryApiKeyRequest, CreateQueryApiKeyResponse, DegradedRoot,
     LoginRequest, LoginResponse, ObservationCoverageCapabilities, QueryApiKeysResponse,
@@ -445,6 +445,7 @@ const ROOTS_PUT_SOURCE_SECOND_WAVE_TIMEOUT: Duration = Duration::from_secs(5);
 const MANUAL_RESCAN_SOURCE_SECOND_WAVE_TIMEOUT: Duration = Duration::from_secs(25);
 const MANUAL_RESCAN_SOURCE_STATUS_ROUTE_TIMEOUT: Duration = Duration::from_secs(20);
 const MANUAL_RESCAN_SCOPED_SOURCE_STATUS_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(2500);
+const MANUAL_RESCAN_CURRENT_ROOTS_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(3);
 const ROOTS_PUT_SOURCE_SECOND_WAVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ROOTS_PUT_SOURCE_SECOND_WAVE_RESEND_INTERVAL: Duration = Duration::from_secs(2);
 const ROOTS_PUT_SOURCE_SECOND_WAVE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -610,17 +611,6 @@ fn summarize_roots_put_second_wave_runtime_scope(
     )
 }
 
-async fn discover_roots_put_control_target_node_ids(state: &ApiState) -> BTreeSet<String> {
-    discover_roots_put_control_target_node_ids_with_boundary(
-        state
-            .query_runtime_boundary
-            .clone()
-            .or_else(|| state.runtime_boundary.clone()),
-        state.node_id.clone(),
-    )
-    .await
-}
-
 async fn discover_roots_put_control_target_node_ids_with_boundary(
     query_runtime_boundary: Option<std::sync::Arc<dyn ChannelIoSubset>>,
     node_id: NodeId,
@@ -640,6 +630,7 @@ async fn discover_roots_put_control_target_node_ids_with_boundary(
             execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
         ],
         internal_status_request_payload(),
+        None,
         None,
     );
     let sink_status = route_sink_status_snapshot(
@@ -963,6 +954,72 @@ async fn collect_roots_put_source_second_wave_status_snapshot(
     ),
     CnxError,
 > {
+    collect_roots_put_source_second_wave_status_snapshot_with_completion(
+        boundary,
+        origin_id,
+        timeout,
+        idle_after_first,
+        source_status_payload,
+        complete_after_events,
+        None,
+    )
+    .await
+}
+
+async fn collect_roots_put_source_second_wave_status_snapshot_until_manual_rescan_targets(
+    boundary: std::sync::Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    timeout: Duration,
+    idle_after_first: Duration,
+    source_status_payload: bytes::Bytes,
+    complete_after_events: Option<usize>,
+    roots: &[RootSpec],
+    target_node_ids: &BTreeSet<String>,
+) -> Result<
+    (
+        SourceObservabilitySnapshot,
+        Vec<(String, SourceObservabilitySnapshot)>,
+        Vec<String>,
+        String,
+    ),
+    CnxError,
+> {
+    let complete_when = |events: &[Event]| {
+        manual_rescan_source_status_events_have_delivery_target_coverage(
+            roots,
+            target_node_ids,
+            events,
+        )
+    };
+    collect_roots_put_source_second_wave_status_snapshot_with_completion(
+        boundary,
+        origin_id,
+        timeout,
+        idle_after_first,
+        source_status_payload,
+        complete_after_events,
+        Some(&complete_when),
+    )
+    .await
+}
+
+async fn collect_roots_put_source_second_wave_status_snapshot_with_completion(
+    boundary: std::sync::Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    timeout: Duration,
+    idle_after_first: Duration,
+    source_status_payload: bytes::Bytes,
+    complete_after_events: Option<usize>,
+    complete_when: Option<&(dyn Fn(&[Event]) -> bool + Send + Sync)>,
+) -> Result<
+    (
+        SourceObservabilitySnapshot,
+        Vec<(String, SourceObservabilitySnapshot)>,
+        Vec<String>,
+        String,
+    ),
+    CnxError,
+> {
     let route_timeout =
         if source_status_request_requires_manual_rescan_delivery_evidence(&source_status_payload) {
             timeout.min(MANUAL_RESCAN_SOURCE_STATUS_ROUTE_TIMEOUT)
@@ -977,6 +1034,7 @@ async fn collect_roots_put_source_second_wave_status_snapshot(
             idle_after_first,
             source_status_payload,
             complete_after_events,
+            complete_when,
         )
         .await?;
     let source_summary = summarize_roots_put_source_runtime_scope(&source_snapshot);
@@ -986,6 +1044,28 @@ async fn collect_roots_put_source_second_wave_status_snapshot(
         per_origin,
         source_summary,
     ))
+}
+
+fn manual_rescan_source_status_events_have_delivery_target_coverage(
+    roots: &[RootSpec],
+    target_node_ids: &BTreeSet<String>,
+    events: &[Event],
+) -> bool {
+    let origin_snapshots = events
+        .iter()
+        .filter_map(|event| {
+            let origin = event.metadata().origin_id.0.clone();
+            let snapshot =
+                rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes()).ok()?;
+            Some((origin, snapshot))
+        })
+        .collect::<Vec<_>>();
+    let origin_snapshots = filter_manual_rescan_source_status_origin_snapshots_to_probe_targets(
+        origin_snapshots,
+        target_node_ids,
+    );
+    manual_rescan_target_node_ids_from_source_status_origin_snapshots(roots, &origin_snapshots)
+        .is_some()
 }
 
 fn retain_source_snapshot_groups_to_roots(
@@ -1176,6 +1256,7 @@ async fn collect_manual_rescan_source_status_origin_snapshots(
             execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
         ],
         manual_rescan_source_status_request_payload(),
+        None,
         None,
     )
     .await?;
@@ -1692,7 +1773,7 @@ async fn wait_roots_put_second_wave_readiness_evidence_with_optional_local_sourc
     local_merge_observation: LocalMergeObservation,
     control_replay_policy: RootsPutControlReplayPolicy,
     source_status_payload: bytes::Bytes,
-    local_fast_observation_covers_current_roots: bool,
+    _local_fast_observation_covers_current_roots: bool,
 ) -> Result<Option<SourceRuntimeScopeReadinessEvidence>, ApiError>
 where
     LocalFastObservation: Fn(Option<Duration>) -> LocalFastObservationFuture,
@@ -1838,30 +1919,15 @@ where
             } else {
                 None
             };
-            if source_only_manual_rescan {
-                if local_fast_observation_covers_current_roots
-                    && let Some(local_source) = observe_local_source_with_budget(
-                        &local_fast_observation,
-                        local_first_budget,
-                    )
-                    .await
-                    .map(local_source_snapshot_without_unavailable_worker_runtime_scope_evidence)
-                    && let Some(readiness) = manual_rescan_readiness_from_source_snapshot(
-                        &expected_groups,
-                        roots,
-                        local_source,
-                    )
-                {
-                    return Ok(Some(readiness));
-                }
-            } else if let Some(local_source) = local_source_runtime_scope_ready(
-                roots,
-                &expected_groups,
-                &local_fast_observation,
-                local_first_budget,
-                false,
-            )
-            .await
+            if !source_only_manual_rescan
+                && let Some(local_source) = local_source_runtime_scope_ready(
+                    roots,
+                    &expected_groups,
+                    &local_fast_observation,
+                    local_first_budget,
+                    false,
+                )
+                .await
             {
                 return Ok(Some(SourceRuntimeScopeReadinessEvidence::source(
                     local_source,
@@ -1873,6 +1939,7 @@ where
                     .min(next_resend_at.saturating_duration_since(tokio::time::Instant::now()));
             }
             if source_only_manual_rescan {
+                let local_source_budget = remaining.min(status_route_timeout);
                 let scoped_target_node_ids = source_status_probe_node_ids
                     .iter()
                     .filter(|node_id| {
@@ -1887,15 +1954,11 @@ where
                     scoped_probe_due && !scoped_target_node_ids.is_empty();
                 let run_generic_source_collect = source_status_probe_targets_are_discovery_seed
                     || source_status_probe_node_ids.is_empty()
-                    || !scoped_target_node_ids.is_empty();
+                    || (allow_local_scoped_source_probe && !scoped_target_node_ids.is_empty());
                 let generic_complete_after_events =
-                    if source_status_probe_targets_are_discovery_seed {
-                        None
-                    } else {
-                        manual_rescan_targeted_source_status_complete_after_events(
-                            &source_status_probe_node_ids,
-                        )
-                    };
+                    manual_rescan_targeted_source_status_complete_after_events(
+                        &source_status_probe_node_ids,
+                    );
                 let mut scoped_source_collects = FuturesUnordered::new();
                 if run_scoped_source_collect {
                     prefer_scoped_source_probe = true;
@@ -1915,17 +1978,20 @@ where
                         });
                     }
                 }
+                let source_collect_probe_node_ids = source_status_probe_node_ids.clone();
                 let source_collect = async {
                     if run_generic_source_collect {
                         let generic_source_status_payload = internal_status_request_payload();
                         Some(
-                            collect_roots_put_source_second_wave_status_snapshot(
+                            collect_roots_put_source_second_wave_status_snapshot_until_manual_rescan_targets(
                                 boundary.clone(),
                                 context.node_id.clone(),
                                 route_budget,
                                 STATUS_ROUTE_COLLECT_IDLE_GRACE,
                                 generic_source_status_payload,
                                 generic_complete_after_events,
+                                roots,
+                                &source_collect_probe_node_ids,
                             )
                             .await,
                         )
@@ -1933,8 +1999,10 @@ where
                         None
                     }
                 };
-                let local_source =
-                    observe_local_source_with_budget(&local_merge_observation, Some(route_budget));
+                let local_source = observe_local_source_with_budget(
+                    &local_merge_observation,
+                    Some(local_source_budget),
+                );
                 tokio::pin!(source_collect);
                 tokio::pin!(local_source);
 
@@ -2109,7 +2177,7 @@ where
                         );
                     }
                     if !fallback_budget.is_zero() {
-                        match collect_roots_put_source_second_wave_status_snapshot(
+                        match collect_roots_put_source_second_wave_status_snapshot_until_manual_rescan_targets(
                             boundary.clone(),
                             context.node_id.clone(),
                             fallback_budget,
@@ -2118,6 +2186,8 @@ where
                             manual_rescan_targeted_source_status_complete_after_events(
                                 &source_status_probe_node_ids,
                             ),
+                            roots,
+                            &source_status_probe_node_ids,
                         )
                         .await
                         {
@@ -2602,12 +2672,21 @@ pub async fn login(
 
 pub async fn status(
     State(state): State<ApiState>,
+    ingress_readiness: Option<Extension<ApiRequestControlReadinessSnapshot>>,
     headers: HeaderMap,
 ) -> Result<Json<StatusResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
     let started_at = StdInstant::now();
     let trace_id = next_status_trace_request_id();
     record_status_route_trace(trace_id, "status.enter");
+    let control_gate_fully_ready_at_request_begin = ingress_readiness
+        .as_ref()
+        .map(|extension| extension.0.control_gate_fully_ready)
+        .unwrap_or_else(|| {
+            state.control_gate.is_ready()
+                && state.control_gate.is_management_write_ready()
+                && state.control_gate.is_source_repair_ready()
+        });
 
     if (!state.control_gate.is_ready() || !state.control_gate.is_management_write_ready())
         && !state.control_gate.is_management_write_drain_closed()
@@ -2748,14 +2827,16 @@ pub async fn status(
     let published_facade_state = published_facade_status.state;
     let use_short_status_route_budget =
         management_status_uses_short_observation_budget(published_facade_state);
+    let status_remote_collection_guard = state.control_gate.begin_status_remote_collection();
     #[cfg(test)]
     maybe_pause_status_before_remote_collection().await;
     record_status_route_trace(trace_id, "status.remote.begin");
-    let local_ready_status_complete = status_local_ready_evidence_completes_management_status(
-        &local_sink,
-        &local_source,
-        local_source_used_cached_fallback,
-    );
+    let local_ready_status_complete = control_gate_fully_ready_at_request_begin
+        && status_local_ready_evidence_completes_management_status(
+            &local_sink,
+            &local_source,
+            local_source_used_cached_fallback,
+        );
     let (mut sink_status, mut source, mut runner_sets, sink_outcome, source_outcome) =
         if local_ready_status_complete {
             record_status_route_trace(trace_id, "status.remote.skipped_local_ready");
@@ -2825,7 +2906,9 @@ pub async fn status(
                 }
             }
         };
-    sink_status = apply_status_ready_sink_evidence_cache(sink_status);
+    if matches!(sink_outcome, StatusRouteOutcome::Ok) {
+        sink_status = apply_status_ready_sink_evidence_cache(sink_status);
+    }
     let source_short_budget_owner_fanin_needed = use_short_status_route_budget
         && management_status_should_attempt_short_budget_source_owner_scoped_fanin(
             source_outcome,
@@ -2899,7 +2982,9 @@ pub async fn status(
         state.node_id.clone(),
     )
     .await;
-    sink_status = apply_status_ready_sink_evidence_cache(sink_status);
+    if matches!(sink_outcome, StatusRouteOutcome::Ok) {
+        sink_status = apply_status_ready_sink_evidence_cache(sink_status);
+    }
     record_status_route_trace(
         trace_id,
         format!(
@@ -2908,6 +2993,7 @@ pub async fn status(
             source_outcome.as_str()
         ),
     );
+    drop(status_remote_collection_guard);
     let live_source_nodes = active_source_node_count(&source);
     let gate_inflight = state
         .force_find_inflight
@@ -2929,6 +3015,10 @@ pub async fn status(
         runner_sets,
         merged_inflight
     );
+    let local_cached_sink_not_ready_still_blocks_status = local_cached_sink_not_ready_message
+        .is_some()
+        && local_source_used_cached_fallback
+        && !matches!(published_facade_state, FacadeServiceState::Pending);
     if should_fail_closed_status_route_collection(
         sink_outcome,
         source_outcome,
@@ -2948,8 +3038,7 @@ pub async fn status(
         &sink_status,
         &source,
     ) {
-        if local_cached_sink_not_ready_message.is_some()
-            && !status_observation_is_trusted_materialized(&source, &sink_status)
+        if local_cached_sink_not_ready_still_blocks_status
             && let Some(message) = local_cached_sink_not_ready_message.as_ref()
         {
             return Err(ApiError::service_unavailable(message.clone()));
@@ -2960,8 +3049,7 @@ pub async fn status(
             source_outcome.as_str()
         )));
     }
-    if local_cached_sink_not_ready_message.is_some()
-        && !status_observation_is_trusted_materialized(&source, &sink_status)
+    if local_cached_sink_not_ready_still_blocks_status
         && let Some(message) = local_cached_sink_not_ready_message
     {
         return Err(ApiError::service_unavailable(message));
@@ -3454,28 +3542,6 @@ fn source_snapshot_status_readiness_groups(
     groups
 }
 
-fn source_snapshot_has_published_activity(snapshot: &SourceObservabilitySnapshot) -> bool {
-    snapshot
-        .published_batches_by_node
-        .values()
-        .any(|count| *count > 0)
-        || snapshot
-            .published_events_by_node
-            .values()
-            .any(|count| *count > 0)
-        || snapshot
-            .published_control_events_by_node
-            .values()
-            .any(|count| *count > 0)
-        || snapshot
-            .published_data_events_by_node
-            .values()
-            .any(|count| *count > 0)
-        || !snapshot.last_published_at_us_by_node.is_empty()
-        || !snapshot.last_published_origins_by_node.is_empty()
-        || !snapshot.published_origin_counts_by_node.is_empty()
-}
-
 fn source_published_origin_count_mentions_group(entry: &str, group: &str) -> bool {
     let origin = entry
         .split_once('=')
@@ -3619,22 +3685,6 @@ fn status_local_ready_evidence_completes_management_status(
         && local_sink_schedule_covers_source_runtime_scope(local_sink, source)
 }
 
-fn status_observation_is_trusted_materialized(
-    source: &SourceObservabilitySnapshot,
-    sink: &SinkStatusSnapshot,
-) -> bool {
-    let candidate_groups = status_local_observation_candidate_groups(source, sink);
-    if candidate_groups.is_empty() {
-        return false;
-    }
-    evaluate_observation_status(
-        &candidate_group_observation_evidence(&source.status, sink, &candidate_groups),
-        ObservationTrustPolicy::candidate_generation(),
-    )
-    .state
-        == ObservationState::TrustedMaterialized
-}
-
 fn sink_status_snapshot_omits_active_source_groups(
     source: &SourceObservabilitySnapshot,
     sink: &SinkStatusSnapshot,
@@ -3673,6 +3723,7 @@ const STATUS_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(2);
 const STATUS_ROUTE_READY_FALLBACK_GRACE: Duration = Duration::from_millis(200);
 const STATUS_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const STATUS_SINK_ROUTE_RECOLLECT_BUDGET: Duration = Duration::from_secs(3);
+const STATUS_OWNER_SCOPED_ROUTE_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn management_status_uses_short_observation_budget(
     published_facade_state: FacadeServiceState,
@@ -3875,6 +3926,7 @@ async fn collect_shared_status_routes_once(
 
     let mut sink_result = None::<StatusSinkRouteResult>;
     let mut source_result = None::<StatusSourceRouteResult>;
+    let hard_deadline = tokio::time::Instant::now() + route_timeout;
     loop {
         if sink_result.is_some() && source_result.is_some() {
             break;
@@ -3905,12 +3957,15 @@ async fn collect_shared_status_routes_once(
             result = source_future.as_mut(), if source_result.is_none() => {
                 source_result = Some(result);
             }
+            _ = tokio::time::sleep_until(hard_deadline), if sink_result.is_none() || source_result.is_none() => {
+                break;
+            }
         }
     }
 
     (
-        sink_result.expect("status sink route result"),
-        source_result.expect("status source route result"),
+        sink_result.unwrap_or(Err(CnxError::Timeout)),
+        source_result.unwrap_or(Err(CnxError::Timeout)),
     )
 }
 
@@ -4026,6 +4081,12 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
     let retry_node_id = node_id.clone();
     let sink_retry_boundary = boundary.clone();
     let sink_retry_node_id = node_id.clone();
+    let route_timeout = if use_short_observation_budget {
+        STATUS_ROUTE_READY_FALLBACK_GRACE
+    } else {
+        STATUS_ROUTE_TIMEOUT
+    };
+    let mut retryable_gap_deadline = tokio::time::Instant::now() + route_timeout;
     record_status_route_trace(trace_id, "sink.collect.begin");
     record_status_route_trace(trace_id, "source.collect.begin");
     let (mut sink_result, mut source_result) = collect_shared_status_routes_once(
@@ -4047,16 +4108,12 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
             .err()
             .is_some_and(|err| classify_status_route_error(err) == StatusRouteOutcome::Transport);
     if both_internal || both_transport {
-        let route_timeout = if use_short_observation_budget {
-            STATUS_ROUTE_READY_FALLBACK_GRACE
-        } else {
-            STATUS_ROUTE_TIMEOUT
-        };
         let collect_idle_grace = if use_short_observation_budget {
             STATUS_ROUTE_READY_FALLBACK_GRACE
         } else {
             STATUS_ROUTE_COLLECT_IDLE_GRACE
         };
+        retryable_gap_deadline = tokio::time::Instant::now() + route_timeout;
         sink_result = route_sink_status_snapshot(
             retry_boundary.clone(),
             retry_node_id.clone(),
@@ -4099,7 +4156,10 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
         ),
         Err(err) => {
             log_status_route_fallback("sink", &err);
-            (local_sink, classify_status_route_error(&err))
+            (
+                local_sink,
+                classify_status_route_collect_error(&err, retryable_gap_deadline),
+            )
         }
     };
     record_status_route_trace(
@@ -4119,7 +4179,7 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
             (
                 source,
                 local_source_runner_sets,
-                classify_status_route_error(&err),
+                classify_status_route_collect_error(&err, retryable_gap_deadline),
             )
         }
     };
@@ -4426,7 +4486,7 @@ async fn augment_management_status_source_with_owner_scoped_evidence(
                 let result = collect_node_scoped_status_source_observability_origin_snapshot(
                     boundary,
                     origin_id,
-                    STATUS_ROUTE_TIMEOUT,
+                    STATUS_OWNER_SCOPED_ROUTE_TIMEOUT,
                     &node_id,
                 )
                 .await;
@@ -4530,6 +4590,26 @@ fn sink_status_groups_needing_owner_scoped_evidence(
     group_ids
 }
 
+fn sink_status_groups_are_speculative_zero_rows_without_sink_owner_evidence(
+    sink: &SinkStatusSnapshot,
+    group_ids: &BTreeSet<String>,
+) -> bool {
+    if group_ids.is_empty()
+        || !sink.primary_host_ref_by_group.is_empty()
+        || !sink_status_snapshot_lacks_ingress_evidence(sink)
+    {
+        return false;
+    }
+    group_ids.iter().all(|group_id| {
+        sink.groups.iter().any(|group| {
+            group.group_id == *group_id
+                && group.live_nodes == 0
+                && group.total_nodes == 0
+                && !matches!(group.readiness, crate::sink::GroupReadinessState::Ready)
+        })
+    })
+}
+
 fn collect_sink_owner_candidate_nodes_from_snapshot(
     nodes: &mut BTreeSet<String>,
     sink: &SinkStatusSnapshot,
@@ -4589,6 +4669,11 @@ async fn augment_management_status_sink_with_owner_scoped_evidence(
     if groups_needing_owner_evidence.is_empty() {
         return sink;
     }
+    let speculative_zero_rows_without_sink_owner_evidence =
+        sink_status_groups_are_speculative_zero_rows_without_sink_owner_evidence(
+            &sink,
+            &groups_needing_owner_evidence,
+        );
     let Some(boundary) = boundary else {
         return sink;
     };
@@ -4614,7 +4699,12 @@ async fn augment_management_status_sink_with_owner_scoped_evidence(
         &sink,
         &groups_needing_owner_evidence,
     );
-    if let Some(node_id) = roots_put_control_target_node_id_for_ref_or_node(&origin_id.0) {
+    if speculative_zero_rows_without_sink_owner_evidence && candidate_node_ids.is_empty() {
+        return sink;
+    }
+    if !speculative_zero_rows_without_sink_owner_evidence
+        && let Some(node_id) = roots_put_control_target_node_id_for_ref_or_node(&origin_id.0)
+    {
         candidate_node_ids.insert(node_id);
     }
     if candidate_node_ids.is_empty() {
@@ -4630,7 +4720,7 @@ async fn augment_management_status_sink_with_owner_scoped_evidence(
                 let result = collect_node_scoped_status_sink_snapshot(
                     boundary,
                     origin_id,
-                    STATUS_ROUTE_TIMEOUT,
+                    STATUS_OWNER_SCOPED_ROUTE_TIMEOUT,
                     &node_id,
                 )
                 .await;
@@ -4705,6 +4795,20 @@ fn classify_status_route_error(err: &CnxError) -> StatusRouteOutcome {
     }
 }
 
+fn classify_status_route_collect_error(
+    err: &CnxError,
+    retryable_gap_deadline: tokio::time::Instant,
+) -> StatusRouteOutcome {
+    let outcome = classify_status_route_error(err);
+    if matches!(outcome, StatusRouteOutcome::Transport)
+        && tokio::time::Instant::now() >= retryable_gap_deadline
+    {
+        StatusRouteOutcome::Timeout
+    } else {
+        outcome
+    }
+}
+
 fn should_fail_closed_status_route_collection(
     sink_outcome: StatusRouteOutcome,
     source_outcome: StatusRouteOutcome,
@@ -4752,14 +4856,16 @@ fn should_fail_closed_source_ready_sink_empty_status(
     if worker_runtime {
         return false;
     }
+    let source_ready_groups = source_status_current_health_root_ids(source);
+    if source_ready_groups.is_empty() {
+        return false;
+    }
     matches!(
         published_facade_state,
         FacadeServiceState::Serving | FacadeServiceState::Degraded
     ) && status_route_collection_requested(sink_outcome, source_outcome)
-        && !source_snapshot_active_groups(source).is_empty()
-        && source_snapshot_has_published_activity(source)
-        && !source_snapshot_active_groups(source)
-            .is_subset(&sink_snapshot_live_materialized_groups(sink_status))
+        && source_ready_groups.is_subset(&sink_status_reported_group_ids(sink_status))
+        && !source_ready_groups.is_subset(&sink_snapshot_live_materialized_groups(sink_status))
         && sink_status_snapshot_is_zeroish_for_active_source_groups(sink_status)
         && sink_status_snapshot_lacks_ingress_evidence(sink_status)
 }
@@ -4884,6 +4990,7 @@ pub async fn roots_put(
     Json(req): Json<RootsUpdateRequest>,
 ) -> Result<Json<RootsUpdateResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
+    wait_roots_put_management_write_ready(&state).await?;
     let roots = req
         .roots
         .into_iter()
@@ -5050,6 +5157,30 @@ pub async fn roots_put(
     }))
 }
 
+async fn wait_roots_put_management_write_ready(state: &ApiState) -> Result<(), ApiError> {
+    if state.control_gate.is_management_write_ready() {
+        return Ok(());
+    }
+    if state.control_gate.is_management_write_drain_closed() {
+        return Err(ApiError::service_unavailable(
+            "fs-meta management request handling is unavailable until runtime control initializes the app",
+        ));
+    }
+    if !state.control_gate.is_management_write_ready()
+        && tokio::time::timeout(
+            Duration::from_secs(15),
+            state.control_gate.wait_management_write_ready(),
+        )
+        .await
+        .is_err()
+    {
+        return Err(ApiError::service_unavailable(
+            "fs-meta management request handling is unavailable until runtime control initializes the app",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn rescan(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -5105,15 +5236,37 @@ pub async fn rescan(
                     ))
                 })?;
             let active_source_node_ids =
-                active_source_rescan_node_ids_from_current_roots(&roots, &grants);
+                manual_rescan_delivery_fallback_node_ids_from_current_roots(
+                    &state.node_id,
+                    &roots,
+                    &grants,
+                );
             (roots, grants, active_source_node_ids)
         };
         if !active_source_node_ids.is_empty() {
-            if let Some(runtime_source_primary_node_ids) =
-                wait_manual_rescan_current_roots_runtime_scope_readiness(&state, &roots, &grants)
-                    .await?
+            match tokio::time::timeout(
+                MANUAL_RESCAN_CURRENT_ROOTS_PREFLIGHT_TIMEOUT,
+                wait_manual_rescan_current_roots_runtime_scope_readiness(&state, &roots, &grants),
+            )
+            .await
             {
-                active_source_node_ids = runtime_source_primary_node_ids;
+                Ok(Ok(Some(runtime_source_primary_node_ids))) => {
+                    active_source_node_ids = runtime_source_primary_node_ids;
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(err)) if err.status == StatusCode::SERVICE_UNAVAILABLE => {
+                    eprintln!(
+                        "fs_meta_api: manual rescan current-roots observation incomplete before scoped delivery: {}",
+                        err.message
+                    );
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    eprintln!(
+                        "fs_meta_api: manual rescan current-roots observation window elapsed before scoped delivery; using active source targets {:?}",
+                        active_source_node_ids
+                    );
+                }
             }
         }
         eprintln!(
@@ -5242,6 +5395,24 @@ fn active_source_rescan_node_ids_from_current_roots(
         .filter(|grant| roots.iter().any(|root| root.selector.matches(grant)))
         .filter_map(source_node_id_from_grant)
         .collect()
+}
+
+fn manual_rescan_delivery_fallback_node_ids_from_current_roots(
+    node_id: &NodeId,
+    roots: &[RootSpec],
+    grants: &[GrantedMountRoot],
+) -> BTreeSet<String> {
+    let mut node_ids = active_source_rescan_node_ids_from_current_roots(roots, grants);
+    if local_source_node_owns_any_current_root(node_id, roots, grants)
+        && node_ids
+            .iter()
+            .any(|candidate| runtime_node_identity_matches(candidate, &node_id.0))
+    {
+        node_ids.retain(|candidate| !runtime_node_identity_matches(candidate, &node_id.0));
+        node_ids.insert(node_id.0.clone());
+    }
+    retain_most_specific_runtime_node_identities(&mut node_ids);
+    node_ids
 }
 
 fn source_node_id_from_grant(grant: &GrantedMountRoot) -> Option<String> {
@@ -6495,6 +6666,7 @@ fn manual_rescan_source_snapshot_ready_for_current_roots(
         && roots_put_second_wave_source_runtime_scope_ready(expected_groups, source)
 }
 
+#[cfg(test)]
 fn manual_rescan_readiness_from_source_snapshot(
     expected_groups: &RootsPutSecondWaveExpectedGroups,
     roots: &[RootSpec],
@@ -6574,7 +6746,6 @@ async fn wait_manual_rescan_current_roots_runtime_scope_readiness(
     let mut target_node_ids =
         derive_roots_put_control_target_node_ids_from_grants(&state.node_id, roots, grants);
     target_node_ids.extend(source_status_probe_seed_node_ids.iter().cloned());
-    target_node_ids.extend(discover_roots_put_control_target_node_ids(state).await);
     send_roots_put_control_second_wave(&context, roots, &target_node_ids).await?;
     let source = state.source.clone();
     let runtime_boundary = state.runtime_boundary.clone();
@@ -6992,16 +7163,17 @@ async fn collect_scoped_manual_rescan_request_with_timeout(
         if remaining.is_zero() {
             return Err(CnxError::Timeout);
         }
-        let events = match adapter
-            .call_collect(
-                ROUTE_TOKEN_FS_META_INTERNAL,
-                METHOD_SOURCE_RESCAN,
+        let route = adapter.bound_route(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN)?;
+        let collect_result = route
+            .call_collect_until(
                 payload.clone(),
                 scoped_manual_rescan_delivery_attempt_timeout(remaining),
                 scoped_manual_rescan_delivery_idle_after_first_timeout(remaining),
+                manual_rescan_scoped_source_delivery_has_terminal_target_evidence,
             )
-            .await
-        {
+            .await;
+        route.close();
+        let events = match collect_result {
             Ok(events) => events,
             Err(CnxError::Timeout) => {
                 continue;
@@ -7056,6 +7228,15 @@ async fn collect_scoped_manual_rescan_request_with_timeout(
     }
 }
 
+fn manual_rescan_scoped_source_delivery_has_terminal_target_evidence(events: &[Event]) -> bool {
+    events.iter().any(|event| {
+        let payload = event.payload_bytes();
+        payload == b"accepted"
+            || manual_rescan_scoped_source_delivery_pending_payload(payload)
+            || (payload != b"not-target")
+    })
+}
+
 fn manual_rescan_scoped_source_delivery_error_is_pending(err: &CnxError) -> bool {
     matches!(err, CnxError::Timeout | CnxError::NotReady(_))
 }
@@ -7084,14 +7265,27 @@ fn manual_rescan_scoped_source_delivery_error(node_id: &str, err: CnxError) -> C
 
 fn manual_rescan_scoped_source_route_api_error(err: CnxError) -> ApiError {
     match err {
+        CnxError::NotReady(message)
+            if manual_rescan_scoped_source_delivery_timed_out_without_target_evidence(&message) =>
+        {
+            ApiError::service_unavailable(format!(
+                "manual rescan scoped source route failed: {message}"
+            ))
+        }
         CnxError::NotReady(message) => ApiError::service_unavailable(format!(
             "manual rescan scoped source route pending: {message}"
         )),
         CnxError::Timeout => ApiError::service_unavailable(
-            "manual rescan scoped source route pending: operation timed out",
+            "manual rescan scoped source route failed: operation timed out",
         ),
         err => ApiError::internal(format!("manual rescan scoped source route failed: {err}")),
     }
+}
+
+fn manual_rescan_scoped_source_delivery_timed_out_without_target_evidence(message: &str) -> bool {
+    message.contains("manual rescan scoped source delivery pending for node")
+        && message.ends_with(": operation timed out")
+        && !message.contains(": pending:")
 }
 
 fn manual_rescan_scoped_source_delivery_pending_payload(payload: &[u8]) -> bool {
@@ -7410,6 +7604,7 @@ async fn route_source_observability_snapshot_until_first(
             Duration::ZERO,
             internal_status_request_payload(),
             Some(1),
+            None,
         )
         .await?;
     Ok((snapshot, runner_sets))
@@ -7460,6 +7655,7 @@ async fn route_source_observability_snapshot_with_per_origin_debug_and_payload(
             idle_after_first,
             source_status_payload,
             None,
+            None,
         )
         .await?;
     Ok((snapshot, runner_sets, per_origin))
@@ -7472,6 +7668,7 @@ async fn route_source_observability_origin_snapshots_with_per_origin_debug_and_p
     idle_after_first: Duration,
     source_status_payload: bytes::Bytes,
     complete_after_events: Option<usize>,
+    complete_when: Option<&(dyn Fn(&[Event]) -> bool + Send + Sync)>,
 ) -> Result<
     (
         SourceObservabilitySnapshot,
@@ -7507,6 +7704,7 @@ async fn route_source_observability_origin_snapshots_with_per_origin_debug_and_p
             ],
             source_status_payload.clone(),
             complete_after_events,
+            complete_when,
         )
         .await
         {
@@ -7696,6 +7894,7 @@ async fn collect_internal_source_status_events(
     _unit_ids: &[&str],
     source_status_payload: bytes::Bytes,
     complete_after_events: Option<usize>,
+    complete_when: Option<&(dyn Fn(&[Event]) -> bool + Send + Sync)>,
 ) -> Result<Vec<Event>, CnxError> {
     let requires_manual_rescan_delivery_evidence =
         source_status_request_requires_manual_rescan_delivery_evidence(&source_status_payload);
@@ -7713,7 +7912,17 @@ async fn collect_internal_source_status_events(
         idle_after_first
     };
     let adapter = exchange_host_adapter(boundary, origin_id, default_route_bindings());
-    if let Some(complete_after_events) = complete_after_events {
+    if let Some(complete_when) = complete_when {
+        let route = adapter.bound_route(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)?;
+        let result = route
+            .call_collect_until(source_status_payload, timeout, idle_after_first, |events| {
+                complete_after_events.is_some_and(|target| events.len() >= target.max(1))
+                    || complete_when(events)
+            })
+            .await;
+        route.close();
+        result
+    } else if let Some(complete_after_events) = complete_after_events {
         adapter
             .call_collect_until_count(
                 ROUTE_TOKEN_FS_META_INTERNAL,
@@ -8740,6 +8949,7 @@ mod tests {
     struct DelayedSourceStatusCollectBoundary {
         reply_channel: String,
         sent_correlation: StdMutex<Option<u64>>,
+        correlation_notify: Notify,
         recv_count: std::sync::atomic::AtomicUsize,
         delayed_reply_delay: Duration,
         fast_snapshot: SourceObservabilitySnapshot,
@@ -8974,7 +9184,7 @@ mod tests {
         sink_status_payloads: Vec<(String, Vec<u8>)>,
         correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
         recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
-        active_recvs: std::sync::atomic::AtomicUsize,
+        poisoned_reply_channels: StdMutex<BTreeSet<String>>,
         poisoned: std::sync::atomic::AtomicBool,
     }
 
@@ -9724,6 +9934,7 @@ mod tests {
                 .lock()
                 .expect("delayed source-status sent correlation lock");
             *sent = correlation;
+            self.correlation_notify.notify_waiters();
             Ok(())
         }
 
@@ -9735,11 +9946,12 @@ mod tests {
             if request.channel_key.0 != self.reply_channel {
                 return Err(CnxError::Timeout);
             }
-            let correlation = self
-                .sent_correlation
-                .lock()
-                .expect("delayed source-status sent correlation lock")
-                .unwrap_or(1);
+            let correlation = wait_for_manual_rescan_test_correlation(
+                &self.sent_correlation,
+                &self.correlation_notify,
+                "delayed source-status sent correlation lock",
+            )
+            .await;
             match self
                 .recv_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -11041,7 +11253,7 @@ mod tests {
                     .collect(),
                 correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
                 recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
-                active_recvs: std::sync::atomic::AtomicUsize::new(0),
+                poisoned_reply_channels: StdMutex::new(BTreeSet::new()),
                 poisoned: std::sync::atomic::AtomicBool::new(false),
             }
         }
@@ -12178,7 +12390,31 @@ mod tests {
             _ctx: BoundaryContext,
             request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
         ) -> capanix_app_sdk::Result<Vec<Event>> {
-            let first_recv = {
+            if request.channel_key.0 != self.source_reply_channel
+                && request.channel_key.0 != self.sink_reply_channel
+            {
+                return Err(CnxError::Timeout);
+            }
+
+            let poison_this_recv = {
+                let mut poisoned_reply_channels = self
+                    .poisoned_reply_channels
+                    .lock()
+                    .expect("status overlap poison reply channels lock");
+                poisoned_reply_channels.insert(request.channel_key.0.clone())
+            };
+            if poison_this_recv {
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            if poison_this_recv {
+                return Err(CnxError::TransportClosed(
+                    "simulated same-boundary concurrent source/sink status collect poison"
+                        .to_string(),
+                ));
+            }
+
+            let payload_recv = {
                 let mut recv_batches = self
                     .recv_batches_by_channel
                     .lock()
@@ -12187,35 +12423,11 @@ mod tests {
                     .entry(request.channel_key.0.clone())
                     .or_default();
                 *recv_count += 1;
-                *recv_count == 1
+                *recv_count <= 8
             };
 
-            if request.channel_key.0 != self.source_reply_channel
-                && request.channel_key.0 != self.sink_reply_channel
-            {
-                return Err(CnxError::Timeout);
-            }
-
-            let previous = self
-                .active_recvs
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            tokio::task::yield_now().await;
-            if previous > 0 || self.active_recvs.load(std::sync::atomic::Ordering::SeqCst) > 1 {
-                self.poisoned
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-            let poisoned = self.poisoned.load(std::sync::atomic::Ordering::SeqCst);
-            self.active_recvs
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            if poisoned {
-                return Err(CnxError::TransportClosed(
-                    "simulated same-boundary concurrent source/sink status collect poison"
-                        .to_string(),
-                ));
-            }
-
             if request.channel_key.0 == self.source_reply_channel {
-                if !first_recv {
+                if !payload_recv {
                     return Err(CnxError::Timeout);
                 }
                 let correlation = self
@@ -12244,7 +12456,7 @@ mod tests {
                     .collect());
             }
 
-            if !first_recv {
+            if !payload_recv {
                 return Err(CnxError::Timeout);
             }
             let correlation = self
@@ -14779,6 +14991,33 @@ mod tests {
                 false
             ),
             "local /status may skip remote fan-in only after live sink coverage includes every current logical root, not just the facade-local scheduled root"
+        );
+    }
+
+    #[test]
+    fn status_fail_close_predicate_uses_source_health_when_sink_only_has_zero_rows() {
+        let source = local_source_snapshot();
+        let mut sink = local_sink_snapshot();
+        sink.scheduled_groups_by_node.clear();
+        sink.live_nodes = 0;
+        for group in &mut sink.groups {
+            group.total_nodes = 0;
+            group.live_nodes = 0;
+            group.attested_count = 0;
+            group.readiness = crate::sink::GroupReadinessState::PendingMaterialization;
+            group.shadow_time_us = 0;
+        }
+
+        assert!(
+            should_fail_closed_source_ready_sink_empty_status(
+                StatusRouteOutcome::Ok,
+                StatusRouteOutcome::Timeout,
+                FacadeServiceState::Serving,
+                false,
+                &sink,
+                &source,
+            ),
+            "source health plus sink zero rows is not safe to report as a partial /status fallback even before source has published data batches"
         );
     }
 
@@ -24134,6 +24373,60 @@ mod tests {
     }
 
     #[test]
+    fn manual_rescan_delivery_fallback_rewrites_local_domain_alias_to_runtime_node() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2");
+        let mut nfs1_grant = granted_mount_root("node-d::nfs1", &nfs1);
+        let mut nfs2_grant = granted_mount_root("node-d::nfs2", &nfs2);
+        nfs1_grant.host_ref = "node-d".to_string();
+        nfs2_grant.host_ref = "node-d".to_string();
+        let roots = vec![RootSpec::new("nfs1", &nfs1), RootSpec::new("nfs2", &nfs2)];
+        let node_id = NodeId("node-d-repeated-initialized-mixed-wave-auth-fail-closed".to_string());
+
+        let node_ids = manual_rescan_delivery_fallback_node_ids_from_current_roots(
+            &node_id,
+            &roots,
+            &[nfs1_grant, nfs2_grant],
+        );
+
+        assert_eq!(
+            node_ids,
+            BTreeSet::from([node_id.0]),
+            "manual-rescan scoped delivery fallback must target the local runtime route owner instead of the stable source domain label"
+        );
+    }
+
+    #[test]
+    fn manual_rescan_delivery_fallback_keeps_peer_targets_while_rewriting_local_alias() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2");
+        let mut nfs1_grant = granted_mount_root("node-b::nfs1", &nfs1);
+        let mut nfs2_grant = granted_mount_root("node-d::nfs2", &nfs2);
+        nfs1_grant.host_ref = "node-b".to_string();
+        nfs2_grant.host_ref = "node-d".to_string();
+        let roots = vec![RootSpec::new("nfs1", &nfs1), RootSpec::new("nfs2", &nfs2)];
+        let node_id = NodeId("node-d-29820225113763706589675521".to_string());
+
+        let node_ids = manual_rescan_delivery_fallback_node_ids_from_current_roots(
+            &node_id,
+            &roots,
+            &[nfs1_grant, nfs2_grant],
+        );
+
+        assert_eq!(
+            node_ids,
+            BTreeSet::from(["node-b".to_string(), node_id.0]),
+            "manual-rescan scoped delivery fallback must preserve peer source targets while using the local runtime route for same-node grants"
+        );
+    }
+
+    #[test]
     fn manual_rescan_source_status_probe_seed_uses_runtime_host_ref_not_control_object_alias() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
@@ -25927,6 +26220,7 @@ mod tests {
         let boundary = Arc::new(DelayedSourceStatusCollectBoundary {
             reply_channel: format!("{}:reply", source_status_route.0),
             sent_correlation: StdMutex::new(None),
+            correlation_notify: Notify::new(),
             recv_count: std::sync::atomic::AtomicUsize::new(0),
             delayed_reply_delay: Duration::from_millis(750),
             fast_snapshot: SourceObservabilitySnapshot {
@@ -26064,6 +26358,7 @@ mod tests {
         let boundary = Arc::new(DelayedSourceStatusCollectBoundary {
             reply_channel: format!("{}:reply", source_status_route.0),
             sent_correlation: StdMutex::new(None),
+            correlation_notify: Notify::new(),
             recv_count: std::sync::atomic::AtomicUsize::new(0),
             delayed_reply_delay: STATUS_ROUTE_COLLECT_IDLE_GRACE + Duration::from_millis(250),
             fast_snapshot: fast_non_owner,
@@ -26077,6 +26372,7 @@ mod tests {
                 Duration::from_secs(5),
                 STATUS_ROUTE_COLLECT_IDLE_GRACE,
                 manual_rescan_source_status_request_payload(),
+                None,
                 None,
             )
             .await
@@ -27141,7 +27437,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let response = status(State(state), headers)
+        let response = status(State(state), None, headers)
             .await
             .expect("status should report serving facade state")
             .0;
@@ -27215,7 +27511,7 @@ mod tests {
             control_gate,
         };
 
-        let _response = status(State(state), headers)
+        let _response = status(State(state), None, headers)
             .await
             .expect("status should stay available while running bounded recovery");
 
@@ -27300,7 +27596,7 @@ mod tests {
             control_gate,
         };
 
-        let _response = status(State(state), headers)
+        let _response = status(State(state), None, headers)
             .await
             .expect("status should repair source replay before local source snapshot");
 
@@ -27378,7 +27674,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let response = status(State(state), headers)
+        let response = status(State(state), None, headers)
             .await
             .expect("direct status handler should surface unavailable facade state")
             .0;
@@ -27456,7 +27752,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let response = status(State(state), headers)
+        let response = status(State(state), None, headers)
             .await
             .expect("status should report pending facade state")
             .0;
@@ -27518,7 +27814,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let status_task = tokio::spawn(async move { status(State(state), headers).await });
+        let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(12)).await;
 
@@ -27596,7 +27892,7 @@ mod tests {
         }
         let _reset = StatusPauseHookReset;
 
-        let status_task = tokio::spawn(async move { status(State(state), headers).await });
+        let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
         tokio::time::timeout(Duration::from_secs(1), entered.notified())
             .await
             .expect("paused /status should enter remote-collection pause hook");
@@ -27703,7 +27999,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let response = status(State(state), headers)
+        let response = status(State(state), None, headers)
             .await
             .expect("status should use runtime boundary when query boundary transport-fails")
             .0;
@@ -27813,7 +28109,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let response = status(State(state), headers)
+        let response = status(State(state), None, headers)
             .await
             .expect(
                 "status should fall back to live query boundary when runtime boundary transports",
@@ -27952,7 +28248,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let response = status(State(state), headers)
+        let response = status(State(state), None, headers)
             .await
             .expect("cached worker sink fallback must not fail before remote status fan-in")
             .0;
@@ -28183,7 +28479,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let response = status(State(state), headers)
+        let response = status(State(state), None, headers)
             .await
             .expect("status should retry partial routed sink status when local sink cannot fill missing active groups")
             .0;
@@ -28348,7 +28644,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let err = status(State(state), headers)
+        let err = status(State(state), None, headers)
             .await
             .expect_err("status must fail-close when routed sink-status stays empty while source is ready and local sink cannot fill active groups");
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -28455,7 +28751,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let response = status(State(state), headers)
+        let response = status(State(state), None, headers)
             .await
             .expect("status should avoid same-boundary source/sink collect overlap that would self-poison transport")
             .0;
@@ -28540,7 +28836,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let status_task = tokio::spawn(async move { status(State(state), headers).await });
+        let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(25)).await;
 
@@ -28651,7 +28947,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let status_task = tokio::spawn(async move { status(State(state), headers).await });
+        let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(25)).await;
 
@@ -28780,7 +29076,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let status_task = tokio::spawn(async move { status(State(state), headers).await });
+        let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(25)).await;
 
@@ -28847,7 +29143,7 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let status_task = tokio::spawn(async move { status(State(state), headers).await });
+        let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(25)).await;
 
@@ -28934,11 +29230,12 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
-        let response = tokio::time::timeout(Duration::from_secs(1), status(State(state), headers))
-            .await
-            .expect("pending /status must settle within the local route budget")
-            .expect("pending /status should fall back to local snapshots")
-            .0;
+        let response =
+            tokio::time::timeout(Duration::from_secs(1), status(State(state), None, headers))
+                .await
+                .expect("pending /status must settle within the local route budget")
+                .expect("pending /status should fall back to local snapshots")
+                .0;
 
         assert_eq!(response.facade.state, FacadeServiceState::Pending);
         assert!(response.facade.pending.is_some());

@@ -27,11 +27,23 @@ pub fn source_concrete_root_completed_current_audit(
         })
 }
 
+fn source_concrete_root_reports_implicit_current_audit(
+    root: &crate::source::SourceConcreteRootHealthSnapshot,
+) -> bool {
+    matches!(root.status.as_str(), "ready" | "ok")
+        && root.coverage_mode == "audit_only"
+        && !root.rescan_pending
+        && root.last_rescan_requested_at_us.is_none()
+        && root.last_audit_started_at_us.is_none()
+        && root.last_audit_completed_at_us.is_none()
+}
+
 pub fn source_concrete_root_has_current_owner_evidence(
     root: &crate::source::SourceConcreteRootHealthSnapshot,
 ) -> bool {
     concrete_root_counts_as_materialized_candidate(root)
-        && source_concrete_root_completed_current_audit(root)
+        && (source_concrete_root_completed_current_audit(root)
+            || source_concrete_root_reports_implicit_current_audit(root))
 }
 
 pub fn source_concrete_root_needs_current_owner_evidence(
@@ -47,13 +59,21 @@ fn source_concrete_root_blocks_materialized_observation(
     source_concrete_root_needs_current_owner_evidence(root)
 }
 
+fn source_logical_root_reports_service_ready(
+    root: &crate::source::SourceLogicalRootHealthSnapshot,
+) -> bool {
+    matches!(root.status.as_str(), "ready" | "ok")
+        && root.matched_grants > 0
+        && root.active_members > 0
+}
+
 fn source_groups_with_current_owner_evidence(
     source_status: &SourceStatusSnapshot,
 ) -> BTreeSet<String> {
-    let concrete_candidate_groups = source_status
+    let concrete_observed_scan_groups = source_status
         .concrete_roots
         .iter()
-        .filter(|root| concrete_root_counts_as_materialized_candidate(root))
+        .filter(|root| root.active && root.scan_enabled)
         .map(|root| root.logical_root_id.clone())
         .collect::<BTreeSet<_>>();
     let mut groups = source_status
@@ -67,10 +87,8 @@ fn source_groups_with_current_owner_evidence(
             .logical_roots
             .iter()
             .filter(|root| {
-                !concrete_candidate_groups.contains(&root.root_id)
-                    && root.status == "ready"
-                    && root.matched_grants > 0
-                    && root.active_members > 0
+                !concrete_observed_scan_groups.contains(&root.root_id)
+                    && source_logical_root_reports_service_ready(root)
             })
             .map(|root| root.root_id.clone()),
     );
@@ -169,6 +187,7 @@ pub fn materialized_query_observation_evidence(
     let mut degraded_groups = source_status
         .degraded_roots
         .iter()
+        .filter(|(root_id, _)| candidate_groups.contains(root_id))
         .map(|(root_id, _)| root_id.clone())
         .collect::<BTreeSet<_>>();
     degraded_groups.extend(
@@ -232,6 +251,7 @@ pub fn candidate_group_observation_evidence(
     let mut degraded_groups = source_status
         .degraded_roots
         .iter()
+        .filter(|(root_id, _)| candidate_groups.contains(root_id))
         .map(|(root_id, _)| root_id.clone())
         .collect::<BTreeSet<_>>();
     degraded_groups.extend(

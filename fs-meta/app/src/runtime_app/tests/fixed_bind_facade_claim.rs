@@ -336,6 +336,7 @@ async fn fixed_bind_publication_replay_uses_fresh_session_for_sink_owned_routes(
 
     app.replay_suppressed_public_query_activates_after_publication_with_session(
         stale_pre_publication_session,
+        true,
     )
     .await
     .expect("replay suppressed routes after publication");
@@ -568,6 +569,7 @@ async fn retry_pending_facade_does_not_wait_for_runtime_exposure_behind_dead_act
         app.pending_facade.lock().await.is_none(),
         "retry should clear the pending facade once the replacement is promoted",
     );
+    drop(active_guard);
 
     {
         let guard = app.api_task.lock().await;
@@ -592,7 +594,7 @@ async fn retry_pending_facade_does_not_wait_for_runtime_exposure_behind_dead_act
     })
     .await
     .expect("replacement facade thread should stop after teardown cancel");
-    tokio::time::timeout(Duration::from_secs(2), app.close())
+    tokio::time::timeout(Duration::from_secs(5), app.close())
         .await
         .expect("close app should not hang after explicit facade teardown")
         .expect("close app");

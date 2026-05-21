@@ -354,6 +354,7 @@ fn source_control_frame_machine_owns_post_ack_schedule_refresh_followup_lane() {
     machine.primed_local_schedule = Some(PrimedLocalScheduleSummary {
         saw_activate_with_bound_scopes: true,
         has_local_runnable_groups: true,
+        saw_runtime_host_grant_change: false,
     });
     let post_ack = machine
         .advance(SourceControlFrameEvent::RpcCompleted {
@@ -419,6 +420,7 @@ fn source_control_frame_machine_skips_replay_recovery_cache_priming_without_refr
     machine.primed_local_schedule = Some(PrimedLocalScheduleSummary {
         saw_activate_with_bound_scopes: true,
         has_local_runnable_groups: true,
+        saw_runtime_host_grant_change: false,
     });
 
     let post_ack = machine
@@ -4598,26 +4600,44 @@ fn source_control_state_classifies_tick_only_replay_paths_from_canonical_state()
     );
 
     state.arm_replay();
+    let Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay { signals }) =
+        state.classify_tick_only_wave(&[matching_tick.clone()])
+    else {
+        panic!(
+            "matching-generation tick-only followups must replay retained control state when replay remains armed"
+        );
+    };
     assert!(
-        matches!(
-            state.classify_tick_only_wave(&[matching_tick]),
-            Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay)
-        ),
+        signals
+            .iter()
+            .any(|signal| matches!(signal, SourceControlSignal::Tick { generation: 2, .. })),
         "matching-generation tick-only followups must replay retained control state when replay remains armed",
     );
+    let Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay { signals }) =
+        state.classify_tick_only_wave(&[advanced_tick.clone()])
+    else {
+        panic!(
+            "generation-advanced tick-only followups must replay retained control state when replay remains armed"
+        );
+    };
     assert!(
-        matches!(
-            state.classify_tick_only_wave(&[advanced_tick.clone()]),
-            Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay)
-        ),
+        signals
+            .iter()
+            .any(|signal| matches!(signal, SourceControlSignal::Tick { generation: 3, .. })),
         "generation-advanced tick-only followups must replay retained control state when replay remains armed",
     );
     state.take_replay_state();
+    let Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay { signals }) =
+        state.classify_tick_only_wave(&[advanced_tick.clone()])
+    else {
+        panic!(
+            "generation-advanced tick-only followups must replay through the worker path even when replay is clear so a stale worker cannot be hidden by cache-only fast path"
+        );
+    };
     assert!(
-        matches!(
-            state.classify_tick_only_wave(&[advanced_tick.clone()]),
-            Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay)
-        ),
+        signals
+            .iter()
+            .any(|signal| matches!(signal, SourceControlSignal::Tick { generation: 3, .. })),
         "generation-advanced tick-only followups must replay through the worker path even when replay is clear so a stale worker cannot be hidden by cache-only fast path",
     );
     match state.classify_tick_only_wave(&[stale_tick]) {
