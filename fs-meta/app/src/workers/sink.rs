@@ -446,20 +446,10 @@ fn snapshot_has_scheduled_zero_uninitialized_groups(snapshot: &SinkStatusSnapsho
             .all(|group| group.live_nodes == 0 && group.total_nodes == 0)
 }
 
-fn snapshot_has_zero_uninitialized_groups(snapshot: &SinkStatusSnapshot) -> bool {
-    !snapshot.groups.is_empty()
-        && snapshot
-            .groups
-            .iter()
-            .all(|group| group.live_nodes == 0 && group.total_nodes == 0)
-}
-
 fn snapshot_is_preactivate_unscheduled_cached_truth_for_live(
     snapshot: &SinkStatusSnapshot,
 ) -> bool {
-    !snapshot_has_delivery_evidence(snapshot)
-        && snapshot.scheduled_groups_by_node.is_empty()
-        && (snapshot.groups.is_empty() || snapshot_has_zero_uninitialized_groups(snapshot))
+    snapshot_is_preactivate_cached_status(snapshot)
 }
 
 fn snapshot_is_preactivate_cached_status(snapshot: &SinkStatusSnapshot) -> bool {
@@ -1033,12 +1023,19 @@ impl SinkStatusLiveScenario {
     ) -> SinkStatusOutcomeKind {
         if facts.cached_ready_truth_covers_issue {
             SinkStatusOutcomeKind::ReturnCached
-        } else if matches!(facts.cached_concern, Some(SinkStatusConcern::StaleEmpty)) {
-            SinkStatusOutcomeKind::ReturnLive
-        } else if facts.cached_preactivate_unscheduled {
-            SinkStatusOutcomeKind::ReturnLive
         } else {
-            SinkStatusOutcomeKind::FailClosed
+            match self {
+                Self::ControlInflight => SinkStatusOutcomeKind::FailClosed,
+                Self::SteadyAfterRetryReset
+                    if matches!(facts.cached_concern, Some(SinkStatusConcern::StaleEmpty))
+                        || facts.cached_preactivate_unscheduled =>
+                {
+                    SinkStatusOutcomeKind::ReturnLive
+                }
+                Self::Blocking | Self::Steady | Self::SteadyAfterRetryReset => {
+                    SinkStatusOutcomeKind::FailClosed
+                }
+            }
         }
     }
 
@@ -1060,7 +1057,7 @@ impl SinkStatusLiveScenario {
             SinkStatusConcernLane::Clear => SinkStatusOutcomeKind::ReturnLive,
             SinkStatusConcernLane::StaleEmpty => self.stale_empty_outcome_with_facts(facts),
             SinkStatusConcernLane::ReplayPending => match self {
-                Self::Steady | Self::SteadyAfterRetryReset => {
+                Self::ControlInflight | Self::Steady | Self::SteadyAfterRetryReset => {
                     self.replay_pending_outcome_with_facts(facts)
                 }
                 _ => self.replay_pending_outcome(facts.cached_ready_truth_covers_issue),
@@ -1068,6 +1065,18 @@ impl SinkStatusLiveScenario {
             SinkStatusConcernLane::CoverageGap => match self {
                 Self::Blocking if facts.live_delivery_backed_pending_materialization => {
                     SinkStatusOutcomeKind::ReturnLive
+                }
+                Self::ControlInflight if facts.live_delivery_backed_pending_materialization => {
+                    SinkStatusOutcomeKind::ReturnLive
+                }
+                Self::Steady | Self::SteadyAfterRetryReset
+                    if facts.live_delivery_backed_pending_materialization =>
+                {
+                    if facts.cached_ready_truth_covers_issue {
+                        SinkStatusOutcomeKind::ReturnCached
+                    } else {
+                        SinkStatusOutcomeKind::ReturnLive
+                    }
                 }
                 Self::Blocking => SinkStatusOutcomeKind::FailClosed,
                 Self::ControlInflight | Self::Steady | Self::SteadyAfterRetryReset => {
@@ -1474,6 +1483,41 @@ fn retained_scheduled_group_ids(
         .map(|scope| scope.scope_id.trim())
         .filter(|scope_id| !scope_id.is_empty())
         .map(|scope_id| scope_id.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    (!groups.is_empty()).then_some(groups)
+}
+
+fn control_signal_summary_scope_ids(signal: &str) -> std::collections::BTreeSet<String> {
+    let Some((_, scopes)) = signal.split_once(" scopes=[") else {
+        return std::collections::BTreeSet::new();
+    };
+    scopes
+        .split(']')
+        .next()
+        .unwrap_or(scopes)
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim().trim_matches('"');
+            let scope_id = entry
+                .split_once("=>")
+                .map(|(scope_id, _)| scope_id)
+                .unwrap_or(entry)
+                .trim()
+                .trim_matches('"');
+            (!scope_id.is_empty()).then(|| scope_id.to_string())
+        })
+        .collect()
+}
+
+fn snapshot_control_signal_scope_ids(
+    snapshot: &SinkStatusSnapshot,
+) -> Option<std::collections::BTreeSet<String>> {
+    let groups = snapshot
+        .last_control_frame_signals_by_node
+        .values()
+        .flat_map(|signals| signals.iter())
+        .filter(|signal| signal.starts_with("activate ") && signal.contains("unit=runtime.exec.sink"))
+        .flat_map(|signal| control_signal_summary_scope_ids(signal))
         .collect::<std::collections::BTreeSet<_>>();
     (!groups.is_empty()).then_some(groups)
 }
@@ -2556,6 +2600,13 @@ impl SinkWorkerClientHandle {
         Ok(())
     }
 
+    fn current_logical_root_group_ids(&self) -> Result<std::collections::BTreeSet<String>> {
+        self.logical_roots_cache
+            .lock()
+            .map(|guard| guard.iter().map(|root| root.id.clone()).collect())
+            .map_err(|_| CnxError::Internal("sink worker logical roots cache lock poisoned".into()))
+    }
+
     fn cached_status_snapshot_with_failure(
         &self,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
@@ -2638,6 +2689,74 @@ impl SinkWorkerClientHandle {
         self.cached_status_snapshot_with_failure()
     }
 
+    fn retain_status_snapshot_for_groups(
+        snapshot: &mut SinkStatusSnapshot,
+        surviving_groups: &std::collections::BTreeSet<String>,
+    ) {
+        let filter_group_entries =
+            |entries_by_node: &mut std::collections::BTreeMap<String, Vec<String>>| {
+                entries_by_node.retain(|_, entries| {
+                    entries.retain(|entry| {
+                        surviving_groups.contains(sink_status_origin_entry_group_id(entry))
+                    });
+                    !entries.is_empty()
+                });
+            };
+
+        snapshot
+            .groups
+            .retain(|group| surviving_groups.contains(&group.group_id));
+        snapshot.scheduled_groups_by_node.retain(|_, groups| {
+            groups.retain(|group_id| surviving_groups.contains(group_id));
+            !groups.is_empty()
+        });
+        snapshot
+            .primary_host_ref_by_group
+            .retain(|group_id, _| surviving_groups.contains(group_id));
+        filter_group_entries(&mut snapshot.last_received_origins_by_node);
+        filter_group_entries(&mut snapshot.received_origin_counts_by_node);
+        filter_group_entries(&mut snapshot.stream_received_origin_counts_by_node);
+        filter_group_entries(&mut snapshot.stream_received_path_origin_counts_by_node);
+        filter_group_entries(&mut snapshot.stream_ready_origin_counts_by_node);
+        filter_group_entries(&mut snapshot.stream_ready_path_origin_counts_by_node);
+        filter_group_entries(&mut snapshot.stream_deferred_origin_counts_by_node);
+        filter_group_entries(&mut snapshot.stream_dropped_origin_counts_by_node);
+        filter_group_entries(&mut snapshot.stream_applied_origin_counts_by_node);
+        filter_group_entries(&mut snapshot.stream_applied_path_origin_counts_by_node);
+        snapshot.live_nodes = snapshot.groups.iter().map(|group| group.live_nodes).sum();
+        snapshot.tombstoned_count = snapshot
+            .groups
+            .iter()
+            .map(|group| group.tombstoned_count)
+            .sum();
+        snapshot.attested_count = snapshot
+            .groups
+            .iter()
+            .map(|group| group.attested_count)
+            .sum();
+        snapshot.suspect_count = snapshot
+            .groups
+            .iter()
+            .map(|group| group.suspect_count)
+            .sum();
+        snapshot.blind_spot_count = snapshot
+            .groups
+            .iter()
+            .map(|group| group.blind_spot_count)
+            .sum();
+        snapshot.shadow_time_us = snapshot
+            .groups
+            .iter()
+            .map(|group| group.shadow_time_us)
+            .max()
+            .unwrap_or(0);
+        snapshot.estimated_heap_bytes = snapshot
+            .groups
+            .iter()
+            .map(|group| group.estimated_heap_bytes)
+            .sum();
+    }
+
     fn retain_cached_status_for_surviving_roots(
         &self,
         roots: &[crate::source::config::RootSpec],
@@ -2654,61 +2773,11 @@ impl SinkWorkerClientHandle {
             *guard = (!surviving_groups.is_empty()).then_some(surviving_groups.clone());
         }
 
-        let filter_group_entries =
-            |entries_by_node: &mut std::collections::BTreeMap<String, Vec<String>>| {
-                entries_by_node.retain(|_, entries| {
-                    entries.retain(|entry| {
-                        surviving_groups.contains(sink_status_origin_entry_group_id(entry))
-                    });
-                    !entries.is_empty()
-                });
-            };
-
         let mut guard = self
             .status_cache
             .lock()
             .map_err(|_| CnxError::Internal("sink worker status cache lock poisoned".into()))?;
-        guard
-            .groups
-            .retain(|group| surviving_groups.contains(&group.group_id));
-        guard.scheduled_groups_by_node.retain(|_, groups| {
-            groups.retain(|group_id| surviving_groups.contains(group_id));
-            !groups.is_empty()
-        });
-        filter_group_entries(&mut guard.last_received_origins_by_node);
-        filter_group_entries(&mut guard.received_origin_counts_by_node);
-        filter_group_entries(&mut guard.stream_received_origin_counts_by_node);
-        filter_group_entries(&mut guard.stream_received_path_origin_counts_by_node);
-        filter_group_entries(&mut guard.stream_ready_origin_counts_by_node);
-        filter_group_entries(&mut guard.stream_ready_path_origin_counts_by_node);
-        filter_group_entries(&mut guard.stream_deferred_origin_counts_by_node);
-        filter_group_entries(&mut guard.stream_dropped_origin_counts_by_node);
-        filter_group_entries(&mut guard.stream_applied_origin_counts_by_node);
-        filter_group_entries(&mut guard.stream_applied_path_origin_counts_by_node);
-        guard.live_nodes = guard.groups.iter().map(|group| group.live_nodes).sum();
-        guard.tombstoned_count = guard
-            .groups
-            .iter()
-            .map(|group| group.tombstoned_count)
-            .sum();
-        guard.attested_count = guard.groups.iter().map(|group| group.attested_count).sum();
-        guard.suspect_count = guard.groups.iter().map(|group| group.suspect_count).sum();
-        guard.blind_spot_count = guard
-            .groups
-            .iter()
-            .map(|group| group.blind_spot_count)
-            .sum();
-        guard.shadow_time_us = guard
-            .groups
-            .iter()
-            .map(|group| group.shadow_time_us)
-            .max()
-            .unwrap_or(0);
-        guard.estimated_heap_bytes = guard
-            .groups
-            .iter()
-            .map(|group| group.estimated_heap_bytes)
-            .sum();
+        Self::retain_status_snapshot_for_groups(&mut guard, &surviving_groups);
         Ok(())
     }
 
@@ -3079,6 +3148,10 @@ impl SinkWorkerClientHandle {
         &self,
         mut snapshot: SinkStatusSnapshot,
     ) -> Result<SinkStatusSnapshot> {
+        let current_groups = self.current_logical_root_group_ids()?;
+        if !current_groups.is_empty() {
+            Self::retain_status_snapshot_for_groups(&mut snapshot, &current_groups);
+        }
         let grants = self
             .config
             .lock()
@@ -3383,11 +3456,114 @@ impl SinkWorkerClientHandle {
         }
     }
 
+    fn root_reconfigured_pending_snapshot_needs_replay(
+        &self,
+        cached_snapshot: &SinkStatusSnapshot,
+    ) -> bool {
+        self.logical_roots_generation.load(Ordering::Acquire) > 1
+            && !snapshot_has_delivery_evidence(cached_snapshot)
+            && (cached_snapshot.groups.is_empty()
+                || snapshot_is_preactivate_cached_status(cached_snapshot))
+    }
+
+    fn adjust_retry_reset_pending_outcome(
+        &self,
+        outcome: SinkStatusSnapshotOutcome,
+        live_snapshot: &SinkStatusSnapshot,
+        raw_live_snapshot: &SinkStatusSnapshot,
+        cached_snapshot: &SinkStatusSnapshot,
+        _recovered_after_retry_reset: bool,
+    ) -> SinkStatusSnapshotOutcome {
+        let current_groups = self.current_logical_root_group_ids().unwrap_or_default();
+        let raw_scheduled_groups = raw_live_snapshot.scheduled_groups();
+        let logical_roots_reconfigured = self.logical_roots_generation.load(Ordering::Acquire) > 1;
+        let retained_scheduled_groups = if logical_roots_reconfigured {
+            self.retained_control_state
+                .try_lock()
+                .ok()
+                .and_then(|retained| retained_scheduled_group_ids(&retained))
+        } else {
+            None
+        };
+        let retained_schedule_mismatch_after_root_reconfigure = retained_scheduled_groups
+            .as_ref()
+            .is_some_and(|groups| !groups.is_empty() && groups != &current_groups);
+        let raw_control_signal_scope_groups = if logical_roots_reconfigured {
+            snapshot_control_signal_scope_ids(raw_live_snapshot)
+        } else {
+            None
+        };
+        let raw_control_signal_mismatch_after_root_reconfigure = raw_control_signal_scope_groups
+            .as_ref()
+            .is_some_and(|groups| !groups.is_empty() && groups != &current_groups);
+        let raw_schedule_mismatch_after_root_reconfigure = logical_roots_reconfigured
+            && !current_groups.is_empty()
+            && !raw_scheduled_groups.is_empty()
+            && raw_scheduled_groups != current_groups;
+        let live_projection = live_snapshot.concern_projection();
+        let cached_projection = cached_snapshot.concern_projection();
+        let cached_ready_for_current_groups = !current_groups.is_empty()
+            && current_groups.is_subset(&cached_projection.summary.ready_groups);
+        let live_ready_for_current_groups = !current_groups.is_empty()
+            && current_groups.is_subset(&live_projection.summary.scheduled_groups)
+            && current_groups.is_subset(&live_projection.summary.ready_groups);
+        let live_scheduled_within_current_groups = !current_groups.is_empty()
+            && !live_projection.summary.scheduled_groups.is_empty()
+            && live_projection
+                .summary
+                .scheduled_groups
+                .is_subset(&current_groups);
+        let live_missing_scheduled_rows = !live_projection.summary.scheduled_groups.is_empty()
+            && !live_projection.summary.missing_scheduled_groups.is_empty();
+        let live_pending_without_truth =
+            matches!(outcome.concern, Some(SinkStatusConcern::ReplayPending))
+                || (outcome.concern.is_none() && live_missing_scheduled_rows);
+        if matches!(
+            outcome.kind,
+            SinkStatusOutcomeKind::ReturnLive | SinkStatusOutcomeKind::ReturnCached
+        ) && (raw_control_signal_mismatch_after_root_reconfigure
+            || (retained_schedule_mismatch_after_root_reconfigure && live_ready_for_current_groups)
+            || (raw_schedule_mismatch_after_root_reconfigure && !live_ready_for_current_groups)
+            || (live_pending_without_truth
+                && self.root_reconfigured_pending_snapshot_needs_replay(cached_snapshot)))
+        {
+            return SinkStatusSnapshotOutcome {
+                kind: SinkStatusOutcomeKind::FailClosed,
+                concern: outcome.concern,
+                should_mark_replay_required: true,
+                should_republish_zero_row_summary: outcome.should_republish_zero_row_summary,
+            };
+        }
+        if logical_roots_reconfigured
+            && cached_ready_for_current_groups
+            && live_scheduled_within_current_groups
+            && !live_ready_for_current_groups
+            && matches!(
+                outcome.concern,
+                Some(
+                    SinkStatusConcern::ReplayPending
+                        | SinkStatusConcern::WaitingForMaterializedRoot
+                        | SinkStatusConcern::CoverageGap
+                        | SinkStatusConcern::MixedReadiness
+                )
+            )
+        {
+            return SinkStatusSnapshotOutcome {
+                kind: SinkStatusOutcomeKind::ReturnCached,
+                concern: outcome.concern,
+                should_mark_replay_required: outcome.should_mark_replay_required,
+                should_republish_zero_row_summary: outcome.should_republish_zero_row_summary,
+            };
+        }
+        outcome
+    }
+
     async fn finalize_nonblocking_live_probe(
         &self,
         plan: SinkStatusNonblockingProbePlan,
         probe_outcome: SinkStatusSnapshotProbeOutcome,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        let raw_live_snapshot = probe_outcome.snapshot.clone();
         let live_snapshot =
             self.prepare_status_snapshot_for_evaluation_with_failure(probe_outcome.snapshot)?;
         if matches!(plan.mode, SinkStatusNonblockingMode::ControlInflight)
@@ -3415,6 +3591,13 @@ impl SinkWorkerClientHandle {
             &cached_snapshot,
             cached_concern,
             plan.live_access_path(probe_outcome.recovered_after_retry_reset),
+        );
+        let outcome = self.adjust_retry_reset_pending_outcome(
+            outcome,
+            &live_snapshot,
+            &raw_live_snapshot,
+            &cached_snapshot,
+            probe_outcome.recovered_after_retry_reset,
         );
         apply_live_sink_status_snapshot_outcome_side_effects(self, &live_snapshot, &outcome, false)
             .map_err(SinkFailure::from)?;
@@ -3657,25 +3840,56 @@ impl SinkWorkerClientHandle {
                 .finalize_nonblocking_cached_status_snapshot(snapshot, access_path, None)
                 .map(|snapshot| (snapshot, true)),
             SinkStatusNonblockingEntryAction::ProbeLive(plan) => {
-                match self
-                    .status_snapshot_with_timeout_outcome(
-                        status_snapshot_nonblocking_live_probe_budget(),
-                    )
+                self.status_snapshot_nonblocking_live_probe_with_access_path(plan)
                     .await
-                {
-                    Ok(probe_outcome) => self
-                        .finalize_nonblocking_live_probe(plan, probe_outcome)
+            }
+        }
+    }
+
+    async fn status_snapshot_nonblocking_live_probe_with_access_path(
+        &self,
+        plan: SinkStatusNonblockingProbePlan,
+    ) -> std::result::Result<(SinkStatusSnapshot, bool), SinkFailure> {
+        let deadline = std::time::Instant::now() + status_snapshot_nonblocking_live_probe_budget();
+        let mut last_fail_closed = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(last_fail_closed.unwrap_or_else(SinkFailure::timeout_like));
+            }
+            match self.status_snapshot_with_timeout_outcome(remaining).await {
+                Ok(probe_outcome) => {
+                    match self
+                        .finalize_nonblocking_live_probe(plan.clone(), probe_outcome)
                         .await
-                        .map(|snapshot| (snapshot, false)),
-                    Err(err) => {
-                        let access_path = plan.err_access_path();
-                        self.finalize_nonblocking_cached_status_snapshot(
+                    {
+                        Ok(snapshot) => return Ok((snapshot, false)),
+                        Err(err)
+                            if matches!(err.as_error(), CnxError::Timeout)
+                                && self.control_state_replay_required.load(Ordering::Acquire)
+                                    > 0
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            last_fail_closed = Some(err);
+                            tokio::time::sleep(
+                                deadline
+                                    .saturating_duration_since(std::time::Instant::now())
+                                    .min(Duration::from_millis(25)),
+                            )
+                            .await;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(err) => {
+                    let access_path = plan.err_access_path();
+                    return self
+                        .finalize_nonblocking_cached_status_snapshot(
                             plan.cached_snapshot,
                             access_path,
                             Some(err),
                         )
-                        .map(|snapshot| (snapshot, true))
-                    }
+                        .map(|snapshot| (snapshot, true));
                 }
             }
         }
@@ -3713,6 +3927,26 @@ impl SinkWorkerClientHandle {
             let snapshot = self
                 .cached_status_snapshot_with_republished_scheduled_groups()
                 .unwrap_or_else(|_| SinkStatusSnapshot::default());
+            if control_inflight
+                && (snapshot_looks_stale_empty(&snapshot) || snapshot.groups.is_empty())
+                && let Ok(probe_outcome) = self
+                    .status_route_existing_client_probe_once(
+                        status_snapshot_nonblocking_live_probe_budget(),
+                    )
+                    .await
+            {
+                let plan = SinkStatusNonblockingProbePlan {
+                    mode: SinkStatusNonblockingMode::Steady,
+                    cached_snapshot: snapshot.clone(),
+                    inflight_control_summaries: Vec::new(),
+                };
+                if let Ok(live_snapshot) = self
+                    .finalize_nonblocking_live_probe(plan, probe_outcome)
+                    .await
+                {
+                    return (live_snapshot, false);
+                }
+            }
             if debug_control_scope_capture_enabled() {
                 let reason = if replay_required {
                     "status_route_retained_replay_pending"
@@ -4214,8 +4448,12 @@ impl SinkWorkerClientHandle {
         &self,
         request: InternalQueryRequest,
     ) -> std::result::Result<Vec<Event>, SinkFailure> {
-        if self.control_op_inflight() {
-            return Ok(Vec::new());
+        if self.control_op_inflight()
+            || self.control_state_replay_required.load(Ordering::Acquire) > 0
+        {
+            return self
+                .materialized_query_existing_client_once_with_failure(request)
+                .await;
         }
         match self.existing_client_with_failure().await? {
             Some(client) => {
@@ -4235,6 +4473,28 @@ impl SinkWorkerClientHandle {
                 }
             }
             None => Ok(Vec::new()),
+        }
+    }
+
+    async fn materialized_query_existing_client_once_with_failure(
+        &self,
+        request: InternalQueryRequest,
+    ) -> std::result::Result<Vec<Event>, SinkFailure> {
+        let Some(client) = self.existing_client_with_failure().await? else {
+            return Ok(Vec::new());
+        };
+        match Self::call_worker_with_failure(
+            &client,
+            SinkWorkerRequest::MaterializedQuery { request },
+            SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
+        )
+        .await?
+        {
+            SinkWorkerResponse::Events(events) => Ok(events),
+            other => Err(unexpected_sink_worker_response_failure(
+                "for materialized query",
+                other,
+            )),
         }
     }
 
@@ -4620,7 +4880,7 @@ impl SinkFileMeta {
     pub(crate) fn status_snapshot_with_failure(
         &self,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
-        self.build_status_snapshot().map_err(SinkFailure::from)
+        self.status_snapshot().map_err(SinkFailure::from)
     }
 
     pub(crate) fn cached_status_snapshot_with_failure(
@@ -4633,7 +4893,7 @@ impl SinkFileMeta {
     pub(crate) fn status_snapshot_nonblocking_with_failure(
         &self,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
-        self.build_status_snapshot().map_err(SinkFailure::from)
+        self.status_snapshot().map_err(SinkFailure::from)
     }
 
     pub(crate) fn scheduled_group_ids_snapshot_with_failure(

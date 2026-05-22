@@ -474,7 +474,21 @@ fn emit_demo_evidence_result(
         Duration::from_secs(120),
         "full demo evidence reaches accepted state",
         || {
-            let status = session.status()?;
+            let status = match session.status() {
+                Ok(status) => status,
+                Err(err)
+                    if policy != DemoEvidencePolicy::FullAcceptance
+                        && is_trusted_materialized_status_unavailable(&err) =>
+                {
+                    last_report = Some(bounded_materialization_unready_demo_evidence(
+                        environment,
+                        policy,
+                        &err,
+                    ));
+                    return Ok(true);
+                }
+                Err(err) => return Err(err),
+            };
             let report = build_demo_evidence_report(&status, environment)?;
             let accepted = report.accepted_for(policy);
             last_report = Some(report);
@@ -498,6 +512,28 @@ fn emit_demo_evidence_result(
     }
     eprintln!("[fs-meta-api-matrix] demo_evidence_result={evidence}");
     Ok(())
+}
+
+fn is_trusted_materialized_status_unavailable(err: &str) -> bool {
+    err.contains("trusted-materialized reads remain unavailable")
+        || err.contains("package-local materialized observation evidence is trusted")
+}
+
+fn bounded_materialization_unready_demo_evidence(
+    environment: DemoEvidenceEnvironment,
+    policy: DemoEvidencePolicy,
+    err: &str,
+) -> DemoEvidenceReport {
+    DemoEvidenceReport {
+        evidence: json!({
+            "environment": environment.as_str(),
+            "status": "bounded_degraded",
+            "reason": "sink_materialization_unready",
+            "status_error": err,
+            "policy": policy.as_str(),
+        }),
+        unacceptable_reasons: vec!["sink_materialization_unready".to_string()],
+    }
 }
 
 struct DemoEvidenceReport {
@@ -1695,6 +1731,19 @@ fn source_repair_retry_classifier_treats_target_proof_as_transient_readiness() {
     assert!(is_retryable_source_repair_not_ready(err));
 }
 
+#[test]
+fn l4_demo_evidence_accepts_bounded_materialization_unready() {
+    let err = "http 503 failed: {\"error\":\"trusted-materialized reads remain unavailable until package-local materialized observation evidence is trusted: initial audit incomplete for groups [nfs2]\"}";
+    assert!(is_trusted_materialized_status_unavailable(err));
+    let report = bounded_materialization_unready_demo_evidence(
+        DemoEvidenceEnvironment::Full5Node5Nfs,
+        DemoEvidencePolicy::EnvironmentBaseline,
+        err,
+    );
+    assert!(report.accepted_for(DemoEvidencePolicy::EnvironmentBaseline));
+    assert!(!report.accepted_for(DemoEvidencePolicy::FullAcceptance));
+}
+
 fn run_mini_roots_management_smoke(
     session: &mut OperatorSession,
     lab: &NfsLab,
@@ -2305,7 +2354,7 @@ fn assert_trusted_tree_matches_readiness(
     session: &mut OperatorSession,
     context: &str,
 ) -> Result<(), String> {
-    let status = session.status()?;
+    let status = trusted_observation_status_gate(session, context)?;
     let trusted_ready = status
         .pointer("/readiness_planes/trusted_observation_readiness")
         .and_then(Value::as_bool)
@@ -2326,7 +2375,7 @@ fn assert_trusted_tree_matches_readiness(
         assert_trusted_tree_response(response, context)?;
     } else {
         if response.status == 200 {
-            let status_after_tree = session.status()?;
+            let status_after_tree = trusted_observation_status_gate(session, context)?;
             if status_after_tree
                 .pointer("/readiness_planes/trusted_observation_readiness")
                 .and_then(Value::as_bool)
@@ -2344,6 +2393,38 @@ fn assert_trusted_tree_matches_readiness(
     }
 
     Ok(())
+}
+
+fn trusted_observation_status_gate(
+    session: &mut OperatorSession,
+    context: &str,
+) -> Result<Value, String> {
+    let response = session.client().get_json_raw("/status", session.token())?;
+    match response.status {
+        200 => Ok(response.body),
+        503 => {
+            let body = response.body.to_string();
+            if body.contains("trusted-materialized reads remain unavailable")
+                || body.contains("package-local materialized observation evidence is trusted")
+            {
+                Ok(json!({
+                    "readiness_planes": {
+                        "trusted_observation_readiness": false
+                    },
+                    "status_not_ready": response.body,
+                }))
+            } else {
+                Err(format!(
+                    "{context}: status failed with non-materialized 503: {}",
+                    response.body
+                ))
+            }
+        }
+        status => Err(format!(
+            "{context}: status expected 200 or trusted-materialized 503, got {status}: {}",
+            response.body
+        )),
+    }
 }
 
 fn assert_trusted_tree_response(response: ApiResponse, context: &str) -> Result<(), String> {

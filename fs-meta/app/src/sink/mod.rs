@@ -3977,6 +3977,9 @@ impl SinkFileMeta {
     }
 
     pub(crate) fn sync_logical_roots_from_authoritative_cell_if_changed(&self) -> Result<bool> {
+        if !self.unit_control.is_runtime_managed() {
+            return Ok(false);
+        }
         let Some(authoritative_roots) = self.authoritative_logical_roots_if_changed()? else {
             return Ok(false);
         };
@@ -3989,7 +3992,7 @@ impl SinkFileMeta {
         self.perform_update_logical_roots_with_scope_policy(
             authoritative_roots.clone(),
             &grants,
-            false,
+            true,
         )?;
         eprintln!(
             "fs_meta_sink: authoritative logical-roots sync ok node={} roots={}",
@@ -4038,7 +4041,7 @@ impl SinkFileMeta {
         );
         let root_count = roots.len();
         let grant_count = host_object_grants.len();
-        if expand_runtime_scopes {
+        if expand_runtime_scopes && self.unit_control.has_runtime_state() {
             let bound_scopes = roots
                 .iter()
                 .map(|root| RuntimeBoundScope {

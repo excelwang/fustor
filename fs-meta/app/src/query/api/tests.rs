@@ -4032,6 +4032,205 @@ fn real_materialized_tree_payload_with_entries_for_test(
     .expect("encode real materialized tree payload with entries")
 }
 
+fn tree_session_for_trusted_response_guard_test(
+    read_class: ReadClass,
+    group: GroupPitSnapshot,
+) -> PitSession {
+    build_pit_session(
+        CursorQueryMode::Tree,
+        PitScope::Tree(TreePitScope {
+            path: b"/".to_vec(),
+            group: None,
+            recursive: true,
+            max_depth: None,
+            group_order: GroupOrder::GroupKey,
+            read_class,
+        }),
+        read_class,
+        ObservationStatus::trusted_materialized(),
+        vec![group],
+    )
+}
+
+fn group_snapshot_for_trusted_response_guard_test(
+    read_class: ReadClass,
+    reliable: bool,
+    unreliable_reason: Option<crate::shared_types::query::UnreliableReason>,
+) -> GroupPitSnapshot {
+    GroupPitSnapshot {
+        group: "nfs2".to_string(),
+        status: "ok",
+        reliable,
+        unreliable_reason,
+        stability: TreeStability::not_evaluated(),
+        meta: PitMetadata {
+            read_class,
+            metadata_available: true,
+            withheld_reason: None,
+        },
+        root: Some(TreePageRoot {
+            path: b"/".to_vec(),
+            size: 0,
+            modified_time_us: 1,
+            is_dir: true,
+            exists: true,
+            has_children: true,
+        }),
+        entries: Vec::new(),
+        entry_window_complete: true,
+        errors: Vec::new(),
+    }
+}
+
+#[test]
+fn trusted_materialized_tree_response_fails_closed_on_unreliable_group_payload() {
+    let session = tree_session_for_trusted_response_guard_test(
+        ReadClass::TrustedMaterialized,
+        group_snapshot_for_trusted_response_guard_test(
+            ReadClass::TrustedMaterialized,
+            false,
+            Some(crate::shared_types::query::UnreliableReason::SuspectNodes),
+        ),
+    );
+
+    let err = render_pit_response(&session, "pit", 10, 0, &BTreeMap::new(), 100)
+        .expect_err("unreliable trusted-materialized group must fail closed");
+
+    assert!(
+        matches!(&err, CnxError::NotReady(message) if message.contains("trusted-materialized")
+            && message.contains("nfs2")
+            && message.contains("SuspectNodes")),
+        "unexpected trusted-materialized fail-closed error: {err}"
+    );
+}
+
+#[test]
+fn materialized_tree_response_preserves_unreliable_group_metadata() {
+    let session = tree_session_for_trusted_response_guard_test(
+        ReadClass::Materialized,
+        group_snapshot_for_trusted_response_guard_test(
+            ReadClass::Materialized,
+            false,
+            Some(crate::shared_types::query::UnreliableReason::BlindSpotsDetected),
+        ),
+    );
+
+    let response = render_pit_response(&session, "pit", 10, 0, &BTreeMap::new(), 100)
+        .expect("materialized read_class should expose degraded evidence instead of failing");
+    let group = response
+        .get("groups")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|groups| groups.first())
+        .expect("rendered group");
+
+    assert_eq!(
+        response.get("status").and_then(serde_json::Value::as_str),
+        Some("ok")
+    );
+    assert_eq!(
+        group
+            .get("unreliable_reason")
+            .and_then(serde_json::Value::as_str),
+        Some("BlindSpotsDetected")
+    );
+}
+
+#[test]
+fn trusted_materialized_tree_cache_rejects_unreliable_group_payload() {
+    let reliable = tree_session_for_trusted_response_guard_test(
+        ReadClass::TrustedMaterialized,
+        group_snapshot_for_trusted_response_guard_test(ReadClass::TrustedMaterialized, true, None),
+    );
+    let unreliable = tree_session_for_trusted_response_guard_test(
+        ReadClass::TrustedMaterialized,
+        group_snapshot_for_trusted_response_guard_test(
+            ReadClass::TrustedMaterialized,
+            false,
+            Some(crate::shared_types::query::UnreliableReason::SuspectNodes),
+        ),
+    );
+
+    assert!(pit_session_has_cacheable_materialized_content(&reliable));
+    assert!(
+        !pit_session_has_cacheable_materialized_content(&unreliable),
+        "trusted-materialized cache must not retain unreliable group evidence"
+    );
+}
+
+#[test]
+fn query_pit_store_remove_drops_failed_trusted_materialized_session() {
+    let mut store = QueryPitStore::default();
+    let session = Arc::new(tree_session_for_trusted_response_guard_test(
+        ReadClass::TrustedMaterialized,
+        group_snapshot_for_trusted_response_guard_test(
+            ReadClass::TrustedMaterialized,
+            false,
+            Some(crate::shared_types::query::UnreliableReason::SuspectNodes),
+        ),
+    ));
+    store
+        .insert("pit".to_string(), session)
+        .expect("insert test PIT session");
+
+    store.remove("pit");
+
+    let err = store
+        .get("pit")
+        .expect_err("removed failed trusted-materialized PIT must not be reusable");
+    assert!(
+        matches!(&err, CnxError::InvalidInput(message) if message.contains("pit expired")),
+        "unexpected removed PIT error: {err}"
+    );
+}
+
+#[test]
+fn trusted_materialized_stats_groups_fail_closed_on_partial_or_error_payload() {
+    let mut partial = serde_json::Map::new();
+    partial.insert(
+        "nfs2".to_string(),
+        serde_json::json!({
+            "status": "ok",
+            "data": {
+                "total_nodes": 1,
+                "total_files": 0,
+                "total_dirs": 1,
+                "total_size": 0,
+                "latest_file_mtime_us": null,
+                "attested_count": 1,
+                "blind_spot_count": 0
+            },
+            "partial_failure": true,
+            "errors": ["decode failed"]
+        }),
+    );
+
+    let partial_message = trusted_materialized_stats_groups_not_ready_message(&partial)
+        .expect("partial trusted stats group must fail closed");
+    assert!(
+        partial_message.contains("trusted-materialized")
+            && partial_message.contains("nfs2")
+            && partial_message.contains("partial")
+    );
+
+    let mut error = serde_json::Map::new();
+    error.insert(
+        "nfs3".to_string(),
+        serde_json::json!({
+            "status": "error",
+            "message": "all group stats failed",
+            "errors": ["missing payload"]
+        }),
+    );
+
+    let error_message = trusted_materialized_stats_groups_not_ready_message(&error)
+        .expect("error trusted stats group must fail closed");
+    assert!(
+        error_message.contains("trusted-materialized")
+            && error_message.contains("nfs3")
+            && error_message.contains("status")
+    );
+}
+
 fn real_materialized_tree_payload_with_entries_and_mtime_for_test(
     root_path: &[u8],
     entry_paths: &[&[u8]],

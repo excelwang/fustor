@@ -23601,6 +23601,190 @@ async fn worker_backed_scoped_source_rescan_route_returns_pending_when_target_ac
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_backed_scoped_source_rescan_route_waits_for_transient_control_apply_within_target_acceptance_budget()
+ {
+    struct ControlHookReset;
+
+    impl Drop for ControlHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_control_frame_pause_hook();
+        }
+    }
+
+    let _reset = ControlHookReset;
+
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(nfs1.join("rescan")).expect("create nfs1 rescan dir");
+    fs::write(nfs1.join("rescan").join("seed.txt"), b"a").expect("seed nfs1");
+    let nfs1_source = nfs1.display().to_string();
+    let node_id = NodeId("node-a-scoped-rescan-control-apply".into());
+    let scoped_route = source_rescan_request_route_for(&node_id.0).0;
+    let boundary = Arc::new(RuntimeProxyUnitAwareBoundary::new(None, None, None, None));
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_watch_scan_root("nfs1", &nfs1_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "node-a::nfs1",
+                        "node-a",
+                        "10.0.0.11",
+                        &nfs1_source,
+                        nfs1.clone(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            node_id.clone(),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            scoped_route,
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("source manual-rescan route wave should succeed");
+
+    let source_client = match app.source.as_ref() {
+        SourceFacade::Worker(client) => client.clone(),
+        _ => panic!("expected worker-backed source facade"),
+    };
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    crate::workers::source::install_source_worker_control_frame_pause_hook(
+        crate::workers::source::SourceWorkerControlFramePauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        },
+    );
+
+    let control_task = tokio::spawn({
+        let source_client = source_client.clone();
+        async move {
+            source_client
+                .on_control_frame(vec![
+                    encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                        RuntimeExecActivate {
+                            route_key: ROUTE_KEY_QUERY.to_string(),
+                            unit_id: execution_units::SOURCE_RUNTIME_UNIT_ID.to_string(),
+                            lease: None,
+                            generation: 3,
+                            expires_at_ms: 1,
+                            bound_scopes: vec![RuntimeBoundScope {
+                                scope_id: "nfs1".to_string(),
+                                resource_ids: vec!["node-a::nfs1".to_string()],
+                            }],
+                        },
+                    ))
+                    .expect("encode source activate"),
+                ])
+                .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("control-frame rpc did not enter pause hook");
+
+    let envelope =
+        crate::runtime::orchestration::encode_manual_rescan_envelope_with_scoped_target_acceptance_timeout(
+            now_us(),
+            Some(Duration::from_millis(400)),
+        )
+        .expect("encode manual rescan envelope");
+    let payload = Bytes::from(rmp_serde::to_vec_named(&envelope).expect("serialize envelope"));
+    let scoped_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        source_rescan_route_bindings_for(&node_id.0),
+    );
+
+    let scoped_call = tokio::spawn(async move {
+        capanix_host_adapter_fs::HostAdapter::call_collect(
+            &scoped_adapter,
+            ROUTE_TOKEN_FS_META_INTERNAL,
+            METHOD_SOURCE_RESCAN,
+            payload,
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    release.notify_waiters();
+
+    let scoped_events = tokio::time::timeout(Duration::from_secs(1), scoped_call)
+        .await
+        .expect("scoped source-rescan should finish after releasing control apply")
+        .expect("join scoped source-rescan task")
+        .expect("scoped source-rescan should return accepted after transient control apply");
+
+    assert!(
+        scoped_events.iter().any(|event| {
+            event.metadata().origin_id == node_id && event.payload_bytes().as_ref() == b"accepted"
+        }),
+        "scoped source-rescan must return accepted once transient control apply settles: {scoped_events:?}"
+    );
+    assert!(
+        !scoped_events
+            .iter()
+            .any(|event| event.payload_bytes().starts_with(b"pending:")),
+        "scoped source-rescan must not fail-fast to pending while the transient control apply fits inside budget: {scoped_events:?}"
+    );
+
+    control_task
+        .await
+        .expect("join control apply")
+        .expect("control apply should finish after releasing pause hook");
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_scoped_source_rescan_repairs_retained_replay_before_acceptance() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");

@@ -35,6 +35,7 @@ const SOURCE_WORKER_START_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_WORKER_START_MAX_RETRYABLE_RESETS: usize = 64;
 const SOURCE_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SOURCE_WORKER_FORCE_FIND_RETRY_BACKOFF: Duration = Duration::from_millis(25);
+const SOURCE_WORKER_TARGETED_RESCAN_ACCEPTANCE_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 const SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
 const SOURCE_WORKER_CLOSE_DRAIN_TIMEOUT: Duration = SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
@@ -5948,6 +5949,16 @@ impl SourceWorkerClientHandle {
                     &self.config.host_object_grants,
                 );
             });
+        } else if !signals.is_empty() {
+            self.with_cache_mut(|cache| {
+                apply_retained_replay_control_state_to_cache(
+                    cache,
+                    &self.node_id,
+                    signals,
+                    &self.config.roots,
+                    &self.config.host_object_grants,
+                );
+            });
         }
         self.bump_source_progress(SourceProgressReason::ControlSignalsRetained);
     }
@@ -8183,79 +8194,148 @@ impl SourceWorkerClientHandle {
         &self,
         acceptance_timeout: Duration,
     ) -> std::result::Result<u64, SourceFailure> {
-        self.ensure_targeted_rescan_delivery_acceptance_probe_ready()
-            .await?;
         if acceptance_timeout.is_zero() {
             return Err(SourceFailure::from(CnxError::Timeout));
         }
-        let timeout = acceptance_timeout.min(SOURCE_WORKER_CONTROL_RPC_TIMEOUT);
-        let (worker_instance_id, worker) = self.shared_worker().await;
-        let client = worker
-            .existing_client()
-            .await
-            .map_err(SourceFailure::from)?;
-        let Some(client) = client else {
-            return Err(SourceFailure::from(CnxError::NotReady(
-                "source worker targeted rescan delivery acceptance is pending while worker client is not started"
-                    .to_string(),
-            )));
-        };
-        let request = async {
-            #[cfg(test)]
-            maybe_delay_source_worker_submit_targeted_rescan_attempt().await;
-            Self::call_worker_with_failure(
-                &client,
-                SourceWorkerRequest::SubmitTargetedRescanRequestEpoch,
-                timeout,
-            )
-            .await
-        };
-        let response = match tokio::time::timeout(timeout, request).await {
-            Ok(result) => result?,
-            Err(_) => return Err(SourceFailure::from(CnxError::Timeout)),
-        };
-        self.ensure_source_worker_client_still_current(
-            worker_instance_id,
-            &worker,
-            &client,
-            "targeted rescan acceptance",
-        )
-        .await?;
-        let epoch = match response {
-            SourceWorkerResponse::RescanRequestEpoch(epoch) => epoch,
-            SourceWorkerResponse::InvalidInput(message) => {
-                return Err(SourceFailure::from(CnxError::InvalidInput(message)));
+        let deadline = clip_retry_deadline(Instant::now() + acceptance_timeout, acceptance_timeout);
+        let mut last_pending_err: Option<SourceFailure> = None;
+        loop {
+            if self.retained_replay_required_for_status().await {
+                return Err(SourceFailure::from(CnxError::NotReady(
+                    "source worker targeted rescan delivery acceptance is pending while retained control state replays"
+                        .to_string(),
+                )));
             }
-            SourceWorkerResponse::Error(message) => {
-                return Err(SourceFailure::from(CnxError::Internal(message)));
-            }
-            other => {
-                return Err(unexpected_source_worker_response_failure(
-                    "for submit_targeted_rescan_request_epoch",
-                    other,
+            if self.control_op_inflight() {
+                let err = SourceFailure::from(CnxError::NotReady(
+                    "source worker targeted rescan delivery acceptance is pending while control state is applying"
+                        .to_string(),
                 ));
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(err);
+                }
+                last_pending_err = Some(err);
+                tokio::time::sleep(
+                    remaining.min(SOURCE_WORKER_TARGETED_RESCAN_ACCEPTANCE_RETRY_BACKOFF),
+                )
+                .await;
+                continue;
             }
-        };
-        self.with_cache_mut(|cache| {
-            let last_audit_completed_at_us = cache
-                .status
-                .as_ref()
-                .map(source_status_rescan_completion_marker)
-                .unwrap_or_default();
-            let (published_batches, last_published_at_us) = cached_source_publication_marker(cache);
-            cache.rescan_request_published_batches = published_batches;
-            cache.rescan_request_last_published_at_us = last_published_at_us;
-            cache.rescan_request_last_audit_completed_at_us = last_audit_completed_at_us;
-            cache.rescan_request_epoch = cache.rescan_request_epoch.max(epoch);
-            annotate_cached_manual_rescan_route_receivable_evidence(
-                cache,
-                &self.node_id,
-                &self.config.host_object_grants,
-                None,
-            );
-        });
-        self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
-        Ok(epoch)
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(
+                    last_pending_err.unwrap_or_else(|| SourceFailure::from(CnxError::Timeout))
+                );
+            }
+            let timeout = remaining.min(SOURCE_WORKER_CONTROL_RPC_TIMEOUT);
+            let (worker_instance_id, worker) = self.shared_worker().await;
+            let client = worker
+                .existing_client()
+                .await
+                .map_err(SourceFailure::from)?;
+            let Some(client) = client else {
+                let err = SourceFailure::from(CnxError::NotReady(
+                    "source worker targeted rescan delivery acceptance is pending while worker client is not started"
+                        .to_string(),
+                ));
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(err);
+                }
+                last_pending_err = Some(err);
+                tokio::time::sleep(
+                    remaining.min(SOURCE_WORKER_TARGETED_RESCAN_ACCEPTANCE_RETRY_BACKOFF),
+                )
+                .await;
+                continue;
+            };
+            let request = async {
+                #[cfg(test)]
+                maybe_delay_source_worker_submit_targeted_rescan_attempt().await;
+                Self::call_worker_with_failure(
+                    &client,
+                    SourceWorkerRequest::SubmitTargetedRescanRequestEpoch,
+                    timeout,
+                )
+                .await
+            };
+            let response = match tokio::time::timeout(timeout, request).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) if can_retry_update_logical_roots(err.as_error()) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(err);
+                    }
+                    tokio::time::sleep(
+                        remaining.min(SOURCE_WORKER_TARGETED_RESCAN_ACCEPTANCE_RETRY_BACKOFF),
+                    )
+                    .await;
+                    continue;
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(_) => return Err(SourceFailure::from(CnxError::Timeout)),
+            };
+            match self
+                .ensure_source_worker_client_still_current(
+                    worker_instance_id,
+                    &worker,
+                    &client,
+                    "targeted rescan acceptance",
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(err) if can_retry_update_logical_roots(err.as_error()) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(err);
+                    }
+                    tokio::time::sleep(
+                        remaining.min(SOURCE_WORKER_TARGETED_RESCAN_ACCEPTANCE_RETRY_BACKOFF),
+                    )
+                    .await;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+            let epoch = match response {
+                SourceWorkerResponse::RescanRequestEpoch(epoch) => epoch,
+                SourceWorkerResponse::InvalidInput(message) => {
+                    return Err(SourceFailure::from(CnxError::InvalidInput(message)));
+                }
+                SourceWorkerResponse::Error(message) => {
+                    return Err(SourceFailure::from(CnxError::Internal(message)));
+                }
+                other => {
+                    return Err(unexpected_source_worker_response_failure(
+                        "for submit_targeted_rescan_request_epoch",
+                        other,
+                    ));
+                }
+            };
+            self.with_cache_mut(|cache| {
+                let last_audit_completed_at_us = cache
+                    .status
+                    .as_ref()
+                    .map(source_status_rescan_completion_marker)
+                    .unwrap_or_default();
+                let (published_batches, last_published_at_us) =
+                    cached_source_publication_marker(cache);
+                cache.rescan_request_published_batches = published_batches;
+                cache.rescan_request_last_published_at_us = last_published_at_us;
+                cache.rescan_request_last_audit_completed_at_us = last_audit_completed_at_us;
+                cache.rescan_request_epoch = cache.rescan_request_epoch.max(epoch);
+                annotate_cached_manual_rescan_route_receivable_evidence(
+                    cache,
+                    &self.node_id,
+                    &self.config.host_object_grants,
+                    None,
+                );
+            });
+            self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
+            return Ok(epoch);
+        }
     }
 
     #[cfg(test)]

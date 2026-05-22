@@ -698,6 +698,20 @@ fn store_materialized_stats_groups(
     Ok(())
 }
 
+fn remove_cached_materialized_tree_session_if_matches(
+    state: &ApiState,
+    pit_id: &str,
+) -> Result<(), CnxError> {
+    let mut cache = state
+        .materialized_tree_cache
+        .lock()
+        .map_err(|_| CnxError::Internal("materialized tree cache lock poisoned".into()))?;
+    if cache.as_ref().is_some_and(|cached| cached.pit_id == pit_id) {
+        *cache = None;
+    }
+    Ok(())
+}
+
 fn cached_materialized_tree_session(
     state: &ApiState,
     key: &MaterializedTreeCacheKey,
@@ -752,6 +766,9 @@ fn replace_cached_materialized_tree_session_if_matches(
 }
 
 fn pit_session_has_cacheable_materialized_content(session: &PitSession) -> bool {
+    if trusted_materialized_tree_session_not_ready_message(session).is_some() {
+        return false;
+    }
     !session.groups.is_empty()
         && session.groups.iter().all(|group| {
             group
@@ -3201,6 +3218,26 @@ fn materialized_observation_status(
     )
 }
 
+fn materialized_observation_status_for_request_scope(
+    state: &ApiState,
+    path: &[u8],
+    group: Option<&str>,
+    source_status: &SourceStatusSnapshot,
+    sink_status: &SinkStatusSnapshot,
+) -> ObservationStatus {
+    if group.is_none()
+        && trusted_materialized_empty_group_root_requires_fail_closed(path)
+        && let Ok(readiness_groups) = scan_enabled_readiness_groups(state)
+    {
+        return materialized_observation_status_for_readiness_groups(
+            source_status,
+            sink_status,
+            &readiness_groups,
+        );
+    }
+    materialized_observation_status(source_status, sink_status)
+}
+
 async fn load_trusted_materialized_status_snapshots_with_settle(
     state: &ApiState,
 ) -> Result<
@@ -3978,6 +4015,12 @@ impl QueryPitStore {
         self.total_bytes = projected_total;
         self.sessions.insert(pit_id.to_string(), session);
         Ok(())
+    }
+
+    fn remove(&mut self, pit_id: &str) {
+        if let Some(session) = self.sessions.remove(pit_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(session.estimated_bytes);
+        }
     }
 
     fn get(&mut self, pit_id: &str) -> Result<Arc<PitSession>, CnxError> {
@@ -7301,6 +7344,20 @@ fn sink_primary_owner_node_for_group_requires_explicit_primary_host_ref() {
 }
 
 #[test]
+fn owner_collection_gap_candidates_include_calling_node_as_sink_owner_fallback() {
+    let candidates = selected_group_owner_collection_gap_candidates(
+        vec![NodeId("node-b".to_string()), NodeId("node-b".to_string())],
+        &NodeId("node-a".to_string()),
+    );
+
+    assert_eq!(
+        candidates,
+        vec![NodeId("node-a".to_string()), NodeId("node-b".to_string())],
+        "selected-group materialized collection gaps must probe the calling node too; source-owner candidates can differ from the sink materialization owner"
+    );
+}
+
+#[test]
 fn selected_group_tree_pit_plan_allows_empty_owner_retry_only_for_first_ready_group() {
     let plan = SelectedGroupTreePitPlan::new(SelectedGroupTreePitPlanInput {
         read_class: ReadClass::TrustedMaterialized,
@@ -10248,6 +10305,8 @@ async fn query_materialized_events_via_candidate_owner_nodes(
         &groups,
     )
     .map_err(QueryWorkerObservationFailure::into_error)?;
+    let candidate_nodes =
+        selected_group_owner_collection_gap_candidates(candidate_nodes, &origin_id);
     if candidate_nodes.is_empty() {
         return Ok(CandidateOwnerRouteOutcome {
             events: None,
@@ -10295,6 +10354,21 @@ async fn query_materialized_events_via_candidate_owner_nodes(
         events: None,
         attempted_nodes,
     })
+}
+
+fn selected_group_owner_collection_gap_candidates(
+    candidate_nodes: Vec<NodeId>,
+    origin_id: &NodeId,
+) -> Vec<NodeId> {
+    candidate_nodes
+        .into_iter()
+        .chain(std::iter::once(origin_id.clone()))
+        .map(|node| node.0)
+        .filter(|node| !node.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(NodeId)
+        .collect()
 }
 
 async fn query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
@@ -13019,6 +13093,9 @@ fn render_pit_response(
     entry_offsets: &BTreeMap<String, usize>,
     entry_page_size: usize,
 ) -> Result<serde_json::Value, CnxError> {
+    if let Some(message) = trusted_materialized_tree_session_not_ready_message(session) {
+        return Err(CnxError::NotReady(message));
+    }
     if group_offset > session.groups.len() {
         return Err(CnxError::InvalidInput(
             "group_after cursor exceeds available group page bounds".into(),
@@ -13094,6 +13171,51 @@ fn render_pit_response(
         }),
     );
     Ok(serde_json::Value::Object(body))
+}
+
+fn trusted_materialized_tree_session_not_ready_message(session: &PitSession) -> Option<String> {
+    if session.read_class != ReadClass::TrustedMaterialized {
+        return None;
+    }
+    if session.groups.is_empty() {
+        return Some(
+            "trusted-materialized reads remain unavailable until response materialized observation evidence is trusted: no materialized groups returned"
+                .to_string(),
+        );
+    }
+    for group in &session.groups {
+        if group.status != "ok" {
+            return Some(format!(
+                "trusted-materialized reads remain unavailable until response materialized observation evidence is trusted: group {} status={}",
+                group.group, group.status
+            ));
+        }
+        if !group.errors.is_empty() {
+            return Some(format!(
+                "trusted-materialized reads remain unavailable until response materialized observation evidence is trusted: group {} returned errors",
+                group.group
+            ));
+        }
+        if let Some(reason) = group.unreliable_reason.as_ref() {
+            match reason {
+                crate::shared_types::query::UnreliableReason::Unattested => {}
+                crate::shared_types::query::UnreliableReason::SuspectNodes
+                | crate::shared_types::query::UnreliableReason::BlindSpotsDetected
+                | crate::shared_types::query::UnreliableReason::WatchOverflowPendingMaterialization => {
+                    return Some(format!(
+                        "trusted-materialized reads remain unavailable until response materialized observation evidence is trusted: group {} unreliable_reason={reason:?}",
+                        group.group
+                    ));
+                }
+            }
+        } else if !group.reliable {
+            return Some(format!(
+                "trusted-materialized reads remain unavailable until response materialized observation evidence is trusted: group {} unreliable without reason",
+                group.group
+            ));
+        }
+    }
+    None
 }
 
 fn tree_pit_snapshot_needs_entry_window(
@@ -13279,9 +13401,29 @@ async fn extend_tree_pit_session_entry_windows(
     }
 
     if !changed {
+        if let Some(message) = trusted_materialized_tree_session_not_ready_message(&session) {
+            let mut guard = state
+                .pit_store
+                .lock()
+                .map_err(|_| CnxError::Internal("pit store lock poisoned".into()))?;
+            guard.remove(pit_id);
+            drop(guard);
+            remove_cached_materialized_tree_session_if_matches(state, pit_id)?;
+            return Err(CnxError::NotReady(message));
+        }
         return Ok(session);
     }
     let replacement = Arc::new(rebuild_pit_session_with_groups(&session, groups));
+    if let Some(message) = trusted_materialized_tree_session_not_ready_message(&replacement) {
+        let mut guard = state
+            .pit_store
+            .lock()
+            .map_err(|_| CnxError::Internal("pit store lock poisoned".into()))?;
+        guard.remove(pit_id);
+        drop(guard);
+        remove_cached_materialized_tree_session_if_matches(state, pit_id)?;
+        return Err(CnxError::NotReady(message));
+    }
     {
         let mut guard = state
             .pit_store
@@ -14728,6 +14870,9 @@ async fn collect_materialized_stats_groups(
     if let Some(key) = cache_key.as_ref()
         && let Some(groups) = cached_materialized_stats_groups(state, key)?
     {
+        if let Some(message) = trusted_materialized_stats_groups_not_ready_message(&groups) {
+            return Err(CnxError::NotReady(message));
+        }
         return Ok(groups);
     }
 
@@ -14741,10 +14886,52 @@ async fn collect_materialized_stats_groups(
     }
     .run()
     .await?;
+    if read_class == ReadClass::TrustedMaterialized
+        && let Some(message) = trusted_materialized_stats_groups_not_ready_message(&groups)
+    {
+        return Err(CnxError::NotReady(message));
+    }
     if let Some(key) = cache_key {
         store_materialized_stats_groups(state, key, &groups)?;
     }
     Ok(groups)
+}
+
+fn trusted_materialized_stats_groups_not_ready_message(
+    groups: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    if groups.is_empty() {
+        return Some(
+            "trusted-materialized stats remain unavailable until response materialized observation evidence is trusted: no materialized groups returned"
+                .to_string(),
+        );
+    }
+    for (group_id, group) in groups {
+        if group.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+            return Some(format!(
+                "trusted-materialized stats remain unavailable until response materialized observation evidence is trusted: group {group_id} status is not ok"
+            ));
+        }
+        if group
+            .get("partial_failure")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Some(format!(
+                "trusted-materialized stats remain unavailable until response materialized observation evidence is trusted: group {group_id} has partial failures"
+            ));
+        }
+        if group
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|errors| !errors.is_empty())
+        {
+            return Some(format!(
+                "trusted-materialized stats remain unavailable until response materialized observation evidence is trusted: group {group_id} returned errors"
+            ));
+        }
+    }
+    None
 }
 
 async fn get_stats(
@@ -14782,7 +14969,13 @@ async fn get_stats(
                             );
                         }
                     };
-                let status = materialized_observation_status(&source_status, &sink_status);
+                let status = materialized_observation_status_for_request_scope(
+                    &state,
+                    &params.path,
+                    params.group.as_deref(),
+                    &source_status,
+                    &sink_status,
+                );
                 (source_status, sink_status, status)
             };
             if read_class == ReadClass::TrustedMaterialized {
@@ -14940,7 +15133,13 @@ async fn get_tree(
                     return error_response_with_context(err.into_error(), Some(&path_for_error));
                 }
             };
-        let observation_status = materialized_observation_status(&source_status, &sink_status);
+        let observation_status = materialized_observation_status_for_request_scope(
+            &state,
+            &params.path,
+            params.group.as_deref(),
+            &source_status,
+            &sink_status,
+        );
         (source_status, sink_status, observation_status)
     };
     if read_class == ReadClass::TrustedMaterialized

@@ -10,6 +10,7 @@ use std::time::Duration;
 const RECONNECT_RETRY_WINDOW: Duration = Duration::from_secs(90);
 const RECONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const HTTP_TIMEOUT_DEFAULT: Duration = Duration::from_secs(45);
+const HTTP_TIMEOUT_RESCAN: Duration = Duration::from_secs(75);
 const HTTP_TIMEOUT_FORCE_FIND: Duration = Duration::from_secs(75);
 const HTTP_TIMEOUT_PROJECTION: Duration = Duration::from_secs(75);
 
@@ -291,6 +292,7 @@ impl FsMetaApiClient {
 
     fn request_timeout(&self, path: &str) -> Duration {
         match path {
+            "/index/rescan" => HTTP_TIMEOUT_RESCAN,
             "/tree" | "/stats" => HTTP_TIMEOUT_PROJECTION,
             "/on-demand-force-find" => HTTP_TIMEOUT_FORCE_FIND,
             _ => HTTP_TIMEOUT_DEFAULT,
@@ -482,14 +484,26 @@ impl OperatorSession {
                 match client.status(&self.management_token) {
                     Ok(status) => statuses.push(status),
                     Err(err) if is_invalid_session_error(&err) => {
-                        should_reauth = true;
-                        last_err = Some(err);
+                        match client
+                            .login(&self.username, &self.password)
+                            .and_then(extract_token)
+                            .and_then(|token| client.status(&token))
+                        {
+                            Ok(status) => statuses.push(status),
+                            Err(reauth_err) if is_invalid_session_error(&reauth_err) => {
+                                should_reauth = true;
+                                last_err = Some(format!("{base_url}: {reauth_err}"));
+                            }
+                            Err(reauth_err) => {
+                                last_err = Some(format!("{base_url}: {reauth_err}"));
+                            }
+                        }
                     }
                     Err(err) if is_transport_error(&err) => {
-                        last_err = Some(err);
+                        last_err = Some(format!("{base_url}: {err}"));
                     }
                     Err(err) => {
-                        last_err = Some(err);
+                        last_err = Some(format!("{base_url}: {err}"));
                     }
                 }
             }
@@ -771,8 +785,9 @@ pub fn is_retryable_management_unavailable_error(err: &str) -> bool {
         && (err.contains("temporarily unavailable while runtime workers reconfigure")
             || err.contains("runtime control initializes the app")
             || err.contains("manual rescan current roots runtime-scope readiness failed")
+            || err.contains("manual rescan source-status target proof incomplete")
             || err.contains("manual rescan scoped source route pending"))
-}
+    }
 
 pub fn extract_token(login: Value) -> Result<String, String> {
     login
@@ -914,6 +929,14 @@ mod tests {
     }
 
     #[test]
+    fn rescan_timeout_covers_manual_rescan_preflight_budget() {
+        assert!(
+            HTTP_TIMEOUT_RESCAN >= Duration::from_secs(50),
+            "rescan requests must not time out before server-side current-roots preflight can finish"
+        );
+    }
+
+    #[test]
     fn management_retry_includes_manual_rescan_runtime_scope_readiness() {
         let err = r#"http 503 failed: {"error":"manual rescan current roots runtime-scope readiness failed: roots update applied locally but peer runtime-scope second-wave convergence did not settle before followup exhausted"}"#;
 
@@ -931,6 +954,101 @@ mod tests {
             is_retryable_management_unavailable_error(err),
             "manual-rescan scoped source delivery pending is a temporary convergence state and should stay in the management retry window"
         );
+    }
+
+    #[test]
+    fn management_retry_includes_manual_rescan_target_proof_incomplete() {
+        let err = r#"http 503 failed: {"error":"manual rescan source-status target proof incomplete: expected_roots={\"nfs1\"}"}"#;
+
+        assert!(
+            is_retryable_management_unavailable_error(err),
+            "manual-rescan target proof gaps are temporary convergence states and should stay in the management retry window"
+        );
+    }
+
+    #[test]
+    fn status_all_reauths_per_endpoint_after_node_local_session_rejection() {
+        fn write_json_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+            let response = format!(
+                "HTTP/1.1 {status}
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.flush().expect("flush response");
+        }
+
+        let first = TcpListener::bind("127.0.0.1:0").expect("bind first status listener");
+        let first_addr = first.local_addr().expect("first status listener addr");
+        let second = TcpListener::bind("127.0.0.1:0").expect("bind second status listener");
+        let second_addr = second.local_addr().expect("second status listener addr");
+
+        let first_server = std::thread::spawn(move || {
+            let (mut stream, _) = first.accept().expect("accept first status request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            write_json_response(&mut stream, "200 OK", r#"{"node":"first"}"#);
+        });
+
+        let second_server = std::thread::spawn(move || {
+            let (mut stream, _) = second
+                .accept()
+                .expect("accept second stale-token status request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            write_json_response(
+                &mut stream,
+                "401 Unauthorized",
+                r#"{"error":"invalid session token"}"#,
+            );
+
+            let (mut stream, _) = second.accept().expect("accept second login request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            write_json_response(&mut stream, "200 OK", r#"{"token":"second-token"}"#);
+
+            let (mut stream, _) = second
+                .accept()
+                .expect("accept second reauthed status request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            write_json_response(&mut stream, "200 OK", r#"{"node":"second"}"#);
+        });
+
+        let mut session = OperatorSession {
+            client: FsMetaApiClient::new(format!("http://{}", first_addr)).expect("client"),
+            candidate_base_urls: vec![
+                format!("http://{}", first_addr),
+                format!("http://{}", second_addr),
+            ],
+            username: "operator".to_string(),
+            password: "operator123".to_string(),
+            management_token: "first-token".to_string(),
+            query_api_key: "ignored".to_string(),
+        };
+
+        let statuses = session
+            .status_all()
+            .expect("status_all should collect every endpoint after per-endpoint reauth");
+        let nodes = statuses
+            .iter()
+            .filter_map(|status| status.get("node").and_then(Value::as_str))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            nodes,
+            std::collections::BTreeSet::from(["first", "second"]),
+            "status_all must not stop at the first successful node when another node rejects the shared token"
+        );
+        first_server.join().expect("join first status server");
+        second_server.join().expect("join second status server");
     }
 
     #[test]

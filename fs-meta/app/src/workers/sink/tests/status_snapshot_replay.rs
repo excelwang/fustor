@@ -6325,6 +6325,87 @@ async fn status_route_snapshot_does_not_execute_retained_replay_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_route_snapshot_republishes_scheduled_groups_when_control_inflight_cache_is_empty() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            sink_worker_root("nfs1", &nfs1),
+            sink_worker_root("nfs2", &nfs2),
+        ],
+        host_object_grants: Vec::new(),
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    sink.on_control_frame(vec![encode_runtime_exec_control(
+        &RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["nfs1"]),
+                bound_scope_with_resources("nfs2", &["nfs2"]),
+            ],
+        }),
+    )
+    .expect("encode sink activate")])
+    .await
+    .expect("activate sink groups");
+
+    sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
+        .expect("seed empty cached status");
+    let _inflight = sink.begin_control_op();
+
+    let (snapshot, used_cached_fallback) = tokio::time::timeout(
+        Duration::from_secs(2),
+        sink.status_snapshot_nonblocking_for_status_route(),
+    )
+    .await
+    .expect("status-route sink snapshot should settle during control inflight");
+
+    assert!(
+        used_cached_fallback,
+        "status-route without materialized data should remain nonblocking during control inflight"
+    );
+    let scheduled_groups = snapshot
+        .scheduled_groups_by_node
+        .get("node-d")
+        .into_iter()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        scheduled_groups,
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        "status-route cached fallback must republish scheduled groups instead of publishing an empty sink status: {snapshot:?}"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_route_snapshot_uses_existing_sink_client_once_before_cached_fallback() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
@@ -6375,6 +6456,139 @@ async fn status_route_snapshot_uses_existing_sink_client_once_before_cached_fall
     assert!(
         used_cached_fallback,
         "status-route sink snapshot should answer from cache after one bounded existing-client probe failure"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_route_snapshot_returns_live_delivery_backed_pending_materialization_instead_of_empty_cache(
+) {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            sink_worker_root("nfs1", &nfs1),
+            sink_worker_root("nfs2", &nfs2),
+        ],
+        host_object_grants: Vec::new(),
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
+        .expect("seed stale empty cache");
+    let live_snapshot = SinkStatusSnapshot {
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs1".to_string(),
+                primary_object_ref: "node-d::nfs1".to_string(),
+                total_nodes: 12,
+                live_nodes: 12,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 7,
+                estimated_heap_bytes: 256,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "node-d::nfs2".to_string(),
+                total_nodes: 14,
+                live_nodes: 14,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 9,
+                estimated_heap_bytes: 512,
+            },
+        ],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]),
+        stream_applied_events_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            26,
+        )]),
+        stream_applied_data_events_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            26,
+        )]),
+        stream_applied_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            vec![
+                "node-d::nfs1=12".to_string(),
+                "node-d::nfs2=14".to_string(),
+            ],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    let _reply_reset = SinkWorkerStatusResponseQueueHookReset;
+    install_sink_worker_status_response_queue_hook(SinkWorkerStatusResponseQueueHook {
+        replies: std::collections::VecDeque::from([Ok(SinkWorkerResponse::StatusSnapshot(
+            live_snapshot,
+        ))]),
+    });
+
+    let (snapshot, used_cached_fallback) = tokio::time::timeout(
+        Duration::from_secs(2),
+        sink.status_snapshot_nonblocking_for_status_route(),
+    )
+    .await
+    .expect("status-route sink snapshot should settle");
+
+    assert!(
+        !used_cached_fallback,
+        "status route must expose the live data-backed pending-materialization owner snapshot instead of falling back to stale empty cache: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot
+            .groups
+            .iter()
+            .map(|group| (group.group_id.as_str(), group.live_nodes))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        std::collections::BTreeMap::from([("nfs1", 12), ("nfs2", 14)]),
+        "status route must preserve live group rows so selected-group bridge can target the data-owning sink worker: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot
+            .stream_applied_data_events_by_node
+            .get("node-d")
+            .copied(),
+        Some(26),
+        "status route must preserve stream apply evidence instead of returning an empty cached snapshot: {snapshot:?}"
     );
 
     sink.close().await.expect("close sink worker");

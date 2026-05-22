@@ -4658,6 +4658,118 @@ async fn management_logical_roots_scope_survives_later_stale_runtime_activate() 
 }
 
 #[tokio::test]
+async fn status_snapshot_refreshes_stale_authoritative_scope_after_live_only_restore() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+        RootSpec::new("nfs3", "/mnt/nfs3"),
+    ];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-a::nfs2", "node-a", "10.0.0.11", "/mnt/nfs2", true),
+        granted_mount_root("node-a::nfs3", "node-a", "10.0.0.11", "/mnt/nfs3", true),
+        granted_mount_root("node-a::nfs4", "node-a", "10.0.0.11", "/mnt/nfs4", true),
+        granted_mount_root("node-a::nfs5", "node-a", "10.0.0.11", "/mnt/nfs5", true),
+    ];
+    let sink = SinkFileMeta::with_boundaries(
+        NodeId("node-a".to_string()),
+        Some(Arc::new(NoopBoundary)),
+        cfg.clone(),
+    )
+    .expect("init runtime-managed sink");
+
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                bound_scope_with_resources("nfs3", &["node-a::nfs3"]),
+            ],
+        },
+    ))
+    .expect("encode live-only sink activate")])
+        .await
+        .expect("apply live-only sink activate");
+
+    sink.update_logical_roots_from_management_apply(
+        vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+            RootSpec::new("nfs3", "/mnt/nfs3"),
+        ],
+        &cfg.host_object_grants,
+    )
+    .expect("live-only roots apply should become stale runtime authority");
+
+    sink.logical_roots_cell
+        .replace(vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+            RootSpec::new("nfs3", "/mnt/nfs3"),
+            RootSpec::new("nfs4", "/mnt/nfs4"),
+            RootSpec::new("nfs5", "/mnt/nfs5"),
+        ])
+        .await
+        .expect("replace authoritative roots with restored full set");
+
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 2,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                bound_scope_with_resources("nfs4", &["node-a::nfs4"]),
+                bound_scope_with_resources("nfs5", &["node-a::nfs5"]),
+            ],
+        },
+    ))
+    .expect("encode restored sparse sink activate")])
+        .await
+        .expect("apply restored sparse sink activate");
+
+    let snapshot = sink
+        .status_snapshot_with_failure()
+        .expect("status snapshot should refresh authoritative roots before evaluation");
+    let scheduled = snapshot
+        .scheduled_groups_by_node
+        .values()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        scheduled,
+        std::collections::BTreeSet::from([
+            "nfs1".to_string(),
+            "nfs2".to_string(),
+            "nfs3".to_string(),
+            "nfs4".to_string(),
+            "nfs5".to_string()
+        ]),
+        "status path must refresh stale authoritative runtime scopes instead of masking restored roots: {snapshot:?}",
+    );
+
+    let group_ids = snapshot
+        .groups
+        .iter()
+        .map(|group| group.group_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        group_ids, scheduled,
+        "status path must expose all restored roots after refreshing authoritative state: {snapshot:?}",
+    );
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
 async fn retained_root_id_ready_state_survives_same_instance_scope_wobble_and_later_reactivate() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![

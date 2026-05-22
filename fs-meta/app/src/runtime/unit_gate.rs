@@ -353,6 +353,10 @@ impl RuntimeUnitGate {
             .unwrap_or(false)
     }
 
+    pub(crate) fn is_runtime_managed(&self) -> bool {
+        self.runtime_managed
+    }
+
     pub(crate) fn unit_state(
         &self,
         unit_id: &str,

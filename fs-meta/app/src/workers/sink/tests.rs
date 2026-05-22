@@ -1135,25 +1135,6 @@ fn sink_worker_export(
     }
 }
 
-fn test_worker_control_route_key_for(role_id: &str, node_id: &str) -> String {
-    let normalize = |raw: &str| -> String {
-        raw.chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() {
-                    ch.to_ascii_lowercase()
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    };
-    format!(
-        "capanix.worker.{}.{}.rpc:v1",
-        normalize(role_id),
-        normalize(node_id)
-    )
-}
-
 fn selected_group_request(path: &[u8], group_id: &str) -> InternalQueryRequest {
     InternalQueryRequest::materialized(
         QueryOp::Tree,
@@ -3099,10 +3080,12 @@ async fn status_snapshot_hook_scoped_to_target_worker_instance_is_not_consumed_b
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn materialized_query_nonblocking_does_not_dispatch_worker_rpc_while_control_inflight() {
+async fn materialized_query_nonblocking_uses_existing_worker_payload_while_control_inflight() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
-    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    let selected_dir = b"/force-find-stress";
+    std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+    std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
 
     let cfg = SourceConfig {
         roots: vec![sink_worker_root("nfs1", &nfs1)],
@@ -3114,6 +3097,9 @@ async fn materialized_query_nonblocking_does_not_dispatch_worker_rpc_while_contr
         )],
         ..SourceConfig::default()
     };
+    let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-d".to_string()), None)
+        .expect("init source");
+    let mut stream = source.pub_().await.expect("start source pub stream");
     let boundary = Arc::new(LoopbackWorkerBoundary::default());
     let state_boundary = in_memory_state_boundary();
     let worker_socket_dir = tempdir().expect("create worker socket dir");
@@ -3146,26 +3132,54 @@ async fn materialized_query_nonblocking_does_not_dispatch_worker_rpc_while_contr
     .await
     .expect("activate sink query route");
 
-    let worker_route = test_worker_control_route_key_for("sink", "node-d");
-    let baseline_send_batches = boundary.send_batch_count(&worker_route);
+    let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < materialized_deadline {
+        match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+        let ready = decode_exact_query_node(
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs1"))
+                .await
+                .expect("query nfs1"),
+            selected_dir,
+        )
+        .expect("decode nfs1")
+        .is_some();
+        if ready {
+            break;
+        }
+    }
+    assert!(
+        decode_exact_query_node(
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs1"))
+                .await
+                .expect("query nfs1 after initial materialization"),
+            selected_dir,
+        )
+        .expect("decode nfs1 after initial materialization")
+        .is_some(),
+        "initial materialized payload must exist before marking sink control in-flight"
+    );
+
     let _inflight = sink.begin_control_op();
 
     let events = sink
-            .materialized_query_nonblocking_with_failure(selected_group_request(b"/", "nfs1"))
-            .await
-            .expect(
-                "materialized_query_nonblocking should fail closed from the local nonblocking path while sink worker control is already in flight",
-            );
+        .materialized_query_nonblocking_with_failure(selected_group_request(selected_dir, "nfs1"))
+        .await
+        .expect("materialized_query_nonblocking should read existing worker payload while control is already in flight");
     assert!(
-        events.is_empty(),
-        "nonblocking materialized query during control inflight should fail closed with an empty result instead of dispatching another worker rpc: {events:?}"
-    );
-    assert_eq!(
-        boundary.send_batch_count(&worker_route),
-        baseline_send_batches,
-        "materialized_query_nonblocking must not dispatch a worker rpc while sink worker control is already in flight"
+        decode_exact_query_node(events, selected_dir)
+            .expect("decode nonblocking materialized query")
+            .is_some(),
+        "nonblocking materialized query during control inflight should return the existing materialized payload"
     );
 
+    source.close().await.expect("close source");
     sink.close().await.expect("close sink worker");
 }
 
