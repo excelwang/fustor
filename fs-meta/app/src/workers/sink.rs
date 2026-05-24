@@ -505,6 +505,15 @@ fn snapshot_has_delivery_evidence(snapshot: &SinkStatusSnapshot) -> bool {
         || !snapshot.stream_last_applied_at_us_by_node.is_empty()
 }
 
+fn snapshot_has_schedule_only_missing_rows_without_delivery_evidence(
+    snapshot: &SinkStatusSnapshot,
+) -> bool {
+    let summary = snapshot.readiness_summary();
+    !summary.scheduled_groups.is_empty()
+        && !summary.missing_scheduled_groups.is_empty()
+        && !snapshot_has_delivery_evidence(snapshot)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SinkStatusAccessPath {
     Blocking,
@@ -1218,7 +1227,11 @@ fn evaluate_live_sink_status_snapshot(
     };
     let live_projection = project_sink_status_snapshot_concern(live_snapshot);
     let cached_projection = project_sink_status_snapshot_concern(cached_snapshot);
-    let live_concern = live_projection.concern;
+    let live_concern = live_projection.concern.or_else(|| {
+        (!live_projection.summary.scheduled_groups.is_empty()
+            && !live_projection.summary.missing_scheduled_groups.is_empty())
+        .then_some(SinkStatusConcern::CoverageGap)
+    });
     let cached_ready_truth_covers_issue = live_concern.is_some_and(|concern| {
         cached_ready_truth_covers_live_concern(concern, &live_projection, &cached_projection)
     });
@@ -3696,6 +3709,20 @@ impl SinkWorkerClientHandle {
         access_path: SinkStatusAccessPath,
         err: Option<SinkFailure>,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        if err
+            .as_ref()
+            .is_some_and(|err| matches!(err.as_error(), CnxError::Timeout))
+            && snapshot_has_schedule_only_missing_rows_without_delivery_evidence(&snapshot)
+        {
+            if debug_control_scope_capture_enabled() {
+                eprintln!(
+                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=timeout_schedule_only_missing_group_rows {}",
+                    self.node_id.0,
+                    summarize_sink_status_snapshot(&snapshot)
+                );
+            }
+            return Err(SinkFailure::timeout_like());
+        }
         let outcome = evaluate_cached_sink_status_snapshot(&snapshot, access_path);
         let mut snapshot = snapshot;
         if outcome.should_republish_zero_row_summary {

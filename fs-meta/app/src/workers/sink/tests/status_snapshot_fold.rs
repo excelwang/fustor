@@ -838,6 +838,37 @@ fn evaluate_live_sink_status_snapshot_marks_replay_required_for_pending_material
 }
 
 #[test]
+fn evaluate_live_sink_status_snapshot_fails_closed_for_scheduled_missing_group_rows_without_stream_evidence()
+ {
+    let cached_snapshot = SinkStatusSnapshot::default();
+    let live_snapshot = SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs3".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    let evaluation = evaluate_live_sink_status_snapshot(
+        &live_snapshot,
+        &cached_snapshot,
+        None,
+        SinkStatusAccessPath::Steady,
+    );
+
+    assert_eq!(
+        evaluation,
+        SinkStatusSnapshotOutcome {
+            kind: SinkStatusOutcomeKind::FailClosed,
+            concern: Some(SinkStatusConcern::CoverageGap),
+            should_mark_replay_required: false,
+            should_republish_zero_row_summary: false,
+        },
+        "live status probes must fail closed on scheduled group metadata that has no corresponding group row instead of publishing a diagnostics-only schedule as healthy truth",
+    );
+}
+
+#[test]
 fn evaluate_live_sink_status_snapshot_returns_live_for_steady_after_retry_reset_waiting_for_materialized_root()
  {
     let cached_snapshot = SinkStatusSnapshot::default();
