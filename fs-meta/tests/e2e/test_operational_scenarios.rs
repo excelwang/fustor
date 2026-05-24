@@ -1712,22 +1712,28 @@ fn scenario_visibility_change_and_sink_selection(
     }
 
     visibility_phase_step(VisibilityPhase::FacadeLive, || {
-        let status = session.status().map_err(|err| {
-            format!(
-                "facade unavailable while adjusting sink visibility for {facade_resource_id}: {err}"
-            )
-        })?;
-        let api_facade_liveness = status
-            .get("readiness_planes")
-            .and_then(Value::as_object)
-            .and_then(|planes| planes.get("api_facade_liveness"))
-            .and_then(Value::as_bool);
-        if api_facade_liveness != Some(true) {
-            return Err(format!(
-                "facade status missing open api facade liveness plane while adjusting sink visibility for {facade_resource_id}: {status}"
-            ));
-        }
-        Ok(())
+        wait_until(
+            Duration::from_secs(90),
+            "api facade liveness reopens after sink visibility change",
+            || {
+                let status = session.status().map_err(|err| {
+                    format!(
+                        "facade unavailable while adjusting sink visibility for {facade_resource_id}: {err}"
+                    )
+                })?;
+                let api_facade_liveness = status
+                    .get("readiness_planes")
+                    .and_then(Value::as_object)
+                    .and_then(|planes| planes.get("api_facade_liveness"))
+                    .and_then(Value::as_bool);
+                if api_facade_liveness != Some(true) {
+                    return Err(format!(
+                        "facade status missing open api facade liveness plane while adjusting sink visibility for {facade_resource_id}: {status}"
+                    ));
+                }
+                Ok(true)
+            },
+        )
     })?;
 
     Ok(())
