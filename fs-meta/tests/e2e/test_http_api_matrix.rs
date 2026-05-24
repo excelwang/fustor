@@ -151,7 +151,11 @@ pub fn run_mini_real_nfs_smoke() -> Result<(), String> {
         "operator123",
     )?;
     eprintln!("[fs-meta-api-matrix-mini] step=initial-rescan");
-    session.rescan()?;
+    wait_for_rescan_accepted(
+        &mut session,
+        CURRENT_ROOTS_RESCAN_ACCEPTED_TIMEOUT,
+        "mini initial source repair rescan accepted",
+    )?;
 
     eprintln!("[fs-meta-api-matrix-mini] step=status-and-grants");
     run_mini_status_and_grants_checks(&harness.client, &mut session, &harness.lab, 1)?;
@@ -183,7 +187,11 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
         "operator123",
     )?;
     eprintln!("[fs-meta-api-matrix] step=initial-rescan");
-    session.rescan()?;
+    wait_for_rescan_accepted(
+        &mut session,
+        CURRENT_ROOTS_RESCAN_ACCEPTED_TIMEOUT,
+        "initial source repair rescan accepted",
+    )?;
 
     match mode {
         MatrixMode::Full => {
@@ -451,7 +459,11 @@ fn run_query_matrix(
 
 fn run_full_query_capacity_baseline_phase(session: &mut OperatorSession) -> Result<(), String> {
     eprintln!("[fs-meta-api-matrix] substep=full-capacity-trusted-materialized-gate");
-    session.rescan()?;
+    wait_for_rescan_accepted(
+        session,
+        CURRENT_ROOTS_RESCAN_ACCEPTED_TIMEOUT,
+        "mini roots source repair rescan accepted",
+    )?;
     assert_trusted_tree_matches_readiness(session, "full capacity trusted materialized gate")?;
     assert_error(
         session.client().force_find_raw(
@@ -728,7 +740,11 @@ fn run_query_live_only_rescan_phase(
         &expected_live_force_find,
     )?;
 
-    session.rescan()?;
+    wait_for_rescan_accepted(
+        session,
+        CURRENT_ROOTS_RESCAN_ACCEPTED_TIMEOUT,
+        "mini roots source repair rescan accepted",
+    )?;
     match session.status() {
         Ok(post_rescan_status) => validate_status_monitoring_shape(&post_rescan_status, true)?,
         Err(err) if is_trusted_materialized_status_unavailable(&err) => {
