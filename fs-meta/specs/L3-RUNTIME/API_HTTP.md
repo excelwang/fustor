@@ -184,7 +184,7 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
    1. query: `path` (UTF-8 convenience path, default `/`) or `path_b64` (authoritative base64url raw-path bytes, mutually exclusive with `path`), `recursive` (default `true`), `pit_id` (optional on first page, required on continuation), `group_order` (`group-key|file-count|file-age`, default `group-key`), `group_page_size` (default `64`, range `1..=1000`), `group_after` (opaque PIT cursor, optional), `entry_page_size` (default `1000`, range `1..=10000`), `entry_after` (opaque per-group PIT cursor bundle, optional).
    2. response: `{ "path": string, "status": "ok", "read_class": "fresh", "observation_status": ObservationStatus, "group_order": GroupOrder, "pit": PitHandle, "groups": ForceFindGroupEnvelope[], "group_page": GroupPage }`, plus optional `path_b64` when the authoritative raw path is not valid UTF-8.
 3. `GET /stats`
-   1. query: `path` (UTF-8 convenience path, default `/`) or `path_b64` (authoritative base64url raw-path bytes, mutually exclusive with `path`), `recursive` (default `true`), `group` (optional), `read_class` (`fresh|materialized|trusted-materialized`, default `trusted-materialized`).
+   1. query: `path` (UTF-8 convenience path, default `/`) or `path_b64` (authoritative base64url raw-path bytes, mutually exclusive with `path`), `recursive` (default `true`), `group` (optional), `read_class` (`materialized|trusted-materialized`, default `trusted-materialized`).
    2. response: `{ "path": string, "read_class": ReadClass, "observation_status": ObservationStatus, "groups": { "<group>": GroupEnvelopeStats } }`, plus optional `path_b64` when the authoritative raw path is not valid UTF-8.
 4. `GET /bound-route-metrics`
    1. response: `{ "call_timeout_total": u64, "correlation_mismatch_total": u64, "uncorrelated_reply_total": u64, "recv_loop_iterations": u64, "pending_calls": usize }`.
@@ -215,7 +215,10 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
    9. group-level fresh execution errors include `GROUP_UNBOUND`, `RUNNER_UNAVAILABLE`, and `HOST_FS_UNAVAILABLE`; these errors do not authorize fallback to materialized results.
    10. after fs-meta selects a runner for a group and receives selected-runner execution evidence, that group item is completed by the selected runner's fresh success, explicit error, or execution timeout; when the selected request/reply lane produces only a retryable delivery gap before runner execution evidence, fs-meta may re-plan within the same requested group and the original caller budget, but the group is not held open to wait for unrelated group replies.
    11. multi-group force-find may return several group items, but each group item follows its own Selected-Runner Fresh Execution outcome.
-7. `PitHandle`
+7. `GET /stats` payload details
+   1. `/stats` supports only materialized read classes. `read_class=fresh` is rejected by the public contract until a future contract defines live stats semantics.
+   2. `read_class=materialized` and `read_class=trusted-materialized` follow the same materialized/trusted observation availability windows as `/tree`.
+8. `PitHandle`
    1. required keys: `id`, `expires_at_ms`.
    2. `id` is an opaque server-issued query session id; clients do not derive meaning from it.
 ## [decision] QueryAvailabilityWindowOrdering

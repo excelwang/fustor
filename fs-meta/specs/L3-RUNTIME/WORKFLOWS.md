@@ -242,9 +242,9 @@ User-visible and operator-visible state names consumed by these workflows are ow
 
 **Steps**
 
-1. caller selects `read_class=fresh|materialized|trusted-materialized` instead of hand-composing stability or metadata modes.
+1. caller selects named read classes instead of hand-composing stability or metadata modes: `/tree` accepts `read_class=fresh|materialized|trusted-materialized`, while `/stats` accepts `read_class=materialized|trusted-materialized`.
 2. group bucket ordering runs first; `read_class` does not alter the bucket-order algorithm.
-3. `fresh` delegates to the live/freshness path and reports `observation_status.state=fresh-only`; it may be useful before materialized observation catches up, but it does not claim current trusted observation.
+3. `fresh` delegates to the live/freshness path for `/tree` and reports `observation_status.state=fresh-only`; `/stats` does not expose `fresh` unless a future contract defines live stats semantics.
 4. `materialized` reads the current materialized projection and returns explicit `observation_status`; degraded coverage, missing initial audit, or overflow evidence are surfaced as `materialized-untrusted` reasons instead of forcing the caller to infer trust from parameter combinations.
 5. `trusted-materialized` consumes the same package-local observation evidence as cutover `observation_eligible`; until that evidence is trusted enough, the request fails closed with explicit `NOT_READY`.
 6. `group_page_size/group_after` paginate bucket selection inside one PIT and `entry_page_size/entry_after` paginate per-group metadata only; `read_class` does not change PIT ownership or cursor meaning.

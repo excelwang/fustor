@@ -1202,6 +1202,49 @@ fn normalize_api_params_uses_defaults() {
 }
 
 #[test]
+fn validate_stats_query_rejects_fresh_read_class() {
+    let params = ApiParams {
+        path: Some("/mnt".into()),
+        path_b64: None,
+        group: None,
+        recursive: None,
+        max_depth: None,
+        pit_id: None,
+        group_order: None,
+        group_page_size: None,
+        group_after: None,
+        entry_page_size: None,
+        entry_after: None,
+        read_class: Some(ReadClass::Fresh),
+    };
+    let normalized = normalize_api_params(params).expect("normalize stats params");
+    let err = validate_stats_query_params(&normalized).expect_err("reject stats fresh read_class");
+    assert!(err.to_string().contains("not supported on /stats"));
+}
+
+#[test]
+fn validate_stats_query_accepts_materialized_read_classes() {
+    for read_class in [ReadClass::Materialized, ReadClass::TrustedMaterialized] {
+        let params = ApiParams {
+            path: Some("/mnt".into()),
+            path_b64: None,
+            group: None,
+            recursive: None,
+            max_depth: None,
+            pit_id: None,
+            group_order: None,
+            group_page_size: None,
+            group_after: None,
+            entry_page_size: None,
+            entry_after: None,
+            read_class: Some(read_class),
+        };
+        let normalized = normalize_api_params(params).expect("normalize stats params");
+        validate_stats_query_params(&normalized).expect("accept stats materialized read_class");
+    }
+}
+
+#[test]
 fn normalize_api_params_keeps_group_pagination_shape() {
     let params = ApiParams {
         path: Some("/mnt".into()),

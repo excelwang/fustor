@@ -4601,6 +4601,18 @@ fn stats_read_class(params: &NormalizedApiParams) -> ReadClass {
     params.read_class.unwrap_or(ReadClass::TrustedMaterialized)
 }
 
+fn validate_stats_query_params(params: &NormalizedApiParams) -> std::result::Result<(), CnxError> {
+    if params
+        .read_class
+        .is_some_and(|read_class| read_class == ReadClass::Fresh)
+    {
+        return Err(CnxError::InvalidInput(
+            "read_class=fresh is not supported on /stats".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_tree_query_params(params: &NormalizedApiParams) -> std::result::Result<(), CnxError> {
     if params.pit_id.is_none() && (params.group_after.is_some() || params.entry_after.is_some()) {
         return Err(CnxError::InvalidInput(
@@ -15706,6 +15718,10 @@ async fn get_stats(
         Ok(params) => params,
         Err(err) => return error_response_with_context(err, None),
     };
+    let path_for_error = params.path.clone();
+    if let Err(err) = validate_stats_query_params(&params) {
+        return error_response_with_context(err, Some(&path_for_error));
+    }
     let read_class = stats_read_class(&params);
     let mut request_source_status = None::<SourceStatusSnapshot>;
     let mut request_sink_status = None::<SinkStatusSnapshot>;

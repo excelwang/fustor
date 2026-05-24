@@ -143,11 +143,13 @@ QueryObservationState =
 
 1. fs-meta readiness MUST be reported and evaluated across separate domain planes instead of a single `ready` boolean.
 2. `API Facade Liveness` means the resource-scoped HTTP namespace is reachable enough to accept and authenticate product API requests.
-3. `Management Write Ready` means the current Authority Epoch has an active control stream that can safely submit management writes such as roots apply, manual rescan, and query-api-key mutation.
-4. `Trusted Observation Ready` means materialized readiness evidence and observation eligibility allow trusted-materialized `/tree` and `/stats` reads.
-5. API Facade Liveness MAY be open while Management Write Ready is closed; in that case read-only status/diagnostics can answer, but management writes fail closed with explicit not-ready evidence.
-6. Management Write Ready MAY be open while Trusted Observation Ready is still closed; in that case roots apply/rescan can be accepted, but trusted-materialized reads remain closed until observation evidence catches up.
-7. Trusted Observation Ready MUST NOT be inferred from API Facade Liveness or Management Write Ready; it follows `QueryObservationState=trusted-materialized` and package-local observation eligibility.
+3. `Management Write Ready` means the current Authority Epoch has an active control stream that can safely submit full management writes such as roots apply and query-api-key mutation.
+4. `Source Repair Ready` means the current Authority Epoch has an active control stream plus current retained source replay/source control apply state for source-owned repair operations; it does not wait for sink replay, sink-status materialization, or trusted materialized observation readiness.
+5. `Trusted Observation Ready` means materialized readiness evidence and observation eligibility allow trusted-materialized `/tree` and `/stats` reads.
+6. API Facade Liveness MAY be open while Management Write Ready or Source Repair Ready is closed; in that case read-only status/diagnostics can answer, but writes fail closed with explicit not-ready evidence.
+7. Source Repair Ready MAY be open while Management Write Ready is closed; in that case manual rescan can proceed only after scoped source delivery proof, while roots apply and query-api-key mutation remain closed.
+8. Management Write Ready MAY be open while Trusted Observation Ready is still closed; in that case full management writes can be accepted, but trusted-materialized reads remain closed until observation evidence catches up.
+9. Trusted Observation Ready MUST NOT be inferred from API Facade Liveness, Source Repair Ready, or Management Write Ready; it follows `QueryObservationState=trusted-materialized` and package-local observation eligibility.
 
 ## [decision] MaterializedReadinessEvidenceEpochMonotonicity
 

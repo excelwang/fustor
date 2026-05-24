@@ -40,12 +40,12 @@ Cutover and exposure semantics in this file consume the domain states from [STAT
 **Steps**
 
 1. HTTP facade listener readiness is necessary but not sufficient for trusted exposure.
-2. HTTP facade listener readiness is also not sufficient for management writes; roots apply, manual rescan, and query-api-key mutation require Management Write Ready from the current-epoch active control stream.
+2. HTTP facade listener readiness is also not sufficient for writes; roots apply and query-api-key mutation require Management Write Ready from the current-epoch active control stream, while manual rescan requires Source Repair Ready plus scoped source delivery proof.
 3. app evaluates `observation_eligible` from the same package-local observation evaluator and materialized observation evidence that feeds query `observation_status`: initial-audit completion on active scan-enabled primary groups, materialized degraded/overflow status, and stale-writer fencing evidence.
 4. the worker-facing runtime wrapper lowers runtime loading through the bounded app/runtime entry surface; exact helper API names and wrapper composition remain implementation detail as long as the observation evaluator stays app-owned.
 5. package-local status/health surfaces expose the materialized readiness evidence through source coverage and audit timing plus sink `initial_audit_completed` and `overflow_pending_materialization`; these signals support cutover diagnostics but do not become a competing truth source.
 6. when facade activation remains pending because runtime exposure proof is still outstanding or listener spawn is retrying, package-local status/health surfaces also expose optional `facade.pending` diagnostics so operators can distinguish cutover waiting from generic host-boundary liveness.
-7. runtime consumes generation/bind/route proof to decide which active facade unit owns the resource-scoped one-cardinality HTTP facade, while the app uses Management Write Ready to decide whether management writes may be accepted and `observation_eligible` to decide when `trusted-materialized` `/tree` and `/stats` may answer as current observation.
+7. runtime consumes generation/bind/route proof to decide which active facade unit owns the resource-scoped one-cardinality HTTP facade, while the app uses Management Write Ready for full management writes, Source Repair Ready for manual-rescan source repair admission, and `observation_eligible` to decide when `trusted-materialized` `/tree` and `/stats` may answer as current observation.
 8. when `observation_eligible` is absent or proof is incomplete, the app keeps `trusted-materialized` `/tree` and `/stats` explicitly not-ready and surfaces weaker materialized reads as `materialized-untrusted`; `/on-demand-force-find` stays a freshness path and may be externally available earlier.
 
 ## [workflow] MaterializedReadinessEvidenceFanIn

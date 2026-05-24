@@ -89,53 +89,54 @@ version: 3.0.0
    > Verification: grouped query paths keep explicit per-group `ok`/`error` envelopes and `partial_failure/errors` visibility instead of silently dropping failed groups.
 
 4. **ROUTE_SAFE_MATERIALIZED_TREE_WINDOWS**: **fs-meta System** MUST keep internal materialized `/tree` route replies bounded by encoded payload bytes while preserving public PIT paging correctness.
+   > Covers L0: VISION.QUERY_OUTCOME.ROUTE_SAFE_MATERIALIZED_TREE_WINDOWS
    > Responsibility: the app-owned query protocol slices large materialized tree reads into byte-budgeted same-PIT/same-group windows instead of relying on transport/kernel layers to split opaque fs-meta payloads.
    > Verification: a short positive internal tree reply caused by the encoded payload budget is not treated as end-of-group; the facade continues fetching bounded windows until the requested public page plus sentinel is available, a zero-entry continuation proves completion, or the caller deadline expires.
    > Verification: if one tree entry cannot fit the route byte budget, fs-meta MUST fail the internal materialized query closed instead of publishing an over-budget opaque route event or silently dropping that entry.
 
-4. **CORRELATION_ID_CONTINUITY**: **fs-meta System** MUST preserve request-response correlation metadata on query paths.
+5. **CORRELATION_ID_CONTINUITY**: **fs-meta System** MUST preserve request-response correlation metadata on query paths.
    > Covers L0: VISION.QUERY_OUTCOME.QUERY_TRANSPORT_DIAGNOSTICS
 
-5. **GROUP_ORDER_MULTI_GROUP_BUCKET_SELECTION**: **fs-meta System** MUST expose group bucket ordering as an explicit query axis instead of hiding it behind a single-group winner selection knob.
+6. **GROUP_ORDER_MULTI_GROUP_BUCKET_SELECTION**: **fs-meta System** MUST expose group bucket ordering as an explicit query axis instead of hiding it behind a single-group winner selection knob.
    > Covers L0: VISION.QUERY_OUTCOME.GROUP_ORDER_MULTI_GROUP_QUERY
    > Responsibility: keep group ranking deterministic while avoiding API-level “pick exactly one winner” semantics.
    > Verification: `/tree` and `/on-demand-force-find` accept `group_order=group-key|file-count|file-age`; default is `group-key`.
    > Verification: clients that want one group use `group_page_size=1`; the server does not require `group=<id>` or `best=true`.
    > Verification: when `group_order=file-count`, groups are ordered by highest file count; when `group_order=file-age`, groups are ordered by newest file activity (`latest_file_mtime_us`); ties break deterministically by group key.
 
-6. **QUERY_PARAMETER_AXES_REMAIN_ORTHOGONAL**: **fs-meta System** MUST keep group ordering, PIT session ownership, bucket pagination, entry pagination, and named read selection orthogonal.
+7. **QUERY_PARAMETER_AXES_REMAIN_ORTHOGONAL**: **fs-meta System** MUST keep group ordering, PIT session ownership, bucket pagination, entry pagination, and named read selection orthogonal.
    > Covers L0: VISION.QUERY_OUTCOME.QUERY_HTTP_FACADE
    > Responsibility: let callers freely combine group ordering (`group_order`), PIT session continuation (`pit_id`), group bucket pagination (`group_page_size`, `group_after`), per-group entry pagination (`entry_page_size`, `entry_after`), and named read selection (`read_class`) without hidden semantic coupling.
    > Verification: `group_order` affects only group ranking, `pit_id` only binds one frozen query session, `group_page_size/group_after` affect only bucket slicing, `entry_page_size/entry_after` affect only per-group entry slicing, and `read_class` affects only freshness/trust semantics.
    > Verification: a materialized `/tree` PIT freezes query scope, read class, observation status, group ranking, and the PIT-owned entry cursor stream; it MUST NOT require the facade to fetch or store a full subtree payload merely to prove that later entry pages exist, and the facade may assemble one public entry page from multiple smaller same-PIT/same-group sink windows.
    > Verification: `group_order=file-age` does not implicitly request `trusted-materialized`, and `read_class=trusted-materialized` does not redefine group ranking.
 
-7. **FORCE_FIND_GROUP_LOCAL_EXCLUSIVITY**: **fs-meta System** MUST keep `force-find` execution exclusive per group while allowing any bound source run in that group to perform the scan.
+8. **FORCE_FIND_GROUP_LOCAL_EXCLUSIVITY**: **fs-meta System** MUST keep `force-find` execution exclusive per group while allowing any bound source run in that group to perform the scan.
    > Responsibility: avoid duplicate diagnostic scans without overloading runtime with transient lease semantics.
    > Verification: each group keeps one in-flight `force-find` at a time through app-owned mutex/state.
    > Verification: runner selection uses round-robin across bound source runs in the target group, and failed runner selection falls back to the next bound source run.
    > Verification: `file-count` and `file-age` ordering paths MAY use lightweight phase-1 stats probe; they MUST NOT require full fanout materialized tree payload just to rank groups.
    > Covers L0: VISION.QUERY_OUTCOME.GROUP_ORDER_MULTI_GROUP_QUERY
 
-8. **FORCE_FIND_CURRENT_EPOCH_RUNNER_SELECTION**: **fs-meta System** MUST select `force-find` runners from Runner Binding Evidence that belongs to the current Authority Epoch.
+9. **FORCE_FIND_CURRENT_EPOCH_RUNNER_SELECTION**: **fs-meta System** MUST select `force-find` runners from Runner Binding Evidence that belongs to the current Authority Epoch.
    > Responsibility: keep freshness execution tied to the current business monitoring scope without waiting for materialized observation catch-up.
    > Verification: Runner Binding Evidence MAY be cached, but cached evidence is valid only while roots signature, grants signature, source stream generation, sink materialization generation, and facade/runtime generation still belong to the same Authority Epoch.
    > Verification: fs-meta discards runner binding evidence from older Authority Epochs before dispatching a fresh scan.
    > Covers L0: VISION.QUERY_OUTCOME.FIND_PATH_AVAILABILITY, VISION.OBSERVATION_CONVERGENCE.OBSERVATION_IS_NOT_TRUTH
 
-9. **FORCE_FIND_MATERIALIZATION_INDEPENDENCE**: **fs-meta System** MUST NOT block an otherwise Force-Find Ready request on source initial audit completion, sink materialization readiness, or trusted materialized observation eligibility.
+10. **FORCE_FIND_MATERIALIZATION_INDEPENDENCE**: **fs-meta System** MUST NOT block an otherwise Force-Find Ready request on source initial audit completion, sink materialization readiness, or trusted materialized observation eligibility.
    > Responsibility: preserve `/on-demand-force-find` as the widest query-side availability window.
    > Verification: a group can be Force-Find Ready while `/tree` or `/stats` with `read_class=trusted-materialized` still returns explicit `NOT_READY`.
    > Verification: `force-find` results keep `read_class=fresh` and `observation_status.state=fresh-only`; they do not promote materialized observation to trusted state.
    > Covers L0: VISION.QUERY_OUTCOME.FIND_PATH_AVAILABILITY
 
-10. **FORCE_FIND_GROUP_BOUNDARY**: **fs-meta System** MUST dispatch `force-find` only to runner candidates bound to the requested group in the current Authority Epoch.
+11. **FORCE_FIND_GROUP_BOUNDARY**: **fs-meta System** MUST dispatch `force-find` only to runner candidates bound to the requested group in the current Authority Epoch.
    > Responsibility: keep group isolation, ownership visibility, and failure attribution intact.
    > Verification: if a requested group has no current runner candidate, fs-meta returns an explicit group-level unavailable/error result instead of borrowing a runner from another group.
    > Verification: multi-group `force-find` keeps successful groups independent from groups that are unbound or runner-unavailable.
    > Covers L0: VISION.QUERY_OUTCOME.UNIFIED_FOREST_RESPONSE, VISION.QUERY_OUTCOME.GROUP_ORDER_MULTI_GROUP_QUERY
 
-11. **FORCE_FIND_SELECTED_RUNNER_SINGLE_REPLY**: **fs-meta System** MUST finish each selected group `force-find` from that group's selected runner outcome, not from a later collection of unrelated runners or groups.
+12. **FORCE_FIND_SELECTED_RUNNER_SINGLE_REPLY**: **fs-meta System** MUST finish each selected group `force-find` from that group's selected runner outcome, not from a later collection of unrelated runners or groups.
    > Responsibility: keep selected-group fresh lookup as one group, one selected runner, one fresh outcome.
    > Verification: after fs-meta selects a runner for a Force-Find Ready group and receives selected-runner execution evidence, that group bucket completes on that selected runner's success, explicit failure, or execution timeout.
    > Verification: if the selected route produces no selected-runner execution evidence because the request/reply lane times out or reports a retryable delivery gap before the runner accepts the fresh scan, fs-meta MAY re-plan inside the same group and original caller budget; this is delivery recovery, not materialized fallback.
@@ -144,20 +145,20 @@ version: 3.0.0
    > Verification: runtime/kernel transport carries the selected fresh execution exchange but does not decide group ownership or runner selection policy.
    > Covers L0: VISION.QUERY_OUTCOME.FIND_PATH_AVAILABILITY, VISION.QUERY_OUTCOME.PARTIAL_FAILURE_ISOLATION
 
-12. **FORCE_FIND_EXPLICIT_UNAVAILABLE**: **fs-meta System** MUST represent unavailable `force-find` execution as explicit not-ready or group-level error evidence.
+13. **FORCE_FIND_EXPLICIT_UNAVAILABLE**: **fs-meta System** MUST represent unavailable `force-find` execution as explicit not-ready or group-level error evidence.
    > Responsibility: avoid silently dropping groups, returning empty success for unscanned groups, or substituting materialized results for failed fresh execution.
    > Verification: empty monitoring roots returns explicit `NOT_READY`; unavailable runtime grants or not-yet-built runner binding returns explicit `NOT_READY`; group-specific missing or unreachable runners return explicit per-group error.
    > Verification: when a bound remote mount-root is no longer a mounted root, fresh execution fails closed as `HOST_FS_UNAVAILABLE`; fs-meta MUST NOT scan the empty underlying host directory and report it as a fresh success.
    > Verification: when another current-epoch bound runner exists for the same logical group, fs-meta MUST route that same fresh group execution to the next bound runner before rendering the group as unavailable.
    > Covers L0: VISION.QUERY_OUTCOME.PARTIAL_FAILURE_ISOLATION
 
-13. **NO_CROSS_GROUP_ENTRY_MERGE**: **fs-meta System** MUST keep multi-group query payloads as independent group buckets and MUST NOT merge metadata from multiple groups into one synthetic tree page.
+14. **NO_CROSS_GROUP_ENTRY_MERGE**: **fs-meta System** MUST keep multi-group query payloads as independent group buckets and MUST NOT merge metadata from multiple groups into one synthetic tree page.
    > Covers L0: VISION.QUERY_OUTCOME.UNIFIED_FOREST_RESPONSE
    > Responsibility: preserve per-group visibility, cursor correctness, and failure isolation semantics.
    > Verification: `/tree` and `/on-demand-force-find` return `groups[]`; each group item owns its own `root/entries/entry_page`.
    > Verification: `entry_after` continuation is per-group, and `group_after` continuation is top-level bucket paging inside one PIT; neither cursor family may be reinterpreted as a cross-group merged page.
 
-14. **QUERY_HTTP_FACADE_DEFAULTS_AND_SHAPE**: **fs-meta System** MUST provide query HTTP facade with deterministic defaults and explicit grouped response shaping.
+15. **QUERY_HTTP_FACADE_DEFAULTS_AND_SHAPE**: **fs-meta System** MUST provide query HTTP facade with deterministic defaults and explicit grouped response shaping.
    > Responsibility: keep UI/CLI integration stable across `/tree` `/stats` `/on-demand-force-find`.
    > Verification: `/tree` default query params are `path=/`, `recursive=true`, `group_order=group-key`, `group_page_size=64`, `entry_page_size=1000`, and `read_class=trusted-materialized`; `/stats` defaults `read_class=trusted-materialized`.
    > Verification: the first `/tree` request MAY omit `pit_id`; the response returns `pit.id` and `pit.expires_at_ms`. Any continuation using `group_after` or `entry_after` MUST supply that `pit_id`.
@@ -174,35 +175,36 @@ version: 3.0.0
    > Verification: `/stats` returns group envelopes with aggregate subtree stats and per-group `partial_failure/errors` visibility.
    > Covers L0: VISION.QUERY_OUTCOME.QUERY_HTTP_FACADE
 
-15. **READ_CLASS_REPLACES_FREEFORM_STABILITY_SELECTION**: **fs-meta System** MUST replace free-form stability/mode selection with named read semantics so app developers do not hand-compose trust decisions.
+16. **READ_CLASS_REPLACES_FREEFORM_STABILITY_SELECTION**: **fs-meta System** MUST replace free-form stability/mode selection with named read semantics so app developers do not hand-compose trust decisions.
    > Covers L0: VISION.QUERY_OUTCOME.UNIFIED_FOREST_RESPONSE
    > Responsibility: eliminate caller-owned “pick the right stable state” logic from public query surfaces.
-   > Verification: `/tree` and `/stats` accept `read_class=fresh|materialized|trusted-materialized` instead of `stability_mode` / `quiet_window_ms` / `metadata_mode`.
-   > Verification: `fresh` remains the live/freshness path, `materialized` returns current materialized observation with explicit `observation_status`, and `trusted-materialized` is the only read mode that may be treated as stable current observation.
+   > Verification: `/tree` accepts `read_class=fresh|materialized|trusted-materialized` and `/stats` accepts only `read_class=materialized|trusted-materialized` instead of `stability_mode` / `quiet_window_ms` / `metadata_mode`.
+   > Verification: `fresh` remains the live/freshness path for `/tree` and `/on-demand-force-find`; `/stats` does not expose a fresh read class unless a future contract defines live stats semantics.
+   > Verification: `materialized` returns current materialized observation with explicit `observation_status`, and `trusted-materialized` is the only read mode that may be treated as stable current observation.
    > Verification: `/on-demand-force-find` remains a freshness path and does not expose a second free-form stability selector family.
 
-16. **ORIGIN_TRACE_DRIVEN_GROUP_AGGREGATION**: **fs-meta System** MUST derive query aggregation groups from per-request RPC `origin_id` traces and policy mapping, without precomputed peer registry coupling.
+17. **ORIGIN_TRACE_DRIVEN_GROUP_AGGREGATION**: **fs-meta System** MUST derive query aggregation groups from per-request RPC `origin_id` traces and policy mapping, without precomputed peer registry coupling.
    > Responsibility: keep projection membership resolution request-scoped and kernel-routing driven.
    > Verification: projection groups are built from returned events' `origin_id` plus policy mapping (`mount-path`/`source-locator`/`origin`) and do not require stored peer inventory.
    > Covers L0: VISION.QUERY_OUTCOME.STATELESS_QUERY_PROXY_AGGREGATION
 
-17. **GROUPED_QUERY_PARTIAL_FAILURE_HTTP_SUCCESS_ENVELOPE**: **fs-meta System** MUST isolate per-group decode/peer failures on grouped query paths and preserve successful group payloads in the same HTTP response.
+18. **GROUPED_QUERY_PARTIAL_FAILURE_HTTP_SUCCESS_ENVELOPE**: **fs-meta System** MUST isolate per-group decode/peer failures on grouped query paths and preserve successful group payloads in the same HTTP response.
    > Responsibility: avoid cascading single-group observation failure into full-request failure.
    > Verification: `/stats` keeps decode failure on one group as explicit `status:error` envelope while other groups remain `status:ok`; when a grouped path has mixed decode success/failure it sets `partial_failure=true` and keeps `errors[]`.
    > Covers L0: VISION.QUERY_OUTCOME.PARTIAL_FAILURE_ISOLATION
 
-18. **QUERY_TRANSPORT_TIMEOUT_AND_ERROR_MAPPING**: **fs-meta System** MUST bound projection RPC waits and report transport/protocol failures as explicit structured HTTP errors.
+19. **QUERY_TRANSPORT_TIMEOUT_AND_ERROR_MAPPING**: **fs-meta System** MUST bound projection RPC waits and report transport/protocol failures as explicit structured HTTP errors.
    > Covers L0: VISION.QUERY_OUTCOME.QUERY_TRANSPORT_DIAGNOSTICS
    > Responsibility: prevent indefinite query hangs and keep failure diagnostics machine-readable.
    > Verification: projection enforces bounded timeouts (`query_timeout_ms` default `30000`, `force_find_timeout_ms` default `60000`).
    > Verification: query error responses include `error/code/path`; timeout/protocol/transport/peer failures map to explicit HTTP status families.
 
-19. **QUERY_BOUND_ROUTE_METRICS_DIAGNOSTICS_BOUNDARY**: **fs-meta System** MUST expose projection bound-route transport counters for runtime diagnostics.
+20. **QUERY_BOUND_ROUTE_METRICS_DIAGNOSTICS_BOUNDARY**: **fs-meta System** MUST expose projection bound-route transport counters for runtime diagnostics.
    > Responsibility: provide lightweight observability for query transport anomalies.
    > Verification: `/bound-route-metrics` returns `call_timeout_total`, `correlation_mismatch_total`, `uncorrelated_reply_total`, `recv_loop_iterations`, and `pending_calls`.
    > Covers L0: VISION.QUERY_OUTCOME.QUERY_TRANSPORT_DIAGNOSTICS
 
-20. **QUERY_CALLER_FLOW_LIFECYCLE_IMPLEMENTATION_DEFINED**: **fs-meta System** MUST keep query correctness independent from caller channel reuse policy; baseline implementation MAY use per-request caller open/close lifecycle.
+21. **QUERY_CALLER_FLOW_LIFECYCLE_IMPLEMENTATION_DEFINED**: **fs-meta System** MUST keep query correctness independent from caller channel reuse policy; baseline implementation MAY use per-request caller open/close lifecycle.
    > Covers L0: VISION.QUERY_OUTCOME.STATELESS_QUERY_PROXY_AGGREGATION
    > Responsibility: avoid coupling correctness semantics to a specific connection-pooling model.
    > Verification: route call path can remain correct when caller channel is opened/closed per request (`caller.open -> ask -> close`) and without long-lived peer cache state.
@@ -262,7 +264,7 @@ version: 3.0.0
    > Verification: sink keeps integrity flags (`monitoring_attested`, `suspect`, `blind_spot`) and derives group-global response reliability (`reliable/unreliable_reason`) from those flags rather than from service admission.
    > Verification: status service-state and materialized observation evidence use service-readiness blockers such as pending materialization, overflow-pending materialization, and explicit source degradation; query response reliability remains a separate per-result evidence channel so trusted-materialized responses can report `reliable=false` without hiding current materialized data.
    > Verification: sink shadow clock tracks `EventMetadata.timestamp_us` high-water mark for NFS-domain freshness calculations; `logical_ts` is transport-preserved ordering metadata and is not used as sink arbitration time axis.
-   > Covers L0: VISION.SINK_SINGLE_TREE_ARBITRATION, VISION.INDEX_LIFECYCLE.SINK_SINGLE_TREE_ARBITRATION
+   > Covers L0: VISION.INDEX_LIFECYCLE.SINK_SINGLE_TREE_ARBITRATION
 6. **IN_MEMORY_MATERIALIZED_INDEX_BASELINE**: **fs-meta System** MUST keep sink materialized tree as in-memory observation/projection state in current baseline architecture.
    > Covers L0: VISION.OBSERVATION_CONVERGENCE.AUTHORITATIVE_TRUTH_LEDGER, VISION.OBSERVATION_CONVERGENCE.OBSERVATION_IS_NOT_TRUTH
    > Responsibility: preserve the current low-latency projection baseline while keeping authoritative truth distinct from derived observation state across both embedded and external-worker execution shapes.
@@ -358,7 +360,7 @@ version: 3.0.0
    > Covers L0: VISION.EVOLUTION_AND_OPERATIONS.RELEASE_GENERATION_UPGRADE
 
 6. **SINGLE_ENTRYPOINT_DESIRED_STATE**: **fs-meta System** MUST allow app desired-state submission from one management entrypoint, while peer nodes can start from baseline config and receive distributed apply from runtime/kernel privileged mutation path.
-   > Covers L0: VISION.BOUNDED_PRODUCT_MANAGEMENT_NAMESPACE, VISION.API_BOUNDARY.BOUNDED_PRODUCT_MANAGEMENT_NAMESPACE
+   > Covers L0: VISION.API_BOUNDARY.BOUNDED_PRODUCT_MANAGEMENT_NAMESPACE
 7. **GLOBAL_HTTP_API_RESOURCE_SCOPED_APP_FACADE**: **fs-meta System** MUST keep one operator-facing HTTP API on a resource-scoped one-cardinality facade while internal source/sink execution evolves independently.
    > Covers L0: VISION.QUERY_OUTCOME.RESOURCE_SCOPED_DOMAIN_HTTP_FACADE
    > Responsibility: preserve one stable external URL through ingress-resource selection without introducing a separate roaming API boundary.
@@ -458,17 +460,17 @@ version: 3.0.0
    > Verification: external query ingress uses one active HTTP entrypoint selected from the facade resource scope on the fs-meta app package boundary; internal query/find/source/sink coordination remains on route-resolved opaque channels and does not promote extra multi-writer HTTP ingress.
 
 3. **UNIX_STYLE_LOCAL_AUTH_IN_DOMAIN**: **fs-meta System** MUST treat Unix-style local user authentication as a domain-local credential-acquisition personality, not as a replacement for upstream signed control-submit and scope authority.
-   > Covers L0: VISION.LOCAL_AUTH_WITHOUT_PLATFORM_BYPASS, VISION.API_BOUNDARY.LOCAL_AUTH_WITHOUT_PLATFORM_BYPASS
+   > Covers L0: VISION.API_BOUNDARY.LOCAL_AUTH_WITHOUT_PLATFORM_BYPASS
    > Responsibility: provide product-local login UX without creating a domain-owned control-auth bypass.
    > Verification: login verifies passwd+shadow records, rejects locked/disabled users, and issues a session/token/signing context that is consumed by the upstream signed control-submit path rather than bypassing it.
    > Verification: protected API operations still enforce upstream signed submit and scope checks; domain-local auth only supplies product-local credential acquisition.
 
 4. **ROLE_GROUP_ACCESS_GUARD**: **fs-meta System** MUST gate management API operations by the configured product management-session group and reject non-management sessions from the management surface.
-   > Covers L0: VISION.SEPARATE_QUERY_AND_MANAGEMENT_AUTH_SUBJECTS, VISION.API_BOUNDARY.SEPARATE_QUERY_AND_MANAGEMENT_AUTH_SUBJECTS
+   > Covers L0: VISION.API_BOUNDARY.SEPARATE_QUERY_AND_MANAGEMENT_AUTH_SUBJECTS
    > Responsibility: preserve one explicit management-session boundary for product API operations without inventing an independent domain authority lattice.
    > Verification: `/status`, `/runtime/grants`, `/monitoring/roots`, `/monitoring/roots/preview`, `PUT /monitoring/roots`, `POST /index/rescan`, and query-api-key management endpoints require a management session whose principal belongs to the configured `management_group`; non-management sessions are rejected.
 
-5. **READINESS_PLANES_ARE_INDEPENDENT**: **fs-meta System** MUST keep API facade liveness, management write readiness, and trusted observation readiness as independent readiness planes.
+5. **READINESS_PLANES_ARE_INDEPENDENT**: **fs-meta System** MUST keep API facade liveness, management write readiness, source repair readiness, and trusted observation readiness as independent readiness planes.
    > Responsibility: avoid treating HTTP listener reachability as permission to mutate business scope or as proof that trusted materialized observation is ready.
    > Verification: API facade liveness means the product HTTP namespace can accept and authenticate requests; it does not by itself authorize roots apply, rescan, query-api-key mutation, or trusted-materialized query success.
    > Verification: management write readiness requires an active current-epoch control stream capable of safely submitting management writes; `PUT /monitoring/roots` MUST fail closed with explicit not-ready semantics when this plane is closed. Manual rescan uses the narrower source repair readiness plane because it targets source-owned repair routes and still performs scoped delivery proof before accepting.
@@ -484,7 +486,7 @@ version: 3.0.0
    > Covers L0: VISION.API_BOUNDARY.BOUNDED_PRODUCT_MANAGEMENT_NAMESPACE, VISION.OBSERVATION_CONVERGENCE.OBSERVATION_ELIGIBILITY_BEFORE_EXPOSURE
 
 6. **ONLINE_ROOT_RECONFIG_WITHOUT_RESTART**: **fs-meta System** MUST support online logical-root reconfiguration through API without app restart while keeping roots/group definitions app-owned and bind/run realization runtime-owned.
-   > Covers L0: VISION.ONLINE_SCOPE_MUTATION_AND_REPAIR, VISION.API_BOUNDARY.ONLINE_SCOPE_MUTATION_AND_REPAIR
+   > Covers L0: VISION.API_BOUNDARY.ONLINE_SCOPE_MUTATION_AND_REPAIR
    > Responsibility: keep fs-meta root lifecycle mutable at runtime while preserving fanout correctness and current owner boundaries.
    > Verification: API root/group update applies validation (including rejecting legacy `roots[].source_locator`), updates app-owned authoritative roots/group definitions against current host object grants, consumes current runtime-returned bound scopes only for resulting source/sink refresh and compensatory rescan, and does not promote API/app code into bind/run semantic ownership.
    > Verification: roots apply requires Management Write Ready; HTTP facade liveness alone is insufficient to accept the write.
@@ -657,16 +659,16 @@ version: 3.0.0
 ## CONTRACTS.FAILURE_ISOLATION_BOUNDARY
 
 1. **EXECUTION_FAILURE_DOMAINS_ARE_EXPLICIT**: **fs-meta System** MUST explicitly distinguish non-isolating `embedded` execution from isolated `external` worker execution, and MUST NOT present them as one equivalent fault domain.
-   > Covers L0: VISION.EXPLICIT_EXECUTION_FAILURE_DOMAINS, VISION.FAILURE_ISOLATION_BOUNDARY.EXPLICIT_EXECUTION_FAILURE_DOMAINS
+   > Covers L0: VISION.FAILURE_ISOLATION_BOUNDARY.EXPLICIT_EXECUTION_FAILURE_DOMAINS
    > Responsibility: keep worker-mode failure domains explicit so embedded host-boundary failures and external worker failures are not treated as the same operational event.
    > Verification: architecture and workflow specs describe `embedded` workers as sharing the host boundary and `external` workers as isolated external worker hosting; public docs do not present them as equivalent isolation shapes.
 
 2. **INTERFACE_LOCAL_EXECUTION_OR_WORKER_FAILURE_CONTAINMENT_TARGET**: **fs-meta System** SHOULD isolate recoverable interface failures (for example watcher/audit local execution panic, query worker crash, or sink worker loss) to the narrowest local execution partition or worker scope when feasible, while preserving explicit degraded visibility.
-   > Covers L0: VISION.TASK_OR_WORKER_FAILURE_CONTAINMENT, VISION.FAILURE_ISOLATION_BOUNDARY.TASK_OR_WORKER_FAILURE_CONTAINMENT
+   > Covers L0: VISION.FAILURE_ISOLATION_BOUNDARY.TASK_OR_WORKER_FAILURE_CONTAINMENT
    > Responsibility: keep recoverable local-execution and worker failures contained to the narrowest feasible scope while surfacing degraded/failure evidence.
    > Verification: managed endpoint loops and worker supervision keep source/sink/query failures explicit in status or degraded outputs instead of silently collapsing them into whole-app success.
 
 3. **FAILURE_IMPACT_BY_EXECUTION_SHAPE_DECLARED**: **fs-meta System** MUST document that embedded crash semantics can take down all boundaries in the shared host boundary, while external worker failures are recovered through runtime lifecycle restart/rebind and rebuild paths rather than being mistaken for truth loss.
-   > Covers L0: VISION.FAILURE_IMPACT_DECLARED_BY_MODE, VISION.FAILURE_ISOLATION_BOUNDARY.FAILURE_IMPACT_DECLARED_BY_MODE
+   > Covers L0: VISION.FAILURE_ISOLATION_BOUNDARY.FAILURE_IMPACT_DECLARED_BY_MODE
    > Responsibility: declare user-visible failure impact by worker mode so recovery expectations stay stable across product docs, tooling, and runtime behavior.
    > Verification: specs and runtime behavior state that embedded crash semantics can terminate the shared host boundary, while external worker failures recover through restart/rebind/rebuild rather than being interpreted as authoritative truth loss.

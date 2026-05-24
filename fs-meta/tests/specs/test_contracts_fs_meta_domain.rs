@@ -249,12 +249,16 @@ fn test_host_adapter_sdk_translation_boundary() {
 }
 
 // @verify_spec("CONTRACTS.KERNEL_RELATION.HOST_ADAPTER_SDK_TRANSLATION_BOUNDARY", mode="system")
+// @verify_spec("CONTRACTS.APP_SCOPE.LOCAL_HOST_RESOURCE_PROGRAMMING_ONLY", mode="system")
 #[test]
 fn test_source_host_fs_calls_are_abstracted_through_host_adapter_sdk() {
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     let source_mod = read_fs_meta_spec_file("fs-meta/app/src/source/mod.rs");
     let scanner = read_fs_meta_spec_file("fs-meta/app/src/source/scanner.rs");
     let watcher = read_fs_meta_spec_file("fs-meta/app/src/source/watcher.rs");
 
+    assert!(l1.contains("LOCAL_HOST_RESOURCE_PROGRAMMING_ONLY"));
+    assert!(l1.contains("local-host programming targets"));
     assert!(
         scanner.contains("HostFs"),
         "scanner should consume host-adapter-fs HostFs trait"
@@ -316,10 +320,14 @@ async fn test_empty_roots_valid_deployed_state_without_silent_secondary_path() {
 }
 
 // @verify_spec("CONTRACTS.INDEX_LIFECYCLE.REALTIME_PLUS_BASELINE_PLUS_AUDIT_PLUS_SENTINEL", mode="system")
+// @verify_spec("CONTRACTS.INDEX_LIFECYCLE.HOST_FS_OPERATION_TIMEOUT_IS_OBSERVATION_EVIDENCE", mode="system")
 #[test]
 fn test_sentinel_actions_are_bridged_to_runtime_rescan_and_health_projection() {
     let source_mod = read_fs_meta_spec_file("fs-meta/app/src/source/mod.rs");
     let sentinel = read_fs_meta_spec_file("fs-meta/app/src/source/sentinel.rs");
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let l3_api = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/API_HTTP.md");
+    let l3_state = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/STATE_MODEL.md");
     assert!(
         sentinel.contains("TriggerRescan"),
         "sentinel contract requires explicit rescan action"
@@ -332,6 +340,18 @@ fn test_sentinel_actions_are_bridged_to_runtime_rescan_and_health_projection() {
         source_mod.contains("degraded: {reason}"),
         "sentinel degraded action should project explicit degraded state"
     );
+    assert!(l1.contains("HOST_FS_OPERATION_TIMEOUT_IS_OBSERVATION_EVIDENCE"));
+    assert!(l1.contains("HOST_FS_TIMEOUT"));
+    assert!(l1.contains("HOST_FS_BACKPRESSURE"));
+    assert!(l3_api.contains("host-fs timeout/backpressure evidence"));
+    assert!(l3_state.contains("HOST_FS_TIMEOUT"));
+    assert!(l3_state.contains("HOST_FS_BACKPRESSURE"));
+    assert!(sentinel.contains("HealthSignal::HostFsTimeout"));
+    assert!(sentinel.contains("HealthSignal::HostFsBackpressure"));
+    assert!(sentinel.contains("HOST_FS_TIMEOUT"));
+    assert!(sentinel.contains("HOST_FS_BACKPRESSURE"));
+    assert!(source_mod.contains("HealthSignal::HostFsTimeout"));
+    assert!(source_mod.contains("degraded: HOST_FS_TIMEOUT"));
 }
 
 // @verify_spec("CONTRACTS.INDEX_LIFECYCLE.REALTIME_PLUS_BASELINE_PLUS_AUDIT_PLUS_SENTINEL", mode="system")
@@ -701,9 +721,15 @@ fn test_interface_endpoints_use_managed_task_lifecycle_and_bounded_shutdown() {
     assert!(l0.contains("EXPLICIT_EXECUTION_FAILURE_DOMAINS"));
     assert!(l0.contains("TASK_OR_WORKER_FAILURE_CONTAINMENT"));
     assert!(l0.contains("FAILURE_IMPACT_DECLARED_BY_MODE"));
-    assert!(l1.contains("Covers L0: VISION.EXPLICIT_EXECUTION_FAILURE_DOMAINS"));
-    assert!(l1.contains("Covers L0: VISION.TASK_OR_WORKER_FAILURE_CONTAINMENT"));
-    assert!(l1.contains("Covers L0: VISION.FAILURE_IMPACT_DECLARED_BY_MODE"));
+    assert!(l1.contains(
+        "Covers L0: VISION.FAILURE_ISOLATION_BOUNDARY.EXPLICIT_EXECUTION_FAILURE_DOMAINS"
+    ));
+    assert!(l1.contains(
+        "Covers L0: VISION.FAILURE_ISOLATION_BOUNDARY.TASK_OR_WORKER_FAILURE_CONTAINMENT"
+    ));
+    assert!(
+        l1.contains("Covers L0: VISION.FAILURE_ISOLATION_BOUNDARY.FAILURE_IMPACT_DECLARED_BY_MODE")
+    );
     assert!(source.contains("ManagedEndpointTask"));
     assert!(sink.contains("ManagedEndpointTask"));
     assert!(source.contains("task.shutdown(Duration::from_secs(2))"));
@@ -744,7 +770,7 @@ fn test_in_memory_materialized_index_baseline_contract() {
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     assert!(l1.contains("IN_MEMORY_MATERIALIZED_INDEX_BASELINE"));
     assert!(l1.contains("AUTHORITATIVE_JOURNAL_TRUTH_LEDGER"));
-    assert!(l1.contains("Covers L0: VISION.SINK_SINGLE_TREE_ARBITRATION"));
+    assert!(l1.contains("Covers L0: VISION.INDEX_LIFECYCLE.SINK_SINGLE_TREE_ARBITRATION"));
     assert!(l0.contains("AUTHORITATIVE_TRUTH_LEDGER"));
     assert!(l1.contains("SourceStateCell"));
     assert!(l1.contains("startup MUST fail closed"));
@@ -1002,10 +1028,12 @@ fn test_fs_meta_http_api_boundary_contract() {
     assert!(l0.contains("LOCAL_AUTH_WITHOUT_PLATFORM_BYPASS"));
     assert!(l0.contains("ONLINE_SCOPE_MUTATION_AND_REPAIR"));
     assert!(l1.contains("FS_META_HTTP_API_BOUNDARY"));
-    assert!(l1.contains("Covers L0: VISION.BOUNDED_PRODUCT_MANAGEMENT_NAMESPACE"));
-    assert!(l1.contains("Covers L0: VISION.LOCAL_AUTH_WITHOUT_PLATFORM_BYPASS"));
-    assert!(l1.contains("Covers L0: VISION.SEPARATE_QUERY_AND_MANAGEMENT_AUTH_SUBJECTS"));
-    assert!(l1.contains("Covers L0: VISION.ONLINE_SCOPE_MUTATION_AND_REPAIR"));
+    assert!(l1.contains("Covers L0: VISION.API_BOUNDARY.BOUNDED_PRODUCT_MANAGEMENT_NAMESPACE"));
+    assert!(l1.contains("Covers L0: VISION.API_BOUNDARY.LOCAL_AUTH_WITHOUT_PLATFORM_BYPASS"));
+    assert!(
+        l1.contains("Covers L0: VISION.API_BOUNDARY.SEPARATE_QUERY_AND_MANAGEMENT_AUTH_SUBJECTS")
+    );
+    assert!(l1.contains("Covers L0: VISION.API_BOUNDARY.ONLINE_SCOPE_MUTATION_AND_REPAIR"));
     assert!(l3.contains("GET /status"));
     assert!(l3.contains("QueryApiKeyManagementEndpoints"));
     assert!(l3.contains("matched_grants"));
@@ -1029,14 +1057,56 @@ fn test_fs_meta_http_api_boundary_contract() {
     );
 }
 
+// @verify_spec("CONTRACTS.API_BOUNDARY.READINESS_PLANES_ARE_INDEPENDENT", mode="system")
+#[test]
+fn test_readiness_planes_are_independent_contract() {
+    let glossary = read_fs_meta_spec_file("fs-meta/specs/L0-GLOSSARY.md");
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let api_http = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/API_HTTP.md");
+    let state_model = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/STATE_MODEL.md");
+    let cutover = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/OBSERVATION_CUTOVER.md");
+    let workflows = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKFLOWS.md");
+    let api_server = read_fs_meta_spec_file("fs-meta/app/src/api/server.rs");
+    let runtime_tests = read_fs_meta_spec_file("fs-meta/app/src/runtime_app/tests.rs");
+
+    assert!(glossary.contains("Source Repair Ready"));
+    assert!(l1.contains("READINESS_PLANES_ARE_INDEPENDENT"));
+    assert!(l1.contains("source repair readiness"));
+    assert!(l1.contains("trusted observation readiness"));
+    assert!(l1.contains("Manual rescan uses the narrower source repair readiness plane"));
+    assert!(
+        api_http.contains("server MUST require Source Repair Ready before accepting manual rescan")
+    );
+    assert!(api_http
+        .contains("server MUST require Management Write Ready before accepting roots apply"));
+    assert!(state_model
+        .contains("Source Repair Ready MAY be open while Management Write Ready is closed"));
+    assert!(cutover
+        .contains("manual rescan requires Source Repair Ready plus scoped source delivery proof"));
+    assert!(workflows.contains("api checks Source Repair Ready for the current Authority Epoch"));
+    assert!(api_server.contains("ApiManagementReadinessGate::FullManagementWrite"));
+    assert!(api_server.contains("ApiManagementReadinessGate::SourceRepair"));
+    assert!(api_server.contains("api_request_route_policy_assigns_rescan_to_source_repair_gate"));
+    assert!(runtime_tests.contains(
+        "source_repair_publication_allows_facade_only_handoff_without_full_management_write"
+    ));
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.API_BOUNDARY.READINESS_PLANES_ARE_INDEPENDENT",
+        "test_readiness_planes_are_independent_contract",
+    );
+}
+
 // @verify_spec("CONTRACTS.EVOLUTION_AND_OPERATIONS.GLOBAL_HTTP_API_RESOURCE_SCOPED_APP_FACADE", mode="system")
+// @verify_spec("CONTRACTS.APP_SCOPE.RESOURCE_SCOPED_HTTP_FACADE_ONLY", mode="system")
 #[test]
 fn test_global_http_api_resource_scoped_app_facade_contract() {
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
     let api_server = read_fs_meta_spec_file("fs-meta/app/src/api/server.rs");
     assert!(l1.contains("GLOBAL_HTTP_API_RESOURCE_SCOPED_APP_FACADE"));
+    assert!(l1.contains("RESOURCE_SCOPED_HTTP_FACADE_ONLY"));
     assert!(l1.contains("resource-scoped one-cardinality facade"));
+    assert!(l1.contains("one-cardinality HTTP facade"));
     assert!(l2.contains("Single fs-meta App Boundary"));
     assert!(l2.contains("resource-scoped HTTP facade semantics"));
     assert!(api_server.contains("/api/fs-meta/v1"));
@@ -1144,6 +1214,218 @@ fn test_role_group_access_guard_contract() {
     );
 }
 
+// @verify_spec("CONTRACTS.APP_SCOPE.DOMAIN_CONTRACT_CONSUMPTION_ONLY", mode="system")
+#[test]
+fn test_app_scope_domain_contract_consumption_only_contract() {
+    let l0 = read_fs_meta_spec_file("fs-meta/specs/L0-VISION.md");
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
+    let governance = read_fs_meta_spec_file("fs-meta/docs/ENGINEERING_GOVERNANCE.md");
+    let authoring_lib = read_fs_meta_spec_file("fs-meta/lib/src/lib.rs");
+    let runtime_lib = read_fs_meta_spec_file("fs-meta/app/src/lib.rs");
+    let deploy_lib = read_fs_meta_spec_file("fs-meta/deploy/src/lib.rs");
+
+    assert!(l0.contains("consume fs-meta domain specs and root Convergence Vocabulary"));
+    assert!(l1.contains("DOMAIN_CONTRACT_CONSUMPTION_ONLY"));
+    assert!(l1.contains("trace root/domain Convergence Vocabulary"));
+    assert!(l1.contains("stateful observation-facing business modules consume bounded upstream authoring, runtime, and deploy surfaces"));
+    assert!(l1.contains(
+        "exact dependency allowlists, package names, helper crates, file paths, and implementation tuning knob names live in engineering governance"
+    ));
+    assert!(l1.contains("bounded implementation tuning knobs may exist"));
+    assert!(l2.contains("App-facing business modules consume bounded upstream authoring, runtime, and service surfaces"));
+    assert!(governance.contains("FS_META_SOURCE_SCAN_WORKERS"));
+    assert!(governance.contains("FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS"));
+    assert!(authoring_lib.contains("pub mod api;"));
+    assert!(authoring_lib.contains("pub mod product_model;"));
+    assert!(authoring_lib.contains("pub struct FSMetaConfig"));
+    assert!(runtime_lib.contains("pub mod query;"));
+    assert!(runtime_lib.contains("pub mod workers;"));
+    assert!(runtime_lib.contains("pub use fs_meta::{"));
+    assert!(deploy_lib.contains("pub fn build_release_doc_value"));
+    assert!(!deploy_lib.contains("fs_meta_runtime::runtime::"));
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.APP_SCOPE.DOMAIN_CONTRACT_CONSUMPTION_ONLY",
+        "test_app_scope_domain_contract_consumption_only_contract",
+    );
+}
+
+// @verify_spec("CONTRACTS.APP_SCOPE.NO_PRODUCT_OR_PLATFORM_OWNERSHIP", mode="system")
+#[test]
+fn test_app_scope_no_product_or_platform_ownership_contract() {
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let source = [
+        read_fs_meta_spec_file("fs-meta/lib/src/lib.rs"),
+        read_fs_meta_spec_file("fs-meta/app/src/lib.rs"),
+        read_fs_meta_spec_file("fs-meta/app/src/runtime_app.rs"),
+        read_fs_meta_spec_file("fs-meta/app/src/api/server.rs"),
+        read_fs_meta_spec_file("fs-meta/deploy/src/lib.rs"),
+    ]
+    .join("\n");
+
+    assert!(l1.contains("NO_PRODUCT_OR_PLATFORM_OWNERSHIP"));
+    assert!(l1.contains(
+        "MUST NOT own product CLI/deploy semantics or platform bind/route/grant authority"
+    ));
+    assert!(!source.contains("capanix-cli"));
+    assert!(!source.contains("PlatformAdminContext"));
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.APP_SCOPE.NO_PRODUCT_OR_PLATFORM_OWNERSHIP",
+        "test_app_scope_no_product_or_platform_ownership_contract",
+    );
+}
+
+// @verify_spec("CONTRACTS.APP_SCOPE.WORKER_MODE_MODEL", mode="system")
+#[test]
+fn test_app_scope_worker_mode_model_contract() {
+    let l0 = read_fs_meta_spec_file("fs-meta/specs/L0-VISION.md");
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
+    let deployment = read_fs_meta_spec_file("fs-meta/docs/PRODUCT_DEPLOYMENT.md");
+
+    assert!(l0.contains("WORKER_MODE_MODEL"));
+    assert!(l1.contains("WORKER_MODE_MODEL"));
+    assert!(l1.contains("embedded | external"));
+    assert!(l1.contains("per-role mode fields"));
+    assert!(l2.contains("Product-facing execution vocabulary stays at `embedded | external`"));
+    assert!(l2.contains("Current baseline defaults: `facade-worker=embedded`"));
+    assert!(l2.contains("workers.facade.mode"));
+    assert!(l2.contains("workers.source.mode"));
+    assert!(l2.contains("workers.sink.mode"));
+    assert!(l2.contains("runtime-facing architecture keeps only the `worker / unit` split"));
+    assert!(l2.contains("source-worker=external"));
+    assert!(l2.contains("sink-worker=external"));
+    assert!(deployment.contains("mode: embedded"));
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.APP_SCOPE.WORKER_MODE_MODEL",
+        "test_app_scope_worker_mode_model_contract",
+    );
+}
+
+// @verify_spec("CONTRACTS.CLI_SCOPE.PRODUCT_DEPLOYMENT_CLIENT_ONLY", mode="system")
+// @verify_spec("CONTRACTS.CLI_SCOPE.RESOURCE_SCOPED_HTTP_FACADE_CONSUMPTION_ONLY", mode="system")
+// @verify_spec("CONTRACTS.CLI_SCOPE.RELEASE_GENERATION_DEPLOY_CONSUMPTION_ONLY", mode="system")
+// @verify_spec("CONTRACTS.CLI_SCOPE.DOMAIN_BOUNDARY_CONSUMPTION_ONLY", mode="system")
+// @verify_spec("CONTRACTS.CLI_SCOPE.AUTH_BOUNDARY_CONSUMPTION_ONLY", mode="system")
+// @verify_spec("CONTRACTS.CLI_SCOPE.NO_RUNTIME_OR_PLATFORM_OWNERSHIP", mode="system")
+// @verify_spec("CONTRACTS.CLI_SCOPE.NO_OBSERVATION_PLANE_OWNERSHIP", mode="system")
+#[test]
+fn test_cli_scope_consumes_domain_auth_without_runtime_ownership_contracts() {
+    let l0 = read_fs_meta_spec_file("fs-meta/specs/L0-VISION.md");
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
+    let manifest = read_fs_meta_spec_file("fs-meta/tooling/Cargo.toml");
+    let source = read_fs_meta_spec_file("fs-meta/tooling/src/bin/fsmeta.rs");
+
+    assert!(l0.contains("DOMAIN_BOUNDARY_CONSUMPTION_ONLY"));
+    assert!(l0.contains("AUTH_BOUNDARY_CONSUMPTION_ONLY"));
+    assert!(l0.contains("NO_RUNTIME_OR_PLATFORM_OWNERSHIP"));
+    assert!(l0.contains("NO_OBSERVATION_PLANE_OWNERSHIP"));
+    assert!(l1.contains("PRODUCT_DEPLOYMENT_CLIENT_ONLY"));
+    assert!(l1.contains("RESOURCE_SCOPED_HTTP_FACADE_CONSUMPTION_ONLY"));
+    assert!(l1.contains("RELEASE_GENERATION_DEPLOY_CONSUMPTION_ONLY"));
+    assert!(l1.contains("DOMAIN_BOUNDARY_CONSUMPTION_ONLY"));
+    assert!(l1.contains("AUTH_BOUNDARY_CONSUMPTION_ONLY"));
+    assert!(l1.contains("NO_RUNTIME_OR_PLATFORM_OWNERSHIP"));
+    assert!(l1.contains("NO_OBSERVATION_PLANE_OWNERSHIP"));
+    assert!(l2.contains("external `cnxctl` deploy/control commands"));
+    assert!(source.contains("Commands::Deploy"));
+    assert!(source.contains("Commands::Undeploy"));
+    assert!(source.contains("Commands::Local"));
+    assert!(source.contains("Commands::Grants"));
+    assert!(source.contains("Commands::Roots"));
+    assert!(source.contains("/monitoring/roots"));
+    assert!(source.contains("Deploy/cutover requests submit a new release generation"));
+    assert!(source.contains("build_release_doc_value"));
+    assert!(source.contains("compile_release_doc_to_relation_target_intent"));
+    assert!(source.contains("ControlClient"));
+    assert!(source.contains("apply_relation_target_intent"));
+    assert!(source.contains("clear_relation_target"));
+    assert!(source.contains("run_cnxctl"));
+    assert!(source.contains("resolve_cnxctl_bin"));
+    assert!(source.contains("build_deploy_intent"));
+    assert!(source.contains("build_auth_config("));
+    assert!(source.contains("login_api("));
+    assert!(source.contains("/session/login"));
+    assert!(source.contains(".bearer_auth("));
+    assert!(source.contains("does not own `link`"));
+    assert!(source.contains("`bind/run` realization"));
+    assert!(source.contains("convergence"));
+    assert!(source.contains("target selection"));
+    assert!(source.contains("state/effect observation plane"));
+    assert!(source.contains("observation_eligible"));
+    assert!(!source.contains("ScopeWorkerIntentDoc"));
+    assert!(!source.contains("compile_scope_worker_intent_doc"));
+    assert!(!source.contains("CtlCommand::RelationTargetApply"));
+    assert!(!source.contains("CtlCommand::RelationTargetClear"));
+    assert!(!source.contains("create_session("));
+    assert!(!source.contains("bypass_auth"));
+    assert!(!source.contains("Commands::Login"));
+    assert!(!source.contains("Commands::Rescan"));
+    assert!(!manifest.contains("capanix-config = { workspace = true }"));
+    assert!(!manifest.contains("capanix-runtime-api = \"0.1.0\""));
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.CLI_SCOPE.PRODUCT_DEPLOYMENT_CLIENT_ONLY",
+        "test_cli_scope_consumes_domain_auth_without_runtime_ownership_contracts",
+    );
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.CLI_SCOPE.RESOURCE_SCOPED_HTTP_FACADE_CONSUMPTION_ONLY",
+        "test_cli_scope_consumes_domain_auth_without_runtime_ownership_contracts",
+    );
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.CLI_SCOPE.RELEASE_GENERATION_DEPLOY_CONSUMPTION_ONLY",
+        "test_cli_scope_consumes_domain_auth_without_runtime_ownership_contracts",
+    );
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.CLI_SCOPE.DOMAIN_BOUNDARY_CONSUMPTION_ONLY",
+        "test_cli_scope_consumes_domain_auth_without_runtime_ownership_contracts",
+    );
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.CLI_SCOPE.AUTH_BOUNDARY_CONSUMPTION_ONLY",
+        "test_cli_scope_consumes_domain_auth_without_runtime_ownership_contracts",
+    );
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.CLI_SCOPE.NO_RUNTIME_OR_PLATFORM_OWNERSHIP",
+        "test_cli_scope_consumes_domain_auth_without_runtime_ownership_contracts",
+    );
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.CLI_SCOPE.NO_OBSERVATION_PLANE_OWNERSHIP",
+        "test_cli_scope_consumes_domain_auth_without_runtime_ownership_contracts",
+    );
+}
+
+// @verify_spec("CONTRACTS.CLI_SCOPE.LOCAL_DEV_DAEMON_COMPOSITION_ONLY", mode="system")
+#[test]
+fn test_cli_scope_local_dev_daemon_composition_only_contract() {
+    let l0 = read_fs_meta_spec_file("fs-meta/specs/L0-VISION.md");
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
+    let manifest = read_fs_meta_spec_file("fs-meta/tooling/Cargo.toml");
+    let launcher = read_fs_meta_spec_file("fs-meta/tooling/src/bin/fsmeta-locald.rs");
+
+    assert!(l0.contains("LOCAL_DEV_DAEMON_COMPOSITION_ONLY"));
+    assert!(l1.contains("LOCAL_DEV_DAEMON_COMPOSITION_ONLY"));
+    assert!(l1.contains("tooling-only composition over upstream daemon bootstrap seams"));
+    assert!(l2.contains("Local-dev helpers remain tooling only"));
+    assert!(l2.contains("feature-gated away from the default CLI install"));
+    assert!(l2.contains("do not create new platform authority or alter daemon ownership"));
+    assert!(manifest.contains("name = \"fs-meta-tooling\""));
+    assert!(manifest.contains("local-daemon = [\"dep:capanix-daemon\"]"));
+    assert!(manifest.contains("capanix-daemon = { workspace = true, optional = true }"));
+    assert!(manifest.contains("capanix-host-adapter-fs = { workspace = true }"));
+    assert!(manifest.contains("required-features = [\"local-daemon\"]"));
+    assert!(launcher.contains("run_with_host_passthrough_bootstrap(Some(Arc::new("));
+    assert!(launcher.contains("spawn_host_passthrough_endpoint"));
+    assert!(!launcher.contains("UnixListener::bind"));
+    assert!(!launcher.contains("RuntimeControlService"));
+    assert!(!launcher.contains("start_runtime("));
+    assert!(!launcher.contains("control_service.handle_request"));
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.CLI_SCOPE.LOCAL_DEV_DAEMON_COMPOSITION_ONLY",
+        "test_cli_scope_local_dev_daemon_composition_only_contract",
+    );
+}
+
 // @verify_spec("CONTRACTS.APP_SCOPE.OPAQUE_INTERNAL_PORTS_ONLY", mode="system")
 // @verify_spec("CONTRACTS.APP_SCOPE.WORKER_MODE_FAILURE_BOUNDARY_IS_EXPLICIT", mode="system")
 #[test]
@@ -1174,6 +1456,85 @@ fn test_runtime_support_transport_supervision_contracts() {
     assert!(worker_l1.contains("RUNTIME_WORKER_CLIENT_FACTORY_REUSE"));
     assert!(worker_l2.contains("helper-only worker transport/bootstrap support"));
     assert!(worker_l2.contains("hidden dispatch bridge"));
+}
+
+// @verify_spec("CONTRACTS.INDEX_LIFECYCLE.AUDIT_COVERAGE_MODE_IS_EXPLICIT", mode="system")
+#[test]
+fn test_audit_coverage_mode_is_explicit_contract() {
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let api_types = read_fs_meta_spec_file("fs-meta/lib/src/api/types.rs");
+    let api_handlers = read_fs_meta_spec_file("fs-meta/app/src/api/handlers.rs");
+    let source_mod = read_fs_meta_spec_file("fs-meta/app/src/source/mod.rs");
+    let query_api = read_fs_meta_spec_file("fs-meta/app/src/query/api.rs");
+
+    assert!(l1.contains("AUDIT_COVERAGE_MODE_IS_EXPLICIT"));
+    assert!(l1.contains("AuditCoverageMode"));
+    assert!(l1.contains("audit_without_file_metadata"));
+    assert!(l1.contains("metadata_available=false"));
+    assert!(api_types.contains("ObservationCoverageCapabilities"));
+    assert!(api_types.contains("exists_coverage"));
+    assert!(api_types.contains("file_count_coverage"));
+    assert!(api_types.contains("file_metadata_coverage"));
+    assert!(api_types.contains("mtime_size_coverage"));
+    assert!(api_types.contains("watch_freshness_coverage"));
+    assert!(api_types.contains("coverage_mode: String"));
+    assert!(api_handlers.contains("coverage_capabilities_from_mode"));
+    assert!(api_handlers.contains("\"realtime_hotset_plus_audit\""));
+    assert!(api_handlers.contains("\"audit_only\""));
+    assert!(api_handlers.contains("\"audit_with_metadata\""));
+    assert!(api_handlers.contains("\"audit_without_file_metadata\""));
+    assert!(source_mod.contains("coverage_mode_for_root"));
+    assert!(source_mod.contains("\"watch_degraded\""));
+    assert!(query_api.contains("metadata_available"));
+    assert!(query_api.contains("withheld_reason"));
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.INDEX_LIFECYCLE.AUDIT_COVERAGE_MODE_IS_EXPLICIT",
+        "test_audit_coverage_mode_is_explicit_contract",
+    );
+}
+
+// @verify_spec("CONTRACTS.INDEX_LIFECYCLE.AUTHORITY_EPOCH_BINDS_OBSERVATION_EVIDENCE", mode="system")
+// @verify_spec("CONTRACTS.INDEX_LIFECYCLE.MATERIALIZED_READINESS_EVIDENCE_MONOTONIC_WITHIN_EPOCH", mode="system")
+#[test]
+fn test_authority_epoch_binds_materialized_readiness_evidence_contract() {
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let api_types = read_fs_meta_spec_file("fs-meta/lib/src/api/types.rs");
+    let api_handlers = read_fs_meta_spec_file("fs-meta/app/src/api/handlers.rs");
+    let query_api = read_fs_meta_spec_file("fs-meta/app/src/query/api.rs");
+    let cached_readiness_tests =
+        read_fs_meta_spec_file("fs-meta/app/src/query/api/tests/status_stats_cached_readiness.rs");
+
+    assert!(l1.contains("AUTHORITY_EPOCH_BINDS_OBSERVATION_EVIDENCE"));
+    assert!(l1.contains("MATERIALIZED_READINESS_EVIDENCE_MONOTONIC_WITHIN_EPOCH"));
+    assert!(l1.contains("roots signature, grants signature, source stream generation, sink materialization generation, or facade/runtime generation"));
+    assert!(l1.contains("steady `/tree` and `/stats` reads MAY reuse cached same-epoch materialized readiness evidence"));
+    assert!(api_types.contains("pub struct AuthorityEpochEvidence"));
+    assert!(api_types.contains("pub roots_signature: String"));
+    assert!(api_types.contains("pub grants_signature: String"));
+    assert!(api_types.contains("pub source_stream_generation: Option<u64>"));
+    assert!(api_types.contains("pub sink_materialization_generation: String"));
+    assert!(api_types.contains("pub facade_runtime_generation: String"));
+    assert!(api_handlers.contains("authority_epoch_evidence("));
+    assert!(api_handlers.contains("status_roots_signature(source)"));
+    assert!(api_handlers.contains("status_sink_materialization_signature(sink)"));
+    assert!(query_api.contains("materialized_ready_sink_evidence_cache"));
+    assert!(query_api.contains("materialized_ready_sink_evidence_key_for"));
+    assert!(query_api.contains("source_primary_object_refs_by_group"));
+    assert!(query_api.contains("source_status_group_still_active"));
+    assert!(query_api.contains("apply_materialized_ready_sink_evidence_cache"));
+    assert!(cached_readiness_tests
+        .contains("materialized_readiness_signature_tracks_source_audit_completion"));
+    assert!(cached_readiness_tests.contains("materialized_ready_sink_evidence_cache_restores_missing_scheduled_group_for_current_source_primary"));
+    assert!(cached_readiness_tests.contains("materialized_ready_sink_evidence_cache_replaces_stale_primary_pending_group_with_current_source_primary"));
+    assert!(cached_readiness_tests.contains("same-epoch materialized reads should not re-run source status fan-in once readiness is cached"));
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.INDEX_LIFECYCLE.AUTHORITY_EPOCH_BINDS_OBSERVATION_EVIDENCE",
+        "test_authority_epoch_binds_materialized_readiness_evidence_contract",
+    );
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.INDEX_LIFECYCLE.MATERIALIZED_READINESS_EVIDENCE_MONOTONIC_WITHIN_EPOCH",
+        "test_authority_epoch_binds_materialized_readiness_evidence_contract",
+    );
 }
 
 // @verify_spec("CONTRACTS.APP_SCOPE.WORKER_ROLE_MODEL", mode="system")
@@ -1303,17 +1664,53 @@ fn test_product_configuration_split_contract() {
     );
 }
 
+// @verify_spec("CONTRACTS.EVOLUTION_AND_OPERATIONS.RUNTIME_ARTIFACT_EVIDENCE_IS_VERIFIABLE", mode="system")
+#[test]
+fn test_runtime_artifact_evidence_is_verifiable_contract() {
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let api_types = read_fs_meta_spec_file("fs-meta/lib/src/api/types.rs");
+    let api_handlers = read_fs_meta_spec_file("fs-meta/app/src/api/handlers.rs");
+
+    assert!(l1.contains("RUNTIME_ARTIFACT_EVIDENCE_IS_VERIFIABLE"));
+    assert!(l1.contains("loaded artifact path and content hash"));
+    assert!(l1.contains("expected artifact hash with the actual loaded hash"));
+    assert!(l1.contains("stale-artifact detection includes the fs-meta workspace"));
+    assert!(api_types.contains("pub struct RuntimeArtifactEvidence"));
+    assert!(api_types.contains("pub path: Option<String>"));
+    assert!(api_types.contains("pub sha256: Option<String>"));
+    assert!(api_types.contains("pub runtime_artifact: RuntimeArtifactEvidence"));
+    assert!(api_handlers.contains("runtime_artifact_evidence()"));
+    assert!(api_handlers.contains("compute_runtime_artifact_evidence"));
+    assert!(api_handlers.contains("runtime_artifact_path"));
+    assert!(api_handlers.contains("file_sha256_hex"));
+    assert!(api_handlers.contains("CAPANIX_LOADED_APP_PATH"));
+    assert!(api_handlers.contains("CAPANIX_FS_META_APP_BINARY"));
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.EVOLUTION_AND_OPERATIONS.RUNTIME_ARTIFACT_EVIDENCE_IS_VERIFIABLE",
+        "test_runtime_artifact_evidence_is_verifiable_contract",
+    );
+}
+
 // @verify_spec("CONTRACTS.EVOLUTION_AND_OPERATIONS.RELEASE_GENERATION_CUTOVER", mode="system")
 // @verify_spec("CONTRACTS.EVOLUTION_AND_OPERATIONS.OBSERVATION_ELIGIBILITY_BEFORE_EXPOSURE", mode="system")
+// @verify_spec("CONTRACTS.APP_SCOPE.RELEASE_GENERATION_CUTOVER_CONSUMPTION_ONLY", mode="system")
+// @verify_spec("CONTRACTS.APP_SCOPE.AUTHORITATIVE_TRUTH_CARRIER_CONSUMPTION_ONLY", mode="system")
+// @verify_spec("CONTRACTS.APP_SCOPE.OBSERVATION_ELIGIBILITY_GATE_OWNERSHIP", mode="system")
+// @verify_spec("CONTRACTS.APP_SCOPE.STALE_WRITER_FENCE_BEFORE_EXPOSURE", mode="system")
 #[test]
 fn test_release_generation_cutover_contract() {
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKFLOWS.md");
+    let cutover = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/OBSERVATION_CUTOVER.md");
     let deploy = read_fs_meta_spec_file("fs-meta/docs/PRODUCT_DEPLOYMENT.md");
     let l0 = read_fs_meta_spec_file("fs-meta/specs/L0-VISION.md");
     let glossary = read_fs_meta_spec_file("fs-meta/specs/L0-GLOSSARY.md");
     assert!(l1.contains("RELEASE_GENERATION_CUTOVER"));
+    assert!(l1.contains("RELEASE_GENERATION_CUTOVER_CONSUMPTION_ONLY"));
+    assert!(l1.contains("AUTHORITATIVE_TRUTH_CARRIER_CONSUMPTION_ONLY"));
     assert!(l1.contains("OBSERVATION_ELIGIBILITY_BEFORE_EXPOSURE"));
+    assert!(l1.contains("OBSERVATION_ELIGIBILITY_GATE_OWNERSHIP"));
+    assert!(l1.contains("STALE_WRITER_FENCE_BEFORE_EXPOSURE"));
     assert!(l0.contains("OBSERVATION_ELIGIBILITY_BEFORE_EXPOSURE"));
     assert!(l0.contains("CROSS_RELATION_DRIFT_VISIBILITY"));
     assert!(
@@ -1337,6 +1734,10 @@ fn test_release_generation_cutover_contract() {
     assert!(l1.contains("POST_CUTOVER_STALE_OWNER_FENCING"));
     assert!(l3.contains("trusted external materialized `/tree` and `/stats` exposure"));
     assert!(l3.contains("`/on-demand-force-find` remains a freshness path"));
+    assert!(
+        cutover.contains("older observations are not allowed to reclaim facade/query ownership")
+    );
+    assert!(cutover.contains("runtime-owned trusted exposure gate"));
     assert!(!l3.contains("internal query/find/sink exposure"));
     assert!(deploy.contains("升级版本") && deploy.contains("release generation cutover"));
     assert!(deploy.contains("authoritative truth"));
@@ -1412,19 +1813,98 @@ fn test_domain_traceability_chain() {
 }
 
 // @verify_spec("CONTRACTS.QUERY_OUTCOME.FORCE_FIND_GROUP_LOCAL_EXCLUSIVITY", mode="system")
+// @verify_spec("CONTRACTS.QUERY_OUTCOME.FORCE_FIND_CURRENT_EPOCH_RUNNER_SELECTION", mode="system")
+// @verify_spec("CONTRACTS.QUERY_OUTCOME.FORCE_FIND_MATERIALIZATION_INDEPENDENCE", mode="system")
+// @verify_spec("CONTRACTS.QUERY_OUTCOME.FORCE_FIND_GROUP_BOUNDARY", mode="system")
+// @verify_spec("CONTRACTS.QUERY_OUTCOME.FORCE_FIND_SELECTED_RUNNER_SINGLE_REPLY", mode="system")
+// @verify_spec("CONTRACTS.QUERY_OUTCOME.FORCE_FIND_EXPLICIT_UNAVAILABLE", mode="system")
 #[test]
 fn test_force_find_group_local_exclusivity_contract() {
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     assert!(l1.contains("FORCE_FIND_GROUP_LOCAL_EXCLUSIVITY"));
+    assert!(l1.contains("FORCE_FIND_CURRENT_EPOCH_RUNNER_SELECTION"));
+    assert!(l1.contains("FORCE_FIND_MATERIALIZATION_INDEPENDENCE"));
+    assert!(l1.contains("FORCE_FIND_GROUP_BOUNDARY"));
+    assert!(l1.contains("FORCE_FIND_SELECTED_RUNNER_SINGLE_REPLY"));
+    assert!(l1.contains("FORCE_FIND_EXPLICIT_UNAVAILABLE"));
 
     let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKFLOWS.md");
     assert!(l3.contains("round-robin"));
     assert!(l3.contains("in-flight mutex"));
+    assert!(l3.contains("successful results return `read_class=fresh`"));
 
     let source_mod = read_fs_meta_spec_file("fs-meta/app/src/source/mod.rs");
+    let query_api = read_fs_meta_spec_file("fs-meta/app/src/query/api.rs");
     assert!(
         source_mod.contains("selected_group") || source_mod.contains("failed_roots"),
         "force-find implementation must stay app-owned and route work across source instances"
+    );
+    assert!(query_api.contains("force_find_candidate_nodes_for_group_with_failure"));
+    assert!(query_api.contains("route_source_observability_snapshots("));
+    assert!(query_api.contains("scheduled_source_groups_by_node"));
+    assert!(query_api.contains("FORCE_FIND_RUNNER_BINDING_NOT_READY_PREFIX"));
+    assert!(query_api.contains("ObservationStatus::fresh_only()"));
+    assert!(query_api.contains(
+        "selected_runner_force_find_route_uses_single_reply_call_for_scoped_source_find_route"
+    ));
+    assert!(query_api
+        .contains("generic_force_find_route_uses_collect_for_scoped_selected_group_fallback"));
+    assert!(
+        query_api.contains("force_find_runtime_should_own_the_selected_runner_delivery_plan")
+            || query_api.contains("selected-runner delivery plan")
+    );
+    assert!(query_api
+        .contains("multi_group_force_find_dispatches_ranked_groups_as_independent_branches"));
+    assert!(query_api.contains("force_find_event_matches_selected_group"));
+    assert!(query_api.contains("selected_group matched no group"));
+    assert!(query_api.contains("HOST_FS_UNAVAILABLE"));
+    assert!(query_api.contains(
+        "force_find_route_machine_fails_host_fs_unavailable_if_executor_did_not_replan_runner"
+    ));
+    assert!(query_api.contains("force-find runner selection must not substitute materialized owner lookup for missing current runner binding"));
+}
+
+// @verify_spec("CONTRACTS.QUERY_OUTCOME.ROUTE_SAFE_MATERIALIZED_TREE_WINDOWS", mode="system")
+#[test]
+fn test_route_safe_materialized_tree_windows_contract() {
+    let l0 = read_fs_meta_spec_file("fs-meta/specs/L0-VISION.md");
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
+    let l3_api = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/API_HTTP.md");
+    let query_api = read_fs_meta_spec_file("fs-meta/app/src/query/api.rs");
+    let pit_tests =
+        read_fs_meta_spec_file("fs-meta/app/src/query/api/tests/pit_public/pit_sessions.rs");
+
+    assert!(l0.contains("ROUTE_SAFE_MATERIALIZED_TREE_WINDOWS"));
+    assert!(l1.contains("ROUTE_SAFE_MATERIALIZED_TREE_WINDOWS"));
+    assert!(l1.contains("byte-budgeted same-PIT/same-group windows"));
+    assert!(l1.contains("short positive internal tree reply caused by the encoded payload budget"));
+    assert!(l2.contains("route-safe windows under the same caller deadline"));
+    assert!(
+        l2.contains("zero-entry continuation proves the PIT-owned group entry stream is complete")
+    );
+    assert!(l3_api.contains("byte-budgeted per-group entry windows"));
+    assert!(l3_api.contains("over-budget route event"));
+    assert!(query_api.contains("MATERIALIZED_TREE_ROUTE_PAYLOAD_BYTES_MAX"));
+    assert!(query_api.contains("build_materialized_tree_request_with_entry_window"));
+    assert!(
+        query_api.contains("payload_limit_bytes: Some(MATERIALIZED_TREE_ROUTE_PAYLOAD_BYTES_MAX)")
+    );
+    assert!(query_api.contains("tree_pit_snapshot_needs_entry_window"));
+    assert!(query_api.contains("merge_tree_pit_entry_window"));
+    assert!(query_api.contains("query_tree_pit_entry_window"));
+    assert!(query_api.contains("extend_tree_pit_session_entry_windows"));
+    assert!(query_api.contains("entry_window_is_complete"));
+    assert!(query_api.contains("entry_window_repeats_prior_position"));
+    assert!(pit_tests
+        .contains("materialized_tree_pit_extends_entry_window_without_full_subtree_payload"));
+    assert!(pit_tests.contains(
+        "materialized_tree_pit_assembles_public_page_from_payload_limited_entry_windows"
+    ));
+    assert!(pit_tests.contains("MATERIALIZED_TREE_ROUTE_PAYLOAD_BYTES_MAX"));
+    assert_domain_fs_meta_contract_test(
+        "CONTRACTS.QUERY_OUTCOME.ROUTE_SAFE_MATERIALIZED_TREE_WINDOWS",
+        "test_route_safe_materialized_tree_windows_contract",
     );
 }
 
@@ -1537,10 +2017,12 @@ fn test_named_read_class_replaces_freeform_stability_selection() {
     let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKFLOWS.md");
 
     assert!(l1.contains("READ_CLASS_REPLACES_FREEFORM_STABILITY_SELECTION"));
-    assert!(l1.contains("read_class=fresh|materialized|trusted-materialized"));
+    assert!(l1.contains("/tree` accepts `read_class=fresh|materialized|trusted-materialized"));
+    assert!(l1.contains("/stats` accepts only `read_class=materialized|trusted-materialized"));
     assert!(l1.contains("eliminate caller-owned"));
     assert!(l3.contains("## [workflow] NamedReadClassQuery"));
-    assert!(l3.contains("read_class=fresh|materialized|trusted-materialized"));
+    assert!(l3.contains("/tree` accepts `read_class=fresh|materialized|trusted-materialized"));
+    assert!(l3.contains("/stats` accepts `read_class=materialized|trusted-materialized"));
     assert!(l3.contains("observation_status.state=fresh-only"));
     assert!(l3.contains("materialized-untrusted"));
     assert!(l3.contains("`group_page_size/group_after` paginate bucket selection inside one PIT"));
