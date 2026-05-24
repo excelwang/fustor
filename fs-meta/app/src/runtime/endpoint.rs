@@ -749,6 +749,7 @@ impl ManagedEndpointTask {
         task
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn_with_recv_units_and_task_units_without_ready_wait<F, Fut, I, S, J, T>(
         boundary: Arc<dyn ChannelIoSubset>,
         route: RouteKey,

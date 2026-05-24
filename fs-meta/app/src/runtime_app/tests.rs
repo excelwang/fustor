@@ -25155,6 +25155,13 @@ async fn worker_manual_rescan_status_exposes_route_proof_while_source_state_pend
     assert!(
         status_signals.iter().any(|signal| signal
             == &format!(
+                "activate unit=runtime.exec.source route={scoped_route} generation={route_generation} scopes=[\"nfs1=>nfs1\"]"
+            )),
+        "manual-rescan source-status must preserve app-proxy scoped route activation evidence: {status_signals:?}"
+    );
+    assert!(
+        status_signals.iter().any(|signal| signal
+            == &format!(
                 "ready unit=runtime.exec.source route={scoped_route} generation={route_generation} scopes=[\"nfs1=>nfs1\"]"
             )),
         "manual-rescan source-status must expose route-ready proof after app proxy receive-arm: {status_signals:?}"

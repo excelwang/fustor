@@ -9209,6 +9209,20 @@ fn annotate_manual_rescan_route_receivable_evidence_by_key_and_route(
     let Some(scopes) = manual_rescan_ready_scopes_from_groups(scheduled_scan_groups) else {
         return;
     };
+    if let Some(generation) = generation {
+        let activation = format!(
+            "activate unit=runtime.exec.source route={route} generation={generation}{scopes}"
+        );
+        let signals = signals_by_node.entry(node_key.clone()).or_default();
+        if !signals.iter().any(|existing| {
+            existing.contains("activate ")
+                && existing.contains("unit=runtime.exec.source")
+                && existing.contains(&format!("route={route}"))
+                && source_observability_signal_generation(existing) == Some(generation)
+        }) {
+            signals.push(activation);
+        }
+    }
     let signal = match generation {
         Some(generation) => {
             format!("ready unit=runtime.exec.source route={route} generation={generation}{scopes}")

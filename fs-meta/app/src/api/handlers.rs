@@ -498,10 +498,17 @@ async fn roots_put_second_wave_context_with_current_generation(
 
 type RootsControlSendCacheKey = (String, u64, Vec<String>);
 
+#[derive(Debug)]
+struct RootsControlSendCacheEntry {
+    target_node_ids: BTreeSet<String>,
+    sent_at: StdInstant,
+}
+
 fn manual_rescan_roots_control_send_cache()
--> &'static StdMutex<BTreeMap<RootsControlSendCacheKey, BTreeSet<String>>> {
-    static CACHE: OnceLock<StdMutex<BTreeMap<RootsControlSendCacheKey, BTreeSet<String>>>> =
-        OnceLock::new();
+-> &'static StdMutex<BTreeMap<RootsControlSendCacheKey, RootsControlSendCacheEntry>> {
+    static CACHE: OnceLock<
+        StdMutex<BTreeMap<RootsControlSendCacheKey, RootsControlSendCacheEntry>>,
+    > = OnceLock::new();
     CACHE.get_or_init(|| StdMutex::new(BTreeMap::new()))
 }
 
@@ -542,6 +549,15 @@ fn remember_roots_control_send(
     roots: &[RootSpec],
     target_node_ids: &BTreeSet<String>,
 ) {
+    remember_roots_control_send_at(context, roots, target_node_ids, StdInstant::now());
+}
+
+fn remember_roots_control_send_at(
+    context: &RootsPutSecondWaveFollowupContext,
+    roots: &[RootSpec],
+    target_node_ids: &BTreeSet<String>,
+    sent_at: StdInstant,
+) {
     let key = roots_control_send_cache_key(context, roots);
     let mut cache = match manual_rescan_roots_control_send_cache().lock() {
         Ok(cache) => cache,
@@ -552,8 +568,16 @@ fn remember_roots_control_send(
     }
     cache
         .entry(key)
-        .or_default()
-        .extend(target_node_ids.iter().cloned());
+        .and_modify(|entry| {
+            entry
+                .target_node_ids
+                .extend(target_node_ids.iter().cloned());
+            entry.sent_at = sent_at;
+        })
+        .or_insert_with(|| RootsControlSendCacheEntry {
+            target_node_ids: target_node_ids.clone(),
+            sent_at,
+        });
 }
 
 fn roots_control_send_cache_covers(
@@ -561,14 +585,24 @@ fn roots_control_send_cache_covers(
     roots: &[RootSpec],
     target_node_ids: &BTreeSet<String>,
 ) -> bool {
+    roots_control_send_cache_covers_at(context, roots, target_node_ids, StdInstant::now())
+}
+
+fn roots_control_send_cache_covers_at(
+    context: &RootsPutSecondWaveFollowupContext,
+    roots: &[RootSpec],
+    target_node_ids: &BTreeSet<String>,
+    now: StdInstant,
+) -> bool {
     let key = roots_control_send_cache_key(context, roots);
     let cache = match manual_rescan_roots_control_send_cache().lock() {
         Ok(cache) => cache,
         Err(poisoned) => poisoned.into_inner(),
     };
-    cache
-        .get(&key)
-        .is_some_and(|sent_targets| sent_targets.is_superset(target_node_ids))
+    cache.get(&key).is_some_and(|entry| {
+        now.duration_since(entry.sent_at) < ROOTS_PUT_SOURCE_SECOND_WAVE_RESEND_INTERVAL
+            && entry.target_node_ids.is_superset(target_node_ids)
+    })
 }
 
 #[cfg(test)]
@@ -2342,11 +2376,27 @@ where
                 let mut local_source_done = false;
                 let mut observed_source_snapshot = None::<SourceObservabilitySnapshot>;
                 let mut observed_discovery_source_snapshot = None::<SourceObservabilitySnapshot>;
+                let mut observed_generic_discovery_source_snapshot =
+                    None::<SourceObservabilitySnapshot>;
                 let mut observed_per_origin = Vec::<String>::new();
                 let mut observed_err = None::<CnxError>;
                 let mut local_scoped_source_probe_unblocked = false;
 
                 while !(source_collect_done && scoped_source_collect_done && local_source_done) {
+                    if source_status_probe_targets_are_discovery_seed
+                        && observed_source_snapshot.is_some()
+                        && scoped_source_collect_done
+                        && local_source_done
+                        && !source_collect_done
+                        && manual_rescan_delivery_target_node_ids_from_accumulated_source_status(
+                            roots,
+                            &accumulated_manual_rescan_source_status,
+                        )
+                        .is_some()
+                    {
+                        source_collect_done = true;
+                        continue;
+                    }
                     tokio::select! {
                         biased;
                         result = scoped_source_collects.next(), if !scoped_source_collect_done => {
@@ -2358,6 +2408,18 @@ where
                                             summarize_source_status_route_snapshot(snapshot)
                                         )
                                     }));
+                                    if source_status_probe_targets_are_discovery_seed {
+                                        let discovery_source =
+                                            manual_rescan_discovery_source_snapshot_from_origin_snapshots(
+                                                roots,
+                                                &origin_snapshots,
+                                            );
+                                        merge_manual_rescan_discovery_source_snapshot(
+                                            roots,
+                                            &mut observed_discovery_source_snapshot,
+                                            discovery_source,
+                                        );
+                                    }
                                     let merged = merge_manual_rescan_source_status_origin_snapshots(
                                         roots,
                                         &mut accumulated_manual_rescan_source_status,
@@ -2414,13 +2476,20 @@ where
                                         continue;
                                     }
                                     if source_status_probe_targets_are_discovery_seed {
-                                        merge_manual_rescan_discovery_source_snapshot(
-                                            roots,
-                                            &mut observed_discovery_source_snapshot,
+                                        let discovery_source =
                                             manual_rescan_discovery_source_snapshot_from_origin_snapshots(
                                                 roots,
                                                 &origin_snapshots,
-                                            ),
+                                            );
+                                        merge_manual_rescan_discovery_source_snapshot(
+                                            roots,
+                                            &mut observed_generic_discovery_source_snapshot,
+                                            discovery_source.clone(),
+                                        );
+                                        merge_manual_rescan_discovery_source_snapshot(
+                                            roots,
+                                            &mut observed_discovery_source_snapshot,
+                                            discovery_source,
                                         );
                                     }
                                     let merged = merge_manual_rescan_source_status_origin_snapshots(
@@ -2606,8 +2675,17 @@ where
 
                 if let Some(mut source_snapshot) = observed_source_snapshot {
                     if source_status_probe_targets_are_discovery_seed {
-                        let discovery_source_snapshot = observed_discovery_source_snapshot
-                            .as_ref()
+                        let generic_discovery_source_snapshot =
+                            observed_generic_discovery_source_snapshot
+                                .as_ref()
+                                .filter(|source| {
+                                    manual_rescan_discovered_source_status_probe_target_node_ids(
+                                        roots, source,
+                                    )
+                                    .is_some()
+                                });
+                        let discovery_source_snapshot = generic_discovery_source_snapshot
+                            .or(observed_discovery_source_snapshot.as_ref())
                             .unwrap_or(&source_snapshot);
                         if let Some(discovered_probe_node_ids) =
                             manual_rescan_discovered_source_status_probe_target_node_ids(
@@ -7592,6 +7670,224 @@ fn manual_rescan_runtime_scope_coverage_gaps_by_root(
         .collect()
 }
 
+fn source_node_has_generic_fallback_group_primary_root_for_group(
+    source: &SourceObservabilitySnapshot,
+    group_id: &str,
+    node_id: &str,
+) -> bool {
+    if source_observability_snapshot_is_worker_status_cache(source)
+        || source_observability_snapshot_is_degraded_worker_cache(source)
+        || source_observability_snapshot_has_pending_source_state_observation(source)
+    {
+        return false;
+    }
+    if !source.status.logical_roots.iter().any(|root| {
+        root.root_id == group_id
+            && root.matched_grants > 0
+            && root.active_members > 0
+            && !source_logical_root_status_is_not_live(&root.status)
+    }) {
+        return false;
+    }
+    source.status.concrete_roots.iter().any(|concrete_root| {
+        concrete_root.logical_root_id == group_id
+            && concrete_root.is_group_primary
+            && source_concrete_root_allows_domain_target(concrete_root)
+            && source_primary_runtime_node_id_from_ref(&concrete_root.object_ref, &source.grants)
+                .is_some_and(|primary_node_id| {
+                    runtime_node_identity_matches(&primary_node_id, node_id)
+                })
+    })
+}
+
+fn manual_rescan_generic_fallback_allowed_after_scoped_activation_gaps(
+    roots: &[RootSpec],
+    source: &SourceObservabilitySnapshot,
+    coverage_gaps: &BTreeSet<String>,
+    route_activation_gaps: &BTreeMap<String, BTreeSet<String>>,
+    route_readiness_gaps: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    manual_rescan_generic_fallback_blocker_after_scoped_activation_gaps(
+        roots,
+        source,
+        coverage_gaps,
+        route_activation_gaps,
+        route_readiness_gaps,
+    )
+    .is_none()
+}
+
+fn manual_rescan_generic_fallback_blocker_after_scoped_activation_gaps(
+    roots: &[RootSpec],
+    source: &SourceObservabilitySnapshot,
+    coverage_gaps: &BTreeSet<String>,
+    route_activation_gaps: &BTreeMap<String, BTreeSet<String>>,
+    route_readiness_gaps: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<String> {
+    if roots.is_empty() {
+        return Some("empty_roots".to_string());
+    }
+    if source.lifecycle_state == "grant_derived_current_roots" {
+        return Some("grant_derived_current_roots".to_string());
+    }
+    if !coverage_gaps.is_empty() {
+        return Some(format!("coverage_gaps={coverage_gaps:?}"));
+    }
+    if route_activation_gaps.is_empty() {
+        return Some("no_route_activation_gaps".to_string());
+    }
+    if !route_readiness_gaps.is_empty() {
+        return Some(format!("route_readiness_gaps={route_readiness_gaps:?}"));
+    }
+    if source_observability_snapshot_is_worker_status_cache(source) {
+        return Some("worker_status_cache".to_string());
+    }
+    if source_observability_snapshot_is_degraded_worker_cache(source) {
+        return Some(format!(
+            "degraded_worker_cache={:?}",
+            source.status.degraded_roots
+        ));
+    }
+    if source_observability_snapshot_has_pending_source_state_observation(source) {
+        return Some("pending_source_state_observation".to_string());
+    }
+    let expected_groups = roots_put_second_wave_expected_groups(roots);
+    if !source_snapshot_declares_only_current_logical_roots(roots, source) {
+        let declared = source
+            .logical_roots
+            .iter()
+            .map(|root| root.id.clone())
+            .collect::<BTreeSet<_>>();
+        return Some(format!("logical_roots_not_current={declared:?}"));
+    }
+    if !source_snapshot_has_current_root_health_evidence(roots, source) {
+        let missing = roots
+            .iter()
+            .filter(|root| {
+                !source.status.logical_roots.iter().any(|health| {
+                    health.root_id == root.id
+                        && health.matched_grants > 0
+                        && health.active_members > 0
+                        && !health.status.starts_with("waiting_for_root:")
+                })
+            })
+            .map(|root| root.id.clone())
+            .collect::<BTreeSet<_>>();
+        return Some(format!("missing_current_root_health={missing:?}"));
+    }
+    if !roots_put_second_wave_source_runtime_scope_ready(&expected_groups, source) {
+        let observed = roots_put_second_wave_source_runtime_scope_observed_groups(source);
+        return Some(format!(
+            "runtime_scope_not_exact expected_source={:?} expected_scan={:?} observed_source={:?} observed_scan={:?}",
+            expected_groups.source_groups, expected_groups.scan_groups, observed.0, observed.1,
+        ));
+    }
+    let missing_group_primary = roots
+        .iter()
+        .filter(|root| {
+            !source_runtime_scope_nodes_for_group(source, &root.id)
+                .into_iter()
+                .any(|node_id| {
+                    source_node_reports_runtime_scope_group(source, &root.id, &node_id)
+                        && source_node_reports_scan_runtime_scope_group(source, &root.id, &node_id)
+                        && source_node_has_generic_fallback_group_primary_root_for_group(
+                            source, &root.id, &node_id,
+                        )
+                })
+        })
+        .map(|root| {
+            let candidates = source_runtime_scope_nodes_for_group(source, &root.id)
+                .into_iter()
+                .map(|node_id| {
+                    format!(
+                        "{node_id}:source={} scan={} primary={}",
+                        source_node_reports_runtime_scope_group(source, &root.id, &node_id),
+                        source_node_reports_scan_runtime_scope_group(source, &root.id, &node_id),
+                        source_node_has_generic_fallback_group_primary_root_for_group(
+                            source, &root.id, &node_id,
+                        )
+                    )
+                })
+                .collect::<Vec<_>>();
+            format!("{}={candidates:?}", root.id)
+        })
+        .collect::<Vec<_>>();
+    if !missing_group_primary.is_empty() {
+        return Some(format!("missing_group_primary={missing_group_primary:?}"));
+    }
+    None
+}
+
+fn manual_rescan_generic_fallback_allowed_with_current_roots_evidence(
+    roots: &[RootSpec],
+    current_roots_source: &SourceObservabilitySnapshot,
+    fallback_source: &SourceObservabilitySnapshot,
+    coverage_gaps: &BTreeSet<String>,
+    route_activation_gaps: &BTreeMap<String, BTreeSet<String>>,
+    route_readiness_gaps: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    manual_rescan_generic_fallback_allowed_after_scoped_activation_gaps(
+        roots,
+        fallback_source,
+        coverage_gaps,
+        route_activation_gaps,
+        route_readiness_gaps,
+    ) || manual_rescan_generic_fallback_allowed_after_scoped_activation_gaps(
+        roots,
+        current_roots_source,
+        coverage_gaps,
+        route_activation_gaps,
+        route_readiness_gaps,
+    )
+}
+
+fn manual_rescan_generic_fallback_blocker_with_current_roots_evidence(
+    roots: &[RootSpec],
+    current_roots_source: &SourceObservabilitySnapshot,
+    fallback_source: &SourceObservabilitySnapshot,
+    coverage_gaps: &BTreeSet<String>,
+    route_activation_gaps: &BTreeMap<String, BTreeSet<String>>,
+    route_readiness_gaps: &BTreeMap<String, BTreeSet<String>>,
+) -> String {
+    let fallback_blocker = manual_rescan_generic_fallback_blocker_after_scoped_activation_gaps(
+        roots,
+        fallback_source,
+        coverage_gaps,
+        route_activation_gaps,
+        route_readiness_gaps,
+    );
+    let current_blocker = manual_rescan_generic_fallback_blocker_after_scoped_activation_gaps(
+        roots,
+        current_roots_source,
+        coverage_gaps,
+        route_activation_gaps,
+        route_readiness_gaps,
+    );
+    format!("fallback_snapshot={fallback_blocker:?} current_roots_snapshot={current_blocker:?}")
+}
+
+#[cfg(test)]
+fn manual_rescan_generic_fallback_allowed_after_target_probe_loses_live_domain_evidence(
+    roots: &[RootSpec],
+    current_roots_source: &SourceObservabilitySnapshot,
+    target_probe_source: &SourceObservabilitySnapshot,
+) -> bool {
+    let coverage_gaps =
+        manual_rescan_runtime_scope_coverage_gaps_by_root(roots, target_probe_source);
+    let route_activation_gaps =
+        manual_rescan_runtime_scope_route_activation_gaps_by_root(roots, target_probe_source);
+    let route_readiness_gaps =
+        manual_rescan_runtime_scope_route_readiness_gaps_by_root(roots, target_probe_source);
+    manual_rescan_generic_fallback_allowed_with_current_roots_evidence(
+        roots,
+        current_roots_source,
+        target_probe_source,
+        &coverage_gaps,
+        &route_activation_gaps,
+        &route_readiness_gaps,
+    )
+}
+
 fn manual_rescan_discovered_source_status_probe_target_node_ids(
     roots: &[RootSpec],
     source: &SourceObservabilitySnapshot,
@@ -8214,6 +8510,7 @@ async fn wait_manual_rescan_current_roots_runtime_scope_readiness(
     if let Some(target_node_ids) = readiness.manual_rescan_delivery_target_node_ids {
         return Ok(Some(target_node_ids));
     }
+    let current_roots_source_snapshot = readiness.source_snapshot.clone();
     let mut source_snapshot = readiness.source_snapshot;
     let target_proof_deadline =
         tokio::time::Instant::now() + MANUAL_RESCAN_SOURCE_STATUS_ROUTE_TIMEOUT;
@@ -8418,14 +8715,36 @@ async fn wait_manual_rescan_current_roots_runtime_scope_readiness(
         manual_rescan_runtime_scope_route_readiness_gaps_by_root(roots, &source_snapshot);
     let grant_derived_current_roots =
         source_snapshot.lifecycle_state == "grant_derived_current_roots";
+    if manual_rescan_generic_fallback_allowed_with_current_roots_evidence(
+        roots,
+        &current_roots_source_snapshot,
+        &source_snapshot,
+        &coverage_gaps,
+        &route_activation_gaps,
+        &route_readiness_gaps,
+    ) {
+        eprintln!(
+            "fs_meta_api: manual rescan source-status target proof incomplete; current roots are live but no complete scoped activation cover exists, using generic source route fallback: route_activation_gaps={route_activation_gaps:?}"
+        );
+        return Ok(None);
+    }
     if grant_derived_current_roots
         || !coverage_gaps.is_empty()
         || !route_activation_gaps.is_empty()
         || !route_readiness_gaps.is_empty()
     {
         run_status_source_repair_recovery_if_needed(state, true).await;
+        let generic_fallback_blocker =
+            manual_rescan_generic_fallback_blocker_with_current_roots_evidence(
+                roots,
+                &current_roots_source_snapshot,
+                &source_snapshot,
+                &coverage_gaps,
+                &route_activation_gaps,
+                &route_readiness_gaps,
+            );
         return Err(ApiError::service_unavailable(format!(
-            "manual rescan source-status target proof incomplete: expected_roots={expected_roots:?} grant_derived_current_roots={grant_derived_current_roots} coverage_gaps={coverage_gaps:?} route_activation_gaps={route_activation_gaps:?} route_readiness_gaps={route_readiness_gaps:?} probe_targets={target_probe_node_ids:?} runtime_hints={target_hint_node_ids:?} probe_state={probe_state}"
+            "manual rescan source-status target proof incomplete: expected_roots={expected_roots:?} grant_derived_current_roots={grant_derived_current_roots} coverage_gaps={coverage_gaps:?} route_activation_gaps={route_activation_gaps:?} route_readiness_gaps={route_readiness_gaps:?} generic_fallback_blocker={generic_fallback_blocker} probe_targets={target_probe_node_ids:?} runtime_hints={target_hint_node_ids:?} probe_state={probe_state}"
         )));
     }
     Ok(None)
@@ -10214,6 +10533,41 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex as StdMutex, RwLock};
     use tempfile::tempdir;
+
+    #[test]
+    fn manual_rescan_roots_control_send_cache_expires_after_resend_interval() {
+        clear_roots_control_send_cache_for_test();
+        let context = RootsPutSecondWaveFollowupContext {
+            node_id: NodeId("api-node".into()),
+            runtime_boundary: None,
+            query_runtime_boundary: None,
+            roots_control_generation: 42,
+        };
+        let roots = vec![RootSpec::new("nfs4", "/mnt/nfs4")];
+        let targets = BTreeSet::from(["node-a".to_string(), "node-c".to_string()]);
+        let sent_at = StdInstant::now();
+
+        remember_roots_control_send_at(&context, &roots, &targets, sent_at);
+
+        assert!(
+            roots_control_send_cache_covers_at(
+                &context,
+                &roots,
+                &BTreeSet::from(["node-a".to_string()]),
+                sent_at + Duration::from_millis(1),
+            ),
+            "recent same-generation current-roots control sends may suppress immediate duplicate retries"
+        );
+        assert!(
+            !roots_control_send_cache_covers_at(
+                &context,
+                &roots,
+                &targets,
+                sent_at + ROOTS_PUT_SOURCE_SECOND_WAVE_RESEND_INTERVAL + Duration::from_millis(1),
+            ),
+            "manual-rescan retries must be able to republish current roots after the resend interval"
+        );
+    }
 
     #[test]
     fn api_handlers_roots_put_uses_typed_cached_sink_helper() {
@@ -27711,6 +28065,152 @@ mod tests {
     }
 
     #[test]
+    fn manual_rescan_live_current_roots_without_full_scoped_activation_uses_generic_fallback() {
+        let roots = vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs4", "/mnt/nfs4"),
+        ];
+        let node_a = "node-a-29857628823871796721745921";
+        let node_d = "node-d-29857628823871796721745921";
+        let mut source = local_source_snapshot();
+        source.lifecycle_state = "runtime-scope-ready".to_string();
+        source.logical_roots = roots.clone();
+        set_live_group_primary_source_root(&mut source, "nfs1", node_a);
+        set_live_group_primary_source_root(&mut source, "nfs4", node_d);
+        source.status.degraded_roots = vec![(
+            SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(),
+            SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON.to_string(),
+        )];
+        source.source_primary_by_group = BTreeMap::from([
+            ("nfs1".to_string(), format!("{node_a}::nfs1")),
+            ("nfs4".to_string(), format!("{node_d}::nfs4")),
+        ]);
+        source.scheduled_source_groups_by_node = BTreeMap::from([
+            (node_a.to_string(), vec!["nfs1".to_string()]),
+            (node_d.to_string(), vec!["nfs4".to_string()]),
+        ]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+        source.last_control_frame_signals_by_node = BTreeMap::from([(
+            node_a.to_string(),
+            vec![
+                format!(
+                    "activate unit=runtime.exec.source route={}.req generation=1779520011001 scopes=[\"nfs1=>nfs1\"]",
+                    source_rescan_route_key_for(node_a)
+                ),
+                format!(
+                    "ready unit=runtime.exec.source route={}.req generation=1779520011001 scopes=[\"nfs1=>nfs1\"]",
+                    source_rescan_route_key_for(node_a)
+                ),
+            ],
+        )]);
+
+        let coverage_gaps = manual_rescan_runtime_scope_coverage_gaps_by_root(&roots, &source);
+        let route_activation_gaps =
+            manual_rescan_runtime_scope_route_activation_gaps_by_root(&roots, &source);
+        let route_readiness_gaps =
+            manual_rescan_runtime_scope_route_readiness_gaps_by_root(&roots, &source);
+
+        assert!(
+            manual_rescan_scoped_delivery_targets_from_runtime_scope_after_preflight(
+                &roots, &source
+            )
+            .is_empty(),
+            "a partial scoped route set must not be expanded into synthetic scoped delivery targets"
+        );
+        assert!(
+            coverage_gaps.is_empty(),
+            "current roots already have source+scan runtime-scope coverage"
+        );
+        assert_eq!(
+            route_activation_gaps,
+            BTreeMap::from([("nfs4".to_string(), BTreeSet::from([node_d.to_string()]))]),
+            "the newly joined root has live ownership but no scoped route activation yet"
+        );
+        assert!(
+            route_readiness_gaps.is_empty(),
+            "missing activation is distinct from active-but-not-ready scoped routes"
+        );
+        assert!(
+            manual_rescan_generic_fallback_allowed_after_scoped_activation_gaps(
+                &roots,
+                &source,
+                &coverage_gaps,
+                &route_activation_gaps,
+                &route_readiness_gaps,
+            ),
+            "when runtime-scope cache provenance still carries complete live current-root source ownership but no full scoped activation cover exists, the spec permits generic source.rescan fallback"
+        );
+    }
+
+    #[test]
+    fn manual_rescan_generic_fallback_keeps_current_roots_evidence_after_partial_target_probe() {
+        let roots = vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs4", "/mnt/nfs4"),
+        ];
+        let node_a = "node-a-29857648589159305094103041";
+        let node_d = "node-d-29857648589159305094103041";
+        let mut current_roots_source = local_source_snapshot();
+        current_roots_source.lifecycle_state = "runtime-scope-ready".to_string();
+        current_roots_source.logical_roots = roots.clone();
+        set_live_group_primary_source_root(&mut current_roots_source, "nfs1", node_a);
+        set_live_group_primary_source_root(&mut current_roots_source, "nfs4", node_d);
+        current_roots_source.scheduled_source_groups_by_node = BTreeMap::from([
+            (node_a.to_string(), vec!["nfs1".to_string()]),
+            (node_d.to_string(), vec!["nfs4".to_string()]),
+        ]);
+        current_roots_source.scheduled_scan_groups_by_node =
+            current_roots_source.scheduled_source_groups_by_node.clone();
+
+        let mut target_probe_source = current_roots_source.clone();
+        target_probe_source.status.logical_roots.clear();
+        target_probe_source.status.concrete_roots.clear();
+        target_probe_source.source_primary_by_group.clear();
+        target_probe_source.status.degraded_roots = vec![(
+            SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(),
+            SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON.to_string(),
+        )];
+        target_probe_source.last_control_frame_signals_by_node = BTreeMap::from([(
+            node_a.to_string(),
+            vec![
+                format!(
+                    "activate unit=runtime.exec.source route={}.req generation=1779520011001 scopes=[\"nfs1=>nfs1\"]",
+                    source_rescan_route_key_for(node_a)
+                ),
+                format!(
+                    "ready unit=runtime.exec.source route={}.req generation=1779520011001 scopes=[\"nfs1=>nfs1\"]",
+                    source_rescan_route_key_for(node_a)
+                ),
+            ],
+        )]);
+
+        assert!(
+            !manual_rescan_generic_fallback_allowed_after_scoped_activation_gaps(
+                &roots,
+                &target_probe_source,
+                &manual_rescan_runtime_scope_coverage_gaps_by_root(&roots, &target_probe_source),
+                &manual_rescan_runtime_scope_route_activation_gaps_by_root(
+                    &roots,
+                    &target_probe_source
+                ),
+                &manual_rescan_runtime_scope_route_readiness_gaps_by_root(
+                    &roots,
+                    &target_probe_source
+                ),
+            ),
+            "a partial target-probe snapshot alone lacks live group-primary evidence"
+        );
+        assert!(
+            manual_rescan_generic_fallback_allowed_after_target_probe_loses_live_domain_evidence(
+                &roots,
+                &current_roots_source,
+                &target_probe_source,
+            ),
+            "current-roots readiness evidence must remain available when later target probes only explain missing scoped activation"
+        );
+    }
+
+    #[test]
     fn manual_rescan_route_activation_gaps_detect_stale_runtime_scope_schedule() {
         let roots = vec![
             RootSpec::new("nfs1", "/mnt/nfs1"),
@@ -27762,13 +28262,29 @@ mod tests {
             ),
         ]);
 
+        let coverage_gaps = manual_rescan_runtime_scope_coverage_gaps_by_root(&roots, &source);
+        let route_activation_gaps =
+            manual_rescan_runtime_scope_route_activation_gaps_by_root(&roots, &source);
+        let route_readiness_gaps =
+            manual_rescan_runtime_scope_route_readiness_gaps_by_root(&roots, &source);
+
         assert_eq!(
-            manual_rescan_runtime_scope_route_activation_gaps_by_root(&roots, &source),
+            route_activation_gaps,
             BTreeMap::from([(
                 "nfs1".to_string(),
                 BTreeSet::from([node_b.to_string(), node_c.to_string()])
             )]),
             "manual-rescan must not burn the generic source route when current-root schedule coverage exists only as stale/tick-only evidence without an activated scoped source route"
+        );
+        assert!(
+            !manual_rescan_generic_fallback_allowed_after_scoped_activation_gaps(
+                &roots,
+                &source,
+                &coverage_gaps,
+                &route_activation_gaps,
+                &route_readiness_gaps,
+            ),
+            "runtime-scope control-cache or sparse tick-only evidence must still fail closed instead of using generic fallback"
         );
     }
 

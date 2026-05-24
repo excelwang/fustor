@@ -6327,6 +6327,54 @@ fn source_rescan_route_groups_for_current_generation(
     }
 }
 
+fn runtime_node_identity_matches(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    left.strip_prefix(right)
+        .is_some_and(|suffix| suffix.starts_with('-'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+}
+
+fn runtime_resource_id_targets_node(resource_id: &str, node_id: &NodeId) -> bool {
+    let resource_id = resource_id.trim();
+    if resource_id.is_empty() {
+        return false;
+    }
+    runtime_node_identity_matches(resource_id, &node_id.0)
+        || resource_id
+            .split_once("::")
+            .is_some_and(|(host_ref, _)| runtime_node_identity_matches(host_ref.trim(), &node_id.0))
+}
+
+fn source_rescan_route_targets_node(
+    facade_gate: &RuntimeUnitGate,
+    route_key: &str,
+    node_id: &NodeId,
+) -> bool {
+    let Some((_generation, bound_scopes)) = facade_gate
+        .active_route_state(execution_units::SOURCE_RUNTIME_UNIT_ID, route_key)
+        .ok()
+        .flatten()
+    else {
+        return true;
+    };
+    let mut has_resource_id = false;
+    for scope in &bound_scopes {
+        for resource_id in &scope.resource_ids {
+            if !resource_id.trim().is_empty() {
+                has_resource_id = true;
+            }
+            if runtime_resource_id_targets_node(resource_id, node_id) {
+                return true;
+            }
+        }
+    }
+    !has_resource_id
+}
+
 fn source_rescan_route_semantic_generation(facade_gate: &RuntimeUnitGate, route_key: &str) -> u64 {
     facade_gate
         .route_semantic_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, route_key)
@@ -12709,6 +12757,7 @@ impl FSMetaApp {
                 let runtime_endpoint_tasks_for_source_status = self.runtime_endpoint_tasks.clone();
                 let source_rescan_proxy_ready_generation =
                     self.source_rescan_proxy_ready_generation.clone();
+                let control_failure_uninitialized = self.control_failure_uninitialized.clone();
                 let source_rescan_proxy_route_key =
                     source_rescan_request_route_for(&self.node_id.0).0;
                 let route_key = route.0.clone();
@@ -12717,7 +12766,7 @@ impl FSMetaApp {
                     route.0
                 );
                 let endpoint =
-                    ManagedEndpointTask::spawn_with_recv_units_and_task_units_without_ready_wait(
+                    ManagedEndpointTask::spawn_with_recv_units_and_task_units_wait_receive_poll(
                         boundary.clone(),
                         route,
                         format!(
@@ -12748,6 +12797,8 @@ impl FSMetaApp {
                                 runtime_endpoint_tasks_for_source_status.clone();
                             let source_rescan_proxy_ready_generation =
                                 source_rescan_proxy_ready_generation.clone();
+                            let control_failure_uninitialized =
+                                control_failure_uninitialized.clone();
                             let source_rescan_proxy_route_key =
                                 source_rescan_proxy_route_key.clone();
                             let route_key = route_key.clone();
@@ -12863,8 +12914,15 @@ impl FSMetaApp {
                                                 .checked_add(budget)
                                                 .unwrap_or_else(tokio::time::Instant::now)
                                         });
+                                    let retained_source_replay_from_control_failure =
+                                        manual_rescan_delivery_evidence
+                                            && runtime_state.source_state_replay_required()
+                                            && control_failure_uninitialized
+                                                .load(Ordering::Acquire);
                                     let (snapshot, used_cached_fallback) =
-                                        if source_state_pending_observation {
+                                        if source_state_pending_observation
+                                            || retained_source_replay_from_control_failure
+                                        {
                                             source
                                             .source_state_pending_observability_snapshot_for_status_route()
                                             .await
@@ -12898,7 +12956,15 @@ impl FSMetaApp {
                                                 let non_target_status_snapshot = if source
                                                     .is_worker()
                                                 {
+                                                    let route_targets_local_source =
+                                                        source_rescan_route_targets_node(
+                                                            &facade_gate_for_source_status,
+                                                            &source_rescan_proxy_route_key,
+                                                            &node_id,
+                                                        );
                                                     let source_rescan_proxy_ready =
+                                                        route_targets_local_source
+                                                            &&
                                                     ensure_worker_source_rescan_proxy_ready_until(
                                                         boundary_for_source_status_rearm.clone(),
                                                         source.clone(),

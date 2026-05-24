@@ -61,9 +61,10 @@ use crate::runtime::orchestration::{
 };
 use crate::runtime::routes::{
     METHOD_SOURCE_RESCAN, METHOD_SOURCE_RESCAN_CONTROL, METHOD_SOURCE_ROOTS_CONTROL,
-    METHOD_SOURCE_STATUS, ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_TOKEN_FS_META_INTERNAL,
-    default_route_bindings, source_find_route_bindings_for, source_rescan_request_route_for,
-    source_roots_control_stream_route_for, source_status_request_route_for,
+    METHOD_SOURCE_STATUS, ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL,
+    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, source_find_route_bindings_for,
+    source_rescan_request_route_for, source_roots_control_stream_route_for,
+    source_status_request_route_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
@@ -1811,6 +1812,66 @@ impl FSMetaSource {
         ))
     }
 
+    fn runtime_scope_rows_local_group_ids(
+        &self,
+        unit: SourceRuntimeUnit,
+        rows: &[RuntimeBoundScope],
+    ) -> Option<BTreeSet<String>> {
+        let logical_roots = self.logical_roots_snapshot();
+        let logical_root_ids = logical_roots
+            .iter()
+            .map(|root| root.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let active_root_groups = rows
+            .iter()
+            .filter(|row| logical_root_ids.contains(row.scope_id.as_str()))
+            .map(|row| row.scope_id.clone())
+            .collect::<BTreeSet<_>>();
+        if !rows.is_empty() && active_root_groups.is_empty() {
+            return None;
+        }
+        let host_object_grants = self.host_object_grants_snapshot();
+        let runnable_local_groups = logical_roots
+            .iter()
+            .filter(|root| match unit {
+                SourceRuntimeUnit::Source => root.watch || root.scan,
+                SourceRuntimeUnit::Scan => root.scan,
+            })
+            .filter(|root| {
+                runtime_scope_rows_make_root_runnable_locally(
+                    root,
+                    &self.node_id,
+                    &host_object_grants,
+                    rows,
+                )
+            })
+            .map(|root| root.id.clone())
+            .collect::<BTreeSet<_>>();
+        Some(
+            active_root_groups
+                .intersection(&runnable_local_groups)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        )
+    }
+
+    fn runtime_route_local_group_ids(
+        &self,
+        unit: SourceRuntimeUnit,
+        route_key: &str,
+    ) -> Result<Option<BTreeSet<String>>> {
+        if !self.unit_control.has_runtime_state() {
+            return Ok(None);
+        }
+        let Some((_, bound_scopes)) = self
+            .unit_control
+            .active_route_state(unit.unit_id(), route_key)?
+        else {
+            return Ok(Some(BTreeSet::new()));
+        };
+        Ok(self.runtime_scope_rows_local_group_ids(unit, &bound_scopes))
+    }
+
     fn runtime_route_accepts_status_request(
         &self,
         route_key: &str,
@@ -1833,6 +1894,21 @@ impl FSMetaSource {
                 .is_none_or(|groups| !groups.is_empty()));
         }
         Ok(false)
+    }
+
+    fn runtime_status_route_targets_local_manual_rescan_delivery(
+        &self,
+        route_key: &str,
+    ) -> Result<bool> {
+        let delivery_route_key = if route_key == source_status_request_route_for(&self.node_id.0).0
+        {
+            source_rescan_request_route_for(&self.node_id.0).0
+        } else {
+            route_key.to_string()
+        };
+        Ok(self
+            .runtime_route_local_group_ids(SourceRuntimeUnit::Source, &delivery_route_key)?
+            .is_none_or(|groups| !groups.is_empty()))
     }
 
     fn should_start_source_status_endpoint_for_route(&self, route_key: &str) -> bool {
@@ -3838,11 +3914,15 @@ impl FSMetaSource {
                             req.payload_bytes(),
                         )
                     });
-                    match status_source.runtime_route_accepts_status_request(
-                        &status_route_key,
-                        manual_rescan_delivery_evidence,
-                    ) {
-                        Ok(true) => {}
+                    let generic_source_status_route =
+                        format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+                    let generic_non_target_status = match status_source
+                        .runtime_route_accepts_status_request(
+                            &status_route_key,
+                            manual_rescan_delivery_evidence,
+                        ) {
+                        Ok(true) => false,
+                        Ok(false) if status_route_key == generic_source_status_route => true,
                         Ok(false) => return Vec::new(),
                         Err(err) => {
                             log::warn!(
@@ -3852,7 +3932,25 @@ impl FSMetaSource {
                             );
                             return Vec::new();
                         }
-                    }
+                    };
+                    let manual_rescan_targets_local_source = if manual_rescan_delivery_evidence {
+                        match status_source
+                            .runtime_status_route_targets_local_manual_rescan_delivery(
+                                &status_route_key,
+                            ) {
+                            Ok(targets_local) => targets_local,
+                            Err(err) => {
+                                log::warn!(
+                                    "source status route manual-rescan scope check failed route={}: {:?}",
+                                    status_route_key,
+                                    err
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
                     let current_owner_health_evidence = requests.iter().any(|req| {
                         crate::query::api::source_status_request_requires_current_owner_health_evidence(
                             req.payload_bytes(),
@@ -3866,7 +3964,17 @@ impl FSMetaSource {
                             )
                         })
                         .min();
-                    let mut snapshot = if current_owner_health_evidence {
+                    let mut snapshot = if generic_non_target_status {
+                        let (snapshot, used_cached_fallback) =
+                            status_source.observability_snapshot_nonblocking_for_status_route();
+                        if used_cached_fallback {
+                            eprintln!(
+                                "fs_meta_source: source-status generic non-target using cached/degraded snapshot node={}",
+                                status_node_id.0
+                            );
+                        }
+                        snapshot
+                    } else if current_owner_health_evidence {
                         let (snapshot, used_cached_fallback) = status_source
                             .current_owner_health_observability_snapshot_for_status_route_with_timeout(
                                 source_status_live_probe_timeout,
@@ -3879,7 +3987,8 @@ impl FSMetaSource {
                             );
                         }
                         snapshot
-                    } else if manual_rescan_delivery_evidence {
+                    } else if manual_rescan_delivery_evidence && manual_rescan_targets_local_source
+                    {
                         if let Err(err) = status_source
                             .rearm_source_rescan_request_endpoints_for_manual_status_on_boundary(
                                 status_boundary,
@@ -3903,6 +4012,16 @@ impl FSMetaSource {
                             );
                         }
                         snapshot
+                    } else if manual_rescan_delivery_evidence {
+                        let (snapshot, used_cached_fallback) =
+                            status_source.observability_snapshot_nonblocking_for_status_route();
+                        if used_cached_fallback {
+                            eprintln!(
+                                "fs_meta_source: source-status manual-rescan non-target using cached/degraded snapshot node={}",
+                                status_node_id.0
+                            );
+                        }
+                        snapshot
                     } else {
                         let (snapshot, used_cached_fallback) =
                             status_source.observability_snapshot_nonblocking_for_status_route();
@@ -3914,7 +4033,9 @@ impl FSMetaSource {
                         }
                         snapshot
                     };
-                    if manual_rescan_delivery_evidence
+                    if !generic_non_target_status
+                        && manual_rescan_delivery_evidence
+                        && manual_rescan_targets_local_source
                         && status_source
                             .endpoint_runtime
                             .owns_external_scoped_rescan_routes()
