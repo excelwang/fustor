@@ -787,10 +787,11 @@ fn pit_session_has_cacheable_materialized_content(session: &PitSession) -> bool 
     }
     !session.groups.is_empty()
         && session.groups.iter().all(|group| {
-            group
-                .root
-                .as_ref()
-                .is_some_and(|root| root.exists && (root.has_children || !group.entries.is_empty()))
+            group.reliable
+                && group.unreliable_reason.is_none()
+                && group.root.as_ref().is_some_and(|root| {
+                    root.exists && (root.has_children || !group.entries.is_empty())
+                })
         })
 }
 
@@ -1983,18 +1984,6 @@ fn trusted_materialized_root_readiness_gap_message(
         .filter(|group| group.overflow_pending_materialization)
         .map(|group| group.group_id.clone())
         .collect::<BTreeSet<_>>();
-    let suspect_groups = sink_status
-        .groups
-        .iter()
-        .filter(|group| group.suspect_count > 0)
-        .map(|group| group.group_id.clone())
-        .collect::<BTreeSet<_>>();
-    let blind_spot_groups = sink_status
-        .groups
-        .iter()
-        .filter(|group| group.blind_spot_count > 0)
-        .map(|group| group.group_id.clone())
-        .collect::<BTreeSet<_>>();
     let degraded_groups = source_status
         .degraded_roots
         .iter()
@@ -2009,21 +1998,11 @@ fn trusted_materialized_root_readiness_gap_message(
         .intersection(&overflow_pending_groups)
         .cloned()
         .collect::<BTreeSet<_>>();
-    let suspect = readiness_groups
-        .intersection(&suspect_groups)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let blind_spot = readiness_groups
-        .intersection(&blind_spot_groups)
-        .cloned()
-        .collect::<BTreeSet<_>>();
 
     if missing_source.is_empty()
         && missing_schedule.is_empty()
         && missing_ready.is_empty()
         && overflow_pending.is_empty()
-        && suspect.is_empty()
-        && blind_spot.is_empty()
         && degraded_groups.is_empty()
     {
         return None;
@@ -2052,18 +2031,6 @@ fn trusted_materialized_root_readiness_gap_message(
         reasons.push(format!(
             "overflow audit pending [{}]",
             readiness_group_list(&overflow_pending)
-        ));
-    }
-    if !suspect.is_empty() {
-        reasons.push(format!(
-            "suspect materialized nodes [{}]",
-            readiness_group_list(&suspect)
-        ));
-    }
-    if !blind_spot.is_empty() {
-        reasons.push(format!(
-            "blind spots [{}]",
-            readiness_group_list(&blind_spot)
         ));
     }
     if !degraded_groups.is_empty() {
@@ -13496,6 +13463,55 @@ fn trusted_materialized_root_readiness_gap_uses_normalized_sink_readiness() {
 }
 
 #[test]
+fn trusted_materialized_root_readiness_gap_accepts_reliability_only_sink_flags() {
+    let source_status = SourceStatusSnapshot {
+        logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
+            root_id: "nfs1".to_string(),
+            status: "ready".to_string(),
+            active_members: 3,
+            matched_grants: 3,
+            coverage_mode: "realtime_hotset_plus_audit".to_string(),
+        }],
+        ..SourceStatusSnapshot::default()
+    };
+    let sink_status = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-a::nfs1".to_string(),
+            total_nodes: 3,
+            live_nodes: 3,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 1,
+            blind_spot_count: 1,
+            shadow_time_us: 10,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        trusted_materialized_root_readiness_gap_message(
+            b"/",
+            None,
+            None,
+            &source_status,
+            &sink_status,
+        )
+        .is_none(),
+        "suspect and blind-spot flags are payload reliability evidence, not root trusted-read service blockers"
+    );
+}
+
+#[test]
 fn trusted_materialized_root_readiness_gap_uses_authoritative_roots_when_source_status_is_partial()
 {
     let source_status = SourceStatusSnapshot {
@@ -14124,9 +14140,9 @@ fn trusted_materialized_tree_session_not_ready_message(session: &PitSession) -> 
         if let Some(reason) = group.unreliable_reason.as_ref() {
             match reason {
                 crate::shared_types::query::UnreliableReason::Unattested
-                | crate::shared_types::query::UnreliableReason::BlindSpotsDetected => {}
-                crate::shared_types::query::UnreliableReason::SuspectNodes
-                | crate::shared_types::query::UnreliableReason::WatchOverflowPendingMaterialization => {
+                | crate::shared_types::query::UnreliableReason::BlindSpotsDetected
+                | crate::shared_types::query::UnreliableReason::SuspectNodes => {}
+                crate::shared_types::query::UnreliableReason::WatchOverflowPendingMaterialization => {
                     return Some(format!(
                         "trusted-materialized reads remain unavailable until response materialized observation evidence is trusted: group {} unreliable_reason={reason:?}",
                         group.group

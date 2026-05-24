@@ -16769,26 +16769,38 @@ mod tests {
     }
 
     #[test]
-    fn trusted_observation_readiness_rejects_suspect_sink_group() {
+    fn trusted_observation_readiness_accepts_suspect_sink_group() {
         let source = local_source_snapshot();
         let mut sink = local_sink_snapshot();
         sink.groups[0].suspect_count = 1;
 
         assert!(
-            !trusted_observation_readiness_for_status(&source, &sink),
-            "public trusted observation readiness must stay closed while trusted tree payloads would be suspect"
+            trusted_observation_readiness_for_status(&source, &sink),
+            "suspect reliability evidence must remain visible in query payloads without closing service-level trusted observation readiness"
         );
     }
 
     #[test]
-    fn trusted_observation_readiness_rejects_blind_spot_sink_group() {
+    fn trusted_observation_readiness_accepts_blind_spot_sink_group() {
         let source = local_source_snapshot();
         let mut sink = local_sink_snapshot();
         sink.groups[0].blind_spot_count = 1;
 
         assert!(
+            trusted_observation_readiness_for_status(&source, &sink),
+            "blind-spot reliability evidence must remain visible in query payloads without closing service-level trusted observation readiness"
+        );
+    }
+
+    #[test]
+    fn trusted_observation_readiness_rejects_overflow_pending_sink_group() {
+        let source = local_source_snapshot();
+        let mut sink = local_sink_snapshot();
+        sink.groups[0].overflow_pending_materialization = true;
+
+        assert!(
             !trusted_observation_readiness_for_status(&source, &sink),
-            "public trusted observation readiness must stay closed while trusted tree payloads would expose blind spots"
+            "overflow-pending materialization remains a service-readiness blocker for trusted observation"
         );
     }
 

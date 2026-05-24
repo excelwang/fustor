@@ -4465,7 +4465,7 @@ fn group_snapshot_for_trusted_response_guard_test(
 }
 
 #[test]
-fn trusted_materialized_tree_response_fails_closed_on_suspect_group_payload() {
+fn trusted_materialized_tree_response_preserves_suspect_metadata() {
     let session = tree_session_for_trusted_response_guard_test(
         ReadClass::TrustedMaterialized,
         group_snapshot_for_trusted_response_guard_test(
@@ -4475,14 +4475,23 @@ fn trusted_materialized_tree_response_fails_closed_on_suspect_group_payload() {
         ),
     );
 
-    let err = render_pit_response(&session, "pit", 10, 0, &BTreeMap::new(), 100)
-        .expect_err("unreliable trusted-materialized group must fail closed");
+    let response = render_pit_response(&session, "pit", 10, 0, &BTreeMap::new(), 100)
+        .expect("suspect reliability evidence should not fail-close trusted-materialized reads");
+    let group = response
+        .get("groups")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|groups| groups.first())
+        .expect("rendered group");
 
-    assert!(
-        matches!(&err, CnxError::NotReady(message) if message.contains("trusted-materialized")
-            && message.contains("nfs2")
-            && message.contains("SuspectNodes")),
-        "unexpected trusted-materialized fail-closed error: {err}"
+    assert_eq!(
+        response.get("status").and_then(serde_json::Value::as_str),
+        Some("ok")
+    );
+    assert_eq!(
+        group
+            .get("unreliable_reason")
+            .and_then(serde_json::Value::as_str),
+        Some("SuspectNodes")
     );
 }
 

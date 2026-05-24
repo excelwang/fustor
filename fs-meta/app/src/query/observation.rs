@@ -373,7 +373,7 @@ pub fn sink_status_covers_ready_readiness_groups(
 fn sink_group_has_trusted_materialized_blockers(
     group: &crate::sink::SinkGroupStatusSnapshot,
 ) -> bool {
-    group.suspect_count > 0 || group.blind_spot_count > 0 || group.overflow_pending_materialization
+    group.overflow_pending_materialization
 }
 
 pub fn sink_status_covers_trusted_readiness_groups(
@@ -1196,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_materialized_status_cache_rejects_suspect_ready_sink_group() {
+    fn trusted_materialized_status_cache_accepts_suspect_ready_sink_group() {
         let source_status = SourceStatusSnapshot {
             logical_roots: vec![SourceLogicalRootHealthSnapshot {
                 root_id: "nfs1".to_string(),
@@ -1225,7 +1225,7 @@ mod tests {
             &sink_status,
             &readiness_groups,
         ));
-        assert!(!trusted_materialized_status_cache_is_ready(
+        assert!(trusted_materialized_status_cache_is_ready(
             &source_status,
             &sink_status,
             &readiness_groups,
@@ -1233,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_materialized_status_cache_rejects_blind_spot_ready_sink_group() {
+    fn trusted_materialized_status_cache_accepts_blind_spot_ready_sink_group() {
         let source_status = SourceStatusSnapshot {
             logical_roots: vec![SourceLogicalRootHealthSnapshot {
                 root_id: "nfs1".to_string(),
@@ -1262,6 +1262,38 @@ mod tests {
             &sink_status,
             &readiness_groups,
         ));
+        assert!(trusted_materialized_status_cache_is_ready(
+            &source_status,
+            &sink_status,
+            &readiness_groups,
+        ));
+    }
+
+    #[test]
+    fn trusted_materialized_status_cache_rejects_overflow_pending_ready_sink_group() {
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            }],
+            concrete_roots: vec![concrete_root("nfs1", true)],
+            ..SourceStatusSnapshot::default()
+        };
+        let mut group = ready_sink_group("nfs1");
+        group.overflow_pending_materialization = true;
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![group],
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..SinkStatusSnapshot::default()
+        };
+        let readiness_groups = BTreeSet::from(["nfs1".to_string()]);
+
         assert!(!trusted_materialized_status_cache_is_ready(
             &source_status,
             &sink_status,
