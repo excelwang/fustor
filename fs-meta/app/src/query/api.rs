@@ -14123,9 +14123,9 @@ fn trusted_materialized_tree_session_not_ready_message(session: &PitSession) -> 
         }
         if let Some(reason) = group.unreliable_reason.as_ref() {
             match reason {
-                crate::shared_types::query::UnreliableReason::Unattested => {}
+                crate::shared_types::query::UnreliableReason::Unattested
+                | crate::shared_types::query::UnreliableReason::BlindSpotsDetected => {}
                 crate::shared_types::query::UnreliableReason::SuspectNodes
-                | crate::shared_types::query::UnreliableReason::BlindSpotsDetected
                 | crate::shared_types::query::UnreliableReason::WatchOverflowPendingMaterialization => {
                     return Some(format!(
                         "trusted-materialized reads remain unavailable until response materialized observation evidence is trusted: group {} unreliable_reason={reason:?}",
