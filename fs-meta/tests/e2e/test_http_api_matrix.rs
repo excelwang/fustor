@@ -1489,9 +1489,7 @@ fn run_roots_matrix(
         ));
     }
 
-    let empty_preview = session
-        .client()
-        .preview_roots_raw(session.token(), &json!([]))?;
+    let empty_preview = session.preview_roots_raw(&json!([]))?;
     assert_status(empty_preview.status, 200, "empty roots preview")?;
     if empty_preview
         .body
@@ -1517,9 +1515,7 @@ fn run_roots_matrix(
             .get(1)
             .ok_or_else(|| "baseline roots must contain at least two roots".to_string())?,
     );
-    let preview = session
-        .client()
-        .preview_roots_raw(session.token(), &roots_payload(&roots))?;
+    let preview = session.preview_roots_raw(&roots_payload(&roots))?;
     assert_status(preview.status, 200, "baseline roots preview")?;
     if preview
         .body
@@ -1548,120 +1544,97 @@ fn run_roots_matrix(
     }
 
     assert_error(
-        session.client().preview_roots_raw(
-            session.token(),
-            &json!([{
-                "id": "",
-                "selector": selector.clone(),
-                "subpath_scope": "/",
-                "watch": true,
-                "scan": true
-            }]),
-        )?,
+        session.preview_roots_raw(&json!([{
+            "id": "",
+            "selector": selector.clone(),
+            "subpath_scope": "/",
+            "watch": true,
+            "scan": true
+        }]))?,
         400,
         "roots[].id must not be empty",
     )?;
     assert_error(
-        session.client().preview_roots_raw(
-            session.token(),
-            &json!([{
-                "id": "bad-subpath",
-                "selector": selector.clone(),
-                "subpath_scope": "relative",
-                "watch": true,
-                "scan": true
-            }]),
-        )?,
+        session.preview_roots_raw(&json!([{
+            "id": "bad-subpath",
+            "selector": selector.clone(),
+            "subpath_scope": "relative",
+            "watch": true,
+            "scan": true
+        }]))?,
         400,
         "subpath_scope",
     )?;
     assert_error(
-        session.client().preview_roots_raw(
-            session.token(),
-            &json!([{
-                "id": "missing-selector",
-                "selector": {},
-                "subpath_scope": "/",
-                "watch": true,
-                "scan": true
-            }]),
-        )?,
+        session.preview_roots_raw(&json!([{
+            "id": "missing-selector",
+            "selector": {},
+            "subpath_scope": "/",
+            "watch": true,
+            "scan": true
+        }]))?,
         400,
         "selector",
     )?;
     assert_error(
-        session.client().preview_roots_raw(
-            session.token(),
-            &json!([{
-                "id": "no-watch-scan",
-                "selector": selector.clone(),
-                "subpath_scope": "/",
-                "watch": false,
-                "scan": false
-            }]),
-        )?,
+        session.preview_roots_raw(&json!([{
+            "id": "no-watch-scan",
+            "selector": selector.clone(),
+            "subpath_scope": "/",
+            "watch": false,
+            "scan": false
+        }]))?,
         400,
         "watch",
     )?;
     assert_error(
-        session.client().preview_roots_raw(
-            session.token(),
-            &json!([{
-                "id": "legacy-path",
-                "path": "/legacy",
-                "selector": selector.clone(),
-                "subpath_scope": "/",
-                "watch": true,
-                "scan": true
-            }]),
-        )?,
+        session.preview_roots_raw(&json!([{
+            "id": "legacy-path",
+            "path": "/legacy",
+            "selector": selector.clone(),
+            "subpath_scope": "/",
+            "watch": true,
+            "scan": true
+        }]))?,
         400,
         "roots[].path is forbidden",
     )?;
     assert_error(
-        session.client().preview_roots_raw(
-            session.token(),
-            &json!([{
-                "id": "legacy-source-locator",
-                "source_locator": "legacy://nfs1",
-                "selector": selector.clone(),
-                "subpath_scope": "/",
-                "watch": true,
-                "scan": true
-            }]),
-        )?,
+        session.preview_roots_raw(&json!([{
+            "id": "legacy-source-locator",
+            "source_locator": "legacy://nfs1",
+            "selector": selector.clone(),
+            "subpath_scope": "/",
+            "watch": true,
+            "scan": true
+        }]))?,
         400,
         "roots[].source_locator is forbidden",
     )?;
     assert_error(
-        session.client().update_roots_raw(
-            session.token(),
-            &json!([
-                {
-                    "id": "dup",
-                    "selector": selector.clone(),
-                    "subpath_scope": "/",
-                    "watch": true,
-                    "scan": true
-                },
-                {
-                    "id": "dup",
-                    "selector": second_selector,
-                    "subpath_scope": "/",
-                    "watch": true,
-                    "scan": true
-                }
-            ]),
-        )?,
+        session.update_roots_raw(&json!([
+            {
+                "id": "dup",
+                "selector": selector.clone(),
+                "subpath_scope": "/",
+                "watch": true,
+                "scan": true
+            },
+            {
+                "id": "dup",
+                "selector": second_selector,
+                "subpath_scope": "/",
+                "watch": true,
+                "scan": true
+            }
+        ]))?,
         400,
         "duplicate",
     )?;
 
     eprintln!("[fs-meta-api-matrix] substep=single-root-apply");
     let single_root = vec![roots[0].clone()];
-    let put = session
-        .client()
-        .update_roots_raw(session.token(), &roots_payload(&single_root))?;
+    let put = session.update_roots_raw(&roots_payload(&single_root))?;
     assert_status(put.status, 200, "single-root apply")?;
     if put.body.get("roots_count").and_then(Value::as_u64) != Some(1) {
         return Err(format!("single-root apply did not converge: {}", put.body));
@@ -1683,9 +1656,7 @@ fn run_roots_matrix(
     })?;
 
     eprintln!("[fs-meta-api-matrix] substep=restore-roots");
-    let restore = session
-        .client()
-        .update_roots_raw(session.token(), &roots_payload(&roots))?;
+    let restore = session.update_roots_raw(&roots_payload(&roots))?;
     assert_response_status(&restore, 200, "restore roots")?;
     wait_for_rescan_accepted(
         session,
@@ -1780,9 +1751,7 @@ fn run_mini_roots_management_smoke(
     }
 
     let roots = mini_roots(lab);
-    let preview = session
-        .client()
-        .preview_roots_raw(session.token(), &roots_payload(&roots))?;
+    let preview = session.preview_roots_raw(&roots_payload(&roots))?;
     assert_status(preview.status, 200, "mini roots preview")?;
     if preview
         .body
@@ -1806,9 +1775,7 @@ fn run_mini_roots_management_smoke(
         ));
     }
 
-    let put = session
-        .client()
-        .update_roots_raw(session.token(), &roots_payload(&roots))?;
+    let put = session.update_roots_raw(&roots_payload(&roots))?;
     assert_status(put.status, 200, "mini roots apply")?;
     if put.body.get("roots_count").and_then(Value::as_u64) != Some(MINI_EXPORTS.len() as u64) {
         return Err(format!("mini roots apply did not converge: {}", put.body));

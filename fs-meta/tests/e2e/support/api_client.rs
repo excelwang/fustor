@@ -531,10 +531,23 @@ impl OperatorSession {
         self.with_management_reauth(|client, token| client.preview_roots(token, roots))
     }
 
+    pub fn preview_roots_raw(&mut self, roots: &Value) -> Result<ApiResponse, String> {
+        self.with_management_raw_reauth(|client, token| client.preview_roots_raw(token, roots))
+    }
+
     pub fn update_roots(&mut self, roots: &Value) -> Result<Value, String> {
         let response =
             self.with_management_reauth(|client, token| client.update_roots(token, roots))?;
         self.best_effort_management_fanout(|client, token| client.update_roots(token, roots));
+        Ok(response)
+    }
+
+    pub fn update_roots_raw(&mut self, roots: &Value) -> Result<ApiResponse, String> {
+        let response =
+            self.with_management_raw_reauth(|client, token| client.update_roots_raw(token, roots))?;
+        if (200..300).contains(&response.status) {
+            self.best_effort_management_fanout(|client, token| client.update_roots(token, roots));
+        }
         Ok(response)
     }
 
@@ -597,6 +610,19 @@ impl OperatorSession {
             self.reconnect_and_login()?;
             std::thread::sleep(RECONNECT_RETRY_INTERVAL);
         }
+    }
+
+    fn with_management_raw_reauth(
+        &mut self,
+        op: impl Fn(&FsMetaApiClient, &str) -> Result<ApiResponse, String>,
+    ) -> Result<ApiResponse, String> {
+        self.with_management_reauth(|client, token| match op(client, token) {
+            Ok(response) => match retryable_management_raw_response_error(&response) {
+                Some(err) => Err(err),
+                None => Ok(response),
+            },
+            Err(err) => Err(err),
+        })
     }
 
     fn with_query_reauth<T>(
@@ -790,6 +816,15 @@ pub fn is_retryable_management_unavailable_error(err: &str) -> bool {
             || err.contains("manual rescan generic source route pending"))
         || (err.contains("http 500 failed")
             && err.contains("manual rescan generic source route failed: operation timed out"))
+}
+
+fn retryable_management_raw_response_error(response: &ApiResponse) -> Option<String> {
+    let err = format!("http {} failed: {}", response.status, response.body);
+    if is_invalid_session_error(&err) || is_retryable_management_unavailable_error(&err) {
+        Some(err)
+    } else {
+        None
+    }
 }
 
 pub fn extract_token(login: Value) -> Result<String, String> {
@@ -1211,6 +1246,77 @@ connection: close
             .expect("management request should fail over while one facade initializes control");
 
         assert_eq!(response.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(session.client.base_url(), format!("http://{}", second_addr));
+        first_server.join().expect("join first facade server");
+        second_server.join().expect("join second facade server");
+    }
+
+    #[test]
+    fn raw_management_request_failsover_when_runtime_control_is_initializing() {
+        let first = TcpListener::bind("127.0.0.1:0").expect("bind first facade listener");
+        let first_addr = first.local_addr().expect("first listener addr");
+        let second = TcpListener::bind("127.0.0.1:0").expect("bind second facade listener");
+        let second_addr = second.local_addr().expect("second listener addr");
+
+        let first_server = std::thread::spawn(move || {
+            let (mut stream, _) = first.accept().expect("accept first roots request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"error":"fs-meta management request handling is unavailable until runtime control initializes the app"}"#;
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write first roots response");
+            stream.flush().expect("flush first roots response");
+        });
+
+        let second_server = std::thread::spawn(move || {
+            let (mut stream, _) = second.accept().expect("accept second roots request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"error":"roots[].id must not be empty"}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write second roots response");
+            stream.flush().expect("flush second roots response");
+        });
+
+        let mut session = OperatorSession {
+            client: FsMetaApiClient::new(format!("http://{}", first_addr)).expect("client"),
+            candidate_base_urls: vec![
+                format!("http://{}", first_addr),
+                format!("http://{}", second_addr),
+            ],
+            username: "operator".to_string(),
+            password: "operator123".to_string(),
+            management_token: "ignored".to_string(),
+            query_api_key: "ignored".to_string(),
+        };
+
+        let response = session
+            .update_roots_raw(&json!([]))
+            .expect("raw management request should fail over while one facade initializes control");
+
+        assert_eq!(response.status, 400);
         assert_eq!(session.client.base_url(), format!("http://{}", second_addr));
         first_server.join().expect("join first facade server");
         second_server.join().expect("join second facade server");
