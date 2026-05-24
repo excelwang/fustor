@@ -4246,6 +4246,15 @@ fn local_sink_schedule_covers_source_runtime_scope(
         })
 }
 
+fn source_runtime_scope_covers_active_source_groups(source: &SourceObservabilitySnapshot) -> bool {
+    let runtime_scope_groups = source_runtime_scope_scheduled_group_ids(source);
+    if runtime_scope_groups.is_empty() {
+        return true;
+    }
+    let active_source_groups = source_snapshot_status_readiness_groups(source);
+    active_source_groups.is_subset(&runtime_scope_groups)
+}
+
 fn status_local_ready_evidence_completes_management_status(
     local_sink: &SinkStatusSnapshot,
     source: &SourceObservabilitySnapshot,
@@ -4256,6 +4265,7 @@ fn status_local_ready_evidence_completes_management_status(
         && source_observability_snapshot_has_active_state(source)
         && local_sink_covers_active_source_groups(local_sink, source)
         && local_sink_has_schedule_evidence_for_active_source_groups(local_sink, source)
+        && source_runtime_scope_covers_active_source_groups(source)
         && local_sink_schedule_covers_source_runtime_scope(local_sink, source)
 }
 
@@ -4270,6 +4280,7 @@ fn status_serving_observation_evidence_completes_management_status(
         && source.status.degraded_roots.is_empty()
         && source_observability_snapshot_has_active_state(source)
         && local_sink_covers_active_source_groups(local_sink, source)
+        && source_runtime_scope_covers_active_source_groups(source)
         && local_sink_has_schedule_evidence_for_active_source_groups(local_sink, source)
 }
 
@@ -16965,6 +16976,65 @@ mod tests {
                 false
             ),
             "complete source root-health plus ready/live sink groups should let steady /status skip optional remote route debug fan-in"
+        );
+    }
+
+    #[test]
+    fn status_local_ready_evidence_keeps_remote_fanin_open_when_source_runtime_scope_is_partial() {
+        let mut local_source = local_source_snapshot();
+        local_source
+            .logical_roots
+            .push(RootSpec::new("nfs2", "/mnt/nfs2"));
+        local_source
+            .status
+            .logical_roots
+            .push(SourceLogicalRootHealthSnapshot {
+                root_id: "nfs2".to_string(),
+                status: "healthy".to_string(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            });
+        let mut local_sink = local_sink_snapshot();
+        local_sink
+            .scheduled_groups_by_node
+            .insert("node-b".to_string(), vec!["nfs2".to_string()]);
+        local_sink.groups.push(status_test_sink_group(
+            "nfs2",
+            "obj-b",
+            GroupReadinessState::Ready,
+            1,
+            1,
+        ));
+
+        assert!(
+            local_sink_covers_active_source_groups(&local_sink, &local_source),
+            "fixture must keep sink materialization complete for every logical source root"
+        );
+        assert!(
+            local_sink_has_schedule_evidence_for_active_source_groups(&local_sink, &local_source),
+            "fixture must keep sink scheduling complete so source runtime-scope coverage is the only missing plane"
+        );
+        assert!(
+            !source_runtime_scope_covers_active_source_groups(&local_source),
+            "fixture must expose that source route-debug maps only cover nfs1 while nfs2 is reported healthy"
+        );
+        assert!(
+            !status_local_ready_evidence_completes_management_status(
+                &local_sink,
+                &local_source,
+                false
+            ),
+            "management /status must keep remote fan-in open until source runtime-scope maps cover every healthy logical root"
+        );
+        assert!(
+            !status_serving_observation_evidence_completes_management_status(
+                FacadeServiceState::Serving,
+                &local_sink,
+                &local_source,
+                false
+            ),
+            "serving fast path must not suppress owner-scoped source-status fan-in for a partially observed distributed source wave"
         );
     }
 

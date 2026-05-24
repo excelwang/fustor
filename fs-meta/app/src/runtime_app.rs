@@ -4699,7 +4699,9 @@ impl ManagementWriteRecoveryContext {
 
     fn restore_control_after_retained_replay_recovery(&self) {
         let state_after_repair = self.runtime_control_state();
-        if state_after_repair.replay_fully_cleared() {
+        let recovery_can_reopen_control = state_after_repair.control_initialized()
+            || self.control_failure_uninitialized.load(Ordering::Acquire);
+        if state_after_repair.replay_fully_cleared() && recovery_can_reopen_control {
             self.update_runtime_control_state(|state| state.mark_initialized());
             self.control_failure_uninitialized
                 .store(false, Ordering::Release);
@@ -4947,6 +4949,12 @@ impl ManagementWriteRecoveryContext {
         let _serial = self.control_frame_serial.lock().await;
         let state_at_entry = self.runtime_control_state();
         if state_at_entry.control_gate_ready(false) {
+            return Ok(());
+        }
+        if !state_at_entry.control_initialized()
+            && state_at_entry.replay_fully_cleared()
+            && !self.control_failure_uninitialized.load(Ordering::Acquire)
+        {
             return Ok(());
         }
 
@@ -18746,6 +18754,8 @@ impl FSMetaApp {
             })
         };
         let retain_pending_spawn = self.pending_spawn_in_flight_for_route_key(route_key).await;
+        let retire_active_uninitialized_cleanup = !self.control_initialized()
+            && !self.control_failure_uninitialized.load(Ordering::Acquire);
         session = self
             .drive_fixed_bind_lifecycle_request_with_session(
                 session,
@@ -18754,7 +18764,8 @@ impl FSMetaApp {
                     generation,
                     retain_active_facade,
                     retain_pending_spawn,
-                    restart_deferred_retire_pending,
+                    restart_deferred_retire_pending: restart_deferred_retire_pending
+                        || retire_active_uninitialized_cleanup,
                 },
             )
             .await?;

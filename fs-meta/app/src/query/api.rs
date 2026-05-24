@@ -718,6 +718,16 @@ fn remove_cached_materialized_tree_session_if_matches(
     Ok(())
 }
 
+fn remove_materialized_tree_pit_session(state: &ApiState, pit_id: &str) -> Result<(), CnxError> {
+    let mut guard = state
+        .pit_store
+        .lock()
+        .map_err(|_| CnxError::Internal("pit store lock poisoned".into()))?;
+    guard.remove(pit_id);
+    drop(guard);
+    remove_cached_materialized_tree_session_if_matches(state, pit_id)
+}
+
 fn cached_materialized_tree_session(
     state: &ApiState,
     key: &MaterializedTreeCacheKey,
@@ -3850,6 +3860,42 @@ fn scan_enabled_readiness_groups(state: &ApiState) -> Result<BTreeSet<String>, C
         })
         .transpose()
         .map(|groups| groups.unwrap_or_default())
+}
+
+fn scan_enabled_group_ids(roots: Vec<crate::source::config::RootSpec>) -> BTreeSet<String> {
+    roots
+        .into_iter()
+        .filter(|root| root.scan)
+        .map(|root| root.id)
+        .collect()
+}
+
+async fn scan_enabled_readiness_groups_for_query_target(
+    state: &ApiState,
+) -> Result<BTreeSet<String>, CnxError> {
+    let source = state
+        .readiness_source
+        .clone()
+        .or_else(|| match &state.backend {
+            QueryBackend::Local { source, .. } | QueryBackend::Route { source, .. } => {
+                Some(source.clone())
+            }
+        });
+    let Some(source) = source else {
+        return Ok(BTreeSet::new());
+    };
+    match source.logical_roots_snapshot_with_failure().await {
+        Ok(roots) => Ok(scan_enabled_group_ids(roots)),
+        Err(err) => {
+            if debug_status_route_fanin_enabled() {
+                eprintln!(
+                    "fs_meta_query_api: live root target snapshot failed; falling back to cached roots err={}",
+                    err.as_error()
+                );
+            }
+            scan_enabled_readiness_groups(state)
+        }
+    }
 }
 
 fn filter_sink_status_snapshot(
@@ -11903,6 +11949,23 @@ fn materialized_scheduled_group_ids(snapshot: &SinkStatusSnapshot) -> BTreeSet<S
     crate::query::observation::materialized_scheduled_group_ids(snapshot)
 }
 
+fn materialized_target_group_ids_from_source_status(
+    status: &SourceStatusSnapshot,
+) -> BTreeSet<String> {
+    let mut groups = status
+        .logical_roots
+        .iter()
+        .map(|root| root.root_id.clone())
+        .collect::<BTreeSet<_>>();
+    groups.extend(
+        status
+            .concrete_roots
+            .iter()
+            .map(|root| root.logical_root_id.clone()),
+    );
+    groups
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MaterializedTargetGroupSelectionMode {
     Tree,
@@ -11915,6 +11978,7 @@ async fn materialized_target_groups(
     request_source_status: Option<&SourceStatusSnapshot>,
     request_sink_status: Option<&SinkStatusSnapshot>,
     timeout: Duration,
+    expected_root_groups: Option<&BTreeSet<String>>,
     preserve_unscheduled_groups: bool,
     selection_mode: MaterializedTargetGroupSelectionMode,
 ) -> Result<Vec<String>, CnxError> {
@@ -11937,15 +12001,14 @@ async fn materialized_target_groups(
     let mut groups = if let Some(group) = selected_group {
         vec![group.to_string()]
     } else {
-        let request_source_groups = request_source_status
-            .map(|status| {
-                status
-                    .logical_roots
-                    .iter()
-                    .map(|root| root.root_id.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let mut request_source_groups = expected_root_groups
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(status) = request_source_status {
+            request_source_groups.extend(materialized_target_group_ids_from_source_status(status));
+        }
         if !request_source_groups.is_empty() {
             request_source_groups
         } else {
@@ -12034,10 +12097,11 @@ async fn materialized_target_groups(
                 .is_some_and(|groups| groups.is_empty());
     let preserve_unscheduled_groups_for_mode = match selection_mode {
         MaterializedTargetGroupSelectionMode::Tree => {
-            preserve_unscheduled_groups
-                && scheduled_groups
-                    .as_ref()
-                    .is_some_and(|groups| groups.is_empty())
+            expected_root_groups.is_some()
+                || (preserve_unscheduled_groups
+                    && scheduled_groups
+                        .as_ref()
+                        .is_some_and(|groups| groups.is_empty()))
         }
         MaterializedTargetGroupSelectionMode::Stats => preserve_unscheduled_groups,
     };
@@ -13483,6 +13547,141 @@ fn trusted_materialized_root_readiness_gap_uses_authoritative_roots_when_source_
 }
 
 #[test]
+fn materialized_target_groups_from_source_status_keeps_concrete_root_ids_when_logical_status_partial()
+ {
+    fn concrete_root(logical_root_id: &str) -> crate::source::SourceConcreteRootHealthSnapshot {
+        crate::source::SourceConcreteRootHealthSnapshot {
+            root_key: format!("{logical_root_id}@node-a::{logical_root_id}"),
+            logical_root_id: logical_root_id.to_string(),
+            object_ref: format!("node-a::{logical_root_id}"),
+            status: "ready".to_string(),
+            coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            watch_enabled: true,
+            scan_enabled: true,
+            is_group_primary: true,
+            active: true,
+            watch_lru_capacity: 65_536,
+            audit_interval_ms: 300_000,
+            overflow_count: 0,
+            overflow_pending: false,
+            rescan_pending: false,
+            last_rescan_requested_at_us: None,
+            last_rescan_reason: None,
+            last_error: None,
+            last_audit_started_at_us: Some(10),
+            last_audit_completed_at_us: Some(20),
+            last_audit_duration_ms: Some(10),
+            emitted_batch_count: 0,
+            emitted_event_count: 0,
+            emitted_control_event_count: 0,
+            emitted_data_event_count: 0,
+            emitted_path_capture_target: None,
+            emitted_path_event_count: 0,
+            last_emitted_at_us: None,
+            last_emitted_origins: Vec::new(),
+            forwarded_batch_count: 0,
+            forwarded_event_count: 0,
+            forwarded_path_event_count: 0,
+            last_forwarded_at_us: None,
+            last_forwarded_origins: Vec::new(),
+            current_revision: Some(1),
+            current_stream_generation: Some(1),
+            candidate_revision: None,
+            candidate_stream_generation: None,
+            candidate_status: None,
+            draining_revision: None,
+            draining_stream_generation: None,
+            draining_status: None,
+        }
+    }
+
+    let source_status = SourceStatusSnapshot {
+        logical_roots: vec![
+            crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "mini_nfs2".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            },
+            crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "mini_nfs3".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            },
+            crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "mini_nfs4".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            },
+        ],
+        concrete_roots: vec![concrete_root("mini_nfs1"), concrete_root("mini_nfs5")],
+        ..SourceStatusSnapshot::default()
+    };
+
+    assert_eq!(
+        materialized_target_group_ids_from_source_status(&source_status),
+        BTreeSet::from([
+            "mini_nfs1".to_string(),
+            "mini_nfs2".to_string(),
+            "mini_nfs3".to_string(),
+            "mini_nfs4".to_string(),
+            "mini_nfs5".to_string(),
+        ]),
+        "root trusted-materialized target groups must use concrete source ownership evidence instead of shrinking to a partial logical-roots status fan-in"
+    );
+}
+
+#[test]
+fn trusted_materialized_root_tree_session_missing_expected_groups_fails_closed() {
+    let mut groups = Vec::new();
+    let mut group_rank_metrics = BTreeMap::new();
+    for group_id in ["mini_nfs2", "mini_nfs3", "mini_nfs4"] {
+        push_empty_materialized_tree_group_snapshot(
+            &mut groups,
+            &mut group_rank_metrics,
+            GroupOrder::GroupKey,
+            ReadClass::TrustedMaterialized,
+            group_id.to_string(),
+            b"/",
+        );
+    }
+    let session = build_pit_session(
+        CursorQueryMode::Tree,
+        PitScope::Tree(TreePitScope {
+            path: b"/".to_vec(),
+            group: None,
+            recursive: true,
+            max_depth: None,
+            group_order: GroupOrder::GroupKey,
+            read_class: ReadClass::TrustedMaterialized,
+        }),
+        ReadClass::TrustedMaterialized,
+        ObservationStatus::trusted_materialized(),
+        groups,
+    );
+    let expected_groups = BTreeSet::from([
+        "mini_nfs1".to_string(),
+        "mini_nfs2".to_string(),
+        "mini_nfs3".to_string(),
+        "mini_nfs4".to_string(),
+        "mini_nfs5".to_string(),
+    ]);
+    let message = trusted_materialized_root_tree_session_missing_expected_groups_message(
+        &session,
+        Some(&expected_groups),
+    )
+    .expect("partial root PIT session must fail closed");
+
+    assert!(message.contains("mini_nfs1"));
+    assert!(message.contains("mini_nfs5"));
+}
+
+#[test]
 fn merge_source_status_snapshots_preserves_completed_audit_evidence_from_older_snapshot() {
     let audited_root = crate::source::SourceConcreteRootHealthSnapshot {
         root_key: "nfs1@node-a::nfs1@/mnt/fustor-peers/nfs145".to_string(),
@@ -13942,6 +14141,64 @@ fn trusted_materialized_tree_session_not_ready_message(session: &PitSession) -> 
         }
     }
     None
+}
+
+fn trusted_materialized_root_tree_session_missing_expected_groups_message(
+    session: &PitSession,
+    expected_groups: Option<&BTreeSet<String>>,
+) -> Option<String> {
+    if session.read_class != ReadClass::TrustedMaterialized {
+        return None;
+    }
+    let PitScope::Tree(scope) = &session.scope else {
+        return None;
+    };
+    if scope.group.is_some()
+        || !trusted_materialized_empty_group_root_requires_fail_closed(&scope.path)
+    {
+        return None;
+    }
+    let expected_groups = expected_groups.filter(|groups| !groups.is_empty())?;
+    let observed_groups = session
+        .groups
+        .iter()
+        .map(|group| group.group.clone())
+        .collect::<BTreeSet<_>>();
+    let missing_groups = missing_readiness_groups(expected_groups, &observed_groups);
+    if missing_groups.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "trusted-materialized root tree remains unavailable until PIT covers all active scan groups: missing [{}]",
+        readiness_group_list(&missing_groups)
+    ))
+}
+
+async fn materialized_root_tree_expected_groups(
+    state: &ApiState,
+    params: &NormalizedApiParams,
+) -> Result<Option<BTreeSet<String>>, CnxError> {
+    if params.group.is_none()
+        && trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
+    {
+        return scan_enabled_readiness_groups_for_query_target(state)
+            .await
+            .map(Some);
+    }
+    Ok(None)
+}
+
+fn trusted_materialized_root_tree_session_covers_expected_groups(
+    session: &PitSession,
+    expected_groups: Option<&BTreeSet<String>>,
+) -> Result<(), CnxError> {
+    if let Some(message) = trusted_materialized_root_tree_session_missing_expected_groups_message(
+        session,
+        expected_groups,
+    ) {
+        return Err(CnxError::NotReady(message));
+    }
+    Ok(())
 }
 
 fn tree_pit_snapshot_needs_entry_window(
@@ -14469,12 +14726,20 @@ async fn prepare_tree_pit_session_machine<'a>(
     request_scoped_schedule_omitted_ready_groups: Option<&'a BTreeSet<String>>,
 ) -> Result<TreePitSessionMachine<'a>, CnxError> {
     let ranking_started_at = tokio::time::Instant::now();
+    let expected_root_groups = if params.group.is_none()
+        && trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
+    {
+        Some(scan_enabled_readiness_groups_for_query_target(state).await?)
+    } else {
+        None
+    };
     let target_groups = materialized_target_groups(
         state,
         params.group.as_deref(),
         request_source_status,
         request_sink_status,
         timeout,
+        expected_root_groups.as_ref(),
         params.group.is_none() && !params.path.is_empty() && params.path != b"/",
         MaterializedTargetGroupSelectionMode::Tree,
     )
@@ -14773,6 +15038,8 @@ async fn query_tree_page_response(
     request_scoped_schedule_omitted_ready_groups: Option<BTreeSet<String>>,
 ) -> Result<serde_json::Value, CnxError> {
     let request_started_at = Instant::now();
+    let trusted_root_expected_groups =
+        materialized_root_tree_expected_groups(state, params).await?;
     let group_page_size = normalize_group_page_size(params)?;
     let entry_page_size = normalize_entry_page_size(params)?.unwrap_or(0);
     let entry_bundle = params
@@ -14829,6 +15096,13 @@ async fn query_tree_page_response(
             request_sink_status.as_ref(),
         )
         .await?;
+        if let Err(err) = trusted_materialized_root_tree_session_covers_expected_groups(
+            &session,
+            trusted_root_expected_groups.as_ref(),
+        ) {
+            remove_materialized_tree_pit_session(state, pit_id)?;
+            return Err(err);
+        }
         return render_pit_response(
             &session,
             pit_id,
@@ -14863,14 +15137,23 @@ async fn query_tree_page_response(
             request_sink_status.as_ref(),
         )
         .await?;
-        return render_pit_response(
+        if trusted_materialized_root_tree_session_covers_expected_groups(
             &session,
-            &pit_id,
-            group_page_size,
-            0,
-            &entry_offsets,
-            entry_page_size,
-        );
+            trusted_root_expected_groups.as_ref(),
+        )
+        .is_err()
+        {
+            remove_materialized_tree_pit_session(state, &pit_id)?;
+        } else {
+            return render_pit_response(
+                &session,
+                &pit_id,
+                group_page_size,
+                0,
+                &entry_offsets,
+                entry_page_size,
+            );
+        }
     }
 
     let _tree_query_serial = state.tree_query_serial.lock().await;
@@ -14891,29 +15174,41 @@ async fn query_tree_page_response(
             request_sink_status.as_ref(),
         )
         .await?;
-        return render_pit_response(
+        if trusted_materialized_root_tree_session_covers_expected_groups(
             &session,
-            &pit_id,
-            group_page_size,
-            0,
-            &entry_offsets,
-            entry_page_size,
-        );
+            trusted_root_expected_groups.as_ref(),
+        )
+        .is_err()
+        {
+            remove_materialized_tree_pit_session(state, &pit_id)?;
+        } else {
+            return render_pit_response(
+                &session,
+                &pit_id,
+                group_page_size,
+                0,
+                &entry_offsets,
+                entry_page_size,
+            );
+        }
     }
 
-    let session = Arc::new(
-        build_tree_pit_session_with_request_scoped_schedule_omitted_ready_groups(
-            state,
-            policy,
-            params,
-            timeout,
-            observation_status,
-            request_source_status.as_ref(),
-            request_sink_status.as_ref(),
-            request_scoped_schedule_omitted_ready_groups.as_ref(),
-        )
-        .await?,
-    );
+    let session = build_tree_pit_session_with_request_scoped_schedule_omitted_ready_groups(
+        state,
+        policy,
+        params,
+        timeout,
+        observation_status,
+        request_source_status.as_ref(),
+        request_sink_status.as_ref(),
+        request_scoped_schedule_omitted_ready_groups.as_ref(),
+    )
+    .await?;
+    trusted_materialized_root_tree_session_covers_expected_groups(
+        &session,
+        trusted_root_expected_groups.as_ref(),
+    )?;
+    let session = Arc::new(session);
     let pit_id = encode_pit_id("tree");
     {
         let mut guard = state
@@ -14936,6 +15231,10 @@ async fn query_tree_page_response(
         request_sink_status.as_ref(),
     )
     .await?;
+    trusted_materialized_root_tree_session_covers_expected_groups(
+        &session,
+        trusted_root_expected_groups.as_ref(),
+    )?;
     if let Some(key) = tree_cache_key
         && pit_session_has_cacheable_materialized_content(&session)
     {
@@ -14972,6 +15271,8 @@ async fn cached_materialized_tree_page_response(
     let Some((pit_id, session)) = cached_materialized_tree_session(state, &key)? else {
         return Ok(None);
     };
+    let trusted_root_expected_groups =
+        materialized_root_tree_expected_groups(state, params).await?;
     let group_page_size = normalize_group_page_size(params)?;
     let entry_page_size = normalize_entry_page_size(params)?.unwrap_or(0);
     let session = extend_tree_pit_session_entry_windows(
@@ -14988,6 +15289,15 @@ async fn cached_materialized_tree_page_response(
         request_sink_status,
     )
     .await?;
+    if trusted_materialized_root_tree_session_covers_expected_groups(
+        &session,
+        trusted_root_expected_groups.as_ref(),
+    )
+    .is_err()
+    {
+        remove_materialized_tree_pit_session(state, &pit_id)?;
+        return Ok(None);
+    }
     render_pit_response(
         &session,
         &pit_id,
@@ -15602,6 +15912,7 @@ impl StatsQueryMachine<'_> {
                     self.request_source_status,
                     self.request_sink_status,
                     self.policy.query_timeout(),
+                    None,
                     self.params.group.is_none()
                         && !self.params.path.is_empty()
                         && self.params.path != b"/",

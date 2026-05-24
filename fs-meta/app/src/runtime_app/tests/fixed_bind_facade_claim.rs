@@ -1450,3 +1450,83 @@ async fn cleanup_only_facade_deactivate_preserves_fail_closed_facade_control_rou
     app.close().await.expect("close app");
     clear_process_facade_claim_for_tests();
 }
+
+#[tokio::test]
+async fn cleanup_only_facade_deactivate_retires_uninitialized_non_failed_facade_control_route() {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+    clear_process_facade_claim_for_tests();
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let listener_resource = api::config::ApiListenerResource {
+        resource_id: "cleanup-only-facade-control-retire-listener".to_string(),
+        bind_addr,
+    };
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let app = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
+                host_object_grants: vec![granted_mount_root("node-a::root-1", tmp.path())],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: listener_resource.resource_id.clone(),
+                local_listener_resources: vec![listener_resource.clone()],
+                auth: api::ApiAuthConfig {
+                    passwd_path,
+                    shadow_path,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        },
+        NodeId("fixed-bind-cleanup-only-retire-control-route".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init app");
+    if !app
+        .install_active_facade_for_tests(&[listener_resource.resource_id.as_str()], 2)
+        .await
+    {
+        clear_process_facade_claim_for_tests();
+        return;
+    }
+    app.apply_facade_activate(
+        FacadeRuntimeUnit::Facade,
+        &facade_control_stream_route(),
+        2,
+        &[RuntimeBoundScope {
+            scope_id: listener_resource.resource_id.clone(),
+            resource_ids: vec![listener_resource.resource_id.clone()],
+        }],
+    )
+    .await
+    .expect("activate serving facade-control route");
+    set_control_initialized_for_tests(&app, false);
+    app.api_control_gate.set_ready(false);
+
+    app.on_control_frame(&[deactivate_envelope_with_route_key(
+        execution_units::FACADE_RUNTIME_UNIT_ID,
+        facade_control_stream_route(),
+        3,
+    )])
+    .await
+    .expect("cleanup-only facade deactivate should settle");
+
+    assert!(
+        app.api_task.lock().await.is_none(),
+        "uninitialized non-failed cleanup-only facade deactivate must retire the stale HTTP boundary instead of preserving two active one-cardinality facades"
+    );
+    assert!(
+        !app.facade_gate
+            .route_active(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                &facade_control_stream_route()
+            )
+            .expect("facade-control route state"),
+        "uninitialized non-failed cleanup-only facade deactivate must clear the stale facade-control route"
+    );
+
+    app.close().await.expect("close app");
+    clear_process_facade_claim_for_tests();
+}

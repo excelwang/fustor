@@ -4948,6 +4948,7 @@ async fn materialized_target_groups_use_request_source_status_for_root_tree_when
         Some(&request_source_status),
         Some(&request_sink_status),
         Duration::from_millis(250),
+        None,
         false,
         MaterializedTargetGroupSelectionMode::Tree,
     )
@@ -4958,6 +4959,115 @@ async fn materialized_target_groups_use_request_source_status_for_root_tree_when
         groups,
         vec!["nfs1", "nfs2"],
         "root materialized tree target groups must not shrink to a sparse local source cache when request-scoped source status already covers current roots"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_target_groups_preserves_expected_root_groups_across_partial_sink_status() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_nfs1 = tmp.path().join("node-a/nfs1");
+    let node_a_nfs2 = tmp.path().join("node-a/nfs2");
+    let node_a_nfs4 = tmp.path().join("node-a/nfs4");
+    fs::create_dir_all(&node_a_nfs1).expect("create nfs1 dir");
+    fs::create_dir_all(&node_a_nfs2).expect("create nfs2 dir");
+    fs::create_dir_all(&node_a_nfs4).expect("create nfs4 dir");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_nfs1,
+            fs_source: "nfs1".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-a::nfs2".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_nfs2,
+            fs_source: "nfs2".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-a::nfs4".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_nfs4,
+            fs_source: "nfs4".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = source_facade_with_roots(
+        vec![
+            crate::source::config::RootSpec::new("nfs1", "/unused"),
+            crate::source::config::RootSpec::new("nfs2", "/unused"),
+            crate::source::config::RootSpec::new("nfs4", "/unused"),
+        ],
+        &grants,
+    );
+    let sink = sink_facade_with_group(&grants);
+    let state = test_api_state_for_source(source, sink);
+    let request_source_status = SourceStatusSnapshot {
+        current_stream_generation: Some(1),
+        logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
+            root_id: "nfs2".into(),
+            status: "ok".into(),
+            matched_grants: 1,
+            active_members: 1,
+            coverage_mode: "realtime_hotset_plus_audit".into(),
+        }],
+        concrete_roots: Vec::new(),
+        degraded_roots: Vec::new(),
+    };
+    let request_sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs2".to_string()],
+        )]),
+        groups: vec![sink_group_status("nfs2", true)],
+        ..SinkStatusSnapshot::default()
+    };
+    let expected_roots =
+        BTreeSet::from(["nfs1".to_string(), "nfs2".to_string(), "nfs4".to_string()]);
+
+    let groups = materialized_target_groups(
+        &state,
+        None,
+        Some(&request_source_status),
+        Some(&request_sink_status),
+        Duration::from_millis(250),
+        Some(&expected_roots),
+        false,
+        MaterializedTargetGroupSelectionMode::Tree,
+    )
+    .await
+    .expect("materialized target groups");
+
+    assert_eq!(
+        groups,
+        vec!["nfs1", "nfs2", "nfs4"],
+        "root materialized tree target groups must use current scan roots rather than shrinking to a partial sink-status fan-in"
     );
 }
 
@@ -5110,6 +5220,7 @@ async fn materialized_target_groups_excludes_unscheduled_request_source_groups_a
         Some(&request_source_status),
         Some(&request_sink_status),
         Duration::from_millis(250),
+        None,
         true,
         MaterializedTargetGroupSelectionMode::Tree,
     )
@@ -5232,6 +5343,7 @@ async fn materialized_target_groups_preserves_unscheduled_request_source_groups_
         Some(&request_source_status),
         Some(&request_sink_status),
         Duration::from_millis(250),
+        None,
         true,
         MaterializedTargetGroupSelectionMode::Stats,
     )
