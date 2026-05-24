@@ -110,10 +110,13 @@ for root in roots:
     root_id = root.get("id", "<missing>")
     host_ip = selector.get("host_ip")
     mount_point = selector.get("mount_point")
+    subpath_scope = root.get("subpath_scope") or "/"
     if not host_ip:
         raise SystemExit(f"full demo root {root_id} must set selector.host_ip")
     if not mount_point:
         raise SystemExit(f"full demo root {root_id} must set selector.mount_point")
+    if not isinstance(subpath_scope, str) or not subpath_scope.startswith("/"):
+        raise SystemExit(f"full demo root {root_id} must set absolute subpath_scope")
     if not os.path.isdir(mount_point):
         raise SystemExit(f"full demo root {root_id} mount {mount_point} for host {host_ip} is not available")
     if mount_point not in mounted:
@@ -122,6 +125,13 @@ for root in roots:
         os.scandir(mount_point).close()
     except OSError as exc:
         raise SystemExit(f"full demo root {root_id} mount {mount_point} for host {host_ip} is not readable: {exc}") from exc
+    scoped_path = mount_point if subpath_scope == "/" else os.path.join(mount_point, subpath_scope.lstrip("/"))
+    if not os.path.isdir(scoped_path):
+        raise SystemExit(f"full demo root {root_id} scoped path {scoped_path} for host {host_ip} is not available")
+    try:
+        os.scandir(scoped_path).close()
+    except OSError as exc:
+        raise SystemExit(f"full demo root {root_id} scoped path {scoped_path} for host {host_ip} is not readable: {exc}") from exc
 PY
   echo "[fs-meta-test-matrix] demo_validation_assets=$roots_file"
 }
