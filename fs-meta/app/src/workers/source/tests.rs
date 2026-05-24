@@ -726,18 +726,21 @@ fn source_scheduled_groups_refresh_machine_owns_reconnect_retry_and_timeout_term
 }
 
 #[test]
-fn source_update_logical_roots_machine_owns_wait_retry_and_timeout_terminal_lanes() {
-    let machine = SourceUpdateLogicalRootsMachine::new(source_machine_test_future_deadline());
-    let wait = machine
+fn source_update_logical_roots_machine_owns_reconnect_wait_retry_and_timeout_terminal_lanes() {
+    let mut machine = SourceUpdateLogicalRootsMachine::new(source_machine_test_future_deadline());
+    let reconnect = machine
         .advance(SourceUpdateLogicalRootsEvent::AttemptCompleted {
             rpc_result: Err(CnxError::Timeout),
             after: SourceProgressState::default(),
         })
-        .expect("retryable update-logical-roots timeout should enter explicit wait lane");
+        .expect("retryable update-logical-roots timeout should enter explicit reconnect lane");
+    let wait = machine
+        .advance(SourceUpdateLogicalRootsEvent::ReconnectCompleted)
+        .expect("reconnect completion should enter update-logical-roots wait lane");
     let retry = machine
         .advance(SourceUpdateLogicalRootsEvent::WaitCompleted)
         .expect("wait completion should resume update-logical-roots attempt lane");
-    let expired_machine =
+    let mut expired_machine =
         SourceUpdateLogicalRootsMachine::new(source_machine_test_expired_deadline());
     let terminal = expired_machine
         .advance(SourceUpdateLogicalRootsEvent::AttemptCompleted {
@@ -747,7 +750,8 @@ fn source_update_logical_roots_machine_owns_wait_retry_and_timeout_terminal_lane
         .expect("expired update-logical-roots deadline should produce a terminal timeout lane");
 
     assert!(
-        matches!(wait, SourceUpdateLogicalRootsEffect::Wait { .. })
+        matches!(reconnect, SourceUpdateLogicalRootsEffect::Reconnect)
+            && matches!(wait, SourceUpdateLogicalRootsEffect::Wait { .. })
             && matches!(retry, SourceUpdateLogicalRootsEffect::Attempt { .. })
             && matches!(
                 terminal,
@@ -757,7 +761,7 @@ fn source_update_logical_roots_machine_owns_wait_retry_and_timeout_terminal_lane
                         SourceRetryBudgetExhaustionKind::OperationWait,
                     )
             ),
-        "source update-logical-roots machine should own explicit wait-retry and deadline-timeout lanes instead of drifting back to an ad hoc retry loop",
+        "source update-logical-roots machine should own explicit reconnect, wait-retry and deadline-timeout lanes instead of drifting back to an ad hoc retry loop",
     );
 }
 
@@ -5833,8 +5837,23 @@ fn manual_rescan_logical_roots_snapshot_uses_cache_for_stale_worker_handoff() {
     );
 }
 
+#[test]
+fn source_snapshot_reads_use_cache_during_worker_resource_exhaustion() {
+    let err = CnxError::ResourceExhausted(
+        "source worker unavailable: max channels (1024) reached".to_string(),
+    );
+    assert!(
+        can_use_cached_grant_derived_snapshot(&err),
+        "source snapshot reads should use cached roots/grants while worker control channels are temporarily exhausted"
+    );
+    assert!(
+        can_use_cached_manual_rescan_logical_roots_snapshot(&err),
+        "manual rescan target selection should not fail hard when worker max-channel pressure blocks a live roots snapshot"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn status_snapshot_retries_stale_drained_fenced_pid_errors() {
+async fn status_snapshot_uses_cache_after_stale_drained_fenced_pid_errors() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -5869,6 +5888,16 @@ async fn status_snapshot_retries_stale_drained_fenced_pid_errors() {
         .expect("source worker start timed out")
         .expect("start source worker");
 
+    let primed_snapshot = client
+        .status_snapshot_with_failure()
+        .await
+        .expect("prime source status cache");
+    assert_eq!(
+        primed_snapshot.logical_roots.len(),
+        1,
+        "primed live status should expose the configured root"
+    );
+
     let _reset = SourceWorkerStatusErrorHookReset;
     install_source_worker_status_error_hook(SourceWorkerStatusErrorHook {
             err: CnxError::AccessDenied(
@@ -5877,26 +5906,34 @@ async fn status_snapshot_retries_stale_drained_fenced_pid_errors() {
             ),
         });
 
-    let snapshot = client.status_snapshot_with_failure().await.expect(
-        "status_snapshot should retry a stale drained/fenced pid error and reach the live worker",
-    );
+    let snapshot = client
+        .status_snapshot_with_failure()
+        .await
+        .expect("status_snapshot should use the cached status after stale drained/fenced pid");
 
     assert_eq!(
         snapshot.logical_roots.len(),
         1,
-        "status snapshot should come back from the rebound live worker with the configured root"
+        "status snapshot should preserve the cached live root"
     );
     assert!(
-        snapshot.degraded_roots.is_empty(),
-        "fresh live source worker snapshot should still decode after stale-pid retry"
+        snapshot
+            .degraded_roots
+            .iter()
+            .any(
+                |(root_key, reason)| root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
+                    && reason == SOURCE_WORKER_CACHE_STATUS_REASON
+            ),
+        "cached source status fallback must be explicit in degraded roots"
     );
 
     client.close().await.expect("close source worker");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn observability_snapshot_nonblocking_retries_stale_drained_fenced_pid_errors() {
+async fn observability_snapshot_nonblocking_falls_back_after_one_stale_drained_fenced_pid_error() {
     let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
+    let _count_hook_reset = SourceWorkerObservabilityCallCountHookReset;
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -5995,31 +6032,43 @@ async fn observability_snapshot_nonblocking_retries_stale_drained_fenced_pid_err
                     .to_string(),
             ),
         });
+    let observability_rpc_count = Arc::new(AtomicUsize::new(0));
+    install_source_worker_observability_call_count_hook(SourceWorkerObservabilityCallCountHook {
+        count: observability_rpc_count.clone(),
+    });
 
-    let snapshot = client
+    let (snapshot, used_cached_fallback) = client
         .observability_snapshot_nonblocking_for_status_route()
-        .await
-        .0;
+        .await;
     let expected = vec!["nfs1".to_string(), "nfs2".to_string()];
-    assert_ne!(
-        snapshot.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
-        "observability_snapshot_nonblocking should retry a stale drained/fenced pid error and reach the live worker"
+    assert!(
+        used_cached_fallback,
+        "nonblocking status must use cache after a stale drained/fenced worker error instead of rebuilding worker routes inline"
+    );
+    assert_eq!(
+        observability_rpc_count.load(Ordering::Relaxed),
+        1,
+        "nonblocking status must not retry stale drained/fenced observability failures inside the live-probe path"
     );
     assert_eq!(
         snapshot.scheduled_source_groups_by_node.get("node-d"),
         Some(&expected),
-        "live observability snapshot should preserve scheduled source groups after stale-pid retry: {:?}",
+        "cached observability snapshot should preserve scheduled source groups after stale-pid fallback: {:?}",
         snapshot.scheduled_source_groups_by_node
     );
     assert_eq!(
         snapshot.scheduled_scan_groups_by_node.get("node-d"),
         Some(&expected),
-        "live observability snapshot should preserve scheduled scan groups after stale-pid retry: {:?}",
+        "cached observability snapshot should preserve scheduled scan groups after stale-pid fallback: {:?}",
         snapshot.scheduled_scan_groups_by_node
     );
     assert!(
-        snapshot.status.degraded_roots.is_empty(),
-        "live observability snapshot after stale-pid retry should not degrade: {:?}",
+        !snapshot
+            .status
+            .degraded_roots
+            .iter()
+            .any(|(_, reason)| reason.contains("drained/fenced")),
+        "cache fallback must not expose the raw stale-pid worker failure as global source status: {:?}",
         snapshot.status.degraded_roots
     );
 

@@ -259,6 +259,7 @@ pub fn run_activation_scope_capture_preserved_layout() -> Result<(), String> {
     let _ = harness.session.tree(&[
         ("path", "/force-find-stress".to_string()),
         ("recursive", "true".to_string()),
+        ("read_class", "materialized".to_string()),
     ])?;
 
     let mut node_a_source_pids = BTreeSet::new();
@@ -945,6 +946,7 @@ pub fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Res
             let tree = harness.session.tree(&[
                 ("path", "/force-find-stress".to_string()),
                 ("recursive", "true".to_string()),
+                ("read_class", "materialized".to_string()),
             ])?;
             late_nfs2_nodes = group_total_nodes(&tree, "nfs2");
             let status = harness.session.status()?;
@@ -1099,6 +1101,7 @@ fn scenario_force_find_execution_semantics(
             let tree = session.tree(&[
                 ("path", "/force-find-stress".to_string()),
                 ("recursive", "true".to_string()),
+                ("read_class", "materialized".to_string()),
             ])?;
             Ok(group_total_nodes(&tree, "nfs1") > 0 && group_total_nodes(&tree, "nfs2") > 0)
         },
@@ -1866,7 +1869,11 @@ fn scenario_nfs_retire(
             "runtime grants still expose retired nfs3: {grants}"
         ));
     }
-    let tree = session.tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
+    let tree = session.tree(&[
+        ("path", "/".to_string()),
+        ("recursive", "true".to_string()),
+        ("read_class", "materialized".to_string()),
+    ])?;
     if tree.to_string().contains("nfs3") {
         return Err(format!("tree still references retired nfs3: {tree}"));
     }

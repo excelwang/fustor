@@ -886,7 +886,11 @@ fn wait_for_node_a_sink_control_convergence(
                 })
                 .find(|scheduled| scheduled == &expected)
                 .unwrap_or_default();
-            if !sink_active.is_empty() && scheduled_sink == expected {
+            let direct_runtime_control_ready = !sink_active.is_empty()
+                && sink_control_route_delivered_for_node(&node_status, "node-a");
+            if (!sink_active.is_empty() && scheduled_sink == expected)
+                || direct_runtime_control_ready
+            {
                 Ok(true)
             } else {
                 let route_summaries = activation_route_summaries(&node_status);
@@ -899,7 +903,7 @@ fn wait_for_node_a_sink_control_convergence(
                     .and_then(|result| result.as_ref().err())
                     .cloned();
                 Err(format!(
-                "node-a sink not converged: active_pids={sink_active:?}; scheduled_sink={scheduled_sink:?}; app_status_error={:?}; app_statuses={app_status_summaries:?}; routes={route_summaries:?}",
+                "node-a sink not converged: active_pids={sink_active:?}; scheduled_sink={scheduled_sink:?}; direct_runtime_control_ready={direct_runtime_control_ready}; app_status_error={:?}; app_statuses={app_status_summaries:?}; routes={route_summaries:?}",
                 app_status_error
             ))
             }
@@ -1159,6 +1163,67 @@ fn source_runtime_scope_debug_groups_by_cluster_node(
     by_node
 }
 
+fn source_runtime_scope_debug_control_signals_by_cluster_node(
+    status: &Value,
+) -> BTreeMap<String, Vec<String>> {
+    let Some(debug_field) = status
+        .get("source")
+        .and_then(|v| v.get("debug"))
+        .and_then(|v| v.get("last_control_frame_signals_by_node"))
+        .and_then(Value::as_object)
+    else {
+        return BTreeMap::new();
+    };
+
+    let mut by_node: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, value) in debug_field {
+        let Some(node_name) = runtime_node_key_cluster_name(key) else {
+            continue;
+        };
+        let signals = by_node.entry(node_name.to_string()).or_default();
+        if let Some(rows) = value.as_array() {
+            signals.extend(rows.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+    }
+    by_node.retain(|_, signals| !signals.is_empty());
+    by_node
+}
+
+fn source_debug_signal_applies_to_group(signal: &str, group: &str) -> bool {
+    match signal.split_once("scopes=") {
+        Some((_prefix, scopes)) => scopes.contains(&format!("{group}=>")),
+        None => true,
+    }
+}
+
+fn source_debug_signal_route_key(signal: &str) -> Option<&str> {
+    let (_, suffix) = signal.split_once("route=")?;
+    suffix.split_whitespace().next()
+}
+
+fn source_debug_manual_rescan_route_targets_node_or_generic(signal: &str, node_name: &str) -> bool {
+    let Some(route_key) = source_debug_signal_route_key(signal) else {
+        return false;
+    };
+    if route_key == "source-manual-rescan:v1.req" {
+        return true;
+    }
+    source_runtime_scope_route_key_node_name(route_key) == Some(node_name)
+}
+
+fn source_debug_signal_activates_manual_rescan_source_route_for_group_node(
+    signal: &str,
+    group: &str,
+    node_name: &str,
+) -> bool {
+    signal.contains("activate ")
+        && signal.contains("unit=runtime.exec.source")
+        && signal.contains("route=source-manual-rescan")
+        && signal.contains(".req")
+        && source_debug_signal_applies_to_group(signal, group)
+        && source_debug_manual_rescan_route_targets_node_or_generic(signal, node_name)
+}
+
 fn source_runtime_scope_debug_owner_nodes_by_group(
     status: &Value,
 ) -> BTreeMap<String, BTreeSet<String>> {
@@ -1168,12 +1233,25 @@ fn source_runtime_scope_debug_owner_nodes_by_group(
     );
     let scheduled_scan =
         source_runtime_scope_debug_groups_by_cluster_node(status, "scheduled_scan_groups_by_node");
+    let control_signals = source_runtime_scope_debug_control_signals_by_cluster_node(status);
+    let require_route_activation = !control_signals.is_empty();
     let mut owners_by_group: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (node_name, source_groups) in scheduled_source {
         let Some(scan_groups) = scheduled_scan.get(&node_name) else {
             continue;
         };
         for group in source_groups.intersection(scan_groups) {
+            if require_route_activation
+                && !control_signals.get(&node_name).is_some_and(|signals| {
+                    signals.iter().any(|signal| {
+                        source_debug_signal_activates_manual_rescan_source_route_for_group_node(
+                            signal, group, &node_name,
+                        )
+                    })
+                })
+            {
+                continue;
+            }
             owners_by_group
                 .entry(group.clone())
                 .or_default()
@@ -1214,6 +1292,125 @@ fn source_runtime_scope_domain_owner_nodes_by_group(
     owners_by_group
 }
 
+fn source_runtime_scope_route_owner_nodes_by_group(
+    status: &Value,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut source_groups_by_node: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut scan_groups_by_node: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let Some(routes) = status
+        .get("daemon")
+        .and_then(|daemon| daemon.get("activation"))
+        .and_then(|activation| activation.get("routes"))
+        .and_then(Value::as_array)
+    else {
+        return BTreeMap::new();
+    };
+
+    for route in routes {
+        if route.get("state").and_then(Value::as_str) != Some("activated")
+            || !route
+                .get("active_pids")
+                .and_then(Value::as_array)
+                .is_some_and(|pids| !pids.is_empty())
+        {
+            continue;
+        }
+        let route_key = route
+            .get("route_key")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for app in route
+            .get("apps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(node_name) = source_runtime_scope_route_app_node_name(route_key, app) else {
+                continue;
+            };
+            let source_groups =
+                source_runtime_scope_route_app_bound_groups(app, "runtime.exec.source");
+            if !source_groups.is_empty() {
+                source_groups_by_node
+                    .entry(node_name.to_string())
+                    .or_default()
+                    .extend(source_groups);
+            }
+            let scan_groups = source_runtime_scope_route_app_bound_groups(app, "runtime.exec.scan");
+            if !scan_groups.is_empty() {
+                scan_groups_by_node
+                    .entry(node_name.to_string())
+                    .or_default()
+                    .extend(scan_groups);
+            }
+        }
+    }
+
+    let mut owners_by_group: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (node_name, source_groups) in source_groups_by_node {
+        let Some(scan_groups) = scan_groups_by_node.get(&node_name) else {
+            continue;
+        };
+        for group in source_groups.intersection(scan_groups) {
+            owners_by_group
+                .entry(group.clone())
+                .or_default()
+                .insert(node_name.clone());
+        }
+    }
+    owners_by_group
+}
+
+fn source_runtime_scope_route_app_bound_groups(app: &Value, unit_id: &str) -> BTreeSet<String> {
+    if !source_runtime_scope_route_app_delivery_ready(app, unit_id) {
+        return BTreeSet::new();
+    }
+    app.get("bound_scopes_by_unit")
+        .and_then(Value::as_object)
+        .and_then(|bound_scopes_by_unit| bound_scopes_by_unit.get(unit_id))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|scope| scope.get("scope_id").and_then(Value::as_str))
+        .filter(|scope_id| !scope_id.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn source_runtime_scope_route_app_delivery_ready(app: &Value, unit_id: &str) -> bool {
+    app.get("delivered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && app.get("error").is_none_or(|value| value.is_null())
+        && (app
+            .get("unit_ids")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .any(|candidate| candidate == unit_id)
+            || app
+                .get("bound_scopes_by_unit")
+                .and_then(Value::as_object)
+                .is_some_and(|bound_scopes_by_unit| bound_scopes_by_unit.contains_key(unit_id)))
+}
+
+fn source_runtime_scope_route_app_node_name(route_key: &str, app: &Value) -> Option<&'static str> {
+    app.get("node_id")
+        .and_then(Value::as_str)
+        .and_then(runtime_node_key_cluster_name)
+        .or_else(|| source_runtime_scope_route_key_node_name(route_key))
+}
+
+fn source_runtime_scope_route_key_node_name(route_key: &str) -> Option<&'static str> {
+    RELEASE_UPGRADE_CLUSTER_NODES
+        .iter()
+        .copied()
+        .find(|node_name| {
+            route_key.contains(*node_name) || route_key.contains(&node_name.replace('-', "_"))
+        })
+}
+
 fn merge_source_runtime_scope_owners(
     target: &mut BTreeMap<String, BTreeSet<String>>,
     source: BTreeMap<String, BTreeSet<String>>,
@@ -1235,6 +1432,10 @@ fn source_runtime_scope_owner_nodes_by_group(
         merge_source_runtime_scope_owners(
             &mut owners_by_group,
             source_runtime_scope_domain_owner_nodes_by_group(status),
+        );
+        merge_source_runtime_scope_owners(
+            &mut owners_by_group,
+            source_runtime_scope_route_owner_nodes_by_group(status),
         );
     }
     owners_by_group
@@ -1454,7 +1655,7 @@ fn steady_cpu_sample_pids_for_node(
 
 fn spawn_light_polling(
     base_url: String,
-    management_token: String,
+    _management_token: String,
     query_api_key: String,
 ) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
@@ -1464,15 +1665,15 @@ fn spawn_light_polling(
             return;
         };
         while !stop_clone.load(Ordering::Relaxed) {
-            let _ = client.status(&management_token);
-            let _ = client.tree(
-                &query_api_key,
-                &[("path", "/".to_string()), ("recursive", "true".to_string())],
-            );
-            let _ = client.stats(
-                &query_api_key,
-                &[("path", "/".to_string()), ("recursive", "true".to_string())],
-            );
+            let bounded_materialized_query = [
+                ("path", "/".to_string()),
+                ("recursive", "false".to_string()),
+                ("read_class", "materialized".to_string()),
+                ("group_page_size", "1".to_string()),
+                ("entry_page_size", "1".to_string()),
+            ];
+            let _ = client.tree(&query_api_key, &bounded_materialized_query);
+            let _ = client.stats(&query_api_key, &bounded_materialized_query);
             thread::sleep(Duration::from_secs(5));
         }
     });
@@ -1776,6 +1977,52 @@ fn activation_route_has_active_pids(status: &Value, route_key: &str) -> bool {
         .is_some_and(|pids| !pids.is_empty())
 }
 
+fn sink_control_route_delivered_for_node(status: &Value, node_name: &str) -> bool {
+    let node_route_fragment = node_name.replace('-', "_");
+    status
+        .get("daemon")
+        .and_then(|v| v.get("activation"))
+        .and_then(|v| v.get("routes"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|route| {
+            let route_key = route
+                .get("route_key")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let route_matches = route_key == "sink-logical-roots-control:v1.stream"
+                || (route_key.starts_with("sink-logical-roots-control.")
+                    && route_key.contains(&node_route_fragment));
+            route_matches
+                && route.get("state").and_then(Value::as_str) == Some("activated")
+                && route
+                    .get("active_pids")
+                    .and_then(Value::as_array)
+                    .is_some_and(|pids| !pids.is_empty())
+                && route
+                    .get("apps")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(sink_control_route_app_delivery_ready)
+        })
+}
+
+fn sink_control_route_app_delivery_ready(app: &Value) -> bool {
+    app.get("delivered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && app.get("error").is_none_or(|value| value.is_null())
+        && app
+            .get("unit_ids")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .any(|unit_id| unit_id == "runtime.exec.sink")
+}
+
 fn unique_suffix() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1869,6 +2116,44 @@ mod tests {
     }
 
     #[test]
+    fn peer_source_control_gate_rejects_stale_schedule_without_source_route_activation() {
+        let status = json!({
+            "source": {
+                "debug": {
+                    "scheduled_source_groups_by_node": {
+                        "node-b-123": ["nfs1"],
+                        "node-d-123": ["nfs2"]
+                    },
+                    "scheduled_scan_groups_by_node": {
+                        "node-b-123": ["nfs1"],
+                        "node-d-123": ["nfs2"]
+                    },
+                    "last_control_frame_signals_by_node": {
+                        "node-b-123": [
+                            "tick unit=runtime.exec.scan route=source-manual-rescan:v1.req generation=1779502751414"
+                        ],
+                        "node-d-123": [
+                            "activate unit=runtime.exec.source route=source-manual-rescan.node_d_123:v1.req generation=1779502939981 scopes=[\"nfs2=>nfs2\"]"
+                        ]
+                    }
+                }
+            }
+        });
+        let expected_groups = vec!["nfs1".to_string(), "nfs2".to_string()];
+        let owners_by_group = source_runtime_scope_owner_nodes_by_group(&[&status]);
+
+        assert_eq!(
+            owners_by_group.get("nfs2"),
+            Some(&BTreeSet::from(["node-d".to_string()])),
+            "route-activated nfs2 should still be accepted"
+        );
+        assert!(
+            !source_runtime_scope_groups_covered(&owners_by_group, &expected_groups),
+            "release-upgrade source convergence must not accept tick-only stale schedules as current-root source route readiness"
+        );
+    }
+
+    #[test]
     fn peer_source_control_gate_rejects_missing_current_root_coverage() {
         let status = json!({
             "source": {
@@ -1929,6 +2214,94 @@ mod tests {
     }
 
     #[test]
+    fn peer_source_control_gate_accepts_runtime_route_bound_scopes_when_status_debug_lags() {
+        let status = json!({
+            "daemon": {
+                "activation": {
+                    "routes": [{
+                        "route_key": "source-manual-rescan.node_a_123:v1.req",
+                        "state": "activated",
+                        "active_pids": [2],
+                        "apps": [{
+                            "node_id": "node-a-123",
+                            "delivered": true,
+                            "unit_ids": ["runtime.exec.source", "runtime.exec.scan"],
+                            "error": Value::Null,
+                            "bound_scopes_by_unit": {
+                                "runtime.exec.source": [{
+                                    "scope_id": "nfs1",
+                                    "resource_ids": ["node-a::nfs1"]
+                                }],
+                                "runtime.exec.scan": [{
+                                    "scope_id": "nfs1",
+                                    "resource_ids": ["node-a::nfs1"]
+                                }]
+                            }
+                        }]
+                    }]
+                }
+            },
+            "source": {
+                "debug": {
+                    "scheduled_source_groups_by_node": {},
+                    "scheduled_scan_groups_by_node": {}
+                }
+            }
+        });
+        let expected_groups = vec!["nfs1".to_string()];
+        let owners_by_group = source_runtime_scope_owner_nodes_by_group(&[&status]);
+
+        assert_eq!(
+            owners_by_group.get("nfs1"),
+            Some(&BTreeSet::from(["node-a".to_string()])),
+            "nfs1 should be covered by direct runtime activation source+scan bound scopes"
+        );
+        assert!(
+            source_runtime_scope_groups_covered(&owners_by_group, &expected_groups),
+            "release-upgrade source convergence should accept delivered source+scan bound-scope evidence when management /status debug lags"
+        );
+    }
+
+    #[test]
+    fn peer_source_control_gate_rejects_route_bound_scope_missing_scan_unit() {
+        let status = json!({
+            "daemon": {
+                "activation": {
+                    "routes": [{
+                        "route_key": "source-manual-rescan.node_a_123:v1.req",
+                        "state": "activated",
+                        "active_pids": [2],
+                        "apps": [{
+                            "node_id": "node-a-123",
+                            "delivered": true,
+                            "unit_ids": ["runtime.exec.source", "runtime.exec.scan"],
+                            "error": Value::Null,
+                            "bound_scopes_by_unit": {
+                                "runtime.exec.source": [{
+                                    "scope_id": "nfs1",
+                                    "resource_ids": ["node-a::nfs1"]
+                                }]
+                            }
+                        }]
+                    }]
+                }
+            },
+            "source": {
+                "debug": {
+                    "scheduled_source_groups_by_node": {},
+                    "scheduled_scan_groups_by_node": {}
+                }
+            }
+        });
+        let owners_by_group = source_runtime_scope_owner_nodes_by_group(&[&status]);
+
+        assert!(
+            !source_runtime_scope_groups_covered(&owners_by_group, &["nfs1".to_string()]),
+            "release-upgrade source convergence must require scan bound-scope evidence for the same node/group, not just source route delivery"
+        );
+    }
+
+    #[test]
     fn peer_source_control_status_view_does_not_let_partial_facade_erase_node_local_scope() {
         let node_status = json!({
             "source": {
@@ -1962,6 +2335,56 @@ mod tests {
         assert!(
             source_runtime_scope_schedule_ready(status_view, "node-b", &expected_groups),
             "release-upgrade source convergence must not let a partial facade aggregate hide positive node-local runtime-scope evidence"
+        );
+    }
+
+    #[test]
+    fn sink_control_gate_accepts_runtime_route_delivery_when_status_schedule_lags() {
+        let status = json!({
+            "daemon": {
+                "activation": {
+                    "routes": [{
+                        "route_key": "sink-logical-roots-control.node_a_123:v1.stream",
+                        "state": "activated",
+                        "active_pids": [2],
+                        "apps": [{
+                            "delivered": true,
+                            "unit_ids": ["runtime.exec.sink"],
+                            "error": Value::Null
+                        }]
+                    }]
+                }
+            }
+        });
+
+        assert!(
+            sink_control_route_delivered_for_node(&status, "node-a"),
+            "release-upgrade sink-control convergence should accept direct runtime route delivery proof even when management /status scheduled debug lags"
+        );
+    }
+
+    #[test]
+    fn sink_control_gate_rejects_route_without_sink_delivery_ack() {
+        let status = json!({
+            "daemon": {
+                "activation": {
+                    "routes": [{
+                        "route_key": "sink-logical-roots-control.node_a_123:v1.stream",
+                        "state": "activated",
+                        "active_pids": [2],
+                        "apps": [{
+                            "delivered": false,
+                            "unit_ids": ["runtime.exec.query-peer"],
+                            "error": Value::Null
+                        }]
+                    }]
+                }
+            }
+        });
+
+        assert!(
+            !sink_control_route_delivered_for_node(&status, "node-a"),
+            "release-upgrade sink-control convergence must require the sink unit delivery ack, not just route/process liveness"
         );
     }
 

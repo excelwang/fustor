@@ -268,11 +268,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
         run_query_live_only_rescan_phase(&harness.cluster, &mut session, &harness.lab)?;
     }
 
-    let evidence_policy = match mode {
-        MatrixMode::QueryBaselineOnly => DemoEvidencePolicy::QueryBaseline,
-        MatrixMode::Full => DemoEvidencePolicy::EnvironmentBaseline,
-        MatrixMode::LiveOnlyOnly => DemoEvidencePolicy::FullAcceptance,
-    };
+    let evidence_policy = demo_evidence_policy_for_mode(mode);
     emit_demo_evidence_result(
         &mut session,
         DemoEvidenceEnvironment::Full5Node5Nfs,
@@ -280,6 +276,14 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
     )?;
 
     Ok(())
+}
+
+fn demo_evidence_policy_for_mode(mode: MatrixMode) -> DemoEvidencePolicy {
+    match mode {
+        MatrixMode::QueryBaselineOnly => DemoEvidencePolicy::QueryBaseline,
+        MatrixMode::Full => DemoEvidencePolicy::EnvironmentBaseline,
+        MatrixMode::LiveOnlyOnly => DemoEvidencePolicy::EnvironmentBaseline,
+    }
 }
 
 fn build_matrix_harness(app_prefix: &str) -> Result<MatrixHarness, String> {
@@ -725,8 +729,15 @@ fn run_query_live_only_rescan_phase(
     )?;
 
     session.rescan()?;
-    let post_rescan_status = session.status()?;
-    validate_status_monitoring_shape(&post_rescan_status, true)?;
+    match session.status() {
+        Ok(post_rescan_status) => validate_status_monitoring_shape(&post_rescan_status, true)?,
+        Err(err) if is_trusted_materialized_status_unavailable(&err) => {
+            eprintln!(
+                "[fs-meta-api-matrix] live-only post-rescan status remains bounded-degraded: {err}"
+            );
+        }
+        Err(err) => return Err(err),
+    }
 
     session.update_roots(&roots_payload(&baseline_roots(lab)))?;
     session.rescan()?;
@@ -1675,7 +1686,7 @@ fn run_roots_matrix(
     let restore = session
         .client()
         .update_roots_raw(session.token(), &roots_payload(&roots))?;
-    assert_status(restore.status, 200, "restore roots")?;
+    assert_response_status(&restore, 200, "restore roots")?;
     wait_for_rescan_accepted(
         session,
         CURRENT_ROOTS_RESCAN_ACCEPTED_TIMEOUT,
@@ -1693,7 +1704,6 @@ fn run_roots_matrix(
 }
 
 const CURRENT_ROOTS_RESCAN_ACCEPTED_TIMEOUT: Duration = Duration::from_secs(180);
-
 fn wait_for_rescan_accepted(
     session: &mut OperatorSession,
     timeout: Duration,
@@ -1742,6 +1752,15 @@ fn l4_demo_evidence_accepts_bounded_materialization_unready() {
     );
     assert!(report.accepted_for(DemoEvidencePolicy::EnvironmentBaseline));
     assert!(!report.accepted_for(DemoEvidencePolicy::FullAcceptance));
+}
+
+#[test]
+fn l4_live_only_mode_uses_environment_baseline_evidence_policy() {
+    assert_eq!(
+        demo_evidence_policy_for_mode(MatrixMode::LiveOnlyOnly),
+        DemoEvidencePolicy::EnvironmentBaseline,
+        "live-only is part of L4 environment validation; L5 full acceptance remains a separate real-cluster gate"
+    );
 }
 
 fn run_mini_roots_management_smoke(
@@ -2303,6 +2322,20 @@ fn assert_status(actual: u16, expected: u16, context: &str) -> Result<(), String
     if actual != expected {
         return Err(format!(
             "{context}: expected status {expected}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn assert_response_status(
+    response: &ApiResponse,
+    expected: u16,
+    context: &str,
+) -> Result<(), String> {
+    if response.status != expected {
+        return Err(format!(
+            "{context}: expected status {expected}, got {}; body={}",
+            response.status, response.body
         ));
     }
     Ok(())

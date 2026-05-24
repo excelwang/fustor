@@ -450,11 +450,38 @@ impl Drop for EndpointReceiveGuard {
     }
 }
 
+fn close_endpoint_channel(
+    boundary: &Arc<dyn ChannelIoSubset>,
+    ctx: BoundaryContext,
+    channel: ChannelKey,
+    endpoint_name: &str,
+) {
+    let channel_key = channel.0.clone();
+    match boundary.channel_close(ctx, channel) {
+        Ok(()) => {}
+        Err(CnxError::ChannelClosed)
+        | Err(CnxError::NotReady(_))
+        | Err(CnxError::NotSupported(_))
+        | Err(CnxError::TransportClosed(_))
+        | Err(CnxError::LinkError(_)) => {}
+        Err(err) => {
+            log::debug!(
+                "endpoint task {} close owned channel {} failed: {:?}",
+                endpoint_name,
+                channel_key,
+                err
+            );
+        }
+    }
+}
+
 pub(crate) struct ManagedEndpointTask {
     name: String,
     route_key: String,
     route_generation: Option<u64>,
     boundary_id: usize,
+    boundary: Arc<dyn ChannelIoSubset>,
+    close_unit_ids: Vec<String>,
     unit_ids: Vec<String>,
     shutdown: CancellationToken,
     terminal_reason: Arc<StdMutex<Option<String>>>,
@@ -885,6 +912,7 @@ impl ManagedEndpointTask {
             .iter()
             .filter_map(|ctx| ctx.unit_id.clone())
             .collect::<Vec<_>>();
+        let close_unit_ids = unit_ids.clone();
         let join_name = name_owned.clone();
         let route_key_for_runner = route_key.clone();
         let task_shutdown = shutdown.child_token();
@@ -915,6 +943,7 @@ impl ManagedEndpointTask {
                 })
             }
         };
+        let task_boundary = boundary.clone();
         let handler = Arc::new(handler);
         let receivable_ready =
             (ready_mode == EndpointReadyMode::FirstReceivable).then_some(ready_signal.clone());
@@ -961,6 +990,8 @@ impl ManagedEndpointTask {
             route_key,
             route_generation: None,
             boundary_id,
+            boundary: task_boundary,
+            close_unit_ids,
             unit_ids,
             shutdown: task_shutdown,
             terminal_reason,
@@ -1038,6 +1069,7 @@ impl ManagedEndpointTask {
             inner: boundary,
             before_recv: before_recv.clone(),
         });
+        let task_boundary = boundary.clone();
         let handler = Arc::new(handler);
         let runner = run_stream_loop_with_wait(
             boundary,
@@ -1080,6 +1112,8 @@ impl ManagedEndpointTask {
             route_key,
             route_generation: None,
             boundary_id,
+            boundary: task_boundary,
+            close_unit_ids: vec![unit_id.clone()],
             unit_ids: vec![unit_id],
             shutdown: task_shutdown,
             terminal_reason,
@@ -1098,6 +1132,11 @@ impl ManagedEndpointTask {
 
     pub(crate) fn with_route_generation(mut self, route_generation: u64) -> Self {
         self.route_generation = Some(route_generation);
+        self
+    }
+
+    pub(crate) fn with_boundary_identity(mut self, boundary: &Arc<dyn ChannelIoSubset>) -> Self {
+        self.boundary_id = Self::boundary_id_for(boundary);
         self
     }
 
@@ -1128,12 +1167,44 @@ impl ManagedEndpointTask {
         self.receive_state.is_receive_polling()
     }
 
-    pub(crate) fn request_shutdown(&self) {
+    pub(crate) fn is_shutdown_requested(&self) -> bool {
+        self.shutdown.is_cancelled()
+    }
+
+    pub(crate) fn request_shutdown_and_close_on(&self, boundary: &Arc<dyn ChannelIoSubset>) {
         self.shutdown.cancel();
+        self.close_owned_channels_on(boundary);
+    }
+
+    pub(crate) fn request_shutdown_and_close(&self) {
+        self.shutdown.cancel();
+        self.close_owned_channels_on(&self.boundary);
+    }
+
+    pub(crate) fn close_owned_channels_on(&self, boundary: &Arc<dyn ChannelIoSubset>) {
+        let mut contexts = self
+            .close_unit_ids
+            .iter()
+            .cloned()
+            .map(BoundaryContext::for_unit)
+            .collect::<Vec<_>>();
+        if contexts.is_empty() {
+            contexts.push(BoundaryContext::default());
+        }
+        let request_or_stream_route = ChannelKey(self.route_key.clone());
+        for ctx in &contexts {
+            close_endpoint_channel(
+                boundary,
+                ctx.clone(),
+                request_or_stream_route.clone(),
+                &self.name,
+            );
+        }
     }
 
     pub(crate) async fn shutdown(&mut self, wait_timeout: Duration) {
         self.shutdown.cancel();
+        self.close_owned_channels_on(&self.boundary);
         let Some(join) = self.join.take() else {
             return;
         };
@@ -1616,6 +1687,8 @@ async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
     let ctx = BoundaryContext::for_unit(unit_id);
     let stream_channel = ChannelKey(route.0.clone());
     let mut stale_recv_gap_count = 0usize;
+    let debug_stream_recv =
+        debug_stream_delivery_enabled() || debug_source_status_lifecycle_enabled();
 
     loop {
         if shutdown_for_task.is_cancelled() {
@@ -1628,7 +1701,11 @@ async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
             wait_until_receivable().await;
             continue;
         }
-        if should_emit_endpoint_retry_log(&format!("recv_begin:{}:{}", stream_channel.0, join_name))
+        if debug_stream_recv
+            && should_emit_endpoint_retry_log(&format!(
+                "recv_begin:{}:{}",
+                stream_channel.0, join_name
+            ))
         {
             eprintln!(
                 "fs_meta_runtime_endpoint: stream loop recv route={} task={}",
@@ -1919,6 +1996,10 @@ mod tests {
         last_timeout_ms: AtomicUsize,
     }
 
+    struct CloseContextRecordingBoundary {
+        close_unit_ids: Mutex<Vec<Option<String>>>,
+    }
+
     #[derive(Clone, Copy)]
     enum FirstFailure {
         NotSupported,
@@ -2049,6 +2130,14 @@ mod tests {
             Self {
                 recv_attempts: AtomicUsize::new(0),
                 last_timeout_ms: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl CloseContextRecordingBoundary {
+        fn new() -> Self {
+            Self {
+                close_unit_ids: Mutex::new(Vec::new()),
             }
         }
     }
@@ -2340,6 +2429,29 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for CloseContextRecordingBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            _request: ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            Err(CnxError::Timeout)
+        }
+
+        fn channel_close(
+            &self,
+            ctx: BoundaryContext,
+            _channel: ChannelKey,
+        ) -> capanix_app_sdk::Result<()> {
+            self.close_unit_ids
+                .lock()
+                .expect("close_unit_ids lock")
+                .push(ctx.unit_id);
+            Ok(())
+        }
+    }
+
     fn test_event(correlation_id: u64, payload: &'static [u8]) -> Event {
         Event::new(
             EventMetadata {
@@ -2599,6 +2711,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn managed_request_endpoint_retire_closes_owned_request_route() {
+        let boundary = Arc::new(RecordingBoundary::new());
+        let mut endpoint = ManagedEndpointTask::spawn_with_unit_without_ready_wait(
+            boundary.clone(),
+            RouteKey("source-status:v1.req".into()),
+            "managed-request-retire",
+            "runtime.exec.source",
+            CancellationToken::new(),
+            |_events: Vec<Event>| std::future::ready(Vec::new()),
+        );
+
+        endpoint.request_shutdown_and_close();
+        let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
+        assert_eq!(
+            close_keys,
+            vec!["source-status:v1.req".to_string()],
+            "retiring a managed request endpoint must release its owned request route without closing the client reply lane"
+        );
+
+        crate::runtime_app::shared_tokio_runtime()
+            .block_on(endpoint.shutdown(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn managed_request_endpoint_retire_uses_recv_unit_context_after_task_unit_override() {
+        let boundary = Arc::new(CloseContextRecordingBoundary::new());
+        let mut endpoint =
+            ManagedEndpointTask::spawn_with_recv_units_and_task_units_without_ready_wait(
+                boundary.clone(),
+                RouteKey("source-status:v1.req".into()),
+                "managed-request-retire-context",
+                vec!["runtime.exec.query-peer"],
+                vec!["runtime.exec.source"],
+                CancellationToken::new(),
+                |_events: Vec<Event>| std::future::ready(Vec::new()),
+            );
+
+        endpoint.request_shutdown_and_close();
+        let close_unit_ids = boundary
+            .close_unit_ids
+            .lock()
+            .expect("close_unit_ids lock")
+            .clone();
+        assert_eq!(
+            close_unit_ids,
+            vec![Some("runtime.exec.query-peer".to_string())],
+            "retiring a managed request endpoint must close the route with the unit context that armed recv interest, not only the logical active task unit"
+        );
+
+        crate::runtime_app::shared_tokio_runtime()
+            .block_on(endpoint.shutdown(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn managed_stream_endpoint_retire_closes_owned_stream_route() {
+        let boundary = Arc::new(RecordingBoundary::new());
+        let mut endpoint = ManagedEndpointTask::spawn_stream(
+            boundary.clone(),
+            RouteKey("fs-meta.events:v1.stream".into()),
+            "managed-stream-retire",
+            "runtime.exec.sink",
+            CancellationToken::new(),
+            || true,
+            |_events: Vec<Event>| std::future::ready(()),
+        );
+
+        endpoint.request_shutdown_and_close();
+        let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
+        assert_eq!(
+            close_keys,
+            vec!["fs-meta.events:v1.stream".to_string()],
+            "retiring a managed stream endpoint must release its owned stream channel"
+        );
+
+        crate::runtime_app::shared_tokio_runtime()
+            .block_on(endpoint.shutdown(Duration::from_secs(1)));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn endpoint_shutdown_timeout_must_not_leave_blocking_join_task_inflight() {
         SHUTDOWN_BLOCKING_JOIN_INFLIGHT.store(0, Ordering::SeqCst);
@@ -2614,6 +2805,8 @@ mod tests {
             route_key: "sink-status:v1.req".to_string(),
             route_generation: None,
             boundary_id: 0,
+            boundary: Arc::new(RecordingBoundary::new()),
+            close_unit_ids: Vec::new(),
             unit_ids: Vec::new(),
             shutdown: CancellationToken::new(),
             terminal_reason: Arc::new(StdMutex::new(None)),

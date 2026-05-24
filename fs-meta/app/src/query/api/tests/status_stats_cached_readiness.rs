@@ -424,6 +424,70 @@ async fn repeated_materialized_status_load_reuses_same_epoch_readiness_cache_wit
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trusted_fail_closed_status_load_reuses_same_epoch_audit_inflight_cache_without_route_fanin()
+{
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a-nfs1");
+    fs::create_dir_all(&node_a_root).expect("create node-a nfs1 dir");
+    let grants = vec![granted_mount_root("node-a::nfs1", &node_a_root)];
+    let source = source_facade_with_group("nfs1", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let mut source_status = source_status_for_cache_key("nfs1");
+    source_status.concrete_roots[0].last_audit_started_at_us = Some(30);
+    source_status.concrete_roots[0].last_audit_completed_at_us = None;
+    source_status.concrete_roots[0].last_audit_duration_ms = None;
+    let sink_status = sink_status_for_cache_key("nfs1");
+    let boundary = Arc::new(RequestScopedSinkStatusStalledBoundary::new());
+    let sink_status_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+        .expect("resolve sink-status route");
+    let state = ApiState {
+        backend: QueryBackend::Route {
+            sink: sink.clone(),
+            boundary: boundary.clone(),
+            origin_id: NodeId("node-d".to_string()),
+            source: source.clone(),
+        },
+        policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+        pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
+        force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+        force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
+        readiness_source: Some(source.clone()),
+        readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(Some(CachedSourceStatusSnapshot {
+            snapshot: source_status,
+            signature: materialized_readiness_cache_signature(&source)
+                .expect("materialized readiness signature"),
+        }))),
+        materialized_sink_status_cache: Arc::new(Mutex::new(Some(CachedSinkStatusSnapshot {
+            snapshot: sink_status,
+        }))),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
+        tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
+    };
+
+    let (_source_status, _sink_status, observation_status) = tokio::time::timeout(
+        Duration::from_millis(250),
+        load_trusted_materialized_status_snapshots_with_settle(&state),
+    )
+    .await
+    .expect("trusted fail-closed cache should not wait for route fan-in")
+    .expect("trusted fail-closed status load should return cached evidence");
+
+    assert_eq!(
+        observation_status.state,
+        ObservationState::MaterializedUntrusted
+    );
+    assert_eq!(
+        boundary.send_batch_count(&sink_status_route.0),
+        0,
+        "steady trusted polling during giant-NFS audit lag should fail closed from same-epoch cached evidence instead of re-running sink/source status fan-in"
+    );
+}
+
 struct RequestScopedSinkStatusStalledBoundary {
     sink_reply_channel: String,
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,

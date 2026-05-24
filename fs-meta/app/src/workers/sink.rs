@@ -51,6 +51,7 @@ enum SinkControlResetKind {
     InvalidGrantAttachmentToken,
     MissingChannelBufferRouteState,
     StateCellWriteFenced,
+    ResourceExhausted,
 }
 
 impl SinkControlResetKind {
@@ -220,6 +221,13 @@ fn classify_sink_control_reset(err: &CnxError) -> Option<SinkControlResetKind> {
         }
         CnxError::TransportClosed(_) => Some(SinkControlResetKind::TransportClosed),
         CnxError::ChannelClosed => Some(SinkControlResetKind::ChannelClosed),
+        CnxError::ResourceExhausted(message)
+            if message.contains("max channels")
+                || message.contains("sink worker unavailable")
+                || message.contains("worker unavailable") =>
+        {
+            Some(SinkControlResetKind::ResourceExhausted)
+        }
         CnxError::PeerError(message) | CnxError::Internal(message)
             if is_retryable_worker_bridge_transport_error_message(message) =>
         {
@@ -252,6 +260,16 @@ fn classify_sink_control_reset(err: &CnxError) -> Option<SinkControlResetKind> {
         }
         _ => None,
     }
+}
+
+fn can_use_cached_sink_status_snapshot(err: &CnxError) -> bool {
+    matches!(
+        classify_sink_control_reset(err),
+        Some(
+            SinkControlResetKind::GrantAttachmentsDrainedOrFenced
+                | SinkControlResetKind::ResourceExhausted
+        )
+    )
 }
 
 #[derive(Debug)]
@@ -1516,7 +1534,9 @@ fn snapshot_control_signal_scope_ids(
         .last_control_frame_signals_by_node
         .values()
         .flat_map(|signals| signals.iter())
-        .filter(|signal| signal.starts_with("activate ") && signal.contains("unit=runtime.exec.sink"))
+        .filter(|signal| {
+            signal.starts_with("activate ") && signal.contains("unit=runtime.exec.sink")
+        })
         .flat_map(|signal| control_signal_summary_scope_ids(signal))
         .collect::<std::collections::BTreeSet<_>>();
     (!groups.is_empty()).then_some(groups)
@@ -3807,9 +3827,21 @@ impl SinkWorkerClientHandle {
             return Ok(snapshot);
         }
         self.replay_retained_control_state_if_needed().await?;
-        let snapshot = self
+        let snapshot = match self
             .status_snapshot_with_timeout_with_failure(Duration::from_secs(5))
-            .await?;
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(err) if can_use_cached_sink_status_snapshot(err.as_error()) => {
+                let cached_snapshot = self.cached_status_snapshot_with_failure()?;
+                return self.finalize_nonblocking_cached_status_snapshot(
+                    cached_snapshot,
+                    SinkStatusAccessPath::WorkerUnavailable,
+                    Some(err),
+                );
+            }
+            Err(err) => return Err(err),
+        };
         self.finalize_blocking_status_snapshot(snapshot, replay_required)
             .map_err(SinkFailure::from)
     }
@@ -4163,25 +4195,30 @@ impl SinkWorkerClientHandle {
                     .await?;
                 }
                 Ok(response) => break response,
-                Err(failure) => match classify_sink_retry_failure_disposition(
-                    machine.deadline,
-                    failure,
-                    SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
-                ) {
-                    SinkRetryDisposition::Retry => {
-                        machine = machine.phase_after_retry_reset();
-                        self.control_state_replay_required
-                            .store(1, Ordering::Release);
-                        self.restart_shared_worker_client_for_retry_until(
-                            machine.deadline,
-                            SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
-                        )
-                        .await?;
-                    }
-                    SinkRetryDisposition::Fail(failure) => {
+                Err(failure) => {
+                    if can_use_cached_sink_status_snapshot(failure.as_error()) {
                         return Err(failure);
                     }
-                },
+                    match classify_sink_retry_failure_disposition(
+                        machine.deadline,
+                        failure,
+                        SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
+                    ) {
+                        SinkRetryDisposition::Retry => {
+                            machine = machine.phase_after_retry_reset();
+                            self.control_state_replay_required
+                                .store(1, Ordering::Release);
+                            self.restart_shared_worker_client_for_retry_until(
+                                machine.deadline,
+                                SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
+                            )
+                            .await?;
+                        }
+                        SinkRetryDisposition::Fail(failure) => {
+                            return Err(failure);
+                        }
+                    }
+                }
             }
         };
         match response {

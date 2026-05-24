@@ -1337,6 +1337,7 @@ enum SourceWorkerControlResetKind {
     GrantAttachmentsDrainedOrFenced,
     InvalidGrantAttachmentToken,
     MissingChannelBufferRouteState,
+    ResourceExhausted,
 }
 
 impl SourceWorkerControlResetKind {
@@ -1347,6 +1348,7 @@ impl SourceWorkerControlResetKind {
                 | Self::TransportClosed
                 | Self::Timeout
                 | Self::GrantAttachmentsDrainedOrFenced
+                | Self::ResourceExhausted
         )
     }
 
@@ -1382,6 +1384,13 @@ fn classify_source_worker_control_reset(err: &CnxError) -> Option<SourceWorkerCo
         CnxError::TransportClosed(_) => Some(SourceWorkerControlResetKind::TransportClosed),
         CnxError::ChannelClosed => Some(SourceWorkerControlResetKind::ChannelClosed),
         CnxError::Timeout => Some(SourceWorkerControlResetKind::Timeout),
+        CnxError::ResourceExhausted(message)
+            if message.contains("max channels")
+                || message.contains("source worker unavailable")
+                || message.contains("worker unavailable") =>
+        {
+            Some(SourceWorkerControlResetKind::ResourceExhausted)
+        }
         CnxError::PeerError(message) | CnxError::Internal(message)
             if message.contains("operation timed out") =>
         {
@@ -1471,7 +1480,8 @@ fn classify_source_scheduled_groups_refresh_exhaustion(
         | SourceWorkerControlResetKind::BridgePeerReset
         | SourceWorkerControlResetKind::UnexpectedCorrelationReply
         | SourceWorkerControlResetKind::GrantAttachmentsDrainedOrFenced
-        | SourceWorkerControlResetKind::InvalidGrantAttachmentToken => {
+        | SourceWorkerControlResetKind::InvalidGrantAttachmentToken
+        | SourceWorkerControlResetKind::ResourceExhausted => {
             SourceScheduledGroupsRefreshExhaustionReason::RetryableReset
         }
     })
@@ -1543,16 +1553,44 @@ fn can_use_cached_grant_derived_snapshot(err: &CnxError) -> bool {
 }
 
 pub(crate) fn can_use_cached_manual_rescan_logical_roots_snapshot(err: &CnxError) -> bool {
-    matches!(
-        classify_source_worker_control_reset(err),
-        Some(SourceWorkerControlResetKind::TransportClosed)
-    ) && err
-        .to_string()
-        .contains("stale shared source worker client detached during logical_roots_snapshot")
+    match classify_source_worker_control_reset(err) {
+        Some(SourceWorkerControlResetKind::ResourceExhausted) => true,
+        Some(SourceWorkerControlResetKind::TransportClosed) => err
+            .to_string()
+            .contains("stale shared source worker client detached during logical_roots_snapshot"),
+        _ => false,
+    }
 }
 
 fn can_retry_update_logical_roots(err: &CnxError) -> bool {
     classify_source_worker_control_reset(err).is_some()
+}
+
+fn can_retry_observability_snapshot(err: &CnxError) -> bool {
+    matches!(
+        classify_source_worker_control_reset(err),
+        Some(
+            SourceWorkerControlResetKind::WorkerNotInitialized
+                | SourceWorkerControlResetKind::TransportClosed
+                | SourceWorkerControlResetKind::ChannelClosed
+                | SourceWorkerControlResetKind::Timeout
+                | SourceWorkerControlResetKind::TimeoutLikePeerOrInternal
+                | SourceWorkerControlResetKind::BridgePeerReset
+                | SourceWorkerControlResetKind::UnexpectedCorrelationReply
+                | SourceWorkerControlResetKind::InvalidGrantAttachmentToken
+                | SourceWorkerControlResetKind::MissingChannelBufferRouteState
+        )
+    )
+}
+
+fn can_use_cached_source_status_snapshot(err: &CnxError) -> bool {
+    matches!(
+        classify_source_worker_control_reset(err),
+        Some(
+            SourceWorkerControlResetKind::GrantAttachmentsDrainedOrFenced
+                | SourceWorkerControlResetKind::ResourceExhausted
+        )
+    )
 }
 
 fn can_retry_force_find(err: &CnxError) -> bool {
@@ -1565,12 +1603,6 @@ fn can_retry_force_find(err: &CnxError) -> bool {
 #[derive(Debug)]
 enum SourceReconnectRetryDisposition {
     ReconnectAfter(SourceProgressState),
-    Fail(SourceFailure),
-}
-
-#[derive(Debug)]
-enum SourceWaitRetryDisposition {
-    WaitAfter(SourceProgressState),
     Fail(SourceFailure),
 }
 
@@ -1599,7 +1631,16 @@ impl SourceRetryMachine {
         err: CnxError,
         after: SourceProgressState,
     ) -> SourceReconnectRetryDisposition {
-        if !can_retry_update_logical_roots(&err) {
+        self.reconnect_after_retryable_gap(err, after, can_retry_update_logical_roots)
+    }
+
+    fn reconnect_after_retryable_gap(
+        &self,
+        err: CnxError,
+        after: SourceProgressState,
+        can_retry: impl FnOnce(&CnxError) -> bool,
+    ) -> SourceReconnectRetryDisposition {
+        if !can_retry(&err) {
             return SourceReconnectRetryDisposition::Fail(SourceFailure::from_cause(err));
         }
         if matches!(self.budget(), SourceRetryBudgetDisposition::Exhausted) {
@@ -1608,23 +1649,6 @@ impl SourceRetryMachine {
             ));
         }
         SourceReconnectRetryDisposition::ReconnectAfter(after)
-    }
-
-    fn wait_after_retryable_gap(
-        &self,
-        err: CnxError,
-        after: SourceProgressState,
-        can_retry: impl FnOnce(&CnxError) -> bool,
-    ) -> SourceWaitRetryDisposition {
-        if !can_retry(&err) {
-            return SourceWaitRetryDisposition::Fail(SourceFailure::from_cause(err));
-        }
-        if matches!(self.budget(), SourceRetryBudgetDisposition::Exhausted) {
-            return SourceWaitRetryDisposition::Fail(SourceFailure::retry_budget_exhausted(
-                SourceRetryBudgetExhaustionKind::OperationWait,
-            ));
-        }
-        SourceWaitRetryDisposition::WaitAfter(after)
     }
 
     fn scheduled_groups_refresh_after_error(
@@ -1755,6 +1779,7 @@ struct SourceScheduledGroupIdsMachine {
 
 struct SourceUpdateLogicalRootsMachine {
     deadline: std::time::Instant,
+    pending_reconnect_wait_after: Option<SourceProgressState>,
 }
 
 struct SourceObservabilitySnapshotMachine {
@@ -1838,6 +1863,7 @@ enum SourceObservabilitySnapshotEffect {
 
 enum SourceUpdateLogicalRootsEffect {
     Attempt { timeout: Duration },
+    Reconnect,
     Wait { after: SourceProgressState },
     Complete,
     Fail(SourceFailure),
@@ -1857,6 +1883,7 @@ enum SourceUpdateLogicalRootsEvent {
         rpc_result: std::result::Result<SourceWorkerResponse, CnxError>,
         after: SourceProgressState,
     },
+    ReconnectCompleted,
     WaitCompleted,
 }
 
@@ -2067,7 +2094,10 @@ impl SourceScheduledGroupIdsMachine {
 
 impl SourceUpdateLogicalRootsMachine {
     fn new(deadline: std::time::Instant) -> Self {
-        Self { deadline }
+        Self {
+            deadline,
+            pending_reconnect_wait_after: None,
+        }
     }
 
     fn start(&self) -> std::result::Result<SourceUpdateLogicalRootsEffect, SourceFailure> {
@@ -2080,7 +2110,7 @@ impl SourceUpdateLogicalRootsMachine {
     }
 
     fn advance(
-        &self,
+        &mut self,
         event: SourceUpdateLogicalRootsEvent,
     ) -> std::result::Result<SourceUpdateLogicalRootsEffect, SourceFailure> {
         match event {
@@ -2103,19 +2133,26 @@ impl SourceUpdateLogicalRootsMachine {
                 rpc_result: Err(err),
                 after,
             } => Ok(
-                match SourceRetryMachine::new(self.deadline).wait_after_retryable_gap(
-                    err,
-                    after,
-                    can_retry_update_logical_roots,
-                ) {
-                    SourceWaitRetryDisposition::WaitAfter(after) => {
-                        SourceUpdateLogicalRootsEffect::Wait { after }
+                match SourceRetryMachine::new(self.deadline)
+                    .reconnect_after_update_roots_gap(err, after)
+                {
+                    SourceReconnectRetryDisposition::ReconnectAfter(after) => {
+                        self.pending_reconnect_wait_after = Some(after);
+                        SourceUpdateLogicalRootsEffect::Reconnect
                     }
-                    SourceWaitRetryDisposition::Fail(failure) => {
+                    SourceReconnectRetryDisposition::Fail(failure) => {
                         SourceUpdateLogicalRootsEffect::Fail(failure)
                     }
                 },
             ),
+            SourceUpdateLogicalRootsEvent::ReconnectCompleted => {
+                Ok(SourceUpdateLogicalRootsEffect::Wait {
+                    after: take_pending_reconnect_wait_after(
+                        &mut self.pending_reconnect_wait_after,
+                        "update-logical-roots",
+                    )?,
+                })
+            }
             SourceUpdateLogicalRootsEvent::WaitCompleted => self.start(),
         }
     }
@@ -2148,9 +2185,11 @@ impl SourceObservabilitySnapshotMachine {
                 rpc_result: Err(err),
                 after,
             } => Ok(
-                match SourceRetryMachine::new(self.deadline)
-                    .reconnect_after_update_roots_gap(err, after)
-                {
+                match SourceRetryMachine::new(self.deadline).reconnect_after_retryable_gap(
+                    err,
+                    after,
+                    can_retry_observability_snapshot,
+                ) {
                     SourceReconnectRetryDisposition::ReconnectAfter(_) => {
                         SourceObservabilitySnapshotEffect::Reconnect
                     }
@@ -7070,7 +7109,7 @@ impl SourceWorkerClientHandle {
             std::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT,
             SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT,
         );
-        let machine = SourceUpdateLogicalRootsMachine::new(deadline);
+        let mut machine = SourceUpdateLogicalRootsMachine::new(deadline);
         drive_source_machine_loop(
             machine.start()?,
             |effect| async {
@@ -7084,6 +7123,14 @@ impl SourceWorkerClientHandle {
                                 after: self.current_source_progress_state(),
                             },
                         )
+                    }
+                    SourceUpdateLogicalRootsEffect::Reconnect => {
+                        match self.reconnect_shared_worker_client_with_failure().await {
+                            Ok(()) => SourceOperationLoopStep::Event(
+                                SourceUpdateLogicalRootsEvent::ReconnectCompleted,
+                            ),
+                            Err(err) => SourceOperationLoopStep::Fail(err),
+                        }
                     }
                     SourceUpdateLogicalRootsEffect::Wait { after } => {
                         self.execute_update_logical_roots_wait(after, deadline).await;
@@ -7132,7 +7179,13 @@ impl SourceWorkerClientHandle {
     async fn logical_roots_snapshot_with_failure(
         &self,
     ) -> std::result::Result<Vec<RootSpec>, SourceFailure> {
-        let (worker_instance_id, client) = self.shared_existing_client_with_failure().await?;
+        let (worker_instance_id, client) = match self.shared_existing_client_with_failure().await {
+            Ok(result) => result,
+            Err(err) if can_use_cached_grant_derived_snapshot(err.as_error()) => {
+                return self.cached_logical_roots_snapshot_with_failure();
+            }
+            Err(err) => return Err(err),
+        };
         let Some(client) = client else {
             return self.cached_logical_roots_snapshot_with_failure();
         };
@@ -7237,10 +7290,40 @@ impl SourceWorkerClientHandle {
         .map_err(SourceFailure::from)
     }
 
+    fn cached_status_snapshot_with_failure(
+        &self,
+        reason: impl Into<String>,
+    ) -> std::result::Result<SourceStatusSnapshot, SourceFailure> {
+        let reason = reason.into();
+        self.with_cache_mut(|cache| {
+            let mut status = cache.status.clone().unwrap_or_default();
+            if !status
+                .degraded_roots
+                .iter()
+                .any(|(root_key, existing_reason)| {
+                    root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY && existing_reason == &reason
+                })
+            {
+                status
+                    .degraded_roots
+                    .push((SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(), reason));
+            }
+            Ok::<SourceStatusSnapshot, CnxError>(status)
+        })
+        .map_err(SourceFailure::from)
+    }
+
     async fn host_object_grants_snapshot_with_failure(
         &self,
     ) -> std::result::Result<Vec<GrantedMountRoot>, SourceFailure> {
-        let Some(client) = self.existing_client_with_failure().await? else {
+        let client = match self.existing_client_with_failure().await {
+            Ok(client) => client,
+            Err(err) if can_use_cached_grant_derived_snapshot(err.as_error()) => {
+                return self.cached_host_object_grants_snapshot_with_failure();
+            }
+            Err(err) => return Err(err),
+        };
+        let Some(client) = client else {
             return self.cached_host_object_grants_snapshot_with_failure();
         };
         let result = Self::call_worker_with_failure(
@@ -7291,7 +7374,7 @@ impl SourceWorkerClientHandle {
     async fn status_snapshot_with_failure(
         &self,
     ) -> std::result::Result<SourceStatusSnapshot, SourceFailure> {
-        let response = self
+        let response = match self
             .with_started_retry_with_failure(|client| async move {
                 #[cfg(test)]
                 if let Some(err) = take_source_worker_status_error_hook() {
@@ -7304,7 +7387,14 @@ impl SourceWorkerClientHandle {
                 )
                 .await
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(err) if can_use_cached_source_status_snapshot(err.as_error()) => {
+                return self.cached_status_snapshot_with_failure(SOURCE_WORKER_CACHE_STATUS_REASON);
+            }
+            Err(err) => return Err(err),
+        };
         match response {
             SourceWorkerResponse::StatusSnapshot(snapshot) => {
                 self.with_cache_mut(|cache| {

@@ -3314,7 +3314,7 @@ impl FSMetaSource {
     fn prune_finished_endpoint_tasks(&self, context: &str) {
         let mut tasks = lock_or_recover(&self.endpoint_tasks, context);
         tasks.retain(|task| {
-            if !task.is_finished() && task.finish_reason().is_none() {
+            if !task.is_finished() {
                 return true;
             }
             eprintln!(
@@ -3334,6 +3334,7 @@ impl FSMetaSource {
                 task.route_key() == route_key
                     && !task.is_finished()
                     && task.finish_reason().is_none()
+                    && !task.is_shutdown_requested()
             })
     }
 
@@ -3346,17 +3347,16 @@ impl FSMetaSource {
         tasks.retain(|task| {
             let retire = !task.is_finished()
                 && task.finish_reason().is_none()
+                && !task.is_shutdown_requested()
                 && !task.belongs_to_boundary(boundary);
             if retire {
                 eprintln!(
                     "fs_meta_source: retiring endpoint from stale runtime boundary route={}",
                     task.route_key()
                 );
-                task.request_shutdown();
-                false
-            } else {
-                true
+                task.request_shutdown_and_close();
             }
+            true
         });
     }
 
@@ -3485,6 +3485,7 @@ impl FSMetaSource {
             task.route_key() == route
                 && !task.is_finished()
                 && task.finish_reason().is_none()
+                && !task.is_shutdown_requested()
                 && task.belongs_to_boundary(boundary)
                 && task.is_receive_armed()
         });
@@ -3495,17 +3496,20 @@ impl FSMetaSource {
             let retire = task.route_key() == route
                 && !task.is_finished()
                 && task.finish_reason().is_none()
+                && !task.is_shutdown_requested()
                 && (!task.belongs_to_boundary(boundary) || !task.is_receive_armed());
             if retire {
                 eprintln!(
                     "fs_meta_source: retiring unproven scoped rescan endpoint route={} before receive-armed ready refresh",
                     task.route_key()
                 );
-                task.request_shutdown();
-                false
-            } else {
-                true
+                if task.belongs_to_boundary(boundary) {
+                    task.request_shutdown_and_close_on(boundary);
+                } else {
+                    task.request_shutdown_and_close();
+                }
             }
+            true
         });
     }
 

@@ -1793,6 +1793,25 @@ async fn manual_rescan_source_status_rearm_replaces_unproven_scoped_rescan_endpo
         repair_boundary.recv_count(&scoped_rescan_route) > 0,
         "manual source-status rearm must prove current scoped receive-armed state on the repair boundary before refreshing ready evidence"
     );
+    let (retired_count, active_replacement_count) = lock_or_recover(
+        &source.endpoint_tasks,
+        "test.source.scoped_rescan_rearm.endpoint_tasks.after_unproven_retire",
+    )
+    .iter()
+    .filter(|task| task.route_key() == scoped_rescan_route)
+    .fold((0usize, 0usize), |(retired, active), task| {
+        if task.is_shutdown_requested() {
+            (retired + 1, active)
+        } else if !task.is_finished() && task.finish_reason().is_none() {
+            (retired, active + 1)
+        } else {
+            (retired, active)
+        }
+    });
+    assert!(
+        retired_count >= 1 && active_replacement_count >= 1,
+        "retired scoped rescan endpoints must stay retained for close-time join while a fresh endpoint owns the route; retired={retired_count} active={active_replacement_count}"
+    );
     let snapshot = source
         .observability_snapshot_with_failure()
         .expect("source observability snapshot");

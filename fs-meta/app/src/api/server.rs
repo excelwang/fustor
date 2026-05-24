@@ -24,7 +24,7 @@ use capanix_app_sdk::{CnxError, Result};
 use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
 
 use crate::query::api::{
-    create_local_router, projection_policy_from_host_object_grants,
+    create_local_router_with_sink_observation_repair, projection_policy_from_host_object_grants,
     refresh_policy_from_host_object_grants,
 };
 use crate::workers::sink::SinkFacade;
@@ -312,7 +312,7 @@ fn router(state: ApiState, control_gate: Arc<ApiControlGate>) -> Result<Router> 
             Method::OPTIONS,
         ])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
-    let projection_router = create_local_router(
+    let projection_router = create_local_router_with_sink_observation_repair(
         state.query_sink.clone(),
         state.source.clone(),
         state.query_runtime_boundary.clone(),
@@ -320,6 +320,7 @@ fn router(state: ApiState, control_gate: Arc<ApiControlGate>) -> Result<Router> 
         state.projection_policy.clone(),
         state.force_find_inflight.clone(),
         state.force_find_runner_evidence.clone(),
+        control_gate.sink_repair_recovery(),
     )
     .layer(middleware::from_fn_with_state(
         state.auth.clone(),
@@ -391,6 +392,10 @@ impl ApiManagementReadinessGate {
         matches!(self, Self::FullManagementWrite)
     }
 
+    fn blocks_handler_until_ready(self) -> bool {
+        matches!(self, Self::FullManagementWrite)
+    }
+
     async fn wait_ready(self, control_gate: &ApiControlGate) {
         match self {
             Self::FullManagementWrite => control_gate.wait_management_write_ready().await,
@@ -403,7 +408,7 @@ impl ApiManagementReadinessGate {
         control_gate: &ApiControlGate,
     ) -> Option<super::state::ManagementWriteRecovery> {
         match self {
-            Self::FullManagementWrite => None,
+            Self::FullManagementWrite => control_gate.management_write_recovery(),
             Self::SourceRepair => control_gate.source_repair_recovery(),
         }
     }
@@ -505,12 +510,12 @@ async fn request_control_readiness_guard(
         });
     }
     let remaining = ready_deadline.saturating_duration_since(tokio::time::Instant::now());
-    if !readiness_gate.is_ready(&control_gate)
+    let wait_timed_out = !readiness_gate.is_ready(&control_gate)
         && (remaining.is_zero()
             || tokio::time::timeout(remaining, readiness_gate.wait_ready(&control_gate))
                 .await
-                .is_err())
-    {
+                .is_err());
+    if wait_timed_out && readiness_gate.blocks_handler_until_ready() {
         return response_with_owned_guards(
             ApiError::service_unavailable(
             "fs-meta management request handling is unavailable until runtime control initializes the app",
@@ -1191,8 +1196,74 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rescan_control_readiness_guard_keeps_source_repair_recovery_running_after_request_timeout()
+    async fn roots_put_control_readiness_guard_runs_management_write_recovery_before_waiting_not_ready()
      {
+        let control_gate = Arc::new(ApiControlGate::new(false));
+        let recovery_calls = Arc::new(AtomicUsize::new(0));
+        control_gate.set_management_write_recovery(Some(Arc::new({
+            let control_gate = control_gate.clone();
+            let recovery_calls = recovery_calls.clone();
+            move || {
+                let control_gate = control_gate.clone();
+                let recovery_calls = recovery_calls.clone();
+                Box::pin(async move {
+                    recovery_calls.fetch_add(1, Ordering::SeqCst);
+                    control_gate.set_ready(true);
+                    Ok(())
+                })
+            }
+        })));
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/monitoring/roots",
+                put({
+                    let handler_calls = handler_calls.clone();
+                    move || {
+                        let handler_calls = handler_calls.clone();
+                        async move {
+                            handler_calls.fetch_add(1, Ordering::SeqCst);
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .with_state(control_gate.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                request_control_readiness_guard,
+            ));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/fs-meta/v1/monitoring/roots")
+                    .body(Body::empty())
+                    .expect("build roots_put request"),
+            ),
+        )
+        .await
+        .expect("roots_put should run bounded management-write recovery before timing out")
+        .expect("route roots_put request");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            recovery_calls.load(Ordering::SeqCst),
+            1,
+            "roots_put readiness guard must drive exactly one bounded management-write recovery before allowing the handler"
+        );
+        assert_eq!(
+            handler_calls.load(Ordering::SeqCst),
+            1,
+            "roots_put handler must run after management-write recovery reopens the gate"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rescan_control_readiness_guard_enters_handler_while_source_repair_recovery_continues()
+    {
         tokio::time::pause();
 
         let control_gate = Arc::new(ApiControlGate::new(false));
@@ -1261,21 +1332,18 @@ mod tests {
         tokio::task::yield_now().await;
         let response = response_task
             .await
-            .expect("join timed-out rescan request")
-            .expect("route timed-out rescan request");
-        assert_eq!(
-            response.status(),
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
-        );
+            .expect("join advisory rescan request")
+            .expect("route advisory rescan request");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
         assert_eq!(
             handler_calls.load(Ordering::SeqCst),
-            0,
-            "timed-out rescan must not enter the handler before source repair is ready"
+            1,
+            "source-repair-gated rescan must enter its handler while advisory source repair continues"
         );
         assert_eq!(
             recovery_completions.load(Ordering::SeqCst),
             0,
-            "precondition: source-repair recovery is still waiting when the request times out"
+            "precondition: source-repair recovery is still waiting when the handler runs"
         );
 
         release_recovery.notify_waiters();

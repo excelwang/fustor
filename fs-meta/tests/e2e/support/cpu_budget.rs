@@ -31,14 +31,12 @@ pub fn summarize_cpu_budget(
     let mut all_means = Vec::new();
     for (node, steady_samples) in steady {
         let base_samples = baseline.get(node).cloned().unwrap_or_default();
-        let baseline_sustained = sustained_mean_sample(&base_samples);
-        let steady_sustained = sustained_mean_sample(steady_samples);
         let deltas = steady_samples
             .iter()
             .zip(base_samples.iter().chain(std::iter::repeat(&0.0)))
             .map(|(steady_sample, baseline_sample)| (steady_sample - baseline_sample).max(0.0))
             .collect::<Vec<_>>();
-        let mean = (steady_sustained - baseline_sustained).max(0.0);
+        let mean = sustained_mean_sample(&deltas);
         let p95 = percentile_sample(&deltas, 0.95);
         per_node_mean_delta.insert(node.clone(), mean);
         per_node_p95_delta.insert(node.clone(), p95);
@@ -275,6 +273,32 @@ mod tests {
                 .get("node-a")
                 .is_some_and(|p95| *p95 > 90.0),
             "tail spike must remain visible as diagnostic evidence: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn summarize_cpu_budget_uses_paired_positive_deltas_for_sustained_overhead() {
+        let idle = vec![1.0, 1.0, 1.0, 1.0, 40.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let polling = vec![1.5, 1.5, 1.5, 1.5, 41.0, 1.5, 1.5, 1.5, 1.5, 1.5, 16.0, 1.5];
+
+        let summary = summarize_cpu_budget(
+            &BTreeMap::from([("node-a".to_string(), idle)]),
+            &BTreeMap::from([("node-a".to_string(), polling)]),
+        );
+
+        assert!(
+            summary
+                .per_node_mean_delta
+                .get("node-a")
+                .is_some_and(|mean| *mean < 2.0),
+            "sustained CPU overhead should be based on paired positive deltas, not separate window means that amplify unrelated host noise: {summary:?}"
+        );
+        assert!(
+            summary
+                .per_node_p95_delta
+                .get("node-a")
+                .is_some_and(|p95| *p95 > 10.0),
+            "tail noise should remain visible in diagnostics: {summary:?}"
         );
     }
 

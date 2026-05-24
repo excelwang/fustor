@@ -700,6 +700,21 @@ async fn start_runtime_endpoints_rebinds_events_stream_on_new_boundary_after_cut
         old_boundary.recv_counts_snapshot(),
         current_boundary.recv_counts_snapshot()
     );
+    let old_boundary_dyn: Arc<dyn ChannelIoSubset> = old_boundary.clone();
+    let retained_old_shutdown = lock_or_recover(
+        &sink.endpoint_tasks,
+        "test.sink.rebind_new_boundary.endpoint_tasks.after_cutover",
+    )
+    .iter()
+    .any(|task| {
+        task.route_key() == events_route
+            && task.belongs_to_boundary(&old_boundary_dyn)
+            && task.is_shutdown_requested()
+    });
+    assert!(
+        retained_old_shutdown,
+        "old-boundary sink endpoint must be shutdown-requested but retained until close can join it"
+    );
 
     sink.close().await.expect("close sink");
 }

@@ -749,6 +749,343 @@ async fn load_materialized_status_snapshots_queries_owner_when_generic_source_st
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn load_materialized_status_snapshots_refreshes_source_owner_before_empty_sink_recollect_when_runtime_scope_has_no_root_health()
+ {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_b_root = tmp.path().join("node-b");
+    fs::create_dir_all(&node_b_root).expect("create node-b dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-b::nfs1".to_string(),
+        host_ref: "node-b".to_string(),
+        host_ip: "10.0.0.2".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: node_b_root,
+        fs_source: "nfs".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let mut root = RootSpec::new("nfs1", "/unused");
+    root.selector = crate::source::config::RootSelector {
+        fs_type: Some("nfs".to_string()),
+        ..crate::source::config::RootSelector::default()
+    };
+    root.subpath_scope = std::path::PathBuf::from("/");
+    let roots = vec![root.clone()];
+    let source = source_facade_with_roots(roots.clone(), &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let source_status_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+        .expect("resolve source-status route");
+    let node_b_source_status_route = source_status_request_route_for("node-b");
+    let sink_status_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+        .expect("resolve sink-status route");
+    let node_b_sink_status_route = sink_status_request_route_for("node-b");
+    let generic_source_status_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+        lifecycle_state: "runtime-scope-ready".into(),
+        host_object_grants_version: 1,
+        grants: grants.clone(),
+        logical_roots: roots,
+        status: SourceStatusSnapshot {
+            degraded_roots: vec![
+                (
+                    "source-worker".to_string(),
+                    "source worker runtime scope served from control cache".to_string(),
+                ),
+                (
+                    "source-worker".to_string(),
+                    "source worker source state pending; delivery proof withheld".to_string(),
+                ),
+            ],
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: BTreeMap::new(),
+        last_force_find_runner_by_group: BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        scheduled_scan_groups_by_node: BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        last_control_frame_signals_by_node: BTreeMap::new(),
+        published_batches_by_node: BTreeMap::new(),
+        published_events_by_node: BTreeMap::new(),
+        published_control_events_by_node: BTreeMap::new(),
+        published_data_events_by_node: BTreeMap::new(),
+        last_published_at_us_by_node: BTreeMap::new(),
+        last_published_origins_by_node: BTreeMap::new(),
+        published_origin_counts_by_node: BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: BTreeMap::new(),
+        pending_path_origin_counts_by_node: BTreeMap::new(),
+        yielded_path_origin_counts_by_node: BTreeMap::new(),
+        summarized_path_origin_counts_by_node: BTreeMap::new(),
+        published_path_origin_counts_by_node: BTreeMap::new(),
+    })
+    .expect("encode generic runtime-scope source-status payload");
+    let node_b_source_status_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+        lifecycle_state: "running".into(),
+        host_object_grants_version: 1,
+        grants: grants.clone(),
+        logical_roots: vec![root],
+        status: SourceStatusSnapshot {
+            current_stream_generation: Some(11),
+            logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".into(),
+                status: "ok".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            }],
+            concrete_roots: vec![routed_source_concrete_root_for_test(
+                "nfs1",
+                "node-b",
+                false,
+                Some(10),
+                Some(11),
+                Some(12),
+            )],
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: BTreeMap::from([("nfs1".to_string(), "node-b::nfs1".to_string())]),
+        last_force_find_runner_by_group: BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        scheduled_scan_groups_by_node: BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        last_control_frame_signals_by_node: BTreeMap::new(),
+        published_batches_by_node: BTreeMap::new(),
+        published_events_by_node: BTreeMap::new(),
+        published_control_events_by_node: BTreeMap::new(),
+        published_data_events_by_node: BTreeMap::new(),
+        last_published_at_us_by_node: BTreeMap::new(),
+        last_published_origins_by_node: BTreeMap::new(),
+        published_origin_counts_by_node: BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: BTreeMap::new(),
+        pending_path_origin_counts_by_node: BTreeMap::new(),
+        yielded_path_origin_counts_by_node: BTreeMap::new(),
+        summarized_path_origin_counts_by_node: BTreeMap::new(),
+        published_path_origin_counts_by_node: BTreeMap::new(),
+    })
+    .expect("encode node-b source-status payload");
+    let empty_sink_status_payload = rmp_serde::to_vec_named(&SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-b::nfs1".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    })
+    .expect("encode empty sink-status payload");
+    let node_b_request_purposes = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let mut generic_source_status_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        source_status_route,
+        "test-runtime-scope-empty-root-health-generic-source-status",
+        CancellationToken::new(),
+        move |requests| {
+            let generic_source_status_payload = generic_source_status_payload.clone();
+            async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        mk_event_with_correlation(
+                            "generic-source-status",
+                            req.metadata()
+                                .correlation_id
+                                .expect("source-status request correlation"),
+                            generic_source_status_payload.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        },
+    );
+    let mut node_b_source_status_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_b_source_status_route.clone(),
+        "test-runtime-scope-empty-root-health-node-b-source-status",
+        CancellationToken::new(),
+        {
+            let node_b_request_purposes = node_b_request_purposes.clone();
+            move |requests| {
+                let node_b_source_status_payload = node_b_source_status_payload.clone();
+                let node_b_request_purposes = node_b_request_purposes.clone();
+                async move {
+                    #[derive(serde::Deserialize)]
+                    struct SourceStatusRequestProbe {
+                        purpose: Option<String>,
+                        live_probe_timeout_ms: Option<u64>,
+                    }
+                    requests
+                        .into_iter()
+                        .map(|req| {
+                            let probe = rmp_serde::from_slice::<SourceStatusRequestProbe>(
+                                req.payload_bytes(),
+                            )
+                            .expect("decode node-b source-status request");
+                            assert!(
+                                probe.live_probe_timeout_ms.is_some(),
+                                "owner-scoped source-status must carry bounded live probe timeout"
+                            );
+                            node_b_request_purposes
+                                .lock()
+                                .expect("node-b request purposes lock")
+                                .push(probe.purpose);
+                            mk_event_with_correlation(
+                                "node-b",
+                                req.metadata()
+                                    .correlation_id
+                                    .expect("node-b source-status request correlation"),
+                                node_b_source_status_payload.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }
+            }
+        },
+    );
+    let mut sink_status_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        sink_status_route,
+        "test-runtime-scope-empty-root-health-sink-status",
+        CancellationToken::new(),
+        {
+            let empty_sink_status_payload = empty_sink_status_payload.clone();
+            move |requests| {
+                let empty_sink_status_payload = empty_sink_status_payload.clone();
+                async move {
+                    requests
+                        .into_iter()
+                        .map(|req| {
+                            mk_event_with_correlation(
+                                "sink-status",
+                                req.metadata()
+                                    .correlation_id
+                                    .expect("sink-status request correlation"),
+                                empty_sink_status_payload.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }
+            }
+        },
+    );
+    let mut node_b_sink_status_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_b_sink_status_route,
+        "test-runtime-scope-empty-root-health-node-b-sink-status",
+        CancellationToken::new(),
+        move |requests| {
+            let empty_sink_status_payload = empty_sink_status_payload.clone();
+            async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        mk_event_with_correlation(
+                            "node-b-sink-status",
+                            req.metadata()
+                                .correlation_id
+                                .expect("node-b sink-status request correlation"),
+                            empty_sink_status_payload.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        },
+    );
+    let state = ApiState {
+        backend: QueryBackend::Route {
+            sink: sink.clone(),
+            boundary: boundary.clone(),
+            origin_id: NodeId("api-node".to_string()),
+            source: source.clone(),
+        },
+        policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+        pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
+        force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+        force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
+        readiness_source: Some(source),
+        readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
+        materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
+        tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
+    };
+
+    let (source_status, sink_status) = load_materialized_status_snapshots(&state)
+        .await
+        .expect("load materialized status snapshots");
+
+    assert!(
+        source_status
+            .logical_roots
+            .iter()
+            .any(|root| root.root_id == "nfs1"),
+        "runtime-scope-only source status must be refreshed from current-owner health before sink readiness gates: {source_status:?}"
+    );
+    assert!(
+        !sink_status_covers_ready_readiness_groups(
+            &sink_status,
+            &BTreeSet::from(["nfs1".to_string()])
+        ),
+        "test fixture should keep sink materialization pending so source refresh is not hidden by sink-ready gating"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&node_b_source_status_route.0),
+        1,
+        "materialized status load must query source current-owner health before treating empty sink status as authoritative"
+    );
+    assert_eq!(
+        node_b_request_purposes
+            .lock()
+            .expect("node-b request purposes lock")
+            .as_slice(),
+        &[Some("current-owner-health".to_string())],
+        "source current-owner refresh must use current-owner-health request purpose"
+    );
+
+    generic_source_status_endpoint
+        .shutdown(Duration::from_secs(2))
+        .await;
+    node_b_source_status_endpoint
+        .shutdown(Duration::from_secs(2))
+        .await;
+    sink_status_endpoint.shutdown(Duration::from_secs(2)).await;
+    node_b_sink_status_endpoint
+        .shutdown(Duration::from_secs(2))
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_source_status_snapshot_retries_missing_route_state_without_blind_sleep() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_root = tmp.path().join("node-a");

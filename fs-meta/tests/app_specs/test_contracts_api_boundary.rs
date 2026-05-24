@@ -154,6 +154,74 @@ fn wait_for_status_sink_groups(
     );
 }
 
+fn materialized_status_sink_groups_ready(
+    resp: &HttpResponse,
+    expected: Option<&BTreeSet<String>>,
+) -> bool {
+    if resp.status != 200 {
+        return false;
+    }
+    let Some(groups) = resp
+        .json
+        .as_ref()
+        .and_then(|value| value.get("sink"))
+        .and_then(|value| value.get("groups"))
+        .and_then(|value| value.as_array())
+    else {
+        return false;
+    };
+    if groups.is_empty() {
+        return false;
+    }
+    if let Some(expected) = expected {
+        let keys: BTreeSet<String> = groups
+            .iter()
+            .filter_map(|group| group.get("group_id").and_then(|value| value.as_str()))
+            .map(ToString::to_string)
+            .collect();
+        if &keys != expected {
+            return false;
+        }
+    }
+    groups.iter().all(|group| {
+        group
+            .get("initial_audit_completed")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+    })
+}
+
+fn wait_for_materialized_status_sink_groups(
+    base: &str,
+    admin_token: &str,
+    expected: Option<&BTreeSet<String>>,
+) -> HttpResponse {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = None;
+    while Instant::now() < deadline {
+        let resp = http_json(
+            base,
+            "GET",
+            "/api/fs-meta/v1/status",
+            Some(admin_token),
+            None,
+        )
+        .expect("status endpoint");
+        if materialized_status_sink_groups_ready(&resp, expected) {
+            return resp;
+        }
+        last = Some(resp);
+        thread::sleep(Duration::from_millis(150));
+    }
+    let last = last.expect("at least one response before timeout");
+    panic!(
+        "materialized sink groups did not become ready; expected={expected:?} last_status={} got={:?} body={}",
+        last.status,
+        status_sink_group_ids(&last),
+        last.body
+    );
+}
+
 fn assert_status_monitoring_shape(status: &HttpResponse) {
     let body = status
         .json
@@ -1212,9 +1280,9 @@ fn blackbox_group_reconfiguration_updates_query_and_force_find_groups() {
     let (query_api_key, _) = create_query_api_key(base, &admin_token, "group-reconfig");
 
     let initial_groups = BTreeSet::from(["root-a".to_string(), "root-b".to_string()]);
-    let tree_query = "/api/fs-meta/v1/tree?path=/";
+    let tree_query = "/api/fs-meta/v1/tree?path=/&read_class=materialized";
     let force_find_query = "/api/fs-meta/v1/on-demand-force-find?path=/";
-    wait_for_status_sink_groups(base, &admin_token, Some(&initial_groups));
+    wait_for_materialized_status_sink_groups(base, &admin_token, Some(&initial_groups));
     let tree_resp = http_json(base, "GET", tree_query, Some(&query_api_key), None)
         .expect("tree initial groups");
     assert_eq!(tree_resp.status, 200, "body={}", tree_resp.body);
@@ -1245,7 +1313,7 @@ fn blackbox_group_reconfiguration_updates_query_and_force_find_groups() {
     .expect("split roots update");
     assert_eq!(split_update.status, 200, "body={}", split_update.body);
 
-    wait_for_status_sink_groups(base, &admin_token, Some(&split_groups));
+    wait_for_materialized_status_sink_groups(base, &admin_token, Some(&split_groups));
     let tree_resp =
         http_json(base, "GET", tree_query, Some(&query_api_key), None).expect("tree split groups");
     assert_eq!(tree_resp.status, 200, "body={}", tree_resp.body);
@@ -1272,7 +1340,7 @@ fn blackbox_group_reconfiguration_updates_query_and_force_find_groups() {
     .expect("remove roots update");
     assert_eq!(remove_update.status, 200, "body={}", remove_update.body);
 
-    wait_for_status_sink_groups(base, &admin_token, Some(&removed_groups));
+    wait_for_materialized_status_sink_groups(base, &admin_token, Some(&removed_groups));
     let tree_resp = http_json(base, "GET", tree_query, Some(&query_api_key), None)
         .expect("tree removed groups");
     assert_eq!(tree_resp.status, 200, "body={}", tree_resp.body);

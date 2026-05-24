@@ -75,6 +75,7 @@ pub struct ApiControlGate {
     status_remote_collection_tracker: Arc<ApiRequestTracker>,
     management_write_recovery: RwLock<Option<ManagementWriteRecovery>>,
     source_repair_recovery: RwLock<Option<ManagementWriteRecovery>>,
+    sink_repair_recovery: RwLock<Option<ManagementWriteRecovery>>,
 }
 
 pub struct ApiRequestGuard {
@@ -116,6 +117,7 @@ impl ApiControlGate {
             status_remote_collection_tracker: Arc::new(ApiRequestTracker::default()),
             management_write_recovery: RwLock::new(None),
             source_repair_recovery: RwLock::new(None),
+            sink_repair_recovery: RwLock::new(None),
         }
     }
 
@@ -247,6 +249,19 @@ impl ApiControlGate {
 
     pub fn source_repair_recovery(&self) -> Option<ManagementWriteRecovery> {
         self.source_repair_recovery
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    pub fn set_sink_repair_recovery(&self, recovery: Option<ManagementWriteRecovery>) {
+        if let Ok(mut guard) = self.sink_repair_recovery.write() {
+            *guard = recovery;
+        }
+    }
+
+    pub fn sink_repair_recovery(&self) -> Option<ManagementWriteRecovery> {
+        self.sink_repair_recovery
             .read()
             .ok()
             .and_then(|guard| guard.clone())

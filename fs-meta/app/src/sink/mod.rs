@@ -2555,7 +2555,35 @@ impl SinkFileMeta {
     ) -> bool {
         lock_or_recover(&self.endpoint_tasks, context)
             .iter()
-            .any(|task| task.route_key() == route_key && task.belongs_to_boundary(boundary))
+            .any(|task| {
+                task.route_key() == route_key
+                    && task.belongs_to_boundary(boundary)
+                    && !task.is_finished()
+                    && task.finish_reason().is_none()
+                    && !task.is_shutdown_requested()
+            })
+    }
+
+    fn retire_endpoint_tasks_for_different_boundary(
+        &self,
+        boundary: &Arc<dyn ChannelIoSubset>,
+        context: &str,
+    ) {
+        let mut tasks = lock_or_recover(&self.endpoint_tasks, context);
+        tasks.retain(|task| {
+            let retire = !task.is_finished()
+                && task.finish_reason().is_none()
+                && !task.is_shutdown_requested()
+                && !task.belongs_to_boundary(boundary);
+            if retire {
+                eprintln!(
+                    "fs_meta_sink: retiring endpoint from stale runtime boundary route={}",
+                    task.route_key()
+                );
+                task.request_shutdown_and_close();
+            }
+            true
+        });
     }
 
     pub(crate) fn start_runtime_endpoints_on_boundary(
@@ -2569,6 +2597,10 @@ impl SinkFileMeta {
             node_id.0
         );
         self.prune_finished_endpoint_tasks("sink.start_runtime_endpoints.prune");
+        self.retire_endpoint_tasks_for_different_boundary(
+            &boundary,
+            "sink.start_runtime_endpoints.retire_stale_boundary",
+        );
 
         self.disable_stream_receive();
 

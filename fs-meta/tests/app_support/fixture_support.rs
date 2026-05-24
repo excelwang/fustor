@@ -33,6 +33,10 @@ impl FsMetaApiFixture {
             .map_err(|e| format!("write root_a seed file failed: {e}"))?;
         std::fs::write(root_b.join("b.txt"), "beta\n")
             .map_err(|e| format!("write root_b seed file failed: {e}"))?;
+        backdate_fixture_path(&root_a.join("a.txt"))?;
+        backdate_fixture_path(&root_b.join("b.txt"))?;
+        backdate_fixture_path(&root_a)?;
+        backdate_fixture_path(&root_b)?;
 
         let auth_dir = base.join("auth");
         std::fs::create_dir_all(&auth_dir).map_err(|e| format!("create auth dir failed: {e}"))?;
@@ -154,6 +158,19 @@ fn reserve_local_port() -> Result<u16, String> {
         .local_addr()
         .map(|addr| addr.port())
         .map_err(|e| format!("read reserved local port failed: {e}"))
+}
+
+fn backdate_fixture_path(path: &Path) -> Result<(), String> {
+    let fixture_time = SystemTime::now()
+        .checked_sub(Duration::from_secs(120))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("open fixture path for timestamp backdate failed: {e}"))?;
+    let times = std::fs::FileTimes::new()
+        .set_accessed(fixture_time)
+        .set_modified(fixture_time);
+    file.set_times(times)
+        .map_err(|e| format!("backdate fixture path timestamp failed: {e}"))
 }
 
 fn workspace_root() -> Result<PathBuf, String> {

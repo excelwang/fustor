@@ -1163,7 +1163,7 @@ async fn single_restart_deferred_retire_pending_events_deactivate_retries_stale_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn status_snapshot_retries_stale_drained_fenced_pid_errors() {
+async fn status_snapshot_uses_cache_after_stale_drained_fenced_pid_errors() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -1196,6 +1196,17 @@ async fn status_snapshot_retries_stale_drained_fenced_pid_errors() {
         .expect("sink worker start timed out")
         .expect("start sink worker");
 
+    let primed_snapshot = sink
+        .status_snapshot_with_failure()
+        .await
+        .expect("prime sink status cache");
+    assert_eq!(
+        primed_snapshot.groups.len(),
+        1,
+        "primed live status should expose the configured group"
+    );
+    let previous_worker_instance_id = sink.worker_instance_id_for_tests().await;
+
     let _reset = SinkWorkerStatusErrorHookReset;
     install_sink_worker_status_error_hook(SinkWorkerStatusErrorHook {
             err: CnxError::AccessDenied(
@@ -1207,12 +1218,17 @@ async fn status_snapshot_retries_stale_drained_fenced_pid_errors() {
     let snapshot = sink
             .status_snapshot_with_failure()
             .await
-            .expect("status_snapshot should retry a stale drained/fenced pid error and reach the live sink worker");
+            .expect("status_snapshot should use the cached status after a stale drained/fenced pid error");
 
     assert_eq!(
         snapshot.groups.len(),
         1,
-        "fresh live sink worker snapshot should still decode after stale-pid retry"
+        "cached sink worker snapshot should still expose the configured group"
+    );
+    assert_eq!(
+        sink.worker_instance_id_for_tests().await,
+        previous_worker_instance_id,
+        "status snapshot cache fallback must not restart the shared sink worker"
     );
 
     sink.close().await.expect("close sink worker");

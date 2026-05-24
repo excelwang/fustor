@@ -48,6 +48,388 @@ fn source_section_between<'a>(
         .and_then(|tail| tail.split(end_marker).next())
 }
 
+fn repair_trigger_source_status_for_test(group_ids: &[&str]) -> SourceStatusSnapshot {
+    SourceStatusSnapshot {
+        current_stream_generation: Some(1),
+        logical_roots: group_ids
+            .iter()
+            .map(|group_id| crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: (*group_id).to_string(),
+                status: "serving".to_string(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            })
+            .collect(),
+        concrete_roots: group_ids
+            .iter()
+            .map(|group_id| crate::source::SourceConcreteRootHealthSnapshot {
+                root_key: format!("{group_id}@node-c"),
+                logical_root_id: (*group_id).to_string(),
+                object_ref: format!("node-c::{group_id}"),
+                status: "serving".to_string(),
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+                watch_enabled: true,
+                scan_enabled: true,
+                is_group_primary: true,
+                active: true,
+                watch_lru_capacity: 1024,
+                audit_interval_ms: 300_000,
+                overflow_count: 0,
+                overflow_pending: false,
+                rescan_pending: false,
+                last_rescan_requested_at_us: None,
+                last_rescan_reason: None,
+                last_error: None,
+                last_audit_started_at_us: Some(10),
+                last_audit_completed_at_us: None,
+                last_audit_duration_ms: None,
+                emitted_batch_count: 1,
+                emitted_event_count: 23_002,
+                emitted_control_event_count: 2,
+                emitted_data_event_count: 23_000,
+                emitted_path_capture_target: None,
+                emitted_path_event_count: 0,
+                last_emitted_at_us: Some(20),
+                last_emitted_origins: vec![format!("node-c::{group_id}=23000")],
+                forwarded_batch_count: 1,
+                forwarded_event_count: 23_002,
+                forwarded_path_event_count: 0,
+                last_forwarded_at_us: Some(21),
+                last_forwarded_origins: vec![format!("node-c::{group_id}=23000")],
+                current_revision: Some(1),
+                current_stream_generation: Some(1),
+                candidate_revision: None,
+                candidate_stream_generation: None,
+                candidate_status: None,
+                draining_revision: None,
+                draining_stream_generation: None,
+                draining_status: None,
+            })
+            .collect(),
+        degraded_roots: Vec::new(),
+    }
+}
+
+fn pending_sink_status_without_ingress_for_test(group_ids: &[&str]) -> SinkStatusSnapshot {
+    SinkStatusSnapshot {
+        groups: group_ids
+            .iter()
+            .map(|group_id| crate::sink::SinkGroupStatusSnapshot {
+                group_id: (*group_id).to_string(),
+                primary_object_ref: format!("node-c::{group_id}"),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 0,
+                estimated_heap_bytes: 0,
+            })
+            .collect(),
+        ..SinkStatusSnapshot::default()
+    }
+}
+
+fn scheduled_only_source_observability_for_test(
+    group_id: &str,
+    node_id: &str,
+) -> SourceObservabilitySnapshot {
+    SourceObservabilitySnapshot {
+        lifecycle_state: "runtime-scope-ready".into(),
+        host_object_grants_version: 1,
+        grants: Vec::new(),
+        logical_roots: Vec::new(),
+        status: SourceStatusSnapshot::default(),
+        source_primary_by_group: BTreeMap::new(),
+        last_force_find_runner_by_group: BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: BTreeMap::from([(
+            node_id.to_string(),
+            vec![group_id.to_string()],
+        )]),
+        scheduled_scan_groups_by_node: BTreeMap::from([(
+            node_id.to_string(),
+            vec![group_id.to_string()],
+        )]),
+        last_control_frame_signals_by_node: BTreeMap::new(),
+        published_batches_by_node: BTreeMap::new(),
+        published_events_by_node: BTreeMap::new(),
+        published_control_events_by_node: BTreeMap::new(),
+        published_data_events_by_node: BTreeMap::new(),
+        last_published_at_us_by_node: BTreeMap::new(),
+        last_published_origins_by_node: BTreeMap::new(),
+        published_origin_counts_by_node: BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: BTreeMap::new(),
+        pending_path_origin_counts_by_node: BTreeMap::new(),
+        yielded_path_origin_counts_by_node: BTreeMap::new(),
+        summarized_path_origin_counts_by_node: BTreeMap::new(),
+        published_path_origin_counts_by_node: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn materialized_source_owner_refresh_skips_runtime_scope_only_pending_source_status() {
+    let readiness_groups = BTreeSet::from(["nfs1".to_string()]);
+    let source_status = SourceStatusSnapshot::default();
+    let routed_snapshots = vec![scheduled_only_source_observability_for_test(
+        "nfs1", "node-c",
+    )];
+
+    assert!(
+        !source_status_should_refresh_current_owner_before_sink_readiness(
+            &source_status,
+            &readiness_groups,
+            &routed_snapshots,
+        ),
+        "runtime-scope-only source status may identify route owners, but it must not trigger current-owner health live probes before sink readiness because giant-NFS source publication can still be pending"
+    );
+}
+
+#[test]
+fn materialized_source_owner_refresh_preserves_concrete_source_status_probe() {
+    let readiness_groups = BTreeSet::from(["nfs1".to_string()]);
+    let source_status = repair_trigger_source_status_for_test(&["nfs1"]);
+    let routed_snapshots = vec![scheduled_only_source_observability_for_test(
+        "nfs1", "node-c",
+    )];
+
+    assert!(
+        source_status_should_refresh_current_owner_before_sink_readiness(
+            &source_status,
+            &readiness_groups,
+            &routed_snapshots,
+        ),
+        "once source status contains concrete root evidence, the pre-sink current-owner refresh remains valid for closing missing owner-health proof"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_sink_owner_refresh_skips_runtime_scope_only_source_status_without_publication()
+ {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a-nfs1");
+    let node_d_root = tmp.path().join("node-d-nfs2");
+    fs::create_dir_all(&node_a_root).expect("create node-a nfs1");
+    fs::create_dir_all(&node_d_root).expect("create node-d nfs2");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_root,
+            fs_source: "nfs1".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-d::nfs2".to_string(),
+            host_ref: "node-d".to_string(),
+            host_ip: "10.0.0.4".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_d_root,
+            fs_source: "nfs2".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = source_facade_with_roots(
+        vec![
+            root_spec_with_fs_source("nfs1"),
+            root_spec_with_fs_source("nfs2"),
+        ],
+        &grants,
+    );
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let mut state = test_api_state_for_route_source(
+        source.clone(),
+        sink.clone(),
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+    );
+    state.readiness_source = Some(source);
+    state.readiness_sink = Some(sink);
+    let readiness_groups = BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let sink_status = pending_sink_status_without_ingress_for_test(&["nfs1", "nfs2"]);
+    let routed_source_observability = vec![scheduled_only_source_observability_for_test(
+        "nfs2", "node-d",
+    )];
+    let source_status = SourceStatusSnapshot::default();
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(80),
+        augment_routed_sink_status_with_current_owner_evidence(
+            &state,
+            sink_status,
+            &source_status,
+            &readiness_groups,
+            StatusRoutePlan::new(Duration::from_millis(300), STATUS_ROUTE_COLLECT_IDLE_GRACE),
+            &routed_source_observability,
+        ),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "runtime-scope-only source status must not turn materialized root-tree polling into long owner-scoped sink-status probes"
+    );
+    for node in ["node-a", "node-d"] {
+        let route = sink_status_request_route_for(node);
+        assert_eq!(
+            boundary.send_batch_count(&route.0),
+            0,
+            "owner-scoped sink-status route should be skipped without source publication evidence for {node}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_sink_owner_refresh_probes_origin_sink_after_source_publication() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_c_root = tmp.path().join("node-c-nfs1");
+    fs::create_dir_all(&node_c_root).expect("create node-c nfs1");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-c::nfs1".to_string(),
+        host_ref: "node-c".to_string(),
+        host_ip: "10.0.0.3".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: node_c_root,
+        fs_source: "nfs1".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source = source_facade_with_roots(vec![root_spec_with_fs_source("nfs1")], &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let mut state = test_api_state_for_route_source(
+        source.clone(),
+        sink.clone(),
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+    );
+    state.readiness_source = Some(source);
+    state.readiness_sink = Some(sink);
+
+    let api_node_sink_status_route = sink_status_request_route_for("api-node");
+    let api_node_sink_status_payload = rmp_serde::to_vec_named(&SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "api-node".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        groups: vec![sink_group_status("nfs1", true)],
+        ..SinkStatusSnapshot::default()
+    })
+    .expect("encode api-node sink-status payload");
+    let mut api_node_sink_status_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        api_node_sink_status_route.clone(),
+        "test-origin-sink-owner-node-status",
+        CancellationToken::new(),
+        move |requests| {
+            let api_node_sink_status_payload = api_node_sink_status_payload.clone();
+            async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        mk_event_with_correlation(
+                            "api-node",
+                            req.metadata()
+                                .correlation_id
+                                .expect("api-node sink-status request correlation"),
+                            api_node_sink_status_payload.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        },
+    );
+
+    let readiness_groups = BTreeSet::from(["nfs1".to_string()]);
+    let sink_status = pending_sink_status_without_ingress_for_test(&["nfs1"]);
+    let source_status = repair_trigger_source_status_for_test(&["nfs1"]);
+
+    let sink_status = augment_routed_sink_status_with_current_owner_evidence(
+        &state,
+        sink_status,
+        &source_status,
+        &readiness_groups,
+        StatusRoutePlan::new(Duration::from_secs(1), STATUS_ROUTE_COLLECT_IDLE_GRACE),
+        &[],
+    )
+    .await
+    .expect("augment sink owner evidence");
+
+    assert!(
+        sink_status_covers_ready_readiness_groups(&sink_status, &readiness_groups),
+        "published source events must allow materialized status fan-in to probe the local/origin sink owner even when source-owner candidates point elsewhere; sink_status={}",
+        summarize_sink_status_route_snapshot(&sink_status)
+    );
+    assert_eq!(
+        boundary.send_batch_count(&api_node_sink_status_route.0),
+        1,
+        "origin sink-status route should be queried after source publication evidence"
+    );
+
+    api_node_sink_status_endpoint
+        .shutdown(Duration::from_secs(2))
+        .await;
+}
+
+#[test]
+fn materialized_sink_observation_repair_triggers_on_published_source_with_pending_sink_no_ingress()
+{
+    let source_status = repair_trigger_source_status_for_test(&["nfs1", "nfs2"]);
+    let sink_status = pending_sink_status_without_ingress_for_test(&["nfs1", "nfs2"]);
+
+    assert!(
+        materialized_should_run_sink_observation_repair(&source_status, &sink_status),
+        "materialized tree/status loading must backstop sink route repair once source has published current-root events but sink still has only pending rows and no ingress evidence"
+    );
+}
+
+#[test]
+fn materialized_sink_observation_repair_waits_for_source_publication_evidence() {
+    let mut source_status = repair_trigger_source_status_for_test(&["nfs1"]);
+    for root in &mut source_status.concrete_roots {
+        root.emitted_batch_count = 0;
+        root.emitted_event_count = 0;
+        root.emitted_data_event_count = 0;
+        root.last_emitted_at_us = None;
+        root.forwarded_batch_count = 0;
+        root.forwarded_event_count = 0;
+        root.last_forwarded_at_us = None;
+    }
+    let sink_status = pending_sink_status_without_ingress_for_test(&["nfs1"]);
+
+    assert!(
+        !materialized_should_run_sink_observation_repair(&source_status, &sink_status),
+        "repair must not run from configured roots alone because giant-NFS publication can legitimately lag"
+    );
+}
+
 #[test]
 fn tree_pit_session_machine_owns_orchestration_only() {
     let source = std::fs::read_to_string(
@@ -4481,6 +4863,104 @@ fn sink_facade_with_group(grants: &[GrantedMountRoot]) -> Arc<SinkFacade> {
     )))
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_target_groups_use_request_source_status_for_root_tree_when_local_cache_is_sparse()
+ {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_nfs1 = tmp.path().join("node-a-nfs1");
+    let node_a_nfs2 = tmp.path().join("node-a-nfs2");
+    fs::create_dir_all(node_a_nfs1.join("live-layout")).expect("create node-a nfs1 dir");
+    fs::create_dir_all(node_a_nfs2.join("live-layout")).expect("create node-a nfs2 dir");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_nfs1,
+            fs_source: "nfs1".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-a::nfs2".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_nfs2,
+            fs_source: "nfs2".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let sparse_source = source_facade_with_roots(
+        vec![crate::source::config::RootSpec::new("nfs2", "/unused")],
+        &grants,
+    );
+    let sink = sink_facade_with_group(&grants);
+    let state = test_api_state_for_source(sparse_source, sink);
+    let request_source_status = SourceStatusSnapshot {
+        current_stream_generation: Some(1),
+        logical_roots: vec![
+            crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".into(),
+                status: "ok".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            },
+            crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "nfs2".into(),
+                status: "ok".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            },
+        ],
+        concrete_roots: Vec::new(),
+        degraded_roots: Vec::new(),
+    };
+    let request_sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]),
+        groups: vec![
+            sink_group_status("nfs1", true),
+            sink_group_status("nfs2", true),
+        ],
+        ..SinkStatusSnapshot::default()
+    };
+
+    let groups = materialized_target_groups(
+        &state,
+        None,
+        Some(&request_source_status),
+        Some(&request_sink_status),
+        Duration::from_millis(250),
+        false,
+        MaterializedTargetGroupSelectionMode::Tree,
+    )
+    .await
+    .expect("materialized target groups");
+
+    assert_eq!(
+        groups,
+        vec!["nfs1", "nfs2"],
+        "root materialized tree target groups must not shrink to a sparse local source cache when request-scoped source status already covers current roots"
+    );
+}
+
 fn test_api_state_for_source(source: Arc<SourceFacade>, sink: Arc<SinkFacade>) -> ApiState {
     ApiState {
         backend: QueryBackend::Local { sink, source },
@@ -7598,6 +8078,143 @@ async fn load_request_scoped_materialized_sink_status_snapshot_accepts_immediate
     );
 
     sink_status_endpoint.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_trusted_tree_response_reuses_pit_session_without_request_scoped_route_probe() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_b_root = tmp.path().join("node-b-nfs4");
+    fs::create_dir_all(&node_b_root).expect("create node-b dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-b::nfs4".to_string(),
+        host_ref: "node-b".to_string(),
+        host_ip: "10.0.0.2".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: node_b_root,
+        fs_source: "nfs".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source_status = source_status_for_cache_key("nfs4");
+    let sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs4".to_string()],
+        )]),
+        groups: vec![sink_group_status("nfs4", true)],
+        ..SinkStatusSnapshot::default()
+    };
+    let source = source_facade_with_group("nfs4", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let sink_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+        .expect("resolve sink-status route");
+    let params = normalize_api_params(ApiParams {
+        path: Some("/".to_string()),
+        path_b64: None,
+        group: None,
+        recursive: Some(true),
+        max_depth: None,
+        pit_id: None,
+        group_order: Some(GroupOrder::GroupKey),
+        group_page_size: None,
+        group_after: None,
+        entry_page_size: None,
+        entry_after: None,
+        read_class: Some(ReadClass::TrustedMaterialized),
+    })
+    .expect("normalize tree params");
+    let state = ApiState {
+        backend: QueryBackend::Route {
+            sink: sink.clone(),
+            boundary: boundary.clone(),
+            origin_id: NodeId("node-api".to_string()),
+            source: source.clone(),
+        },
+        policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+        pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
+        force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+        force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
+        readiness_source: Some(source.clone()),
+        readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(Some(CachedSourceStatusSnapshot {
+            snapshot: source_status.clone(),
+            signature: materialized_readiness_cache_signature(&source)
+                .expect("materialized readiness signature"),
+        }))),
+        materialized_sink_status_cache: Arc::new(Mutex::new(Some(CachedSinkStatusSnapshot {
+            snapshot: sink_status.clone(),
+        }))),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
+        tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    let cache_key = materialized_tree_cache_key(
+        &state,
+        &params,
+        ReadClass::TrustedMaterialized,
+        Some(&source_status),
+        Some(&sink_status),
+    )
+    .expect("tree cache key");
+    let mut cached_group =
+        group_snapshot_for_trusted_response_guard_test(ReadClass::TrustedMaterialized, true, None);
+    cached_group.group = "nfs4".to_string();
+    let cached_session = Arc::new(build_pit_session(
+        CursorQueryMode::Tree,
+        PitScope::Tree(TreePitScope {
+            path: b"/".to_vec(),
+            group: None,
+            recursive: true,
+            max_depth: None,
+            group_order: GroupOrder::GroupKey,
+            read_class: ReadClass::TrustedMaterialized,
+        }),
+        ReadClass::TrustedMaterialized,
+        ObservationStatus::trusted_materialized(),
+        vec![cached_group],
+    ));
+    *state
+        .materialized_tree_cache
+        .lock()
+        .expect("tree cache lock") = Some(CachedMaterializedTreeSession {
+        key: cache_key,
+        pit_id: "cached-tree".to_string(),
+        session: cached_session,
+    });
+
+    let response = cached_materialized_tree_page_response(
+        &state,
+        &ProjectionPolicy::default(),
+        &params,
+        Duration::from_millis(20),
+        ReadClass::TrustedMaterialized,
+        Some(&source_status),
+        Some(&sink_status),
+    )
+    .await
+    .expect("cached tree response")
+    .expect("cached tree should be present");
+
+    assert!(
+        response
+            .get("groups")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|groups| groups.len() == 1),
+        "trusted polling should be able to render the cached tree page without rebuilding request-scoped readiness: {response}"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&sink_route.0),
+        0,
+        "steady trusted tree polling must not spend request-scoped sink-status route probes after an exact trusted tree cache hit"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

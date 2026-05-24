@@ -766,6 +766,94 @@ fn release_upgrade_harness_relogin_waits_for_http_readiness() {
 }
 
 #[test]
+fn operational_materialization_probes_do_not_use_default_trusted_tree() {
+    let operational = read_app_spec("tests/e2e/test_operational_scenarios.rs");
+    for needle in [
+        "let _ = harness.session.tree(&[\n        (\"path\", \"/force-find-stress\".to_string()),\n        (\"recursive\", \"true\".to_string()),",
+        "let tree = harness.session.tree(&[\n                (\"path\", \"/force-find-stress\".to_string()),\n                (\"recursive\", \"true\".to_string()),",
+        "let tree = session.tree(&[\n                (\"path\", \"/force-find-stress\".to_string()),\n                (\"recursive\", \"true\".to_string()),",
+        "let tree = session.tree(&[\n        (\"path\", \"/\".to_string()),\n        (\"recursive\", \"true\".to_string()),",
+    ] {
+        let start = operational
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing operational tree probe: {needle}"));
+        let tail = &operational[start..];
+        let end = tail
+            .find("])?")
+            .unwrap_or_else(|| panic!("unterminated operational tree probe: {needle}"));
+        let call = &tail[..end];
+        assert!(
+            call.contains("(\"read_class\", \"materialized\".to_string())"),
+            "operational materialization probe must not use default trusted-materialized /tree: {call}"
+        );
+    }
+}
+
+#[test]
+fn release_upgrade_cpu_budget_polling_is_bounded_materialized_read() {
+    let release_upgrade = read_app_spec("tests/e2e/test_release_upgrade.rs");
+    let helper = function_body(&release_upgrade, "fn spawn_light_polling(");
+
+    assert!(
+        !helper.contains("(\"recursive\", \"true\".to_string())"),
+        "CPU budget light polling must not issue unbounded recursive tree/stats requests on giant NFS"
+    );
+    assert!(
+        helper.contains("(\"recursive\", \"false\".to_string())"),
+        "CPU budget light polling should use non-recursive probes"
+    );
+    assert!(
+        helper.contains("(\"read_class\", \"materialized\".to_string())"),
+        "CPU budget light polling should use materialized reads rather than trusted/proxy-heavy defaults"
+    );
+    assert!(
+        helper.contains("(\"group_page_size\", \"1\".to_string())")
+            && helper.contains("(\"entry_page_size\", \"1\".to_string())"),
+        "CPU budget light polling should bound tree page sizes"
+    );
+    assert!(
+        !helper.contains(".status("),
+        "CPU budget light polling must not call management /status because status may run remote owner-scoped observation fan-in on giant NFS"
+    );
+}
+
+#[test]
+fn runtime_endpoint_stream_recv_begin_log_is_debug_gated() {
+    let endpoint = read_app_spec("src/runtime/endpoint.rs");
+    let helper = function_body(&endpoint, "async fn run_stream_loop_with_wait");
+    let log = helper
+        .find("\"fs_meta_runtime_endpoint: stream loop recv route={} task={}\"")
+        .expect("stream recv begin log line");
+    let guard = helper[..log]
+        .rfind("if debug_stream_recv")
+        .expect("stream recv begin log must be under explicit debug guard");
+    assert!(
+        helper[guard..log].contains("should_emit_endpoint_retry_log"),
+        "stream recv begin log should remain rate-limited when debug is enabled"
+    );
+}
+
+#[test]
+fn management_status_local_ready_skip_disables_owner_scoped_fanin() {
+    let handlers = read_app_spec("src/api/handlers.rs");
+    let status = function_body(&handlers, "pub async fn status(");
+    let skipped = status
+        .find("status.remote.skipped_local_ready")
+        .expect("local ready status skip trace");
+    let owner_scoped = status
+        .find("preferred_source_owner_scoped_boundary")
+        .expect("source owner-scoped boundary selection");
+    assert!(
+        skipped < owner_scoped,
+        "local-ready skip must be decided before owner-scoped fan-in boundary selection"
+    );
+    assert!(
+        status[owner_scoped..].contains("if local_observation_status_complete {\n        None\n    } else if use_short_status_route_budget"),
+        "steady complete local /status must not open owner-scoped fan-in boundaries after generic remote collection was skipped"
+    );
+}
+
+#[test]
 fn worker_servers_do_not_hold_state_mutex_across_async_control_or_rpc_calls() {
     let source_server = read_app_spec("app/src/workers/source_server.rs");
     let sink_server = read_app_spec("app/src/workers/sink_server.rs");

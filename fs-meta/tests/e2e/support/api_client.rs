@@ -786,8 +786,11 @@ pub fn is_retryable_management_unavailable_error(err: &str) -> bool {
             || err.contains("runtime control initializes the app")
             || err.contains("manual rescan current roots runtime-scope readiness failed")
             || err.contains("manual rescan source-status target proof incomplete")
-            || err.contains("manual rescan scoped source route pending"))
-    }
+            || err.contains("manual rescan scoped source route pending")
+            || err.contains("manual rescan generic source route pending"))
+        || (err.contains("http 500 failed")
+            && err.contains("manual rescan generic source route failed: operation timed out"))
+}
 
 pub fn extract_token(login: Value) -> Result<String, String> {
     login
@@ -953,6 +956,26 @@ mod tests {
         assert!(
             is_retryable_management_unavailable_error(err),
             "manual-rescan scoped source delivery pending is a temporary convergence state and should stay in the management retry window"
+        );
+    }
+
+    #[test]
+    fn management_retry_includes_manual_rescan_generic_source_delivery_pending() {
+        let err = r#"http 503 failed: {"error":"manual rescan generic source route pending: operation timed out"}"#;
+
+        assert!(
+            is_retryable_management_unavailable_error(err),
+            "manual-rescan generic source delivery pending is a temporary convergence state and should stay in the management retry window"
+        );
+    }
+
+    #[test]
+    fn management_retry_includes_legacy_manual_rescan_generic_source_timeout() {
+        let err = r#"http 500 failed: {"error":"manual rescan generic source route failed: operation timed out"}"#;
+
+        assert!(
+            is_retryable_management_unavailable_error(err),
+            "older nodes may still report generic source delivery timeout as 500 during rolling validation; the client should retry that exact transient"
         );
     }
 
