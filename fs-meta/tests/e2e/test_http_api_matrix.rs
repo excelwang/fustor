@@ -406,23 +406,18 @@ fn run_query_matrix(
     eprintln!("[fs-meta-api-matrix] substep=query-core-readiness-gate");
     assert_trusted_tree_matches_readiness(session, "query core readiness gate")?;
     assert_error(
-        session.client().force_find_raw(
-            session.query_api_key(),
-            &[
-                ("path", "/".to_string()),
-                ("recursive", "true".to_string()),
-                ("read_class", "trusted-materialized".to_string()),
-            ],
-        )?,
+        session.force_find_raw(&[
+            ("path", "/".to_string()),
+            ("recursive", "true".to_string()),
+            ("read_class", "trusted-materialized".to_string()),
+        ])?,
         400,
         "read_class must be fresh on /on-demand-force-find",
     )?;
 
     eprintln!("[fs-meta-api-matrix] substep=query-api-key-management");
-    let keys_before = session.client().list_query_api_keys(session.token())?;
-    let created = session
-        .client()
-        .create_query_api_key(session.token(), "full-core-extra-key")?;
+    let keys_before = session.list_query_api_keys()?;
+    let created = session.create_query_api_key("full-core-extra-key")?;
     let api_key = created
         .get("api_key")
         .and_then(Value::as_str)
@@ -432,24 +427,20 @@ fn run_query_matrix(
         .and_then(|key| key.get("key_id"))
         .and_then(Value::as_str)
         .ok_or_else(|| format!("query api key response missing key.key_id: {created}"))?;
-    let keys_after_create = session.client().list_query_api_keys(session.token())?;
+    let keys_after_create = session.list_query_api_keys()?;
     if !query_api_key_list_contains(&keys_after_create, key_id) {
         return Err(format!(
             "created query api key {key_id} not visible: before={keys_before}; after={keys_after_create}"
         ));
     }
-    let revoked = session
-        .client()
-        .revoke_query_api_key(session.token(), key_id)?;
+    let revoked = session.revoke_query_api_key(key_id)?;
     if revoked.get("revoked").and_then(Value::as_bool) != Some(true) {
         return Err(format!(
             "query api key revoke did not report true: {revoked}"
         ));
     }
     assert_error(
-        session
-            .client()
-            .tree_raw(api_key, &[("path", "/".to_string())])?,
+        session.tree_raw_with_query_api_key(api_key, &[("path", "/".to_string())])?,
         401,
         "invalid query api key",
     )?;
@@ -466,14 +457,11 @@ fn run_full_query_capacity_baseline_phase(session: &mut OperatorSession) -> Resu
     )?;
     assert_trusted_tree_matches_readiness(session, "full capacity trusted materialized gate")?;
     assert_error(
-        session.client().force_find_raw(
-            session.query_api_key(),
-            &[
-                ("path", "/".to_string()),
-                ("recursive", "true".to_string()),
-                ("read_class", "trusted-materialized".to_string()),
-            ],
-        )?,
+        session.force_find_raw(&[
+            ("path", "/".to_string()),
+            ("recursive", "true".to_string()),
+            ("read_class", "trusted-materialized".to_string()),
+        ])?,
         400,
         "read_class must be fresh on /on-demand-force-find",
     )?;
@@ -2375,10 +2363,8 @@ fn assert_trusted_tree_matches_readiness(
         .pointer("/readiness_planes/trusted_observation_readiness")
         .and_then(Value::as_bool)
         == Some(true);
-    let response = session.client().tree_raw(
-        session.query_api_key(),
-        &[("path", "/".to_string()), ("recursive", "true".to_string())],
-    )?;
+    let response =
+        session.tree_raw(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
 
     if trusted_ready {
         if response.status != 200 {
@@ -2415,7 +2401,7 @@ fn trusted_observation_status_gate(
     session: &mut OperatorSession,
     context: &str,
 ) -> Result<Value, String> {
-    let response = session.client().get_json_raw("/status", session.token())?;
+    let response = session.get_json_raw("/status")?;
     match response.status {
         200 => Ok(response.body),
         503 => {

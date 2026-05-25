@@ -5216,11 +5216,6 @@ async fn status_snapshot_nonblocking_fails_closed_after_logical_root_retire_when
     install_sink_worker_retry_reset_hook(SinkWorkerRetryResetHook {
         reset_count: reset_count.clone(),
     });
-    let _status_error_reset = SinkWorkerStatusErrorHookReset;
-    install_sink_worker_status_error_hook(SinkWorkerStatusErrorHook {
-        err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
-    });
-    let _status_snapshot_reset = SinkWorkerStatusSnapshotHookReset;
     let replay_only_not_ready_snapshot = SinkStatusSnapshot {
         groups: vec![
             crate::sink::SinkGroupStatusSnapshot {
@@ -5264,29 +5259,16 @@ async fn status_snapshot_nonblocking_fails_closed_after_logical_root_retire_when
         )]),
         ..SinkStatusSnapshot::default()
     };
-    let install_replay_only_not_ready_snapshot = tokio::spawn({
-        let reset_count = reset_count.clone();
-        let sink = sink.clone();
-        async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
-            loop {
-                if reset_count.load(Ordering::SeqCst) > 0 {
-                    let current_worker_instance_id = sink.worker_instance_id_for_tests().await;
-                    install_sink_worker_status_snapshot_hook_for_worker_instance(
-                        current_worker_instance_id,
-                        SinkWorkerStatusSnapshotHook {
-                            snapshot: replay_only_not_ready_snapshot,
-                        },
-                    );
-                    break;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "retryable bridge-stopped status probe after logical-root retire should reset before the replay-only-not-ready live snapshot is installed"
-                );
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }
+    let _reply_reset = SinkWorkerStatusResponseQueueHookReset;
+    install_sink_worker_status_response_queue_hook(SinkWorkerStatusResponseQueueHook {
+        replies: std::collections::VecDeque::from([
+            Err(CnxError::PeerError(
+                "transport closed: sidecar control bridge stopped".to_string(),
+            )),
+            Ok(SinkWorkerResponse::StatusSnapshot(
+                replay_only_not_ready_snapshot,
+            )),
+        ]),
     });
 
     let err = tokio::time::timeout(
@@ -5300,9 +5282,6 @@ async fn status_snapshot_nonblocking_fails_closed_after_logical_root_retire_when
     .expect_err(
         "status_snapshot_nonblocking after logical-root retire must fail closed instead of publishing a retried replay-only-not-ready live snapshot whose schedule is not covered by cached ready truth",
     );
-    install_replay_only_not_ready_snapshot
-        .await
-        .expect("join replay-only-not-ready snapshot installer");
 
     assert!(
         matches!(err, CnxError::Timeout),

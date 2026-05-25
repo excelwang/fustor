@@ -7748,7 +7748,11 @@ fn manual_rescan_generic_fallback_blocker_after_scoped_activation_gaps(
             source.status.degraded_roots
         ));
     }
-    if source_observability_snapshot_has_pending_source_state_observation(source) {
+    let pending_source_state =
+        source_observability_snapshot_has_pending_source_state_observation(source);
+    if pending_source_state
+        && !source_observability_snapshot_has_runtime_scope_control_cache(source)
+    {
         return Some("pending_source_state_observation".to_string());
     }
     let expected_groups = roots_put_second_wave_expected_groups(roots);
@@ -7781,6 +7785,9 @@ fn manual_rescan_generic_fallback_blocker_after_scoped_activation_gaps(
             "runtime_scope_not_exact expected_source={:?} expected_scan={:?} observed_source={:?} observed_scan={:?}",
             expected_groups.source_groups, expected_groups.scan_groups, observed.0, observed.1,
         ));
+    }
+    if pending_source_state {
+        return None;
     }
     let missing_group_primary = roots
         .iter()
@@ -28207,6 +28214,139 @@ mod tests {
                 &target_probe_source,
             ),
             "current-roots readiness evidence must remain available when later target probes only explain missing scoped activation"
+        );
+    }
+
+    #[test]
+    fn manual_rescan_pending_control_cache_with_activation_gap_uses_generic_fallback() {
+        let roots = vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+            RootSpec::new("nfs3", "/mnt/nfs3"),
+            RootSpec::new("nfs4", "/mnt/nfs4"),
+        ];
+        let node_b = "node-b-29857797167858773234024449";
+        let node_c = "node-c-29857797167858773234024449";
+        let node_d = "node-d-29857797167858773234024449";
+        let node_e = "node-e-29857797167858773234024449";
+        let mut source = local_source_snapshot();
+        source.lifecycle_state = "runtime-scope-ready".to_string();
+        source.logical_roots = roots.clone();
+        source.grants = vec![
+            grant_for_node_root(node_b, "nfs1"),
+            grant_for_node_root(node_c, "nfs2"),
+            grant_for_node_root(node_d, "nfs3"),
+            grant_for_node_root(node_c, "nfs4"),
+            grant_for_node_root(node_d, "nfs4"),
+        ];
+        source.status.degraded_roots = vec![
+            (
+                SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(),
+                SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON.to_string(),
+            ),
+            (
+                SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(),
+                SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON.to_string(),
+            ),
+        ];
+        source.status.logical_roots = roots
+            .iter()
+            .map(|root| SourceLogicalRootHealthSnapshot {
+                root_id: root.id.clone(),
+                status: "healthy".to_string(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "runtime_scope_control_cache".to_string(),
+            })
+            .collect();
+        source.status.concrete_roots.clear();
+        source.source_primary_by_group.clear();
+        source.scheduled_source_groups_by_node = BTreeMap::from([
+            (node_b.to_string(), vec!["nfs1".to_string()]),
+            (
+                node_c.to_string(),
+                vec!["nfs2".to_string(), "nfs4".to_string()],
+            ),
+            (
+                node_d.to_string(),
+                vec!["nfs3".to_string(), "nfs4".to_string()],
+            ),
+            (
+                node_e.to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string(), "nfs3".to_string()],
+            ),
+        ]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+        source.last_control_frame_signals_by_node = BTreeMap::from([
+            (
+                node_b.to_string(),
+                vec![format!(
+                    "activate unit=runtime.exec.source route={}.req generation=1779663395132 scopes=[\"nfs1=>nfs1\"]",
+                    source_rescan_route_key_for(node_b)
+                )],
+            ),
+            (
+                node_c.to_string(),
+                vec![format!(
+                    "activate unit=runtime.exec.source route={}.req generation=1779663395132 scopes=[\"nfs2=>nfs2\"]",
+                    source_rescan_route_key_for(node_c)
+                )],
+            ),
+            (
+                node_d.to_string(),
+                vec![format!(
+                    "activate unit=runtime.exec.source route={}.req generation=1779663395132 scopes=[\"nfs3=>nfs3\"]",
+                    source_rescan_route_key_for(node_d)
+                )],
+            ),
+            (
+                node_e.to_string(),
+                vec![format!(
+                    "activate unit=runtime.exec.source route={}.req generation=1779663395132 scopes=[\"nfs1=>nfs1\", \"nfs2=>nfs2\", \"nfs3=>nfs3\"]",
+                    source_rescan_route_key_for(node_e)
+                )],
+            ),
+        ]);
+
+        let coverage_gaps = manual_rescan_runtime_scope_coverage_gaps_by_root(&roots, &source);
+        let route_activation_gaps =
+            manual_rescan_runtime_scope_route_activation_gaps_by_root(&roots, &source);
+        let route_readiness_gaps =
+            manual_rescan_runtime_scope_route_readiness_gaps_by_root(&roots, &source);
+
+        assert!(
+            manual_rescan_target_node_ids_from_source_status_origin_snapshots(
+                &roots,
+                &[(node_c.to_string(), source.clone())],
+            )
+            .is_none(),
+            "source-state-pending control-cache evidence must not become scoped delivery proof"
+        );
+        assert!(
+            manual_rescan_scoped_delivery_targets_from_runtime_scope_after_preflight(
+                &roots, &source
+            )
+            .is_empty(),
+            "a root with no active scoped route must not be expanded into synthetic scoped targets"
+        );
+        assert!(coverage_gaps.is_empty());
+        assert_eq!(
+            route_activation_gaps,
+            BTreeMap::from([(
+                "nfs4".to_string(),
+                BTreeSet::from([node_c.to_string(), node_d.to_string()])
+            )])
+        );
+        assert!(route_readiness_gaps.is_empty());
+        assert!(
+            manual_rescan_generic_fallback_allowed_after_scoped_activation_gaps(
+                &roots,
+                &source,
+                &coverage_gaps,
+                &route_activation_gaps,
+                &route_readiness_gaps,
+            ),
+            "pending source-state control-cache evidence can prove current-root ownership for generic source-route fallback, while still withholding scoped target proof"
         );
     }
 

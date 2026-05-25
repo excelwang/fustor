@@ -565,12 +565,47 @@ impl OperatorSession {
         self.with_query_reauth(|client, query_api_key| client.bound_route_metrics(query_api_key))
     }
 
+    pub fn list_query_api_keys(&mut self) -> Result<Value, String> {
+        self.with_management_reauth(|client, token| client.list_query_api_keys(token))
+    }
+
+    pub fn create_query_api_key(&mut self, label: &str) -> Result<Value, String> {
+        self.with_management_reauth(|client, token| client.create_query_api_key(token, label))
+    }
+
+    pub fn revoke_query_api_key(&mut self, key_id: &str) -> Result<Value, String> {
+        self.with_management_reauth(|client, token| client.revoke_query_api_key(token, key_id))
+    }
+
+    pub fn get_json_raw(&mut self, path: &str) -> Result<ApiResponse, String> {
+        self.with_management_raw_reauth(|client, token| client.get_json_raw(path, token))
+    }
+
     pub fn tree(&mut self, query: &[(&str, String)]) -> Result<Value, String> {
         self.with_query_reauth(|client, query_api_key| client.tree(query_api_key, query))
     }
 
+    pub fn tree_raw(&mut self, query: &[(&str, String)]) -> Result<ApiResponse, String> {
+        self.with_query_raw_reauth(|client, query_api_key| client.tree_raw(query_api_key, query))
+    }
+
+    pub fn tree_raw_with_query_api_key(
+        &mut self,
+        query_api_key: &str,
+        query: &[(&str, String)],
+    ) -> Result<ApiResponse, String> {
+        let query_api_key = query_api_key.to_string();
+        self.with_raw_transport_reconnect(|client| client.tree_raw(&query_api_key, query))
+    }
+
     pub fn force_find(&mut self, query: &[(&str, String)]) -> Result<Value, String> {
         self.with_query_reauth(|client, query_api_key| client.force_find(query_api_key, query))
+    }
+
+    pub fn force_find_raw(&mut self, query: &[(&str, String)]) -> Result<ApiResponse, String> {
+        self.with_query_raw_reauth(|client, query_api_key| {
+            client.force_find_raw(query_api_key, query)
+        })
     }
 
     fn with_management_reauth<T>(
@@ -657,6 +692,77 @@ impl OperatorSession {
             if !saw_reauthable_error || std::time::Instant::now() >= deadline {
                 return Err(last_err.unwrap_or_else(|| {
                     "query operation failed without a recoverable candidate".to_string()
+                }));
+            }
+            self.reconnect_and_login()?;
+            std::thread::sleep(RECONNECT_RETRY_INTERVAL);
+        }
+    }
+
+    fn with_query_raw_reauth(
+        &mut self,
+        op: impl Fn(&FsMetaApiClient, &str) -> Result<ApiResponse, String>,
+    ) -> Result<ApiResponse, String> {
+        let deadline = std::time::Instant::now() + RECONNECT_RETRY_WINDOW;
+        let mut last_err = None::<String>;
+        loop {
+            let mut saw_reauthable_error = false;
+            for base_url in self.prioritized_base_urls() {
+                let client = self.client.with_base_url(base_url.clone());
+                match op(&client, &self.query_api_key) {
+                    Ok(response) if response_is_invalid_query_api_key(&response) => {
+                        saw_reauthable_error = true;
+                        last_err = Some(format!(
+                            "{base_url}: http {} failed: {}",
+                            response.status, response.body
+                        ));
+                    }
+                    Ok(response) => {
+                        self.client = client;
+                        return Ok(response);
+                    }
+                    Err(err) if is_transport_error(&err) => {
+                        saw_reauthable_error = true;
+                        last_err = Some(format!("{base_url}: {err}"));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            if !saw_reauthable_error || std::time::Instant::now() >= deadline {
+                return Err(last_err.unwrap_or_else(|| {
+                    "query raw operation failed without a recoverable candidate".to_string()
+                }));
+            }
+            self.reconnect_and_login()?;
+            std::thread::sleep(RECONNECT_RETRY_INTERVAL);
+        }
+    }
+
+    fn with_raw_transport_reconnect(
+        &mut self,
+        op: impl Fn(&FsMetaApiClient) -> Result<ApiResponse, String>,
+    ) -> Result<ApiResponse, String> {
+        let deadline = std::time::Instant::now() + RECONNECT_RETRY_WINDOW;
+        let mut last_err = None::<String>;
+        loop {
+            let mut saw_transport_error = false;
+            for base_url in self.prioritized_base_urls() {
+                let client = self.client.with_base_url(base_url.clone());
+                match op(&client) {
+                    Ok(response) => {
+                        self.client = client;
+                        return Ok(response);
+                    }
+                    Err(err) if is_transport_error(&err) => {
+                        saw_transport_error = true;
+                        last_err = Some(format!("{base_url}: {err}"));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            if !saw_transport_error || std::time::Instant::now() >= deadline {
+                return Err(last_err.unwrap_or_else(|| {
+                    "raw operation failed without a recoverable candidate".to_string()
                 }));
             }
             self.reconnect_and_login()?;
@@ -785,6 +891,15 @@ pub fn is_invalid_session_error(err: &str) -> bool {
 
 pub fn is_invalid_query_api_key_error(err: &str) -> bool {
     err.contains("\"error\":\"invalid query api key\"") || err.contains("invalid query api key")
+}
+
+fn response_is_invalid_query_api_key(response: &ApiResponse) -> bool {
+    response.status == 401
+        && response
+            .body
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("invalid query api key"))
 }
 
 pub fn is_transport_error(err: &str) -> bool {

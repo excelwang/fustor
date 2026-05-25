@@ -438,11 +438,11 @@ fn wait_for_materialized_tree_observation(
     })
 }
 
-fn assert_trusted_tree_is_ready_or_fail_closed(session: &OperatorSession) -> Result<(), String> {
-    let response = session.client().tree_raw(
-        session.query_api_key(),
-        &[("path", "/".to_string()), ("recursive", "true".to_string())],
-    )?;
+fn assert_trusted_tree_is_ready_or_fail_closed(
+    session: &mut OperatorSession,
+) -> Result<(), String> {
+    let response =
+        session.tree_raw(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
     match response.status {
         200..=299 => {
             if group_total_nodes(&response.body, "nfs1") > 0
@@ -633,7 +633,7 @@ fn scenario_tree_materialization_after_upgrade(harness: &mut UpgradeHarness) -> 
         &mut harness.session,
         "tree materializes after generation-two upgrade",
     )?;
-    assert_trusted_tree_is_ready_or_fail_closed(&harness.session)?;
+    assert_trusted_tree_is_ready_or_fail_closed(&mut harness.session)?;
     l5_progress(harness.mode, "03.05.tree-materialization", "ok");
     Ok(())
 }
@@ -782,7 +782,7 @@ fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
     l5_progress(harness.mode, "03.05.manual-rescan", "ok");
     l5_progress(harness.mode, "03.06.tree-materialization", "begin");
     wait_for_materialized_tree_observation(&mut harness.session, "cpu-budget tree materializes")?;
-    assert_trusted_tree_is_ready_or_fail_closed(&harness.session)?;
+    assert_trusted_tree_is_ready_or_fail_closed(&mut harness.session)?;
     l5_progress(harness.mode, "03.06.tree-materialization", "ok");
 
     l5_progress(harness.mode, "03.07.cpu-idle-baseline", "begin");
