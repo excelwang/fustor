@@ -11967,12 +11967,10 @@ async fn materialized_target_groups(
         });
     let mut groups = if let Some(group) = selected_group {
         vec![group.to_string()]
+    } else if let Some(expected_root_groups) = expected_root_groups {
+        expected_root_groups.iter().cloned().collect::<Vec<_>>()
     } else {
-        let mut request_source_groups = expected_root_groups
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut request_source_groups = Vec::new();
         if let Some(status) = request_source_status {
             request_source_groups.extend(materialized_target_group_ids_from_source_status(status));
         }
@@ -13698,6 +13696,44 @@ fn trusted_materialized_root_tree_session_missing_expected_groups_fails_closed()
 }
 
 #[test]
+fn trusted_materialized_root_tree_session_rejects_groups_outside_expected_roots() {
+    let mut groups = Vec::new();
+    let mut group_rank_metrics = BTreeMap::new();
+    for group_id in ["nfs2", "nfs3", "nfs4"] {
+        push_empty_materialized_tree_group_snapshot(
+            &mut groups,
+            &mut group_rank_metrics,
+            GroupOrder::GroupKey,
+            ReadClass::TrustedMaterialized,
+            group_id.to_string(),
+            b"/",
+        );
+    }
+    let session = build_pit_session(
+        CursorQueryMode::Tree,
+        PitScope::Tree(TreePitScope {
+            path: b"/".to_vec(),
+            group: None,
+            recursive: true,
+            max_depth: None,
+            group_order: GroupOrder::GroupKey,
+            read_class: ReadClass::TrustedMaterialized,
+        }),
+        ReadClass::TrustedMaterialized,
+        ObservationStatus::trusted_materialized(),
+        groups,
+    );
+    let expected_groups = BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]);
+    let message = trusted_materialized_root_tree_session_missing_expected_groups_message(
+        &session,
+        Some(&expected_groups),
+    )
+    .expect("stale root PIT session must fail closed");
+
+    assert!(message.contains("unexpected [nfs3]"));
+}
+
+#[test]
 fn merge_source_status_snapshots_preserves_completed_audit_evidence_from_older_snapshot() {
     let audited_root = crate::source::SourceConcreteRootHealthSnapshot {
         root_key: "nfs1@node-a::nfs1@/mnt/fustor-peers/nfs145".to_string(),
@@ -14181,12 +14217,26 @@ fn trusted_materialized_root_tree_session_missing_expected_groups_message(
         .map(|group| group.group.clone())
         .collect::<BTreeSet<_>>();
     let missing_groups = missing_readiness_groups(expected_groups, &observed_groups);
-    if missing_groups.is_empty() {
+    let unexpected_groups = missing_readiness_groups(&observed_groups, expected_groups);
+    if missing_groups.is_empty() && unexpected_groups.is_empty() {
         return None;
     }
+    let mut details = Vec::new();
+    if !missing_groups.is_empty() {
+        details.push(format!(
+            "missing [{}]",
+            readiness_group_list(&missing_groups)
+        ));
+    }
+    if !unexpected_groups.is_empty() {
+        details.push(format!(
+            "unexpected [{}]",
+            readiness_group_list(&unexpected_groups)
+        ));
+    }
     Some(format!(
-        "trusted-materialized root tree remains unavailable until PIT covers all active scan groups: missing [{}]",
-        readiness_group_list(&missing_groups)
+        "trusted-materialized root tree remains unavailable until PIT matches active scan groups: {}",
+        details.join(" ")
     ))
 }
 

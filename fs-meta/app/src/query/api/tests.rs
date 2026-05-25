@@ -5111,6 +5111,65 @@ async fn materialized_target_groups_preserves_expected_root_groups_across_partia
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_target_groups_drops_stale_request_source_groups_outside_expected_roots() {
+    let source = source_facade_with_roots(
+        vec![
+            crate::source::config::RootSpec::new("nfs2", "/unused"),
+            crate::source::config::RootSpec::new("nfs4", "/unused"),
+        ],
+        &[],
+    );
+    let sink = sink_facade_with_group(&[]);
+    let state = test_api_state_for_source(source, sink);
+    let request_source_status = SourceStatusSnapshot {
+        current_stream_generation: Some(1),
+        logical_roots: ["nfs1", "nfs2", "nfs3", "nfs4"]
+            .into_iter()
+            .map(|root_id| crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: root_id.to_string(),
+                status: "ok".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            })
+            .collect(),
+        concrete_roots: Vec::new(),
+        degraded_roots: Vec::new(),
+    };
+    let request_sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs2".to_string(), "nfs4".to_string()],
+        )]),
+        groups: vec![
+            sink_group_status("nfs2", true),
+            sink_group_status("nfs4", true),
+        ],
+        ..SinkStatusSnapshot::default()
+    };
+    let expected_roots = BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]);
+
+    let groups = materialized_target_groups(
+        &state,
+        None,
+        Some(&request_source_status),
+        Some(&request_sink_status),
+        Duration::from_millis(250),
+        Some(&expected_roots),
+        false,
+        MaterializedTargetGroupSelectionMode::Tree,
+    )
+    .await
+    .expect("materialized target groups");
+
+    assert_eq!(
+        groups,
+        vec!["nfs2", "nfs4"],
+        "root materialized tree target groups must treat current scan roots as authoritative after root contraction"
+    );
+}
+
 fn test_api_state_for_source(source: Arc<SourceFacade>, sink: Arc<SinkFacade>) -> ApiState {
     ApiState {
         backend: QueryBackend::Local { sink, source },
