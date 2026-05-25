@@ -50,13 +50,13 @@ impl VisibilityPhase {
 
     fn step(self) -> &'static str {
         match self {
-            Self::RootsNarrowed => "5.1.roots-narrowed",
-            Self::SourceDeliveryReady => "5.2.source-delivery-ready",
-            Self::ManualRescanAccepted => "5.3.manual-rescan-accepted",
-            Self::GrantsVisible => "5.4.grants-visible",
-            Self::WithdrawConverged => "5.5.withdraw-converged",
-            Self::SinkHolderMoved => "5.6.sink-holder-moved",
-            Self::FacadeLive => "5.7.facade-live",
+            Self::RootsNarrowed => "visibility.1.roots-narrowed",
+            Self::SourceDeliveryReady => "visibility.2.source-delivery-ready",
+            Self::ManualRescanAccepted => "visibility.3.manual-rescan-accepted",
+            Self::GrantsVisible => "visibility.4.grants-visible",
+            Self::WithdrawConverged => "visibility.5.withdraw-converged",
+            Self::SinkHolderMoved => "visibility.6.sink-holder-moved",
+            Self::FacadeLive => "visibility.7.facade-live",
         }
     }
 
@@ -1312,9 +1312,8 @@ fn scenario_root_path_modify(
 
 fn visibility_phase_progress(phase: VisibilityPhase, state: &str) {
     let completed = phase.index();
-    let effective = 4.0 + (completed as f64 / VisibilityPhase::TOTAL as f64);
     eprintln!(
-        "[fs-meta-l5-progress] case=ops-visibility-sink-selection step={} state={} l5_stage=5/24 l5_subprogress={}/{} l5_progress={effective:.2}/24",
+        "[fs-meta-l5-progress] case=ops.visibility.facade-live step={} state={} l5_stage=8/12 l5_phase=ops boundary=foundation-real-runtime visibility_subprogress={}/{}",
         phase.step(),
         state,
         completed,

@@ -8,9 +8,10 @@
 2. L2 `single-process-closed-loop`
 3. L3 `runtime-local-multinode`
 4. L4 `nfs-environment-gate`
-5. L5 `real-cluster-acceptance`
+5. L5 `l5`
 
-旧 suite 名称仍可运行，但报告必须使用新 L1~L5 名称。
+旧 L1~L4 suite 名称仍可运行，但旧 L5 名称不再保留；报告必须使用新
+L1~L5 名称。
 
 ## 2. 什么时候不能继续往上报进度
 
@@ -70,8 +71,9 @@ next_validation: <exact command>
 L5 还必须写：
 
 ```yaml
-l5_stage: x/7
-boundary: preflight | deploy-upgrade | management-api | source-audit | sink-materialization | query | resilience
+l5_stage: x/12
+l5_phase: acceptance | ops
+boundary: preflight | deploy-upgrade | management-api | source-audit | sink-materialization | query | resilience | foundation-real-runtime | upgrade-core | topology-change | recovery-switch | resource-budget
 ```
 
 ## 6. 禁止写法
@@ -103,7 +105,7 @@ fs-meta/docs/examples/test-matrix-commands.sh nfs-environment-gate mini
 FSMETA_FULL_NFS_ROOTS_FILE=/path/to/roots.json \
   fs-meta/docs/examples/test-matrix-commands.sh nfs-environment-gate full
 FSMETA_FULL_NFS_ROOTS_FILE=/path/to/roots.json \
-  fs-meta/docs/examples/test-matrix-commands.sh real-cluster-acceptance
+  fs-meta/docs/examples/test-matrix-commands.sh l5
 ```
 
 如果任一步失败，停止向上给通过结论，先定位第一 raw boundary。

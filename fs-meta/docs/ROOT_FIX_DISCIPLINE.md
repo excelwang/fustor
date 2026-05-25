@@ -53,20 +53,20 @@ Run from cheapest proof to most realistic proof:
 | L2 | single-process-closed-loop | Local roots → source audit → sink materialization → status/query closes inside one app boundary. |
 | L3 | runtime-local-multinode | Local capanix runtime/worker-host route scope, owner fan-in, control replay, handoff, and upgrade-scope behavior pass. |
 | L4 | nfs-environment-gate | Mini/full real-NFS prerequisites, roots assets, grants, mount permissions, bounded readiness, and data-volume tolerance pass. |
-| L5 | real-cluster-acceptance | Real cluster deploy/upgrade, management API, source audit, sink materialization, query, and resilience pass. |
+| L5 | l5 | Full real cluster deploy/upgrade, management API, source audit, sink materialization, query, resilience, and operational regressions pass. |
 
 If L4 or L5 finishes suspiciously fast, verify that the test was not skipped,
 `--ignored` was used intentionally, the filter matched real tests,
 `CAPANIX_REAL_NFS_E2E=1` was set, the roots asset was injected through
 `FSMETA_FULL_NFS_ROOTS_FILE`, and the mounted paths are the intended real NFS
-exports. L5 reports must include the 7-stage acceptance position and boundary.
+exports. L5 reports must include the 12-stage position, phase, and boundary.
 
 ## Work Log
 
 Each non-trivial failure should leave a short work-log entry with:
 
 - Command and suite.
-- Current matrix progress, including L5 stage/substage when applicable.
+- Current matrix progress, including L5 stage, phase, and boundary when applicable.
 - Environment rung.
 - First raw error.
 - Domain state at failure.

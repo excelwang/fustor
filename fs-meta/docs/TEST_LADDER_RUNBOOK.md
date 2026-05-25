@@ -33,11 +33,12 @@ fs-meta/docs/examples/test-matrix-commands.sh nfs-environment-gate mini
 FSMETA_FULL_NFS_ROOTS_FILE=/path/to/roots.json \
   fs-meta/docs/examples/test-matrix-commands.sh nfs-environment-gate full
 FSMETA_FULL_NFS_ROOTS_FILE=/path/to/roots.json \
-  fs-meta/docs/examples/test-matrix-commands.sh real-cluster-acceptance
+  fs-meta/docs/examples/test-matrix-commands.sh l5
 ```
 
 旧入口仍可用：`business-fast`、`business-mini-nfs`、
-`environment-full-nfs`、`operations-local`、`operations-real-nfs`。
+`environment-full-nfs`、`operations-local`。旧 L5 入口不再保留，统一使用
+`l5`。
 
 ## 3. 阶梯定义
 
@@ -89,9 +90,9 @@ FSMETA_FULL_NFS_ROOTS_FILE=/path/to/roots.json \
 - full NFS 数据量不可预测，不能用固定文件数或固定大 timeout 当通过条件。
 - full roots asset 通过 `FSMETA_FULL_NFS_ROOTS_FILE` 注入，不提交具体环境。
 
-### L5：`real-cluster-acceptance`
+### L5：`l5`
 
-证明真实集群已经可用。默认按 7 段执行：
+证明真实集群已经可用，并覆盖真实集群 ops regression。默认按 12 段执行：
 
 1. `preflight`
 2. `deploy-upgrade`
@@ -100,15 +101,26 @@ FSMETA_FULL_NFS_ROOTS_FILE=/path/to/roots.json \
 5. `sink-materialization`
 6. `query`
 7. `resilience`
+8. `foundation-real-runtime`
+9. `upgrade-core`
+10. `topology-change`
+11. `recovery-switch`
+12. `resource-budget`
 
 每段打印：
 
 ```text
-[fs-meta-test-matrix] l5_stage=x/7
+[fs-meta-test-matrix] l5_stage=x/12
+[fs-meta-test-matrix] l5_phase=acceptance|ops
 [fs-meta-test-matrix] boundary=<name>
 ```
 
-旧 24 个 atomic L5 stage 仍可按原 stage 名称调用，用于精确回归，不再作为默认 L5 叙事。
+定向运行使用 `l5 acceptance`、`l5 ops`、上面的 stage group，或当前帮助
+输出中的 canonical atomic ops stage。旧 L5 stage alias 不再作为 public
+interface 保留。
+
+默认 `l5` 覆盖 10 个 acceptance cargo test filter 和 15 个 ops cargo test
+filter，`preflight` 只作为环境 marker。
 
 ## 4. 失败处理
 
@@ -157,7 +169,7 @@ L3_runtime_local_multinode: <status>
 L4_nfs_environment_gate:
   mini: <status>
   full: <status>
-L5_real_cluster_acceptance:
+L5_l5:
   preflight: <status>
   deploy_upgrade: <status>
   management_api: <status>
@@ -165,5 +177,10 @@ L5_real_cluster_acceptance:
   sink_materialization: <status>
   query: <status>
   resilience: <status>
+  foundation_real_runtime: <status>
+  upgrade_core: <status>
+  topology_change: <status>
+  recovery_switch: <status>
+  resource_budget: <status>
 next_lowest_validation: <command>
 ```

@@ -158,49 +158,42 @@ run_real_nfs_runtime_filter() {
       -- --ignored --nocapture --test-threads=1
 }
 
-L5_ACCEPTANCE_STAGE_TOTAL=7
-L5_STAGE_TOTAL=24
-L5_VISIBILITY_SUBSTAGE_TOTAL=7
+L5_STAGE_TOTAL=12
+
+run_l5_marker() {
+  local index="$1"
+  local phase="$2"
+  local boundary="$3"
+  echo "[fs-meta-test-matrix] l5_stage=${index}/${L5_STAGE_TOTAL}"
+  echo "[fs-meta-test-matrix] l5_phase=${phase}"
+  echo "[fs-meta-test-matrix] boundary=${boundary}"
+}
 
 run_l5_acceptance_marker() {
   local index="$1"
   local boundary="$2"
-  echo "[fs-meta-test-matrix] l5_stage=${index}/${L5_ACCEPTANCE_STAGE_TOTAL}"
-  echo "[fs-meta-test-matrix] boundary=${boundary}"
+  run_l5_marker "$index" "acceptance" "$boundary"
 }
 
-run_l5_api_stage() {
+run_l5_api_case() {
   local index="$1"
-  local stage="$2"
-  local filter="$3"
-  echo "[fs-meta-test-matrix] l5_progress=${index}/${L5_STAGE_TOTAL}"
+  local phase="$2"
+  local boundary="$3"
+  local stage="$4"
+  local filter="$5"
+  run_l5_marker "$index" "$phase" "$boundary"
+  echo "[fs-meta-test-matrix] l5_case=${stage}"
   run_real_nfs_api_filter "l5.${stage}" "$filter"
 }
 
-run_l5_api_substage() {
-  local subindex="$1"
-  local stage="$2"
-  local filter="$3"
-  local effective
-  effective="$(python3 - "$subindex" "$L5_VISIBILITY_SUBSTAGE_TOTAL" <<'PY'
-import sys
-
-subindex = int(sys.argv[1])
-total = int(sys.argv[2])
-print(f"{4 + (subindex / total):.2f}")
-PY
-)"
-  echo "[fs-meta-test-matrix] l5_stage=5/${L5_STAGE_TOTAL}"
-  echo "[fs-meta-test-matrix] l5_subprogress=${subindex}/${L5_VISIBILITY_SUBSTAGE_TOTAL}"
-  echo "[fs-meta-test-matrix] l5_progress=${effective}/${L5_STAGE_TOTAL}"
-  run_real_nfs_api_filter "l5.${stage}" "$filter"
-}
-
-run_l5_runtime_stage() {
+run_l5_runtime_case() {
   local index="$1"
-  local stage="$2"
-  local filter="$3"
-  echo "[fs-meta-test-matrix] l5_progress=${index}/${L5_STAGE_TOTAL}"
+  local phase="$2"
+  local boundary="$3"
+  local stage="$4"
+  local filter="$5"
+  run_l5_marker "$index" "$phase" "$boundary"
+  echo "[fs-meta-test-matrix] l5_case=${stage}"
   run_real_nfs_runtime_filter "l5.${stage}" "$filter"
 }
 
@@ -327,190 +320,36 @@ nfs_environment_gate() {
   esac
 }
 
-operations_real_nfs_extended() {
-  local stage="${1:-all}"
-  announce_suite "operations-real-nfs-extended-ops" "5-node-full-real-nfs-demo" "yes" "yes"
-  ensure_worker_host_binary
-  require_full_demo_assets
-  case "$stage" in
-    all)
-      operations_real_nfs foundation-real-runtime
-      operations_real_nfs upgrade-core
-      operations_real_nfs topology-change
-      operations_real_nfs recovery-switch
-      operations_real_nfs resource-budget
-      ;;
-    foundation-real-runtime)
-      operations_real_nfs runtime-selected-group-proxy
-      operations_real_nfs ops-force-find-semantics
-      operations_real_nfs ops-visibility-facade-live
-      ;;
-    upgrade-core)
-      operations_real_nfs upgrade-peer-source-control
-      operations_real_nfs upgrade-sink-scope
-      operations_real_nfs upgrade-runtime-scope
-      ;;
-    topology-change)
-      operations_real_nfs ops-new-nfs-join
-      operations_real_nfs ops-root-path-modify
-      operations_real_nfs ops-nfs-retire
-      operations_real_nfs upgrade-window-join
-      ;;
-    recovery-switch)
-      operations_real_nfs ops-facade-resource-switch
-      operations_real_nfs ops-activation-preserved
-      operations_real_nfs ops-activation-visibility
-      operations_real_nfs ops-activation-force-find
-      ;;
-    resource-budget)
-      operations_real_nfs upgrade-cpu-budget
-      ;;
-    ops-force-find-smoke)
-      run_l5_api_stage 3 "ops.force-find-smoke" \
-        fs_meta_operations_scenarios_real_nfs
-      ;;
-    ops-force-find-semantics)
-      run_l5_api_stage 4 "ops.force-find-semantics" \
-        fs_meta_operations_force_find_execution_semantics_real_nfs
-      ;;
-    ops-new-nfs-join)
-      run_l5_api_stage 14 "ops.new-nfs-join" \
-        fs_meta_operations_new_nfs_join_real_nfs
-      ;;
-    ops-root-path-modify)
-      run_l5_api_stage 15 "ops.root-path-modify" \
-        fs_meta_operations_root_path_modify_real_nfs
-      ;;
-    ops-visibility-sink-selection)
-      run_l5_api_stage 5 "ops.visibility-sink-selection" \
-        fs_meta_operations_visibility_change_and_sink_selection_real_nfs
-      ;;
-    ops-visibility-roots-narrowed)
-      run_l5_api_substage 1 "ops.visibility.5.1.roots-narrowed" \
-        fs_meta_operations_visibility_roots_narrowed_real_nfs
-      ;;
-    ops-visibility-source-delivery-ready)
-      run_l5_api_substage 2 "ops.visibility.5.2.source-delivery-ready" \
-        fs_meta_operations_visibility_source_delivery_ready_real_nfs
-      ;;
-    ops-visibility-manual-rescan-accepted)
-      run_l5_api_substage 3 "ops.visibility.5.3.manual-rescan-accepted" \
-        fs_meta_operations_visibility_manual_rescan_accepted_real_nfs
-      ;;
-    ops-visibility-grants-visible)
-      run_l5_api_substage 4 "ops.visibility.5.4.grants-visible" \
-        fs_meta_operations_visibility_grants_visible_real_nfs
-      ;;
-    ops-visibility-withdraw-converged)
-      run_l5_api_substage 5 "ops.visibility.5.5.withdraw-converged" \
-        fs_meta_operations_visibility_withdraw_converged_real_nfs
-      ;;
-    ops-visibility-sink-holder-moved)
-      run_l5_api_substage 6 "ops.visibility.5.6.sink-holder-moved" \
-        fs_meta_operations_visibility_sink_holder_moved_real_nfs
-      ;;
-    ops-visibility-facade-live)
-      run_l5_api_substage 7 "ops.visibility.5.7.facade-live" \
-        fs_meta_operations_visibility_facade_live_real_nfs
-      ;;
-    ops-sink-failover)
-      run_l5_api_stage 18 "ops.sink-failover" \
-        fs_meta_operations_sink_failover_real_nfs
-      ;;
-    ops-facade-resource-switch)
-      run_l5_api_stage 19 "ops.facade-resource-switch" \
-        fs_meta_operations_facade_failover_and_resource_switch_real_nfs
-      ;;
-    ops-nfs-retire)
-      run_l5_api_stage 16 "ops.nfs-retire" \
-        fs_meta_operations_nfs_retire_real_nfs
-      ;;
-    ops-activation-preserved)
-      run_l5_api_stage 21 "ops.activation-preserved" \
-        fs_meta_operations_activation_scope_preserved_layout_real_nfs
-      ;;
-    ops-activation-visibility)
-      run_l5_api_stage 22 "ops.activation-visibility" \
-        fs_meta_operations_activation_scope_visibility_contracted_real_nfs
-      ;;
-    ops-activation-force-find)
-      run_l5_api_stage 23 "ops.activation-force-find" \
-        fs_meta_operations_activation_scope_force_find_preserved_real_nfs
-      ;;
-    upgrade-apply-generation-two)
-      run_l5_api_stage 6 "upgrade.apply-generation-two" \
-        fs_meta_operations_release_upgrade_apply_real_nfs
-      ;;
-    upgrade-peer-source-control)
-      run_l5_api_stage 8 "upgrade.peer-source-control" \
-        fs_meta_operations_release_upgrade_peer_source_control_completion_real_nfs
-      ;;
-    upgrade-generation-two-http)
-      run_l5_api_stage 7 "upgrade.generation-two-http" \
-        fs_meta_operations_release_upgrade_real_nfs
-      ;;
-    upgrade-facade-continuity)
-      run_l5_api_stage 20 "upgrade.facade-continuity" \
-        fs_meta_operations_release_upgrade_facade_claim_continuity_real_nfs
-      ;;
-    upgrade-sink-scope)
-      run_l5_api_stage 9 "upgrade.sink-scope" \
-        fs_meta_operations_release_upgrade_sink_control_roles_real_nfs
-      ;;
-    upgrade-runtime-scope)
-      run_l5_api_stage 10 "upgrade.runtime-scope" \
-        fs_meta_operations_release_upgrade_runtime_scope_real_nfs
-      ;;
-    upgrade-roots-persist)
-      run_l5_api_stage 11 "upgrade.roots-persist" \
-        fs_meta_operations_release_upgrade_roots_persist_real_nfs
-      ;;
-    upgrade-tree-stats)
-      run_l5_api_stage 12 "upgrade.tree-stats" \
-        fs_meta_operations_release_upgrade_tree_stats_stable_real_nfs
-      ;;
-    upgrade-tree-materialization)
-      run_l5_api_stage 13 "upgrade.tree-materialization" \
-        fs_meta_operations_release_upgrade_tree_materialization_real_nfs
-      ;;
-    upgrade-window-join)
-      run_l5_api_stage 17 "upgrade.window-join" \
-        fs_meta_operations_release_upgrade_window_join_real_nfs
-      ;;
-    upgrade-cpu-budget)
-      run_l5_api_stage 24 "upgrade.cpu-budget" \
-        fs_meta_operations_release_upgrade_cpu_budget_real_nfs
-      ;;
-    runtime-selected-group-proxy)
-      run_l5_runtime_stage 1 "runtime.selected-group-proxy" \
-        external_runtime_app_selected_group_proxy
-      ;;
-    runtime-source-worker-manual-rescan)
-      run_l5_runtime_stage 2 "runtime.source-worker-manual-rescan" \
-        external_source_worker_real_nfs_manual_rescan
-      ;;
-    *)
-      echo "unknown operations-real-nfs stage: $stage" >&2
-      usage >&2
-      exit 2
-      ;;
-  esac
+l5_acceptance_all() {
+  l5_dispatch preflight
+  l5_dispatch deploy-upgrade
+  l5_dispatch management-api
+  l5_dispatch source-audit
+  l5_dispatch sink-materialization
+  l5_dispatch query
+  l5_dispatch resilience
 }
 
-real_cluster_acceptance() {
+l5_ops_all() {
+  l5_dispatch foundation-real-runtime
+  l5_dispatch upgrade-core
+  l5_dispatch topology-change
+  l5_dispatch recovery-switch
+  l5_dispatch resource-budget
+}
+
+l5_dispatch() {
   local stage="${1:-all}"
-  announce_suite "real-cluster-acceptance" "real-cluster-full-nfs" "yes" "yes"
-  ensure_worker_host_binary
-  require_full_demo_assets
   case "$stage" in
     all)
-      real_cluster_acceptance preflight
-      real_cluster_acceptance deploy-upgrade
-      real_cluster_acceptance management-api
-      real_cluster_acceptance source-audit
-      real_cluster_acceptance sink-materialization
-      real_cluster_acceptance query
-      real_cluster_acceptance resilience
+      l5_acceptance_all
+      l5_ops_all
+      ;;
+    acceptance)
+      l5_acceptance_all
+      ;;
+    ops)
+      l5_ops_all
       ;;
     preflight)
       run_l5_acceptance_marker 1 "preflight"
@@ -553,33 +392,143 @@ real_cluster_acceptance() {
       run_real_nfs_api_filter "l5.acceptance.resilience.sink-failover" \
         fs_meta_operations_sink_failover_real_nfs
       ;;
-    foundation-real-runtime|upgrade-core|topology-change|recovery-switch|resource-budget|\
-    runtime-selected-group-proxy|runtime-source-worker-manual-rescan|ops-force-find-smoke|\
-    ops-force-find-semantics|ops-visibility-sink-selection|ops-visibility-roots-narrowed|\
-    ops-visibility-source-delivery-ready|ops-visibility-manual-rescan-accepted|\
-    ops-visibility-grants-visible|ops-visibility-withdraw-converged|\
-    ops-visibility-sink-holder-moved|ops-visibility-facade-live|upgrade-apply-generation-two|\
-    upgrade-generation-two-http|upgrade-peer-source-control|upgrade-sink-scope|\
-    upgrade-runtime-scope|upgrade-roots-persist|upgrade-tree-stats|upgrade-tree-materialization|\
-    ops-new-nfs-join|ops-root-path-modify|ops-nfs-retire|upgrade-window-join|\
-    ops-sink-failover|ops-facade-resource-switch|upgrade-facade-continuity|\
-    ops-activation-preserved|ops-activation-visibility|ops-activation-force-find|\
-    upgrade-cpu-budget)
-      operations_real_nfs_extended "$stage"
+    foundation-real-runtime)
+      l5_dispatch runtime-selected-group-proxy
+      l5_dispatch ops-force-find-semantics
+      l5_dispatch ops-visibility-facade-live
       ;;
-    extended-ops)
-      operations_real_nfs_extended all
+    upgrade-core)
+      l5_dispatch upgrade-peer-source-control
+      l5_dispatch upgrade-sink-scope
+      l5_dispatch upgrade-runtime-scope
+      ;;
+    topology-change)
+      l5_dispatch ops-new-nfs-join
+      l5_dispatch ops-root-path-modify
+      l5_dispatch ops-nfs-retire
+      l5_dispatch upgrade-window-join
+      ;;
+    recovery-switch)
+      l5_dispatch ops-facade-resource-switch
+      l5_dispatch ops-activation-preserved
+      l5_dispatch ops-activation-visibility
+      l5_dispatch ops-activation-force-find
+      ;;
+    resource-budget)
+      l5_dispatch upgrade-cpu-budget
+      ;;
+    runtime-selected-group-proxy)
+      run_l5_runtime_case 8 "ops" "foundation-real-runtime" \
+        "ops.runtime.selected-group-proxy" \
+        external_runtime_app_selected_group_proxy
+      ;;
+    ops-force-find-semantics)
+      run_l5_api_case 8 "ops" "foundation-real-runtime" \
+        "ops.force-find-semantics" \
+        fs_meta_operations_force_find_execution_semantics_real_nfs
+      ;;
+    ops-visibility-facade-live)
+      run_l5_api_case 8 "ops" "foundation-real-runtime" \
+        "ops.visibility.facade-live" \
+        fs_meta_operations_visibility_facade_live_real_nfs
+      ;;
+    upgrade-peer-source-control)
+      run_l5_api_case 9 "ops" "upgrade-core" \
+        "ops.upgrade.peer-source-control" \
+        fs_meta_operations_release_upgrade_peer_source_control_completion_real_nfs
+      ;;
+    upgrade-sink-scope)
+      run_l5_api_case 9 "ops" "upgrade-core" \
+        "ops.upgrade.sink-scope" \
+        fs_meta_operations_release_upgrade_sink_control_roles_real_nfs
+      ;;
+    upgrade-runtime-scope)
+      run_l5_api_case 9 "ops" "upgrade-core" \
+        "ops.upgrade.runtime-scope" \
+        fs_meta_operations_release_upgrade_runtime_scope_real_nfs
+      ;;
+    ops-new-nfs-join)
+      run_l5_api_case 10 "ops" "topology-change" \
+        "ops.new-nfs-join" \
+        fs_meta_operations_new_nfs_join_real_nfs
+      ;;
+    ops-root-path-modify)
+      run_l5_api_case 10 "ops" "topology-change" \
+        "ops.root-path-modify" \
+        fs_meta_operations_root_path_modify_real_nfs
+      ;;
+    ops-nfs-retire)
+      run_l5_api_case 10 "ops" "topology-change" \
+        "ops.nfs-retire" \
+        fs_meta_operations_nfs_retire_real_nfs
+      ;;
+    upgrade-window-join)
+      run_l5_api_case 10 "ops" "topology-change" \
+        "ops.upgrade.window-join" \
+        fs_meta_operations_release_upgrade_window_join_real_nfs
+      ;;
+    ops-facade-resource-switch)
+      run_l5_api_case 11 "ops" "recovery-switch" \
+        "ops.facade-resource-switch" \
+        fs_meta_operations_facade_failover_and_resource_switch_real_nfs
+      ;;
+    ops-activation-preserved)
+      run_l5_api_case 11 "ops" "recovery-switch" \
+        "ops.activation-preserved" \
+        fs_meta_operations_activation_scope_preserved_layout_real_nfs
+      ;;
+    ops-activation-visibility)
+      run_l5_api_case 11 "ops" "recovery-switch" \
+        "ops.activation-visibility" \
+        fs_meta_operations_activation_scope_visibility_contracted_real_nfs
+      ;;
+    ops-activation-force-find)
+      run_l5_api_case 11 "ops" "recovery-switch" \
+        "ops.activation-force-find" \
+        fs_meta_operations_activation_scope_force_find_preserved_real_nfs
+      ;;
+    upgrade-cpu-budget)
+      run_l5_api_case 12 "ops" "resource-budget" \
+        "ops.upgrade.cpu-budget" \
+        fs_meta_operations_release_upgrade_cpu_budget_real_nfs
       ;;
     *)
-      echo "unknown real-cluster-acceptance stage: $stage" >&2
+      echo "unknown l5 stage: $stage" >&2
       usage >&2
       exit 2
       ;;
   esac
 }
 
-operations_real_nfs() {
-  real_cluster_acceptance "${1:-all}"
+l5_stage_known() {
+  local stage="${1:-all}"
+  case "$stage" in
+    all|acceptance|ops|\
+    preflight|deploy-upgrade|management-api|source-audit|sink-materialization|query|resilience|\
+    foundation-real-runtime|upgrade-core|topology-change|recovery-switch|resource-budget|\
+    runtime-selected-group-proxy|ops-force-find-semantics|ops-visibility-facade-live|\
+    upgrade-peer-source-control|upgrade-sink-scope|upgrade-runtime-scope|ops-new-nfs-join|\
+    ops-root-path-modify|ops-nfs-retire|upgrade-window-join|ops-facade-resource-switch|\
+    ops-activation-preserved|ops-activation-visibility|ops-activation-force-find|upgrade-cpu-budget)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+l5() {
+  local stage="${1:-all}"
+  if ! l5_stage_known "$stage"; then
+    echo "unknown l5 stage: $stage" >&2
+    usage >&2
+    exit 2
+  fi
+  announce_suite "l5" "real-cluster-full-nfs" "yes" "yes"
+  ensure_worker_host_binary
+  require_full_demo_assets
+  l5_dispatch "$stage"
 }
 
 progressive_business() {
@@ -595,33 +544,35 @@ progressive_environment() {
 
 progressive_operations() {
   progressive_environment
-  real_cluster_acceptance
+  l5
 }
 
 usage() {
   cat <<'EOF2'
 Usage: fs-meta/docs/examples/test-matrix-commands.sh <suite>
        fs-meta/docs/examples/test-matrix-commands.sh nfs-environment-gate [mini|full|all]
-       fs-meta/docs/examples/test-matrix-commands.sh real-cluster-acceptance [stage]
-       fs-meta/docs/examples/test-matrix-commands.sh operations-real-nfs [stage]
+       fs-meta/docs/examples/test-matrix-commands.sh l5 [all|acceptance|ops|stage]
 
 Suites:
   contracts-fast
   single-process-closed-loop
   runtime-local-multinode
   nfs-environment-gate
-  real-cluster-acceptance
+  l5
   business-fast
   business-mini-nfs
   environment-full-nfs
   operations-local
-  operations-real-nfs
   progressive-business
   progressive-environment
   progressive-operations
 
-real-cluster-acceptance stages:
+L5 suite selectors:
   all
+  acceptance
+  ops
+
+L5 acceptance stages:
   preflight
   deploy-upgrade
   management-api
@@ -629,16 +580,15 @@ real-cluster-acceptance stages:
   sink-materialization
   query
   resilience
-  extended-ops
 
-extended operations-real-nfs ordered groups:
+L5 ops groups:
   foundation-real-runtime
   upgrade-core
   topology-change
   recovery-switch
   resource-budget
 
-extended atomic L5 stages:
+L5 ops atomic stages:
   runtime-selected-group-proxy
   ops-force-find-semantics
   ops-visibility-facade-live
@@ -662,12 +612,11 @@ case "${1:-}" in
   single-process-closed-loop) single_process_closed_loop ;;
   runtime-local-multinode) runtime_local_multinode ;;
   nfs-environment-gate) nfs_environment_gate "${2:-all}" ;;
-  real-cluster-acceptance) real_cluster_acceptance "${2:-all}" ;;
+  l5) l5 "${2:-all}" ;;
   business-fast) business_fast ;;
   business-mini-nfs) business_mini_nfs ;;
   environment-full-nfs) environment_full_nfs ;;
   operations-local) operations_local ;;
-  operations-real-nfs) operations_real_nfs "${2:-all}" ;;
   progressive-business) progressive_business ;;
   progressive-environment) progressive_environment ;;
   progressive-operations) progressive_operations ;;
