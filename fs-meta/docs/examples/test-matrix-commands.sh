@@ -327,9 +327,9 @@ nfs_environment_gate() {
   esac
 }
 
-operations_real_nfs_legacy() {
+operations_real_nfs_extended() {
   local stage="${1:-all}"
-  announce_suite "operations-real-nfs-legacy-24" "5-node-full-real-nfs-demo" "yes" "yes"
+  announce_suite "operations-real-nfs-extended-ops" "5-node-full-real-nfs-demo" "yes" "yes"
   ensure_worker_host_binary
   require_full_demo_assets
   case "$stage" in
@@ -342,20 +342,13 @@ operations_real_nfs_legacy() {
       ;;
     foundation-real-runtime)
       operations_real_nfs runtime-selected-group-proxy
-      operations_real_nfs runtime-source-worker-manual-rescan
-      operations_real_nfs ops-force-find-smoke
       operations_real_nfs ops-force-find-semantics
-      operations_real_nfs ops-visibility-sink-selection
+      operations_real_nfs ops-visibility-facade-live
       ;;
     upgrade-core)
-      operations_real_nfs upgrade-apply-generation-two
-      operations_real_nfs upgrade-generation-two-http
       operations_real_nfs upgrade-peer-source-control
       operations_real_nfs upgrade-sink-scope
       operations_real_nfs upgrade-runtime-scope
-      operations_real_nfs upgrade-roots-persist
-      operations_real_nfs upgrade-tree-stats
-      operations_real_nfs upgrade-tree-materialization
       ;;
     topology-change)
       operations_real_nfs ops-new-nfs-join
@@ -364,9 +357,7 @@ operations_real_nfs_legacy() {
       operations_real_nfs upgrade-window-join
       ;;
     recovery-switch)
-      operations_real_nfs ops-sink-failover
       operations_real_nfs ops-facade-resource-switch
-      operations_real_nfs upgrade-facade-continuity
       operations_real_nfs ops-activation-preserved
       operations_real_nfs ops-activation-visibility
       operations_real_nfs ops-activation-force-find
@@ -574,10 +565,10 @@ real_cluster_acceptance() {
     ops-sink-failover|ops-facade-resource-switch|upgrade-facade-continuity|\
     ops-activation-preserved|ops-activation-visibility|ops-activation-force-find|\
     upgrade-cpu-budget)
-      operations_real_nfs_legacy "$stage"
+      operations_real_nfs_extended "$stage"
       ;;
-    legacy-24)
-      operations_real_nfs_legacy all
+    extended-ops)
+      operations_real_nfs_extended all
       ;;
     *)
       echo "unknown real-cluster-acceptance stage: $stage" >&2
@@ -638,43 +629,27 @@ real-cluster-acceptance stages:
   sink-materialization
   query
   resilience
-  legacy-24
+  extended-ops
 
-legacy operations-real-nfs ordered groups:
+extended operations-real-nfs ordered groups:
   foundation-real-runtime
   upgrade-core
   topology-change
   recovery-switch
   resource-budget
 
-legacy atomic L5 stages:
+extended atomic L5 stages:
   runtime-selected-group-proxy
-  runtime-source-worker-manual-rescan
-  ops-force-find-smoke
   ops-force-find-semantics
-  ops-visibility-sink-selection
-  ops-visibility-roots-narrowed
-  ops-visibility-source-delivery-ready
-  ops-visibility-manual-rescan-accepted
-  ops-visibility-grants-visible
-  ops-visibility-withdraw-converged
-  ops-visibility-sink-holder-moved
   ops-visibility-facade-live
-  upgrade-apply-generation-two
-  upgrade-generation-two-http
   upgrade-peer-source-control
   upgrade-sink-scope
   upgrade-runtime-scope
-  upgrade-roots-persist
-  upgrade-tree-stats
-  upgrade-tree-materialization
   ops-new-nfs-join
   ops-root-path-modify
   ops-nfs-retire
   upgrade-window-join
-  ops-sink-failover
   ops-facade-resource-switch
-  upgrade-facade-continuity
   ops-activation-preserved
   ops-activation-visibility
   ops-activation-force-find

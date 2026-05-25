@@ -20,7 +20,7 @@ Compatibility aliases stay available while reports move to the new names:
 - `business-mini-nfs` = L4 mini-NFS subgate.
 - `environment-full-nfs` = L4 full-NFS subgate.
 - `operations-local` = L3 compatibility alias.
-- `operations-real-nfs` = L5 compatibility alias; legacy 24-stage gates remain callable by name.
+- `operations-real-nfs` = L5 compatibility alias; `extended-ops` provides non-duplicative supplemental L5 gates.
 
 ## Order
 
@@ -47,9 +47,9 @@ drop to the lowest rung that can reproduce it.
 
 Each stage prints `l5_stage=x/7` and `boundary=<name>`.
 
-Legacy 24-stage operation gates are retained for focused regression work by
-passing their existing stage names to `real-cluster-acceptance` or
-`operations-real-nfs`.
+Supplemental operation gates are retained for focused regression work through
+`real-cluster-acceptance extended-ops` or by passing an individual stage name to
+`real-cluster-acceptance` or `operations-real-nfs`.
 
 ## Public Commands
 
