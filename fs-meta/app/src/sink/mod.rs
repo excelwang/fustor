@@ -1446,6 +1446,7 @@ impl SinkStateSnapshotCell {
                     handle: self.handle.clone(),
                     payload,
                     lease_epoch: Some(snapshot.persisted_at_us.max(1)),
+                    retained_revision_limit: Some(0),
                 },
             ))?;
         if response.status != "committed" && response.status != "ok" {

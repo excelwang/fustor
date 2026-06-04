@@ -319,6 +319,7 @@ impl SignalCell {
                     handle: self.handle.clone(),
                     payload,
                     lease_epoch: Some(seq),
+                    retained_revision_limit: None,
                 },
             )
             .await?;
@@ -519,6 +520,7 @@ impl LogicalRootsCell {
                     handle: self.handle.clone(),
                     payload,
                     lease_epoch: Some(lease_epoch),
+                    retained_revision_limit: None,
                 },
             )
             .await?;
@@ -655,6 +657,7 @@ impl HostObjectGrantsCell {
                     handle: self.handle.clone(),
                     payload,
                     lease_epoch: Some(version),
+                    retained_revision_limit: None,
                 },
             )
             .await?;
@@ -687,6 +690,7 @@ fn write_logical_roots_snapshot_blocking(
             handle: handle.clone(),
             payload,
             lease_epoch: Some(snapshot.seq),
+            retained_revision_limit: None,
         },
     )
     .map_err(|err| {
@@ -722,6 +726,7 @@ fn write_host_object_grants_snapshot_blocking(
             handle: handle.clone(),
             payload,
             lease_epoch: Some(snapshot.version),
+            retained_revision_limit: None,
         },
     )
     .map_err(|err| {
@@ -900,6 +905,7 @@ impl AuthorityJournal {
                 handle: self.handle.clone(),
                 payload,
                 lease_epoch,
+                retained_revision_limit: None,
             },
         ) {
             Ok(result) if result.status == "committed" || result.status == "ok" => {}
@@ -1082,6 +1088,7 @@ mod tests {
                 handle,
                 payload: bad_payload,
                 lease_epoch: Some(1),
+                retained_revision_limit: None,
             },
         ))
         .expect("seed payload");

@@ -20,6 +20,50 @@ struct NoopBoundary;
 #[async_trait::async_trait]
 impl ChannelIoSubset for NoopBoundary {}
 
+struct RecordingStateBoundary {
+    inner: Arc<dyn StateBoundary>,
+    writes: Mutex<Vec<StateCellWriteRequest>>,
+}
+
+impl RecordingStateBoundary {
+    fn new() -> Self {
+        Self {
+            inner: in_memory_state_boundary(),
+            writes: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn writes(&self) -> Vec<StateCellWriteRequest> {
+        self.writes
+            .lock()
+            .expect("recording state writes lock")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl StateBoundary for RecordingStateBoundary {
+    async fn statecell_read(
+        &self,
+        ctx: BoundaryContext,
+        request: StateCellReadRequest,
+    ) -> Result<capanix_app_sdk::runtime::KernelResultEnvelope> {
+        self.inner.statecell_read(ctx, request).await
+    }
+
+    async fn statecell_write(
+        &self,
+        ctx: BoundaryContext,
+        request: StateCellWriteRequest,
+    ) -> Result<capanix_app_sdk::runtime::KernelResultEnvelope> {
+        self.writes
+            .lock()
+            .expect("recording state writes lock")
+            .push(request.clone());
+        self.inner.statecell_write(ctx, request).await
+    }
+}
+
 struct RouteCountingTimeoutBoundary {
     recv_counts: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
     recv_notify: tokio::sync::Notify,
@@ -344,6 +388,39 @@ fn build_single_group_sink() -> SinkFileMeta {
         true,
     )];
     SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("build sink")
+}
+
+#[test]
+fn sink_snapshot_statecell_write_disables_revision_retention() {
+    let recording = Arc::new(RecordingStateBoundary::new());
+    let state_boundary: Arc<dyn StateBoundary> = recording.clone();
+    let snapshot_cell = SinkStateSnapshotCell {
+        scope: Arc::<str>::from(SINK_RUNTIME_UNIT_ID),
+        handle: sink_state_handle(SINK_RUNTIME_UNIT_ID),
+        state_boundary,
+    };
+    let snapshot = PersistedSinkState {
+        scope: SINK_RUNTIME_UNIT_ID.to_string(),
+        persisted_at_us: 42,
+        groups: Vec::new(),
+        retained_groups: Vec::new(),
+    };
+
+    snapshot_cell.persist(&snapshot).expect("persist snapshot");
+
+    let writes = recording.writes();
+    let write = writes
+        .iter()
+        .find(|request| request.handle == sink_state_handle(SINK_RUNTIME_UNIT_ID))
+        .expect("sink snapshot statecell write");
+    assert_eq!(
+        write.retained_revision_limit,
+        Some(0),
+        "large sink memory-tree snapshots must overwrite the current statecell payload without retaining historical full-payload revisions"
+    );
+    let decoded: PersistedSinkState =
+        rmp_serde::from_slice(&write.payload).expect("decode persisted sink state");
+    assert_eq!(decoded.scope, SINK_RUNTIME_UNIT_ID);
 }
 
 fn finished_endpoint_task_for_test(route_key: &str) -> ManagedEndpointTask {
