@@ -5,8 +5,8 @@
 //! even when only descendants are materialized. Query-facing data stays close to
 //! the stored node so `/tree`, `/stats`, and PIT creation can read it directly.
 
-use std::collections::HashMap;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
@@ -218,9 +218,13 @@ impl MaterializedTree {
         let id = self.lookup_id(path)?;
         let removed = self.node_mut(id)?.meta.take()?;
         self.meta_count = self.meta_count.saturating_sub(1);
-        let refresh_from =
-            self.node(id)
-                .and_then(|node| if node.children.is_empty() { node.parent } else { Some(id) });
+        let refresh_from = self.node(id).and_then(|node| {
+            if node.children.is_empty() {
+                node.parent
+            } else {
+                Some(id)
+            }
+        });
         self.prune_empty_chain(id);
         if let Some(start) = refresh_from {
             self.refresh_aggregate_chain(start);

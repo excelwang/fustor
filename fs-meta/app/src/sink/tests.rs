@@ -4611,7 +4611,83 @@ async fn roots_control_stream_ignores_older_declaration_after_newer_authoritativ
             "nfs1".to_string(),
             "nfs2".to_string()
         ])),
-        "sink roots-control stream is the remote form of management roots apply and must make the declared roots active sink groups",
+        "sink roots-control stream must derive sink scope only from local active grants that match the accepted logical roots",
+    );
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn full_root_logical_roots_refresh_preserves_runtime_owned_single_sink_group() {
+    let roots = ["nfs-144", "nfs-145", "nfs-146", "nfs-147", "nfs-148"]
+        .into_iter()
+        .map(|group| RootSpec::new(group, format!("/mnt/fustor-peers/{group}")))
+        .collect::<Vec<_>>();
+    let grants = roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| {
+            let host = format!("panda{}", 144 + index);
+            let host_ip = format!("10.0.82.{}", 144 + index);
+            let object_ref = format!("{host}::{}", root.id);
+            granted_mount_root(
+                &object_ref,
+                &host,
+                &host_ip,
+                root.selected_mount_point()
+                    .expect("root fixture mount point")
+                    .to_path_buf(),
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = roots.clone();
+    cfg.host_object_grants = grants.clone();
+    let sink = SinkFileMeta::with_boundaries(
+        NodeId("panda145".to_string()),
+        Some(Arc::new(NoopBoundary)),
+        cfg,
+    )
+    .expect("init runtime-managed sink");
+
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources(
+                "nfs-145",
+                &["panda145::nfs-145"],
+            )],
+        },
+    ))
+    .expect("encode single-owner sink activate")])
+        .await
+        .expect("apply single-owner sink activate");
+
+    sink.update_logical_roots_from_management_apply(roots.clone(), &grants)
+        .expect("full-root management refresh must derive only the local sink schedule");
+
+    let snapshot = sink
+        .status_snapshot()
+        .expect("status after full-root logical-roots refresh");
+    assert_eq!(
+        snapshot
+            .scheduled_groups_by_node
+            .get("panda145")
+            .cloned()
+            .unwrap_or_default(),
+        vec!["nfs-145".to_string()],
+        "a node may know all five full-root logical roots, but runtime.exec.sink cardinality=one must leave the local sink scheduled for only its runtime-owned group: {snapshot:?}"
+    );
+    assert_eq!(
+        sink.scheduled_group_ids_snapshot()
+            .expect("scheduled groups after full-root refresh"),
+        Some(std::collections::BTreeSet::from(["nfs-145".to_string()])),
+        "logical-roots refresh must derive sink placement from local active grants instead of expanding to every full-root group",
     );
 
     sink.close().await.expect("close sink");
@@ -4675,7 +4751,7 @@ async fn status_snapshot_reports_runtime_scheduled_bare_group_even_when_grant_pr
 }
 
 #[tokio::test]
-async fn management_logical_roots_scope_survives_later_stale_runtime_activate() {
+async fn management_logical_roots_update_derives_local_grant_sink_scope() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![
         RootSpec::new("nfs1", "/mnt/nfs1"),
@@ -4717,7 +4793,7 @@ async fn management_logical_roots_scope_survives_later_stale_runtime_activate() 
         ],
         &cfg.host_object_grants,
     )
-    .expect("management roots apply should update sink schedule authority");
+    .expect("management roots apply should update logical roots and derive local active-grant sink scope");
 
     sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
         RuntimeExecActivate {
@@ -4738,19 +4814,19 @@ async fn management_logical_roots_scope_survives_later_stale_runtime_activate() 
 
     assert_eq!(
         sink.scheduled_group_ids_snapshot()
-            .expect("scheduled groups after stale activate"),
+            .expect("scheduled groups after later runtime activate"),
         Some(std::collections::BTreeSet::from([
             "nfs2".to_string(),
             "nfs4".to_string()
         ])),
-        "management-accepted logical roots must remain sink schedule authority; later stale runtime route hints must not reintroduce nfs1 or drop nfs4",
+        "management-accepted logical roots must filter retired nfs1 and add only local active-grant nfs4 instead of blindly trusting later route scopes",
     );
 
     sink.close().await.expect("close sink");
 }
 
 #[tokio::test]
-async fn status_snapshot_refreshes_stale_authoritative_scope_after_live_only_restore() {
+async fn status_snapshot_refreshes_logical_roots_without_expanding_sink_schedule() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![
         RootSpec::new("nfs1", "/mnt/nfs1"),
@@ -4797,7 +4873,7 @@ async fn status_snapshot_refreshes_stale_authoritative_scope_after_live_only_res
         ],
         &cfg.host_object_grants,
     )
-    .expect("live-only roots apply should become stale runtime authority");
+    .expect("live-only roots apply should update logical roots and derive local active-grant sink scope");
 
     sink.logical_roots_cell
         .replace(vec![
@@ -4845,7 +4921,7 @@ async fn status_snapshot_refreshes_stale_authoritative_scope_after_live_only_res
             "nfs4".to_string(),
             "nfs5".to_string()
         ]),
-        "status path must refresh stale authoritative runtime scopes instead of masking restored roots: {snapshot:?}",
+        "status path must refresh logical roots and derive the local active-grant sink schedule without importing foreign roots: {snapshot:?}",
     );
 
     let group_ids = snapshot
@@ -4855,7 +4931,7 @@ async fn status_snapshot_refreshes_stale_authoritative_scope_after_live_only_res
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         group_ids, scheduled,
-        "status path must expose all restored roots after refreshing authoritative state: {snapshot:?}",
+        "status path must expose the refreshed local active-grant sink groups after refreshing logical roots: {snapshot:?}",
     );
 
     sink.close().await.expect("close sink");
