@@ -3541,7 +3541,7 @@ pub async fn status(
             }
         };
     if matches!(sink_outcome, StatusRouteOutcome::Ok) {
-        sink_status = apply_status_ready_sink_evidence_cache(sink_status);
+        sink_status = apply_status_materialized_sink_evidence_cache(sink_status);
     }
     let source_short_budget_owner_fanin_needed = use_short_status_route_budget
         && management_status_should_attempt_short_budget_source_owner_scoped_fanin(
@@ -3641,9 +3641,7 @@ pub async fn status(
         &source,
         &authoritative_source_for_status_fanin,
     );
-    if matches!(sink_outcome, StatusRouteOutcome::Ok) {
-        sink_status = apply_status_ready_sink_evidence_cache(sink_status);
-    }
+    sink_status = apply_status_materialized_sink_evidence_cache(sink_status);
     record_status_route_trace(
         trace_id,
         format!(
@@ -4448,13 +4446,13 @@ fn management_status_source_owner_scoped_timeout(use_short_status_route_budget: 
     }
 }
 
-fn status_ready_sink_evidence_cache() -> &'static StdMutex<BTreeMap<String, SinkGroupStatusSnapshot>>
-{
+fn status_materialized_sink_evidence_cache()
+-> &'static StdMutex<BTreeMap<String, SinkGroupStatusSnapshot>> {
     static CACHE: OnceLock<StdMutex<BTreeMap<String, SinkGroupStatusSnapshot>>> = OnceLock::new();
     CACHE.get_or_init(|| StdMutex::new(BTreeMap::new()))
 }
 
-fn status_ready_sink_evidence_key(group: &SinkGroupStatusSnapshot) -> String {
+fn status_materialized_sink_evidence_key(group: &SinkGroupStatusSnapshot) -> String {
     format!("{}\0{}", group.group_id, group.primary_object_ref)
 }
 
@@ -4476,32 +4474,35 @@ fn source_snapshot_with_status_authority(
     snapshot
 }
 
-fn sink_group_has_ready_live_evidence(group: &SinkGroupStatusSnapshot) -> bool {
-    group.materialized_service_live_ready()
+fn sink_group_has_restorable_materialized_evidence(group: &SinkGroupStatusSnapshot) -> bool {
+    group.has_live_materialized_owner()
 }
 
 fn sink_group_is_unready_zero_for_same_primary(group: &SinkGroupStatusSnapshot) -> bool {
     !matches!(group.readiness, GroupReadinessState::Ready)
         && group.total_nodes == 0
         && group.live_nodes == 0
+        && !group.overflow_pending_materialization
         && !group.primary_object_ref.trim().is_empty()
         && group.primary_object_ref != group.group_id
 }
 
-fn apply_status_ready_sink_evidence_cache(snapshot: SinkStatusSnapshot) -> SinkStatusSnapshot {
-    let mut cache = match status_ready_sink_evidence_cache().lock() {
+fn apply_status_materialized_sink_evidence_cache(
+    snapshot: SinkStatusSnapshot,
+) -> SinkStatusSnapshot {
+    let mut cache = match status_materialized_sink_evidence_cache().lock() {
         Ok(cache) => cache,
         Err(_) => return snapshot,
     };
     let mut merged = snapshot;
     let mut replacements = BTreeMap::<String, SinkGroupStatusSnapshot>::new();
     for group in &merged.groups {
-        let key = status_ready_sink_evidence_key(group);
-        if sink_group_has_ready_live_evidence(group) {
+        let key = status_materialized_sink_evidence_key(group);
+        if sink_group_has_restorable_materialized_evidence(group) {
             cache.insert(key, group.clone());
         } else if sink_group_is_unready_zero_for_same_primary(group)
             && let Some(cached) = cache.get(&key)
-            && sink_group_has_ready_live_evidence(cached)
+            && sink_group_has_restorable_materialized_evidence(cached)
         {
             replacements.insert(group.group_id.clone(), cached.clone());
         }
@@ -10690,13 +10691,14 @@ mod tests {
     }
 
     #[test]
-    fn status_ready_sink_evidence_cache_prevents_same_primary_zero_pending_downgrade() {
-        let primary = "node-b-epoch::nfs3";
-        let ready = SinkStatusSnapshot {
+    fn status_materialized_sink_evidence_cache_prevents_same_primary_zero_pending_downgrade() {
+        let group_id = "nfs-cache-same-primary";
+        let primary = "node-b-epoch::nfs-cache-same-primary";
+        let materialized_pending = SinkStatusSnapshot {
             groups: vec![status_test_sink_group(
-                "nfs3",
+                group_id,
                 primary,
-                GroupReadinessState::Ready,
+                GroupReadinessState::PendingMaterialization,
                 6,
                 5,
             )],
@@ -10704,7 +10706,7 @@ mod tests {
         };
         let zero_pending = SinkStatusSnapshot {
             groups: vec![status_test_sink_group(
-                "nfs3",
+                group_id,
                 primary,
                 GroupReadinessState::PendingMaterialization,
                 0,
@@ -10713,21 +10715,39 @@ mod tests {
             ..SinkStatusSnapshot::default()
         };
 
-        let cached = apply_status_ready_sink_evidence_cache(ready);
-        assert_eq!(cached.groups[0].readiness, GroupReadinessState::Ready);
-        let restored = apply_status_ready_sink_evidence_cache(zero_pending);
+        let cached = apply_status_materialized_sink_evidence_cache(materialized_pending);
+        assert_eq!(
+            cached.groups[0].readiness,
+            GroupReadinessState::PendingMaterialization
+        );
+        let restored = apply_status_materialized_sink_evidence_cache(zero_pending);
 
-        assert_eq!(restored.groups[0].readiness, GroupReadinessState::Ready);
+        assert_eq!(
+            restored.groups[0].readiness,
+            GroupReadinessState::PendingMaterialization
+        );
         assert_eq!(restored.groups[0].total_nodes, 6);
         assert_eq!(restored.groups[0].live_nodes, 5);
+        assert_eq!(restored.live_nodes, 5);
     }
 
     #[test]
-    fn status_ready_sink_evidence_cache_does_not_cross_primary_epoch() {
+    fn status_materialized_sink_evidence_cache_does_not_cross_primary_epoch() {
+        let group_id = "nfs-cache-primary-epoch";
+        let cached = SinkStatusSnapshot {
+            groups: vec![status_test_sink_group(
+                group_id,
+                "node-b-previous-epoch::nfs-cache-primary-epoch",
+                GroupReadinessState::PendingMaterialization,
+                6,
+                5,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
         let zero_pending = SinkStatusSnapshot {
             groups: vec![status_test_sink_group(
-                "nfs3",
-                "node-b-next-epoch::nfs3",
+                group_id,
+                "node-b-next-epoch::nfs-cache-primary-epoch",
                 GroupReadinessState::PendingMaterialization,
                 0,
                 0,
@@ -10735,7 +10755,8 @@ mod tests {
             ..SinkStatusSnapshot::default()
         };
 
-        let unchanged = apply_status_ready_sink_evidence_cache(zero_pending);
+        let _ = apply_status_materialized_sink_evidence_cache(cached);
+        let unchanged = apply_status_materialized_sink_evidence_cache(zero_pending);
 
         assert_eq!(
             unchanged.groups[0].readiness,
@@ -10743,6 +10764,87 @@ mod tests {
         );
         assert_eq!(unchanged.groups[0].total_nodes, 0);
         assert_eq!(unchanged.groups[0].live_nodes, 0);
+    }
+
+    #[test]
+    fn status_materialized_sink_evidence_cache_does_not_hide_explicit_overflow_blocker() {
+        let group_id = "nfs-cache-overflow-blocker";
+        let primary = "node-b::nfs-cache-overflow-blocker";
+        let observed = SinkStatusSnapshot {
+            groups: vec![status_test_sink_group(
+                group_id,
+                primary,
+                GroupReadinessState::PendingMaterialization,
+                6,
+                5,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let mut overflow_pending = status_test_sink_group(
+            group_id,
+            primary,
+            GroupReadinessState::PendingMaterialization,
+            0,
+            0,
+        );
+        overflow_pending.overflow_pending_materialization = true;
+        let current = SinkStatusSnapshot {
+            groups: vec![overflow_pending],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let _ = apply_status_materialized_sink_evidence_cache(observed);
+        let unchanged = apply_status_materialized_sink_evidence_cache(current);
+
+        assert!(unchanged.groups[0].overflow_pending_materialization);
+        assert_eq!(unchanged.groups[0].total_nodes, 0);
+        assert_eq!(unchanged.groups[0].live_nodes, 0);
+    }
+
+    #[test]
+    fn status_materialized_sink_evidence_cache_restores_authoritative_pending_fill_rows() {
+        let group_id = "nfs-cache-authoritative-fill";
+        let primary = "node-b::nfs-cache-authoritative-fill";
+        let observed = SinkStatusSnapshot {
+            groups: vec![status_test_sink_group(
+                group_id,
+                primary,
+                GroupReadinessState::PendingMaterialization,
+                9000,
+                8999,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let mut authoritative_source = local_source_snapshot();
+        authoritative_source.logical_roots = vec![RootSpec::new(group_id, "/mnt/nfs-cache")];
+        authoritative_source.grants = vec![grant_for_node_root("node-b", group_id)];
+        authoritative_source.source_primary_by_group =
+            BTreeMap::from([(group_id.to_string(), primary.to_string())]);
+        let mut empty_source = local_source_snapshot();
+        empty_source.logical_roots.clear();
+        empty_source.grants.clear();
+        empty_source.status.logical_roots.clear();
+        empty_source.status.concrete_roots.clear();
+        empty_source.source_primary_by_group.clear();
+
+        let _ = apply_status_materialized_sink_evidence_cache(observed);
+        let pending_fill = fill_missing_authoritative_pending_sink_groups_from_source(
+            SinkStatusSnapshot::default(),
+            &empty_source,
+            &authoritative_source,
+        );
+        let restored = apply_status_materialized_sink_evidence_cache(pending_fill);
+
+        assert_eq!(restored.groups.len(), 1);
+        assert_eq!(restored.groups[0].group_id, group_id);
+        assert_eq!(restored.groups[0].primary_object_ref, primary);
+        assert_eq!(
+            restored.groups[0].readiness,
+            GroupReadinessState::PendingMaterialization
+        );
+        assert_eq!(restored.groups[0].total_nodes, 9000);
+        assert_eq!(restored.groups[0].live_nodes, 8999);
+        assert_eq!(restored.live_nodes, 8999);
     }
 
     #[test]

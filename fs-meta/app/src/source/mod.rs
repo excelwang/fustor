@@ -2796,6 +2796,29 @@ impl FSMetaSource {
         detail.last_audit_duration_ms = None;
     }
 
+    fn mark_root_rescan_requested_if_not_pending(
+        fanout_health: &Arc<Mutex<FanoutHealthState>>,
+        root_key: &str,
+        reason: &str,
+    ) {
+        let mut health = lock_or_recover(fanout_health, "source.object_health.rescan_requested");
+        let detail = health
+            .object_ref_detail
+            .entry(root_key.to_string())
+            .or_default();
+        let audit_inflight = detail.last_audit_started_at_us.is_some()
+            && detail.last_audit_completed_at_us.is_none();
+        if detail.rescan_pending || audit_inflight {
+            return;
+        }
+        detail.rescan_pending = true;
+        detail.last_rescan_requested_at_us = Some(now_us());
+        detail.last_rescan_reason = Some(reason.to_string());
+        detail.last_audit_started_at_us = None;
+        detail.last_audit_completed_at_us = None;
+        detail.last_audit_duration_ms = None;
+    }
+
     fn mark_root_overflow_observed(fanout_health: &Arc<Mutex<FanoutHealthState>>, root_key: &str) {
         let mut health = lock_or_recover(fanout_health, "source.object_health.overflow");
         let detail = health
@@ -3063,17 +3086,20 @@ impl FSMetaSource {
                 continue;
             }
             let root_key = Self::root_runtime_key(root);
-            if let Some(health) = fanout_health {
-                Self::mark_root_rescan_requested(health, &root_key, reason);
-            }
             if reason == "manual"
                 && let Some(intents) = manual_rescan_intents
             {
                 let mut intents = lock_or_recover(intents, "source.manual_rescan_intents.queue");
-                let entry = intents.entry(root_key).or_default();
+                let entry = intents.entry(root_key.clone()).or_default();
                 entry.requested = entry.requested.saturating_add(1);
                 signal_root_keys.insert(Self::root_runtime_key(root));
+                if let Some(health) = fanout_health {
+                    Self::mark_root_rescan_requested_if_not_pending(health, &root_key, reason);
+                }
             } else {
+                if let Some(health) = fanout_health {
+                    Self::mark_root_rescan_requested(health, &root_key, reason);
+                }
                 signal_root_keys.insert(Self::root_runtime_key(root));
             }
         }
@@ -3092,17 +3118,20 @@ impl FSMetaSource {
                 continue;
             }
             let root_key = Self::root_runtime_key(root);
-            if let Some(health) = fanout_health {
-                Self::mark_root_rescan_requested(health, &root_key, reason);
-            }
             if reason == "manual"
                 && let Some(intents) = manual_rescan_intents
             {
                 let mut intents = lock_or_recover(intents, "source.manual_rescan_intents.queue");
-                let entry = intents.entry(root_key).or_default();
+                let entry = intents.entry(root_key.clone()).or_default();
                 entry.requested = entry.requested.saturating_add(1);
                 signal_root_keys.insert(Self::root_runtime_key(root));
+                if let Some(health) = fanout_health {
+                    Self::mark_root_rescan_requested_if_not_pending(health, &root_key, reason);
+                }
             } else {
+                if let Some(health) = fanout_health {
+                    Self::mark_root_rescan_requested(health, &root_key, reason);
+                }
                 signal_root_keys.insert(Self::root_runtime_key(root));
             }
         }

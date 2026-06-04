@@ -2121,6 +2121,17 @@ impl SinkRecoveryMachine {
                     FSMetaApp::sink_status_snapshot_should_defer_republish_after_retained_replay_timeout(&snapshot)
                 })
         };
+        let cached_sink_status_has_pending_materialization_progress =
+            |sink: &Arc<SinkFacade>, expected_groups: &std::collections::BTreeSet<String>| {
+                sink.cached_status_snapshot_with_failure()
+                    .ok()
+                    .is_some_and(|snapshot| {
+                        FSMetaApp::sink_status_snapshot_has_pending_materialization_progress_for_expected_groups(
+                            &snapshot,
+                            expected_groups,
+                        )
+                    })
+            };
         loop {
             let scope_convergence_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             let converged_groups = loop {
@@ -2194,6 +2205,12 @@ impl SinkRecoveryMachine {
                         ) {
                             return Ok(None);
                         }
+                        if FSMetaApp::sink_status_snapshot_has_pending_materialization_progress_for_expected_groups(
+                            &snapshot,
+                            &converged_groups,
+                        ) {
+                            return Ok(None);
+                        }
                         if FSMetaApp::sink_status_snapshot_should_defer_republish_after_retained_replay_timeout(&snapshot)
                         {
                             if self
@@ -2228,6 +2245,12 @@ impl SinkRecoveryMachine {
                         {
                             break;
                         }
+                        if cached_sink_status_has_pending_materialization_progress(
+                            sink,
+                            &converged_groups,
+                        ) {
+                            return Ok(None);
+                        }
                         if cached_sink_status_should_defer_republish(sink) {
                             return Ok(Some(converged_groups));
                         }
@@ -2257,6 +2280,12 @@ impl SinkRecoveryMachine {
                     }
                     Err(_) if tokio::time::Instant::now() < sink_readiness_deadline => {}
                     Err(_) => {
+                        if cached_sink_status_has_pending_materialization_progress(
+                            sink,
+                            &converged_groups,
+                        ) {
+                            return Ok(None);
+                        }
                         if cached_sink_status_should_defer_republish(sink) {
                             return Ok(Some(converged_groups));
                         }
@@ -3229,6 +3258,8 @@ fn post_recovery_sink_timeout_defers_scheduled_only_zero_state() {
 
 #[test]
 fn post_recovery_sink_timeout_defers_pending_materialization_state() {
+    let expected_groups =
+        std::collections::BTreeSet::from([String::from("g1"), String::from("g2")]);
     let snapshot = crate::sink::SinkStatusSnapshot {
         scheduled_groups_by_node: std::collections::BTreeMap::from([(
             String::from("node-a"),
@@ -3275,7 +3306,81 @@ fn post_recovery_sink_timeout_defers_pending_materialization_state() {
         FSMetaApp::sink_status_snapshot_should_defer_republish_after_retained_replay_timeout(
             &snapshot
         ),
-        "pending materialization after retained replay is catch-up evidence and must not be treated as a terminal control-frame failure"
+        "pending materialization without sink delivery evidence still needs a bounded recovery follow-up"
+    );
+    assert!(
+        !FSMetaApp::sink_status_snapshot_has_pending_materialization_progress_for_expected_groups(
+            &snapshot,
+            &expected_groups
+        ),
+        "pending materialization without sink delivery evidence must not be treated as normal initial-audit catch-up"
+    );
+}
+
+#[test]
+fn post_recovery_pending_materialization_with_delivery_progress_exits_replay_repair() {
+    let expected_groups =
+        std::collections::BTreeSet::from([String::from("g1"), String::from("g2")]);
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            String::from("node-a"),
+            vec![String::from("g1"), String::from("g2")],
+        )]),
+        stream_received_batches_by_node: std::collections::BTreeMap::from([(
+            String::from("node-a"),
+            184,
+        )]),
+        stream_applied_data_events_by_node: std::collections::BTreeMap::from([(
+            String::from("node-a"),
+            27_000,
+        )]),
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: String::from("g1"),
+                primary_object_ref: String::from("node-a::g1"),
+                total_nodes: 12_000,
+                live_nodes: 11_999,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 12_001,
+                estimated_heap_bytes: 0,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: String::from("g2"),
+                primary_object_ref: String::from("node-a::g2"),
+                total_nodes: 15_000,
+                live_nodes: 14_999,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 15_001,
+                estimated_heap_bytes: 0,
+            },
+        ],
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        !sink_status_snapshot_ready_for_expected_groups(&snapshot, &expected_groups),
+        "precondition: pending materialization remains unready for trusted materialized serving"
+    );
+    assert!(
+        FSMetaApp::sink_status_snapshot_has_pending_materialization_progress_for_expected_groups(
+            &snapshot,
+            &expected_groups
+        ),
+        "post-recovery must classify delivered pending materialization as initial-audit catch-up, not as a new sink-generation-cutover repair trigger"
     );
 }
 
@@ -9346,6 +9451,18 @@ impl FSMetaApp {
             Some(crate::sink::SinkStatusConcern::ReplayPending)
                 | Some(crate::sink::SinkStatusConcern::MixedReadiness)
         )
+    }
+
+    fn sink_status_snapshot_has_pending_materialization_progress_for_expected_groups(
+        snapshot: &crate::sink::SinkStatusSnapshot,
+        expected_groups: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        let projection = snapshot.concern_projection();
+        !expected_groups.is_empty()
+            && expected_groups.is_subset(&projection.summary.scheduled_groups)
+            && expected_groups.is_disjoint(&projection.summary.missing_scheduled_groups)
+            && !expected_groups.is_disjoint(&projection.summary.pending_materialization_groups)
+            && FSMetaApp::sink_status_snapshot_has_delivery_evidence_for_republish(snapshot)
     }
 
     fn sink_status_snapshot_has_stale_group_republish_evidence(

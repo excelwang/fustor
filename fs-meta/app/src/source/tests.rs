@@ -5340,6 +5340,83 @@ fn rescan_request_invalidates_previous_audit_completion_evidence() {
 }
 
 #[test]
+fn duplicate_pending_manual_rescan_intent_preserves_inflight_audit_evidence() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::exp1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+        .expect("init source");
+    let primary_root = lock_or_recover(
+        &source.state_cell.roots,
+        "test.duplicate_pending_manual_rescan.roots",
+    )
+    .iter()
+    .find(|root| root.is_group_primary)
+    .cloned()
+    .expect("primary root exists");
+    let root_key = FSMetaSource::root_runtime_key(&primary_root);
+
+    FSMetaSource::request_rescan_on_primary_roots(
+        std::slice::from_ref(&primary_root),
+        None,
+        Some(&source.state_cell.fanout_health),
+        Some(&source.state_cell.manual_rescan_intents),
+        None,
+        "manual",
+    );
+    FSMetaSource::mark_root_audit_start(&source.state_cell.fanout_health, &root_key, "manual", 30);
+    let first_requested_at = {
+        let health = lock_or_recover(
+            &source.state_cell.fanout_health,
+            "test.duplicate_pending_manual_rescan.first_health",
+        );
+        let detail = health
+            .object_ref_detail
+            .get(&root_key)
+            .expect("root detail exists");
+        detail.last_rescan_requested_at_us
+    };
+
+    FSMetaSource::request_rescan_on_primary_roots(
+        std::slice::from_ref(&primary_root),
+        None,
+        Some(&source.state_cell.fanout_health),
+        Some(&source.state_cell.manual_rescan_intents),
+        None,
+        "manual",
+    );
+
+    let health = lock_or_recover(
+        &source.state_cell.fanout_health,
+        "test.duplicate_pending_manual_rescan.second_health",
+    );
+    let detail = health
+        .object_ref_detail
+        .get(&root_key)
+        .expect("root detail exists");
+    assert!(!detail.rescan_pending);
+    assert_eq!(detail.last_rescan_requested_at_us, first_requested_at);
+    assert_eq!(detail.last_audit_started_at_us, Some(30));
+    assert_eq!(detail.last_audit_completed_at_us, None);
+    assert_eq!(detail.last_audit_duration_ms, None);
+    drop(health);
+
+    let intents = lock_or_recover(
+        &source.state_cell.manual_rescan_intents,
+        "test.duplicate_pending_manual_rescan.intents",
+    );
+    let intent = intents.get(&root_key).expect("manual intent exists");
+    assert_eq!(intent.requested, 2);
+    assert_eq!(intent.completed, 0);
+}
+
+#[test]
 fn root_task_signature_tracks_group_primary_flag_changes() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
