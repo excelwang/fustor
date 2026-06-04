@@ -777,6 +777,15 @@ struct ForceFindRunnerBindingStatusBoundary {
     delivered_send_count: std::sync::atomic::AtomicUsize,
 }
 
+struct ForceFindEmptyRunnerBindingStatusBoundary {
+    source_reply_channel: String,
+    send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    changed: Notify,
+    delivered_send_count: std::sync::atomic::AtomicUsize,
+}
+
 struct ForceFindScopedRouteRequiresCallerOriginBoundary {
     request_channel: String,
     reply_channel: String,
@@ -1370,6 +1379,31 @@ impl ForceFindRunnerBindingStatusBoundary {
             .send_batches_by_channel
             .lock()
             .expect("force-find runner binding boundary send batches lock")
+            .get(channel)
+            .unwrap_or(&0)
+    }
+}
+
+impl ForceFindEmptyRunnerBindingStatusBoundary {
+    fn new() -> Self {
+        let source_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+            .expect("resolve source-status route");
+        Self {
+            source_reply_channel: format!("{}:reply", source_route.0),
+            send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
+            recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
+            correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            changed: Notify::new(),
+            delivered_send_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn send_batch_count(&self, channel: &str) -> usize {
+        *self
+            .send_batches_by_channel
+            .lock()
+            .expect("empty force-find runner binding boundary send batches lock")
             .get(channel)
             .unwrap_or(&0)
     }
@@ -3789,6 +3823,77 @@ impl ChannelIoSubset for ForceFindRunnerBindingStatusBoundary {
 }
 
 #[async_trait]
+impl ChannelIoSubset for ForceFindEmptyRunnerBindingStatusBoundary {
+    async fn channel_send(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelSendRequest,
+    ) -> capanix_app_sdk::Result<()> {
+        if let Some(correlation) = request
+            .events
+            .first()
+            .and_then(|event| event.metadata().correlation_id)
+        {
+            self.correlations_by_channel
+                .lock()
+                .expect("empty force-find runner binding boundary correlations lock")
+                .insert(request.channel_key.0.clone(), correlation);
+        }
+        let mut send_batches = self
+            .send_batches_by_channel
+            .lock()
+            .expect("empty force-find runner binding boundary send batches lock");
+        *send_batches.entry(request.channel_key.0).or_default() += 1;
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelRecvRequest,
+    ) -> capanix_app_sdk::Result<Vec<Event>> {
+        {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("empty force-find runner binding boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
+
+        if request.channel_key.0 != self.source_reply_channel {
+            return Err(CnxError::Timeout);
+        }
+        let request_channel = self.source_reply_channel.trim_end_matches(":reply");
+        wait_for_test_correlation(
+            &self.correlations_by_channel,
+            &self.changed,
+            request_channel,
+            "empty force-find runner binding boundary correlations lock",
+        )
+        .await?;
+        let send_count = self
+            .send_batches_by_channel
+            .lock()
+            .expect("empty force-find runner binding boundary send batches lock")
+            .get(request_channel)
+            .copied()
+            .unwrap_or_default();
+        let delivered = self
+            .delivered_send_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if send_count == 0 || delivered >= send_count {
+            return Err(CnxError::Timeout);
+        }
+        self.delivered_send_count
+            .store(send_count, std::sync::atomic::Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+}
+
+#[async_trait]
 impl ChannelIoSubset for ForceFindScopedRouteRequiresCallerOriginBoundary {
     async fn channel_send(
         &self,
@@ -6074,6 +6179,84 @@ fn route_force_find_runner_selection_expands_partial_schedule_from_current_root_
     assert_eq!(first.0, "node-a");
     assert_eq!(second.0, "node-b");
     assert_eq!(third.0, "node-c");
+}
+
+#[test]
+fn route_force_find_runner_selection_uses_local_current_roots_when_status_fanin_is_empty() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a");
+    let node_b_root = tmp.path().join("node-b");
+    fs::create_dir_all(&node_a_root).expect("create node-a dir");
+    fs::create_dir_all(&node_b_root).expect("create node-b dir");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_root,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-b::nfs1".to_string(),
+            host_ref: "node-b".to_string(),
+            host_ip: "10.0.0.2".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_b_root,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = source_facade_with_group("nfs1", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ForceFindEmptyRunnerBindingStatusBoundary::new());
+    let state = test_api_state_for_route_source(
+        source.clone(),
+        sink,
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+    );
+
+    let first = crate::runtime_app::shared_tokio_runtime()
+        .block_on(select_force_find_runner_node_for_group(
+            &state,
+            source.as_ref(),
+            "nfs1",
+        ))
+        .expect("first selection should fall back to local current roots")
+        .expect("first node");
+    let second = crate::runtime_app::shared_tokio_runtime()
+        .block_on(select_force_find_runner_node_for_group(
+            &state,
+            source.as_ref(),
+            "nfs1",
+        ))
+        .expect("second selection should fall back to local current roots")
+        .expect("second node");
+
+    assert_eq!(first.0, "node-a");
+    assert_eq!(second.0, "node-b");
+    let source_status_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+        .expect("resolve source-status route");
+    assert_eq!(
+        boundary.send_batch_count(&source_status_route.0),
+        2,
+        "route source-status should still be attempted before the local current-roots fallback"
+    );
 }
 
 #[test]

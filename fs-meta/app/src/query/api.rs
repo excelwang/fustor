@@ -12402,13 +12402,21 @@ async fn route_force_find_candidate_nodes_for_group_with_failure(
         return Err(QueryWorkerObservationFailure::Other(CnxError::Timeout));
     }
     let idle_grace = force_find_runner_binding_status_idle_grace(status_timeout);
-    let snapshots = route_source_observability_snapshots(
+    let snapshots = match route_source_observability_snapshots(
         boundary.clone(),
         origin_id.clone(),
         StatusRoutePlan::caller_capped(status_timeout, idle_grace),
     )
     .await
-    .map_err(QueryWorkerObservationFailure::from)?;
+    {
+        Ok(snapshots) => snapshots,
+        Err(CnxError::Timeout) => return Ok(None),
+        Err(err) if is_retryable_source_status_continuity_gap(&err) => return Ok(None),
+        Err(err) => return Err(QueryWorkerObservationFailure::from(err)),
+    };
+    if snapshots.is_empty() {
+        return Ok(None);
+    }
     Ok(Some(
         force_find_candidate_nodes_from_runner_binding_evidence(&snapshots, group_id),
     ))

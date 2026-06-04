@@ -6,6 +6,7 @@
 //! the stored node so `/tree`, `/stats`, and PIT creation can read it directly.
 
 use std::collections::HashMap;
+use std::cmp::Ordering;
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
@@ -137,7 +138,9 @@ impl<'a> Iterator for TreeIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(id) = self.stack.pop() {
-            let node = self.tree.node(id);
+            let Some(node) = self.tree.node(id) else {
+                continue;
+            };
             for child in node.children.iter().rev() {
                 self.stack.push(*child);
             }
@@ -156,7 +159,9 @@ impl<'a> Iterator for ChildIter<'a> {
         while self.index < self.child_ids.len() {
             let id = self.child_ids[self.index];
             self.index += 1;
-            let node = self.tree.node(id);
+            let Some(node) = self.tree.node(id) else {
+                continue;
+            };
             if let Some(meta) = node.meta.as_ref() {
                 return Some((node.path.as_ref(), meta));
             }
@@ -183,7 +188,7 @@ impl MaterializedTree {
 
     pub fn get(&self, path: &[u8]) -> Option<&FileMetaNode> {
         let id = self.lookup_id(path)?;
-        self.node(id).meta.as_ref()
+        self.node(id)?.meta.as_ref()
     }
 
     pub fn has_path(&self, path: &[u8]) -> bool {
@@ -191,13 +196,18 @@ impl MaterializedTree {
     }
 
     pub fn aggregate_at(&self, path: &[u8]) -> Option<DirAggregate> {
-        self.lookup_id(path).map(|id| self.node(id).aggregate)
+        self.lookup_id(path)
+            .and_then(|id| self.node(id).map(|node| node.aggregate))
     }
 
     pub fn insert(&mut self, path: Vec<u8>, node: FileMetaNode) {
         let id = self.ensure_path_node(&path);
-        let had_meta = self.node(id).meta.is_some();
-        self.node_mut(id).meta = Some(node);
+        let had_meta = self.node(id).is_some_and(|node| node.meta.is_some());
+        if let Some(target) = self.node_mut(id) {
+            target.meta = Some(node);
+        } else {
+            return;
+        }
         if !had_meta {
             self.meta_count += 1;
         }
@@ -206,13 +216,11 @@ impl MaterializedTree {
 
     pub fn remove(&mut self, path: &[u8]) -> Option<FileMetaNode> {
         let id = self.lookup_id(path)?;
-        let removed = self.node_mut(id).meta.take()?;
+        let removed = self.node_mut(id)?.meta.take()?;
         self.meta_count = self.meta_count.saturating_sub(1);
-        let refresh_from = if self.node(id).children.is_empty() {
-            self.node(id).parent
-        } else {
-            Some(id)
-        };
+        let refresh_from =
+            self.node(id)
+                .and_then(|node| if node.children.is_empty() { node.parent } else { Some(id) });
         self.prune_empty_chain(id);
         if let Some(start) = refresh_from {
             self.refresh_aggregate_chain(start);
@@ -227,7 +235,7 @@ impl MaterializedTree {
     ) -> Option<R> {
         let id = self.lookup_id(path)?;
         let result = {
-            let meta = self.node_mut(id).meta.as_mut()?;
+            let meta = self.node_mut(id)?.meta.as_mut()?;
             update(meta)
         };
         self.refresh_aggregate_chain(id);
@@ -300,7 +308,10 @@ impl MaterializedTree {
     ) -> impl Iterator<Item = (&'a [u8], &'a FileMetaNode)> + 'a {
         let stack = self
             .lookup_id(dir_path)
-            .map(|id| self.node(id).children.iter().rev().copied().collect())
+            .and_then(|id| {
+                self.node(id)
+                    .map(|node| node.children.iter().rev().copied().collect())
+            })
             .unwrap_or_default();
         TreeIter { tree: self, stack }
     }
@@ -311,7 +322,7 @@ impl MaterializedTree {
     ) -> impl Iterator<Item = (&'a [u8], &'a FileMetaNode)> + 'a {
         let child_ids = self
             .lookup_id(dir_path)
-            .map(|id| self.node(id).children.clone())
+            .and_then(|id| self.node(id).map(|node| node.children.clone()))
             .unwrap_or_default();
         ChildIter {
             tree: self,
@@ -333,23 +344,29 @@ impl MaterializedTree {
         let Some(id) = self.lookup_id(dir_path) else {
             return;
         };
-        let children = self.node(id).children.clone();
+        let Some(children) = self.node(id).map(|node| node.children.clone()) else {
+            return;
+        };
         for child in children {
             self.remove_subtree(child);
         }
-        self.node_mut(id).children.clear();
+        if let Some(node) = self.node_mut(id) {
+            node.children.clear();
+        }
         self.refresh_aggregate_chain(id);
     }
 
     pub fn mark_write_significant_change(&mut self, path: &[u8], at: Instant) {
         if let Some(id) = self.lookup_id(path)
-            && let Some(node) = self.node_mut(id).meta.as_mut()
+            && let Some(node) = self.node_mut(id).and_then(|node| node.meta.as_mut())
         {
             node.subtree_last_write_significant_change_at = Some(at);
-            let mut current = self.node(id).parent;
+            let mut current = self.node(id).and_then(|node| node.parent);
             while let Some(ancestor) = current {
-                let parent = self.node(ancestor).parent;
-                if let Some(parent_node) = self.node_mut(ancestor).meta.as_mut() {
+                let parent = self.node(ancestor).and_then(|node| node.parent);
+                if let Some(parent_node) =
+                    self.node_mut(ancestor).and_then(|node| node.meta.as_mut())
+                {
                     parent_node.subtree_last_write_significant_change_at = Some(at);
                 }
                 current = parent;
@@ -382,19 +399,22 @@ impl MaterializedTree {
     }
 
     fn lookup_id(&self, path: &[u8]) -> Option<NodeId> {
-        self.path_index.get(path).copied()
+        self.path_index
+            .get(path)
+            .copied()
+            .filter(|id| self.node_exists(*id))
     }
 
-    fn node(&self, id: NodeId) -> &TreeNode {
-        self.nodes[id]
-            .as_ref()
-            .expect("materialized tree node should exist")
+    fn node_exists(&self, id: NodeId) -> bool {
+        matches!(self.nodes.get(id), Some(Some(_)))
     }
 
-    fn node_mut(&mut self, id: NodeId) -> &mut TreeNode {
-        self.nodes[id]
-            .as_mut()
-            .expect("materialized tree node should exist")
+    fn node(&self, id: NodeId) -> Option<&TreeNode> {
+        self.nodes.get(id).and_then(|node| node.as_ref())
+    }
+
+    fn node_mut(&mut self, id: NodeId) -> Option<&mut TreeNode> {
+        self.nodes.get_mut(id).and_then(|node| node.as_mut())
     }
 
     fn ensure_path_node(&mut self, path: &[u8]) -> NodeId {
@@ -422,64 +442,105 @@ impl MaterializedTree {
     }
 
     fn insert_child_sorted(&mut self, parent_id: NodeId, child_id: NodeId) {
-        let child_path = self.node(child_id).path.clone();
+        let Some(child_path) = self.node(child_id).map(|node| node.path.clone()) else {
+            return;
+        };
+        if !self.prune_missing_children(parent_id) {
+            return;
+        }
         let insert_at = {
-            let children = &self.node(parent_id).children;
+            let Some(parent) = self.node(parent_id) else {
+                return;
+            };
+            let children = &parent.children;
             children
                 .binary_search_by(|existing| {
-                    self.node(*existing).path.as_ref().cmp(child_path.as_ref())
+                    self.node(*existing)
+                        .map(|node| node.path.as_ref().cmp(child_path.as_ref()))
+                        .unwrap_or(Ordering::Greater)
                 })
                 .unwrap_or_else(|idx| idx)
         };
-        self.node_mut(parent_id)
-            .children
-            .insert(insert_at, child_id);
+        if let Some(parent) = self.node_mut(parent_id) {
+            parent.children.insert(insert_at, child_id);
+        }
     }
 
     fn remove_child_link(&mut self, parent_id: NodeId, child_id: NodeId) {
-        self.node_mut(parent_id)
-            .children
-            .retain(|existing| *existing != child_id);
+        if let Some(parent) = self.node_mut(parent_id) {
+            parent.children.retain(|existing| *existing != child_id);
+        }
+    }
+
+    fn prune_missing_children(&mut self, parent_id: NodeId) -> bool {
+        let Some(children) = self.node(parent_id).map(|node| node.children.clone()) else {
+            return false;
+        };
+        let live_children = children
+            .into_iter()
+            .filter(|child| self.node_exists(*child))
+            .collect::<Vec<_>>();
+        if let Some(parent) = self.node_mut(parent_id) {
+            parent.children = live_children;
+            true
+        } else {
+            false
+        }
     }
 
     fn recompute_aggregate(&mut self, id: NodeId) {
-        let mut aggregate = self
-            .node(id)
+        let Some(node) = self.node(id) else {
+            return;
+        };
+        let mut aggregate = node
             .meta
             .as_ref()
             .map(DirAggregate::from_node)
             .unwrap_or_default();
-        let children = self.node(id).children.clone();
+        let children = node.children.clone();
+        let mut live_children = Vec::with_capacity(children.len());
         for child in children {
-            let child_agg = self.node(child).aggregate;
-            aggregate.merge(&child_agg);
+            if let Some(child_node) = self.node(child) {
+                aggregate.merge(&child_node.aggregate);
+                live_children.push(child);
+            }
         }
-        self.node_mut(id).aggregate = aggregate;
+        if let Some(node) = self.node_mut(id) {
+            node.children = live_children;
+            node.aggregate = aggregate;
+        }
     }
 
     fn refresh_aggregate_chain(&mut self, start_id: NodeId) {
         let mut current = Some(start_id);
         while let Some(id) = current {
-            let parent = self.node(id).parent;
+            let Some(parent) = self.node(id).and_then(|node| node.parent) else {
+                self.recompute_aggregate(id);
+                break;
+            };
             self.recompute_aggregate(id);
-            current = parent;
+            current = Some(parent);
         }
     }
 
     fn prune_empty_chain(&mut self, mut id: NodeId) {
         while id != 0 {
             let should_prune = {
-                let node = self.node(id);
+                let Some(node) = self.node(id) else {
+                    break;
+                };
                 node.meta.is_none() && node.children.is_empty()
             };
             if !should_prune {
                 break;
             }
-            let parent_id = self
-                .node(id)
-                .parent
-                .expect("non-root node should have parent");
-            let path = self.node(id).path.clone();
+            let Some(node) = self.node(id) else {
+                break;
+            };
+            let Some(parent_id) = node.parent else {
+                break;
+            };
+            let path = node.path.clone();
             self.remove_child_link(parent_id, id);
             self.path_index.remove(path.as_ref());
             self.nodes[id] = None;
@@ -489,12 +550,18 @@ impl MaterializedTree {
     }
 
     fn remove_subtree(&mut self, id: NodeId) {
-        let children = self.node(id).children.clone();
+        let Some(node) = self.node(id) else {
+            return;
+        };
+        let children = node.children.clone();
         for child in children {
             self.remove_subtree(child);
         }
-        let path = self.node(id).path.clone();
-        if self.node(id).meta.is_some() {
+        let Some(node) = self.node(id) else {
+            return;
+        };
+        let path = node.path.clone();
+        if node.meta.is_some() {
             self.meta_count = self.meta_count.saturating_sub(1);
         }
         self.path_index.remove(path.as_ref());

@@ -1,5 +1,37 @@
 # TODO
 
+## fs-meta Resource-overhead root cause 2026-06-04
+
+- Scope: official `fsmeta-stable` deployment on `10.0.82.144~148`. No more live sampling is needed for this incident; existing artifacts already identify the abnormal process family and state shape.
+- Full-root monitoring is a required product state. Each root must remain `subpath_scope="/"`, `watch=true`, and `scan=true`; this is not the root cause.
+- The abnormal RSS/CPU came from `/home/wanghuajin/fsmeta-stable/run/bin/capanixd`: samples showed roughly `270GB~306GB` RSS per node with `fs-meta-shared-*` and `tokio-rt-worker` CPU activity.
+- Specs recheck:
+  - fustor release/specs declare every root group's `runtime.exec.sink` as `eligibility=resource_visible_nodes` plus `cardinality=one`.
+  - `runtime.exec.source`, `runtime.exec.scan`, and `runtime.exec.query-peer` are group/member fanout lanes and may be one per root member.
+  - capanix runtime L1 requires exactly one eligible node for a one-cardinality unit and fail-closed behavior when resource-visible truth is incomplete.
+  - capanix runtime owns the optional state-carrier side boundary; the daemon default installs an in-memory state boundary. `InMemoryStateBoundary` keeps current statecell payload plus up to `256` revision payloads.
+- Existing artifacts prove the sink contract was violated: source/scan scheduling was one root per node, but `sink.debug.scheduled_groups_by_node` reported `panda145`, `panda146`, `panda147`, and `panda148` each scheduled for all five groups while `sink.primary_host_ref_by_group` still mapped one primary per group.
+- Code-level root cause: sink logical-root refresh calls `sync_active_scopes(SINK_RUNTIME_UNIT_ID, roots)` with all roots and empty `resource_ids`; `RuntimeUnitGate::unit_state()` then treats these authoritative scopes as active sink scopes, and `scheduled_group_ids_from_bound_scopes()` admits them through root selector/grant matching. This bypasses runtime's `resource_visible_nodes + cardinality=one` sink placement and lets non-owner sink workers materialize/report all groups.
+- Memory mechanism: fustor deploy enables state carrier for `runtime.exec.source` and `runtime.exec.sink`; sink persists a full `PersistedSinkState` after event batches, including all live groups and retained groups. With sink tree heap reported around `1.27GB`, retaining `current + 256` full payload revisions in the in-memory statecell explains the observed `270GB~306GB` RSS scale. This memory is outside `sink.estimated_heap_bytes`.
+- Amplifiers, not primary root causes: root-scope manual rescan produced million-level valid data events; repeated sink cutover/repair/facade endpoint rebuild loops amplified CPU/log churn; `force_find_inflight=[]`, so no force-find request was the stuck owner.
+
+Correct expected state for `10.0.82.144~148`:
+
+| host | root | object_ref | NFS mount | source/scan owner | sink owner | sink statecell expectation |
+| --- | --- | --- | --- | --- | --- | --- |
+| `10.0.82.144` / `panda144` | `nfs-144` | `panda144::nfs-144` | `/mnt/fustor-peers/nfs145` from `10.0.82.145:/data/fustor-nfs` | `panda144` | `panda144` | only `nfs-144` plus bounded legitimate handoff-retained state |
+| `10.0.82.145` / `panda145` | `nfs-145` | `panda145::nfs-145` | `/mnt/fustor-peers/nfs146` from `10.0.82.146:/data/fustor-nfs` | `panda145` | `panda145` | only `nfs-145` plus bounded legitimate handoff-retained state |
+| `10.0.82.146` / `panda146` | `nfs-146` | `panda146::nfs-146` | `/mnt/fustor-peers/nfs147` from `10.0.82.147:/data/fustor-nfs` | `panda146` | `panda146` | only `nfs-146` plus bounded legitimate handoff-retained state |
+| `10.0.82.147` / `panda147` | `nfs-147` | `panda147::nfs-147` | `/mnt/fustor-peers/nfs148` from `10.0.82.148:/data/fustor-nfs` | `panda147` | `panda147` | only `nfs-147` plus bounded legitimate handoff-retained state |
+| `10.0.82.148` / `panda148` | `nfs-148` | `panda148::nfs-148` | `/mnt/fustor-peers/nfs144` from `10.0.82.144:/data/fustor-nfs` | `panda148` | `panda148` | only `nfs-148` plus bounded legitimate handoff-retained state |
+
+Repair direction:
+
+- Remove or narrow sink-side `sync_active_scopes` so logical-root refresh cannot mint all roots as authoritative sink scopes.
+- Derive sink scheduled groups from runtime-owned active sink route scopes/resource ids and fail closed when resource-visible truth is absent or incomplete.
+- Add a five-root regression proving full-scope source/scan stays enabled while each node's sink status/statecell remains single-group.
+- Bound statecell retention by bytes or avoid full-snapshot revision retention for giant sink payloads; retaining `256` full sink snapshots is unsafe even after the sink-owner bug is fixed.
+
 ## fs-meta Legacy Refactor Context
 
 ### 重构原因
