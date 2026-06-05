@@ -19,6 +19,8 @@ members = [
     "mysql-source/app",
     "s3-source/lib",
     "s3-source/app",
+    "union-graph/lib",
+    "union-graph/app",
     "fs-meta/lib",
     "fs-meta/app",
     "fs-meta/deploy",
@@ -33,6 +35,8 @@ default-members = [
     "mysql-source/app",
     "s3-source/lib",
     "s3-source/app",
+    "union-graph/lib",
+    "union-graph/app",
     "fs-meta/lib",
     "fs-meta/app",
     "fs-meta/deploy",
@@ -47,6 +51,8 @@ mysql-source = { version = "0.1.0", path = "mysql-source/lib" }
 mysql-source-runtime = { version = "0.1.0", path = "mysql-source/app" }
 s3-source = { version = "0.1.0", path = "s3-source/lib" }
 s3-source-runtime = { version = "0.1.0", path = "s3-source/app" }
+union-graph = { version = "0.1.0", path = "union-graph/lib" }
+union-graph-runtime = { version = "0.1.0", path = "union-graph/app" }
 fs-meta = { version = "0.1.0", path = "fs-meta/lib" }
 fs-meta-runtime = { version = "0.1.0", path = "fs-meta/app" }
 fs-meta-deploy = { version = "0.1.0", path = "fs-meta/deploy" }
