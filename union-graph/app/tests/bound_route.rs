@@ -194,6 +194,7 @@ fn skeleton_for_all_sources() -> SourceGraphSkeleton {
             ),
         ],
         edges: Vec::new(),
+        cross_edges: Vec::new(),
         evidence: Vec::new(),
     }
 }

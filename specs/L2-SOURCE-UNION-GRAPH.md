@@ -5,7 +5,7 @@ version: 0.1.0
 # L2: Source Union Graph Architecture
 
 > Focus: define the minimal source metadata skeleton needed to construct a
-> `union graph view` across FS/NFS, S3, ES, SQL, and future heterogeneous
+> `union graph view` across FS/NFS, local files, S3, ES, SQL, and future heterogeneous
 > sources without duplicating native data or turning every layer into a
 > materialized view.
 
@@ -41,7 +41,9 @@ version: 0.1.0
    2. ES source uses native index, mapping, PIT/search-after, and search APIs.
    3. SQL sources use native catalog tables, information schema, and SQL
       pushdown.
-   4. S3 source uses native bucket/list/head/inventory APIs and may introduce a
+   4. Local file sources such as CSV, JSON, and XLSX use file-native parsing,
+      schema/header inspection, and bounded row sampling only when needed.
+   5. S3 source uses native bucket/list/head/inventory APIs and may introduce a
       source-specific cache only when required by scale or SLA.
 
 2. **Source Graph Adapter**:
@@ -72,7 +74,7 @@ version: 0.1.0
 
    ```text
    SourceGraphNode {
-     source_kind          # fs | s3 | es | pg | mysql | ...
+     source_kind          # fs | local-fs | s3 | es | pg | mysql | ...
      source_instance      # nfs group | bucket endpoint | es cluster | db instance
      local_id             # stable id inside this source instance
      node_kind            # root | namespace | collection | asset | field | entity
@@ -101,7 +103,21 @@ version: 0.1.0
    }
    ```
 
-3. **Adapter Constraints**:
+3. **CrossSourceGraphEdge**:
+
+   ```text
+   CrossSourceGraphEdge {
+     from                  # source_kind + source_instance + local_id
+     to                    # source_kind + source_instance + local_id
+     edge_kind             # parsed_to | loaded_into | projected_as | declares_schema | has_runtime_status
+     evidence_ref
+     confidence
+     observed_at
+     grant_epoch
+   }
+   ```
+
+4. **Adapter Constraints**:
    1. `local_id` must be stable enough for repeat observations within one
       source instance.
    2. `native_ref` must identify the native object in a human-readable form.
@@ -185,7 +201,15 @@ version: 0.1.0
    3. Full object metadata, tags, and object content are hydrated from S3 or
       source-specific cache only when explicitly needed.
 
-3. **ES**:
+3. **Local Files**:
+   1. Local CSV, JSON, XML, and XLSX files may become graph assets when they are
+      inputs to a parser, loader, or graph projection workflow.
+   2. Headers, file fingerprints, and row-family identifiers may become graph
+      facts when required to explain downstream lineage.
+   3. Full file content and full row payloads are not copied into the graph by
+      default.
+
+4. **ES**:
    1. The default source path is native ES pushdown.
    2. Cluster, index, field, and selected document identities may become graph
       nodes.
@@ -193,7 +217,7 @@ version: 0.1.0
    4. PIT/search-after and mapping APIs remain ES adapter implementation
       details.
 
-4. **PG/MySQL**:
+5. **PG/MySQL**:
    1. The default source path is native catalog and SQL pushdown.
    2. Database, schema, table, column, and selected row identities may become
       graph nodes.
@@ -251,6 +275,17 @@ version: 0.1.0
    1. Asset inventory, search, and detail pages are projections over union
       graph plus source hydration.
    2. They do not define a separate `metadata view` state layer.
+
+5. **Bio Pipeline Demonstration**:
+   1. The demo path may ingest the existing bio pipeline state as source graph
+      skeletons without rerunning the bio pipeline.
+   2. NFS raw files are represented as `fs` nodes with `fs-meta` cache pointers.
+   3. CNCB/OMIX CSV and XLSX inputs are represented as `local-fs` nodes.
+   4. PPG schema and status JSON are represented as `es`-style JSON document
+      nodes.
+   5. PostgreSQL catalogs, tables, and PPG labels are connected by
+      `loaded-into`, `projected-as`, `declares-schema`, and
+      `has-runtime-status` edges.
 
 ## SOURCE_UNION_GRAPH.OWNERSHIP
 

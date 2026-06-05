@@ -5,6 +5,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CAPANIX_ROOT="${CAPANIX_ROOT:-$(cd "$ROOT/../capanix" && pwd)}"
 WORKDIR="${WORKDIR:-/tmp/capanix-5node}"
 KEEP="${KEEP:-0}"
+DEFAULT_LISTEN_IP="$(
+  (command -v ip >/dev/null 2>&1 && ip -4 -o addr show scope global || true) \
+    | awk '{ split($4, addr, "/"); if (addr[1] ~ /^10\./) { print addr[1]; exit } }'
+)"
+LISTEN_IP="${LISTEN_IP:-${DEFAULT_LISTEN_IP:-127.0.0.1}}"
+CLUSTER_BIND_IP="${CLUSTER_BIND_IP:-$LISTEN_IP}"
+BACKEND_BIND_IP="${BACKEND_BIND_IP:-$LISTEN_IP}"
 
 CNXCTL_BIN="$CAPANIX_ROOT/target/debug/cnxctl"
 CAPANIXD_BIN="$CAPANIX_ROOT/target/debug/capanixd"
@@ -13,6 +20,7 @@ FSMETA_LIB="$ROOT/target/debug/libfs_meta_runtime.so"
 ES_SOURCE_LIB="$ROOT/target/debug/libes_source_runtime.so"
 MYSQL_SOURCE_LIB="$ROOT/target/debug/libmysql_source_runtime.so"
 S3_SOURCE_LIB="$ROOT/target/debug/libs3_source_runtime.so"
+UNION_GRAPH_LIB="$ROOT/target/debug/libunion_graph_runtime.so"
 
 COMPOSE_FILE="$WORKDIR/docker-compose.yaml"
 CLUSTER_DIR="$WORKDIR/cluster"
@@ -26,6 +34,10 @@ MYSQL_LOCAL_USERNAME="${MYSQL_LOCAL_USERNAME:-testuser}"
 MYSQL_LOCAL_PASSWORD="${MYSQL_LOCAL_PASSWORD:-testpass}"
 S3_LOCAL_ACCESS_KEY_ID="${S3_LOCAL_ACCESS_KEY_ID:-minioadmin}"
 S3_LOCAL_SECRET_ACCESS_KEY="${S3_LOCAL_SECRET_ACCESS_KEY:-minioadmin}"
+
+ES_BASE_URL="http://${BACKEND_BIND_IP}:19200"
+MYSQL_ENDPOINT_URI="mysql://${BACKEND_BIND_IP}:13306/fustor_demo"
+S3_BASE_URL="http://${BACKEND_BIND_IP}:19000"
 
 log() {
   printf '[local-capanix-5node] %s\n' "$*"
@@ -187,7 +199,7 @@ services:
       xpack.security.enabled: "false"
       ES_JAVA_OPTS: -Xms512m -Xmx512m
     ports:
-      - "127.0.0.1:19200:9200"
+      - "${BACKEND_BIND_IP}:19200:9200"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9200/_cluster/health >/dev/null"]
       interval: 5s
@@ -202,7 +214,7 @@ services:
       MYSQL_USER: ${MYSQL_LOCAL_USERNAME}
       MYSQL_PASSWORD: ${MYSQL_LOCAL_PASSWORD}
     ports:
-      - "127.0.0.1:13306:3306"
+      - "${BACKEND_BIND_IP}:13306:3306"
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -prootpass --silent"]
       interval: 5s
@@ -216,8 +228,8 @@ services:
       MINIO_ROOT_USER: ${S3_LOCAL_ACCESS_KEY_ID}
       MINIO_ROOT_PASSWORD: ${S3_LOCAL_SECRET_ACCESS_KEY}
     ports:
-      - "127.0.0.1:19000:9000"
-      - "127.0.0.1:19001:9001"
+      - "${BACKEND_BIND_IP}:19000:9000"
+      - "${BACKEND_BIND_IP}:19001:9001"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null"]
       interval: 5s
@@ -274,14 +286,14 @@ SQL
 start_backends() {
   log "starting local ES/MySQL/MinIO backends"
   docker_compose up -d elasticsearch mysql minio
-  wait_for_http "http://127.0.0.1:19200/_cluster/health" "Elasticsearch"
+  wait_for_http "$ES_BASE_URL/_cluster/health" "Elasticsearch"
   wait_for_mysql
-  wait_for_http "http://127.0.0.1:19000/minio/health/live" "MinIO"
+  wait_for_http "$S3_BASE_URL/minio/health/live" "MinIO"
 
   log "seeding backends"
   curl -fsS -H 'Content-Type: application/x-ndjson' \
     --data-binary "@$SEED_DIR/es-bulk.ndjson" \
-    'http://127.0.0.1:19200/_bulk?refresh=true' >"$LOG_DIR/es-bulk.json"
+    "$ES_BASE_URL/_bulk?refresh=true" >"$LOG_DIR/es-bulk.json"
   if ! grep -q '"errors":false' "$LOG_DIR/es-bulk.json"; then
     cat "$LOG_DIR/es-bulk.json" >&2
     die "Elasticsearch seed bulk request reported errors"
@@ -291,19 +303,19 @@ start_backends() {
 }
 
 write_cluster_spec() {
-  cat >"$WORKDIR/capanix-cluster.yaml" <<'YAML'
+  cat >"$WORKDIR/capanix-cluster.yaml" <<YAML
 domain_id: local
 nodes:
   - node_id: capanix-node-1
-    addr: 127.0.0.1:19401
+    addr: ${CLUSTER_BIND_IP}:19401
   - node_id: capanix-node-2
-    addr: 127.0.0.1:19402
+    addr: ${CLUSTER_BIND_IP}:19402
   - node_id: capanix-node-3
-    addr: 127.0.0.1:19403
+    addr: ${CLUSTER_BIND_IP}:19403
   - node_id: capanix-node-4
-    addr: 127.0.0.1:19404
+    addr: ${CLUSTER_BIND_IP}:19404
   - node_id: capanix-node-5
-    addr: 127.0.0.1:19405
+    addr: ${CLUSTER_BIND_IP}:19405
 YAML
 }
 
@@ -336,12 +348,40 @@ ports:
 YAML
 }
 
+write_union_graph_manifest() {
+  local host_ref="$1"
+  local suffix
+  suffix="$(printf '%s' "$host_ref" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]/_/g')"
+  cat >"$MANIFEST_DIR/union-graph.${host_ref}.yaml" <<YAML
+ports:
+  - route_token: union-graph.internal
+    use_port: query
+    dispatch_tag: query
+    pattern: request_reply
+    route_key: union-graph.query.${suffix}:v1
+    visibility: internal
+    roles:
+      - serve
+      - use
+  - route_token: union-graph.internal
+    use_port: ingest
+    dispatch_tag: ingest
+    pattern: request_reply
+    route_key: union-graph.ingest.${suffix}:v1
+    visibility: internal
+    roles:
+      - serve
+      - use
+YAML
+}
+
 write_source_declarations() {
   local host_ref="capanix-node-1"
   mkdir -p "$MANIFEST_DIR" "$DECL_DIR"
   write_source_manifest "es-source" "es-source.internal" "$host_ref"
   write_source_manifest "mysql-source" "mysql-source.internal" "$host_ref"
   write_source_manifest "s3-source" "s3-source.internal" "$host_ref"
+  write_union_graph_manifest "$host_ref"
 
   cat >"$DECL_DIR/es-source.yaml" <<YAML
 schema_version: scope-worker-declaration-v1
@@ -359,7 +399,7 @@ workers:
       max_page_size: 5000
       endpoints:
         - object_ref: es-local
-          endpoint_uri: http://127.0.0.1:19200
+          endpoint_uri: ${ES_BASE_URL}
           index_scopes:
             - logs-*
           timestamp_field: "@timestamp"
@@ -399,7 +439,7 @@ workers:
       snapshot_ttl_ms: 300000
       endpoints:
         - object_ref: mysql-local
-          endpoint_uri: mysql://127.0.0.1:13306/fustor_demo
+          endpoint_uri: ${MYSQL_ENDPOINT_URI}
           credential_ref: mysql-local-reader
           schema_scopes:
             - fustor_demo
@@ -446,7 +486,7 @@ workers:
       max_page_size: 10000
       endpoints:
         - object_ref: s3-local
-          endpoint_uri: http://127.0.0.1:19000
+          endpoint_uri: ${S3_BASE_URL}
           bucket: fustor-demo
           region: us-east-1
           prefix: logs/
@@ -478,6 +518,31 @@ workers:
       replicas: 1
 route_plans: []
 YAML
+
+  cat >"$DECL_DIR/union-graph.yaml" <<YAML
+schema_version: scope-worker-declaration-v1
+target_id: union-graph
+target_generation: 1
+workers:
+  - worker_role: main
+    worker_id: union-graph-${host_ref}
+    mode: embedded
+    startup:
+      path: ${UNION_GRAPH_LIB}
+      manifest: ${MANIFEST_DIR}/union-graph.${host_ref}.yaml
+    config:
+      bio_pipeline_mock:
+        enabled: true
+        schema_path: ${ROOT}/union-graph/fixtures/bio-mock/PPG_Schema.json
+        union_schema_path: ${ROOT}/union-graph/fixtures/bio-mock/PPG_Union_Schema.json
+        ppg_status_json_path: ${ROOT}/union-graph/fixtures/bio-mock/ppg-status.json
+        observed_at: 1779984000000000
+    runtime:
+      local_host_ref: ${host_ref}
+    policy:
+      replicas: 1
+route_plans: []
+YAML
 }
 
 write_fsmeta_config() {
@@ -504,6 +569,7 @@ build_binaries() {
     -p es-source-runtime \
     -p mysql-source-runtime \
     -p s3-source-runtime \
+    -p union-graph-runtime \
     --lib
   cargo build --manifest-path "$ROOT/Cargo.toml" -p fs-meta-tooling --bin fsmeta
   [ -x "$CNXCTL_BIN" ] || die "cnxctl binary not found at $CNXCTL_BIN"
@@ -513,6 +579,7 @@ build_binaries() {
   [ -f "$ES_SOURCE_LIB" ] || die "es-source runtime library not found at $ES_SOURCE_LIB"
   [ -f "$MYSQL_SOURCE_LIB" ] || die "mysql-source runtime library not found at $MYSQL_SOURCE_LIB"
   [ -f "$S3_SOURCE_LIB" ] || die "s3-source runtime library not found at $S3_SOURCE_LIB"
+  [ -f "$UNION_GRAPH_LIB" ] || die "union-graph runtime library not found at $UNION_GRAPH_LIB"
 }
 
 start_cluster() {
@@ -566,17 +633,18 @@ deploy_apps() {
     --admin-sk-b64 "$CAPANIX_CTL_SK_B64" \
     --config "$WORKDIR/fs-meta.local.yaml" >"$LOG_DIR/fsmeta-deploy.json"
 
-  log "deploying es-source/mysql-source/s3-source"
+  log "deploying es-source/mysql-source/s3-source/union-graph"
   cnxctl app apply "$DECL_DIR/es-source.yaml" >"$LOG_DIR/es-source-apply.json"
   cnxctl app apply "$DECL_DIR/mysql-source.yaml" >"$LOG_DIR/mysql-source-apply.json"
   cnxctl app apply "$DECL_DIR/s3-source.yaml" >"$LOG_DIR/s3-source-apply.json"
+  cnxctl app apply "$DECL_DIR/union-graph.yaml" >"$LOG_DIR/union-graph-apply.json"
 }
 
 smoke_checks() {
   log "running smoke checks"
   cnxctl_cluster cluster status >"$LOG_DIR/cluster-status.json"
   cnxctl process list >"$LOG_DIR/process-list.json"
-  curl -fsS 'http://127.0.0.1:19200/logs-local/_count' >"$LOG_DIR/es-count.json"
+  curl -fsS "$ES_BASE_URL/logs-local/_count" >"$LOG_DIR/es-count.json"
   docker_compose exec -T mysql mysql -h 127.0.0.1 -u"$MYSQL_LOCAL_USERNAME" -p"$MYSQL_LOCAL_PASSWORD" \
     -D fustor_demo -e 'SELECT COUNT(*) AS events_count FROM events;' >"$LOG_DIR/mysql-count.txt"
   docker_compose run --rm minio-mc \
@@ -608,6 +676,9 @@ main() {
   smoke_checks
 
   log "deployment complete"
+  log "listen ip: $LISTEN_IP"
+  log "cluster bind ip: $CLUSTER_BIND_IP"
+  log "backend bind ip: $BACKEND_BIND_IP"
   log "workdir: $WORKDIR"
   log "control socket: $SOCKET"
   log "logs: $LOG_DIR"

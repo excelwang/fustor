@@ -4,6 +4,7 @@ use capanix_app_sdk::runtime::ConfigValue;
 use capanix_app_sdk::{CnxError, Result};
 use serde::{Deserialize, Serialize};
 
+pub mod bio_mock;
 pub mod product_model;
 
 pub use source_kit::{SourceErrorPayload, decode_msgpack, encode_msgpack};
@@ -12,6 +13,7 @@ pub use source_kit::{SourceErrorPayload, decode_msgpack, encode_msgpack};
 #[serde(rename_all = "kebab-case")]
 pub enum SourceKind {
     Fs,
+    LocalFs,
     S3,
     Es,
     Mysql,
@@ -23,6 +25,7 @@ impl SourceKind {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Fs => "fs",
+            Self::LocalFs => "local-fs",
             Self::S3 => "s3",
             Self::Es => "es",
             Self::Mysql => "mysql",
@@ -65,6 +68,11 @@ pub enum EdgeKind {
     HasField,
     Indexes,
     DerivedFrom,
+    ParsedTo,
+    LoadedInto,
+    ProjectedAs,
+    DeclaresSchema,
+    HasRuntimeStatus,
     SameAsCandidate,
     Other(String),
 }
@@ -76,6 +84,11 @@ impl EdgeKind {
             Self::HasField => "has-field",
             Self::Indexes => "indexes",
             Self::DerivedFrom => "derived-from",
+            Self::ParsedTo => "parsed-to",
+            Self::LoadedInto => "loaded-into",
+            Self::ProjectedAs => "projected-as",
+            Self::DeclaresSchema => "declares-schema",
+            Self::HasRuntimeStatus => "has-runtime-status",
             Self::SameAsCandidate => "same-as-candidate",
             Self::Other(value) => value,
         }
@@ -153,6 +166,39 @@ pub struct SourceGraphEdge {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceGraphEndpoint {
+    pub source_kind: SourceKind,
+    pub source_instance: String,
+    pub local_id: String,
+}
+
+impl SourceGraphEndpoint {
+    pub fn new(
+        source_kind: SourceKind,
+        source_instance: impl Into<String>,
+        local_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_kind,
+            source_instance: source_instance.into(),
+            local_id: local_id.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossSourceGraphEdge {
+    pub from: SourceGraphEndpoint,
+    pub to: SourceGraphEndpoint,
+    pub edge_kind: EdgeKind,
+    pub evidence_ref: String,
+    pub confidence: Confidence,
+    pub observed_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeAnchor {
     pub source_kind: SourceKind,
     pub source_instance: String,
@@ -219,7 +265,18 @@ pub struct SourceGraphSkeleton {
     #[serde(default)]
     pub edges: Vec<SourceGraphEdge>,
     #[serde(default)]
+    pub cross_edges: Vec<CrossSourceGraphEdge>,
+    #[serde(default)]
     pub evidence: Vec<EvidenceRecord>,
+}
+
+impl SourceGraphSkeleton {
+    pub fn extend(&mut self, other: SourceGraphSkeleton) {
+        self.nodes.extend(other.nodes);
+        self.edges.extend(other.edges);
+        self.cross_edges.extend(other.cross_edges);
+        self.evidence.extend(other.evidence);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -410,6 +467,55 @@ impl UnionGraphStore {
                 edges_upserted += 1;
             }
         }
+        for cross_edge in skeleton.cross_edges {
+            let source_gid = graph_gid(
+                &cross_edge.from.source_kind,
+                &cross_edge.from.source_instance,
+                &cross_edge.from.local_id,
+            );
+            let target_gid = graph_gid(
+                &cross_edge.to.source_kind,
+                &cross_edge.to.source_instance,
+                &cross_edge.to.local_id,
+            );
+            if !self.nodes.contains_key(&source_gid) || !self.nodes.contains_key(&target_gid) {
+                return Err(CnxError::InvalidInput(format!(
+                    "cross edge references missing node: {}:{}:{} -> {}:{}:{}",
+                    cross_edge.from.source_kind.as_str(),
+                    cross_edge.from.source_instance,
+                    cross_edge.from.local_id,
+                    cross_edge.to.source_kind.as_str(),
+                    cross_edge.to.source_instance,
+                    cross_edge.to.local_id
+                )));
+            }
+            let edge_id = graph_edge_id(&source_gid, &cross_edge.edge_kind, &target_gid);
+            let evidence_ref = if cross_edge.evidence_ref.trim().is_empty() {
+                default_evidence_for_cross_edge(&cross_edge)
+            } else {
+                cross_edge.evidence_ref.clone()
+            };
+            if !self.evidence.contains_key(&evidence_ref) {
+                self.evidence.insert(
+                    evidence_ref.clone(),
+                    evidence_from_cross_edge(&cross_edge, &evidence_ref),
+                );
+                evidence_upserted += 1;
+            }
+            let edge = GraphEdge {
+                edge_id: edge_id.clone(),
+                source_gid,
+                target_gid,
+                edge_kind: cross_edge.edge_kind,
+                confidence: cross_edge.confidence,
+                observed_at: cross_edge.observed_at,
+                grant_epoch: cross_edge.grant_epoch,
+                evidence_refs: vec![evidence_ref],
+            };
+            if self.edges.insert(edge_id, edge).is_none() {
+                edges_upserted += 1;
+            }
+        }
 
         Ok(IngestAck {
             nodes_upserted,
@@ -549,6 +655,18 @@ fn default_evidence_for_edge(edge: &SourceGraphEdge) -> String {
     )
 }
 
+fn default_evidence_for_cross_edge(edge: &CrossSourceGraphEdge) -> String {
+    format!(
+        "evidence:cross-edge:{}:{}:{}:{}:{}:{}",
+        edge.from.source_kind.as_str(),
+        stable_escape(&edge.from.source_instance),
+        stable_escape(&edge.from.local_id),
+        edge.to.source_kind.as_str(),
+        stable_escape(&edge.to.source_instance),
+        stable_escape(&edge.to.local_id)
+    )
+}
+
 fn evidence_from_source_node(node: &SourceGraphNode, evidence_id: &str) -> EvidenceRecord {
     EvidenceRecord {
         evidence_id: evidence_id.to_string(),
@@ -596,9 +714,48 @@ fn evidence_from_source_edge(edge: &SourceGraphEdge, evidence_id: &str) -> Evide
     }
 }
 
+fn evidence_from_cross_edge(edge: &CrossSourceGraphEdge, evidence_id: &str) -> EvidenceRecord {
+    EvidenceRecord {
+        evidence_id: evidence_id.to_string(),
+        anchor: NativeAnchor {
+            source_kind: SourceKind::Other("union-graph".into()),
+            source_instance: "cross-source-lineage".into(),
+            native_ref: format!(
+                "{}:{}:{}:{}->{}:{}:{}",
+                edge.edge_kind.as_str(),
+                edge.from.source_kind.as_str(),
+                edge.from.source_instance,
+                edge.from.local_id,
+                edge.to.source_kind.as_str(),
+                edge.to.source_instance,
+                edge.to.local_id
+            ),
+            native_pointer: format!(
+                "{}:{}:{}->{}:{}:{}",
+                edge.from.source_kind.as_str(),
+                edge.from.source_instance,
+                edge.from.local_id,
+                edge.to.source_kind.as_str(),
+                edge.to.source_instance,
+                edge.to.local_id
+            ),
+            native_version: None,
+            cache_pointer: None,
+            grant_epoch: edge.grant_epoch,
+        },
+        observed_by: "union-graph".into(),
+        observation_kind: ObservationKind::Inferred,
+        observed_at: edge.observed_at,
+        watermark: None,
+        adapter_version: "union-graph-v1".into(),
+        confidence: edge.confidence.clone(),
+    }
+}
+
 fn observed_by(source_kind: &SourceKind) -> &str {
     match source_kind {
         SourceKind::Fs => "fs-meta",
+        SourceKind::LocalFs => "local-fs-source",
         SourceKind::S3 => "s3-source",
         SourceKind::Es => "es-source",
         SourceKind::Mysql => "mysql-source",
@@ -663,42 +820,46 @@ pub fn skeleton_from_manifest_config(
     cfg: &HashMap<String, ConfigValue>,
 ) -> Result<SourceGraphSkeleton> {
     let mut skeleton = SourceGraphSkeleton::default();
-    let Some(ConfigValue::Array(seeds)) = cfg.get("graph_seeds") else {
-        return Ok(skeleton);
-    };
-    for item in seeds {
-        let ConfigValue::Map(row) = item else {
-            return Err(CnxError::InvalidInput(
-                "graph_seeds[] item must be map".into(),
-            ));
-        };
-        let source_kind = parse_source_kind(required_str(row, "source_kind")?);
-        let source_instance = required_str(row, "source_instance")?;
-        let local_id = required_str(row, "local_id")?;
-        let node_kind =
-            parse_node_kind(optional_str(row, "node_kind").unwrap_or_else(|| "asset".to_string()));
-        let native_ref = optional_str(row, "native_ref")
-            .unwrap_or_else(|| format!("{}://{}", source_kind.as_str(), local_id));
-        let display_name = optional_str(row, "display_name").unwrap_or_else(|| local_id.clone());
-        let native_pointer =
-            optional_str(row, "native_pointer").unwrap_or_else(|| native_ref.clone());
-        let observed_at = optional_int(row, "observed_at")
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or_default();
-        let grant_epoch =
-            optional_int(row, "grant_epoch").and_then(|value| u64::try_from(value).ok());
-        skeleton.nodes.push(SourceGraphNode {
-            source_kind,
-            source_instance,
-            local_id,
-            node_kind,
-            native_ref,
-            display_name,
-            native_pointer,
-            fingerprint: optional_str(row, "fingerprint"),
-            observed_at,
-            grant_epoch,
-        });
+    if let Some(ConfigValue::Array(seeds)) = cfg.get("graph_seeds") {
+        for item in seeds {
+            let ConfigValue::Map(row) = item else {
+                return Err(CnxError::InvalidInput(
+                    "graph_seeds[] item must be map".into(),
+                ));
+            };
+            let source_kind = parse_source_kind(required_str(row, "source_kind")?);
+            let source_instance = required_str(row, "source_instance")?;
+            let local_id = required_str(row, "local_id")?;
+            let node_kind = parse_node_kind(
+                optional_str(row, "node_kind").unwrap_or_else(|| "asset".to_string()),
+            );
+            let native_ref = optional_str(row, "native_ref")
+                .unwrap_or_else(|| format!("{}://{}", source_kind.as_str(), local_id));
+            let display_name =
+                optional_str(row, "display_name").unwrap_or_else(|| local_id.clone());
+            let native_pointer =
+                optional_str(row, "native_pointer").unwrap_or_else(|| native_ref.clone());
+            let observed_at = optional_int(row, "observed_at")
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or_default();
+            let grant_epoch =
+                optional_int(row, "grant_epoch").and_then(|value| u64::try_from(value).ok());
+            skeleton.nodes.push(SourceGraphNode {
+                source_kind,
+                source_instance,
+                local_id,
+                node_kind,
+                native_ref,
+                display_name,
+                native_pointer,
+                fingerprint: optional_str(row, "fingerprint"),
+                observed_at,
+                grant_epoch,
+            });
+        }
+    }
+    if let Some(config) = bio_mock::BioPipelineMockConfig::from_manifest_config(cfg)? {
+        skeleton.extend(bio_mock::skeleton_from_bio_pipeline_mock_config(&config)?);
     }
     Ok(skeleton)
 }
@@ -1066,6 +1227,7 @@ pub fn skeleton_from_pg_seed(seed: &PgCatalogSeed) -> SourceGraphSkeleton {
 fn parse_source_kind(value: String) -> SourceKind {
     match value.as_str() {
         "fs" => SourceKind::Fs,
+        "local-fs" => SourceKind::LocalFs,
         "s3" => SourceKind::S3,
         "es" => SourceKind::Es,
         "mysql" => SourceKind::Mysql,
@@ -1129,6 +1291,7 @@ mod tests {
         let mut store = UnionGraphStore::default();
         for kind in [
             SourceKind::Fs,
+            SourceKind::LocalFs,
             SourceKind::S3,
             SourceKind::Es,
             SourceKind::Mysql,
@@ -1148,13 +1311,15 @@ mod tests {
                     grant_epoch: None,
                 }],
                 edges: Vec::new(),
+                cross_edges: Vec::new(),
                 evidence: Vec::new(),
             };
             store.ingest(skeleton).expect("ingest");
         }
         let coverage = store.coverage();
-        assert_eq!(coverage.source_counts.len(), 5);
+        assert_eq!(coverage.source_counts.len(), 6);
         assert_eq!(coverage.source_counts[&SourceKind::Fs], 1);
+        assert_eq!(coverage.source_counts[&SourceKind::LocalFs], 1);
         assert_eq!(coverage.source_counts[&SourceKind::Pg], 1);
     }
 
@@ -1200,6 +1365,7 @@ mod tests {
                     observed_at: 1,
                     grant_epoch: None,
                 }],
+                cross_edges: Vec::new(),
                 evidence: Vec::new(),
             })
             .expect("ingest");
@@ -1207,6 +1373,135 @@ mod tests {
         let edges = store.neighbors(&bucket_gid, NeighborDirection::Outgoing, None, None);
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].edge_kind, EdgeKind::Contains);
+    }
+
+    #[test]
+    fn store_tracks_cross_source_lineage_edges() {
+        let mut store = UnionGraphStore::default();
+        store
+            .ingest(SourceGraphSkeleton {
+                nodes: vec![
+                    SourceGraphNode {
+                        source_kind: SourceKind::Fs,
+                        source_instance: "bio-nfs".into(),
+                        local_id: "/mnt/ncbi_backup_2022/GEN/gene/DATA/gene_info.gz".into(),
+                        node_kind: NodeKind::Asset,
+                        native_ref:
+                            "fs://10.3.200.29/mnt/ncbi_backup_2022/GEN/gene/DATA/gene_info.gz"
+                                .into(),
+                        display_name: "gene_info.gz".into(),
+                        native_pointer:
+                            "fs-meta:bio-nfs:/mnt/ncbi_backup_2022/GEN/gene/DATA/gene_info.gz"
+                                .into(),
+                        fingerprint: Some("gene_info".into()),
+                        observed_at: 1,
+                        grant_epoch: None,
+                    },
+                    SourceGraphNode {
+                        source_kind: SourceKind::Pg,
+                        source_instance: "bio-pg".into(),
+                        local_id: "postgres/public/gene_info".into(),
+                        node_kind: NodeKind::Collection,
+                        native_ref: "pg://bio-pg/postgres/public/gene_info".into(),
+                        display_name: "gene_info".into(),
+                        native_pointer: "pg-table:postgres:public.gene_info".into(),
+                        fingerprint: None,
+                        observed_at: 1,
+                        grant_epoch: None,
+                    },
+                ],
+                edges: Vec::new(),
+                cross_edges: vec![CrossSourceGraphEdge {
+                    from: SourceGraphEndpoint::new(
+                        SourceKind::Fs,
+                        "bio-nfs",
+                        "/mnt/ncbi_backup_2022/GEN/gene/DATA/gene_info.gz",
+                    ),
+                    to: SourceGraphEndpoint::new(
+                        SourceKind::Pg,
+                        "bio-pg",
+                        "postgres/public/gene_info",
+                    ),
+                    edge_kind: EdgeKind::LoadedInto,
+                    evidence_ref: String::new(),
+                    confidence: Confidence::Inferred,
+                    observed_at: 1,
+                    grant_epoch: None,
+                }],
+                evidence: Vec::new(),
+            })
+            .expect("ingest");
+
+        let source_gid = graph_gid(
+            &SourceKind::Fs,
+            "bio-nfs",
+            "/mnt/ncbi_backup_2022/GEN/gene/DATA/gene_info.gz",
+        );
+        let edges = store.neighbors(
+            &source_gid,
+            NeighborDirection::Outgoing,
+            Some(&EdgeKind::LoadedInto),
+            None,
+        );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].edge_kind, EdgeKind::LoadedInto);
+        assert_eq!(
+            edges[0].target_gid,
+            graph_gid(&SourceKind::Pg, "bio-pg", "postgres/public/gene_info")
+        );
+    }
+
+    #[test]
+    fn manifest_config_can_seed_bio_pipeline_mock() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/bio-mock");
+        let mut bio_cfg = HashMap::new();
+        bio_cfg.insert("enabled".into(), ConfigValue::Bool(true));
+        bio_cfg.insert(
+            "schema_path".into(),
+            ConfigValue::String(root.join("PPG_Schema.json").display().to_string()),
+        );
+        bio_cfg.insert(
+            "union_schema_path".into(),
+            ConfigValue::String(root.join("PPG_Union_Schema.json").display().to_string()),
+        );
+        bio_cfg.insert(
+            "ppg_status_json_path".into(),
+            ConfigValue::String(root.join("ppg-status.json").display().to_string()),
+        );
+        let mut cfg = HashMap::new();
+        cfg.insert("bio_pipeline_mock".into(), ConfigValue::Map(bio_cfg));
+
+        let skeleton = skeleton_from_manifest_config(&cfg).expect("manifest skeleton");
+        assert!(
+            skeleton
+                .nodes
+                .iter()
+                .any(|node| node.source_kind == SourceKind::Fs)
+        );
+        assert!(
+            skeleton
+                .nodes
+                .iter()
+                .any(|node| node.source_kind == SourceKind::LocalFs)
+        );
+        assert!(
+            skeleton
+                .nodes
+                .iter()
+                .any(|node| node.source_kind == SourceKind::Es)
+        );
+        assert!(
+            skeleton
+                .nodes
+                .iter()
+                .any(|node| node.source_kind == SourceKind::Pg)
+        );
+        assert!(
+            skeleton
+                .cross_edges
+                .iter()
+                .any(|edge| edge.edge_kind == EdgeKind::ProjectedAs)
+        );
     }
 
     #[test]

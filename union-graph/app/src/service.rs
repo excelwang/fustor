@@ -127,6 +127,7 @@ mod tests {
                     grant_epoch: None,
                 }],
                 edges: Vec::new(),
+                cross_edges: Vec::new(),
                 evidence: Vec::new(),
             },
         };

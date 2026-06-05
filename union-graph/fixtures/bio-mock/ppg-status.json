@@ -1,0 +1,21 @@
+{
+  "Timestamp": "2026-06-05T03:55:18Z",
+  "NodeStatus": {
+    "Healthy": true
+  },
+  "Schema": {
+    "Exists": true,
+    "ModTime": "2026-05-14T05:00:51Z"
+  },
+  "GremlinServer": {
+    "LocalCacheStatus": "READY",
+    "LocalCacheStatusDetail": [
+      {
+        "Type": "VERTEX",
+        "Name": "gene",
+        "State": "SUCCESS",
+        "Progress": "100%"
+      }
+    ]
+  }
+}
