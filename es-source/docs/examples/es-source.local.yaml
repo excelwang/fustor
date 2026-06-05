@@ -1,0 +1,35 @@
+# Product-owned config consumed by es-source.
+default_page_size: 500
+max_page_size: 5000
+
+endpoints:
+  - object_ref: es-prod
+    endpoint_uri: https://es-prod.internal:9200
+    credential_ref: es-prod-reader
+    index_scopes:
+      - logs-*
+    timestamp_field: "@timestamp"
+    tie_breaker_field: _id
+
+# Credential entries hold references only. Secret bytes come from the local
+# runtime environment, not from Capanix grants or manifest config.
+credentials:
+  - credential_ref: es-prod-reader
+    auth_type: api_key_env
+    api_key_env: ES_PROD_READER_API_KEY
+
+# Example runtime overlay for local tests only. In production this section is
+# injected by the Capanix runtime/grant path rather than authored as product
+# config. Capanix still carries no password/API key material here.
+__cnx_runtime:
+  local_host_ref: es-source-node-a
+  resource_grants:
+    - resource_kind: elasticsearch
+      object_ref: es-prod
+      endpoint_ref: prod-cluster-a
+      grant_state: active
+      grant_epoch: 1
+      interfaces:
+        - read
+      index_scopes:
+        - logs-2026-*
