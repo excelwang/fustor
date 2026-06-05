@@ -34,14 +34,15 @@ use crate::runtime::orchestration::{
 };
 use crate::runtime::routes::{
     METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS,
-    METHOD_SOURCE_FIND, METHOD_SOURCE_RESCAN, METHOD_SOURCE_STATUS, ROUTE_KEY_EVENTS,
-    ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_INTERNAL,
+    METHOD_SOURCE_FIND, METHOD_SOURCE_RESCAN, METHOD_SOURCE_STATUS, ROUTE_KEY_FACADE_CONTROL,
+    ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_INTERNAL,
     ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SINK_STATUS_INTERNAL,
     ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
     ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_ROOTS_CONTROL,
     ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_INTERNAL,
-    default_route_bindings, sink_query_request_route_for, sink_query_route_bindings_for,
-    sink_status_request_route_for, source_find_route_bindings_for, source_rescan_request_route_for,
+    default_route_bindings, events_stream_route_for_scope, is_events_stream_route_key,
+    sink_query_request_route_for, sink_query_route_bindings_for, sink_status_request_route_for,
+    source_find_route_bindings_for, source_rescan_request_route_for,
     source_status_request_route_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -174,7 +175,7 @@ fn facade_publication_signal_is_source_status_activate(signal: &FacadeControlSig
             unit: FacadeRuntimeUnit::QueryPeer,
             route_key,
             ..
-        } if route_key == &format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
+        } if is_source_status_request_route(route_key)
     )
 }
 
@@ -1547,19 +1548,13 @@ impl RuntimeScopeConvergenceObservation {
     fn expected_groups_for_logical_roots(
         &self,
         logical_roots: &[source::config::RootSpec],
-    ) -> Option<RuntimeScopeExpectedGroups> {
+    ) -> RuntimeScopeExpectedGroups {
         let mut sink_groups = self.sink_groups.clone();
         if sink_groups.is_empty() {
             sink_groups.extend(self.source_groups.iter().cloned());
             sink_groups.extend(self.scan_groups.iter().cloned());
         }
-        if sink_groups.is_empty() {
-            return None;
-        }
-        Some(RuntimeScopeExpectedGroups::from_logical_roots(
-            logical_roots,
-            &sink_groups,
-        ))
+        RuntimeScopeExpectedGroups::from_logical_roots(logical_roots, &sink_groups)
     }
 
     #[cfg(test)]
@@ -2000,12 +1995,10 @@ impl SinkRecoveryMachine {
     fn post_recovery_scope_action(
         &self,
         observation: &RuntimeScopeConvergenceObservation,
-        expected_scope_groups: Option<&RuntimeScopeExpectedGroups>,
+        expected_scope_groups: &RuntimeScopeExpectedGroups,
         deadline: tokio::time::Instant,
     ) -> SinkRecoveryScopeConvergenceAction {
-        let scope_converged = expected_scope_groups.is_some_and(|expected_groups| {
-            observation.matches_node_local_source_scope(expected_groups)
-        });
+        let scope_converged = observation.matches_node_local_source_scope(expected_scope_groups);
         let source_rescan_pending = self.post_recovery_source_rescan_pending();
         if scope_converged && !source_rescan_pending {
             SinkRecoveryScopeConvergenceAction::Converged
@@ -2180,13 +2173,11 @@ impl SinkRecoveryMachine {
                 );
                 match self.post_recovery_scope_action(
                     &scope_observation,
-                    expected_scope_groups.as_ref(),
+                    &expected_scope_groups,
                     scope_convergence_deadline,
                 ) {
                     SinkRecoveryScopeConvergenceAction::Converged => {
-                        break expected_scope_groups
-                            .expect("converged scope observation must define expected groups")
-                            .sink_groups;
+                        break expected_scope_groups.sink_groups;
                     }
                     SinkRecoveryScopeConvergenceAction::ReturnTimeout => {
                         return Err(RuntimeWorkerObservationFailure::from_cause(
@@ -2218,6 +2209,10 @@ impl SinkRecoveryMachine {
                     }
                 }
             };
+
+            if converged_groups.is_empty() {
+                return Ok(None);
+            }
 
             let sink_readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             loop {
@@ -3197,7 +3192,7 @@ fn sink_recovery_machine_post_recovery_scope_action_owns_deadline_and_trigger_la
     assert_eq!(
         waiting.post_recovery_scope_action(
             &observation,
-            Some(&expected),
+            &expected,
             tokio::time::Instant::now() + Duration::from_secs(1)
         ),
         SinkRecoveryScopeConvergenceAction::TriggerInitialAndWait,
@@ -3206,7 +3201,7 @@ fn sink_recovery_machine_post_recovery_scope_action_owns_deadline_and_trigger_la
     assert_eq!(
         pretriggered.post_recovery_scope_action(
             &observation,
-            Some(&expected),
+            &expected,
             tokio::time::Instant::now() + Duration::from_secs(1)
         ),
         SinkRecoveryScopeConvergenceAction::Wait,
@@ -3215,7 +3210,7 @@ fn sink_recovery_machine_post_recovery_scope_action_owns_deadline_and_trigger_la
     assert_eq!(
         pretriggered.post_recovery_scope_action(
             &observation,
-            Some(&expected),
+            &expected,
             tokio::time::Instant::now()
         ),
         SinkRecoveryScopeConvergenceAction::ReturnTimeout,
@@ -3240,7 +3235,7 @@ fn sink_recovery_machine_post_recovery_accepts_scan_only_expected_groups() {
     assert_eq!(
         waiting.post_recovery_scope_action(
             &observation,
-            Some(&expected),
+            &expected,
             tokio::time::Instant::now() + Duration::from_secs(1)
         ),
         SinkRecoveryScopeConvergenceAction::Converged,
@@ -3268,11 +3263,41 @@ fn sink_recovery_machine_post_recovery_accepts_node_local_source_scope_subset() 
     assert_eq!(
         waiting.post_recovery_scope_action(
             &observation,
-            Some(&expected),
+            &expected,
             tokio::time::Instant::now() + Duration::from_secs(1)
         ),
         SinkRecoveryScopeConvergenceAction::Converged,
         "post-recovery sink replay must treat source/scan as node-local ownership evidence; requiring every sink group on each source owner keeps recovery fail-closed forever on distributed real-NFS scopes",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_post_recovery_accepts_empty_roots_empty_scope() {
+    let waiting = SinkRecoveryMachine::new_post_recovery(None);
+    let observation = RuntimeScopeConvergenceObservation {
+        source_groups: std::collections::BTreeSet::new(),
+        scan_groups: std::collections::BTreeSet::new(),
+        sink_groups: std::collections::BTreeSet::new(),
+    };
+    let expected = observation.expected_groups_for_logical_roots(&[]);
+
+    assert_eq!(
+        expected,
+        RuntimeScopeExpectedGroups {
+            source_groups: std::collections::BTreeSet::new(),
+            scan_groups: std::collections::BTreeSet::new(),
+            sink_groups: std::collections::BTreeSet::new(),
+        },
+        "empty-roots deployment should carry an explicit empty expected scope"
+    );
+    assert_eq!(
+        waiting.post_recovery_scope_action(
+            &observation,
+            &expected,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
+        SinkRecoveryScopeConvergenceAction::Converged,
+        "empty-roots deployment is a valid converged runtime scope and must not trigger sink-generation-cutover repair loops",
     );
 }
 
@@ -4249,7 +4274,7 @@ fn sink_recovery_machine_local_pretriggered_unobserved_source_publication_escala
 #[test]
 fn sink_recovery_machine_local_require_probe_not_ready_probe_replays_retained_sink_wave_before_manual_fallback()
  {
-    let route_key = format!("{}.stream", ROUTE_KEY_EVENTS);
+    let route_key = events_stream_route_for_scope("node-a").0;
     let mut runtime = SinkRecoveryMachine::new_local_pretriggered_with_deadline(
         LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady,
         tokio::time::Instant::now() + Duration::from_secs(1),
@@ -4345,7 +4370,7 @@ fn sink_recovery_machine_local_require_probe_publication_ready_probes_before_sin
 
 #[test]
 fn sink_recovery_machine_local_replays_retained_sink_wave_before_scope_wait() {
-    let route_key = format!("{}.stream", ROUTE_KEY_EVENTS);
+    let route_key = events_stream_route_for_scope("node-a").0;
     let runtime = SinkRecoveryMachine::new_local_with_deadline(
         LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady,
         tokio::time::Instant::now() + Duration::from_secs(1),
@@ -4412,7 +4437,7 @@ fn sink_recovery_machine_post_recovery_waits_for_pretriggered_source_publication
     assert_eq!(
         pretriggered.post_recovery_scope_action(
             &converged,
-            Some(&expected),
+            &expected,
             tokio::time::Instant::now() + Duration::from_secs(1),
         ),
         SinkRecoveryScopeConvergenceAction::Wait,
@@ -4436,11 +4461,8 @@ fn sink_recovery_machine_post_recovery_hands_converged_scope_to_sink_gate_when_p
     };
 
     assert_eq!(
-        pretriggered.post_recovery_scope_action(
-            &converged,
-            Some(&expected),
-            tokio::time::Instant::now(),
-        ),
+        pretriggered
+            .post_recovery_scope_action(&converged, &expected, tokio::time::Instant::now(),),
         SinkRecoveryScopeConvergenceAction::Converged,
         "if a worker restart loses the request epoch after scope convergence, recovery must continue into the sink readiness gate instead of failing before sink materialization can be retriggered",
     );
@@ -4530,6 +4552,7 @@ fn sink_status_snapshot_observed_control_generation(
 }
 
 fn current_generation_sink_replay_tick(
+    node_id: &str,
     source_signals: &[SourceControlSignal],
     facade_signals: &[FacadeControlSignal],
 ) -> Option<SinkControlSignal> {
@@ -4538,7 +4561,7 @@ fn current_generation_sink_replay_tick(
         .map(source_signal_generation)
         .chain(facade_signals.iter().map(facade_signal_generation))
         .find(|generation| *generation > 0)?;
-    let route_key = format!("{}.stream", ROUTE_KEY_EVENTS);
+    let route_key = events_stream_route_for_scope(node_id).0;
     Some(SinkControlSignal::Tick {
         unit: SinkRuntimeUnit::Sink,
         route_key: route_key.clone(),
@@ -4997,7 +5020,7 @@ impl ManagementWriteRecoveryContext {
 
         for route_key in [
             format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
-            format!("{}.stream", ROUTE_KEY_EVENTS),
+            events_stream_route_for_scope(&self.node_id.0).0,
             format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
             format!("{}.req", ROUTE_KEY_FORCE_FIND),
             sink_query_request_route_for(&self.node_id.0).0,
@@ -5057,7 +5080,7 @@ impl ManagementWriteRecoveryContext {
         let Some(generation) = generation else {
             return Vec::new();
         };
-        let route_key = format!("{}.stream", ROUTE_KEY_EVENTS);
+        let route_key = events_stream_route_for_scope(&self.node_id.0).0;
         let tick = SinkControlSignal::Tick {
             unit: SinkRuntimeUnit::Sink,
             route_key: route_key.clone(),
@@ -6534,19 +6557,18 @@ const SINK_QUERY_PROXY_BRIDGE_TIMEOUT: Duration = Duration::from_millis(750);
 const SINK_QUERY_PROXY_BRIDGE_IDLE_GRACE: Duration = Duration::from_millis(150);
 
 fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
-    let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
     match unit {
         FacadeRuntimeUnit::Facade => route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
         FacadeRuntimeUnit::Query => {
             route_key == format!("{}.req", ROUTE_KEY_QUERY)
                 || is_materialized_query_request_route(route_key)
                 || is_sink_status_query_request_route(route_key)
-                || route_key == source_status_route
+                || is_source_status_request_route(route_key)
         }
         FacadeRuntimeUnit::QueryPeer => {
             is_materialized_query_request_route(route_key)
                 || is_sink_status_query_request_route(route_key)
-                || route_key == source_status_route
+                || is_source_status_request_route(route_key)
         }
     }
 }
@@ -6577,7 +6599,7 @@ fn preferred_internal_query_endpoint_units(
 fn is_dual_lane_internal_query_route(route_key: &str) -> bool {
     is_materialized_query_request_route(route_key)
         || is_sink_status_query_request_route(route_key)
-        || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
+        || is_source_status_request_route(route_key)
 }
 
 fn internal_query_route_still_active(facade_gate: &RuntimeUnitGate, route_key: &str) -> bool {
@@ -7185,8 +7207,7 @@ impl ChannelIoSubset for SourceRescanProxyReceiveReadyBoundary {
 }
 
 fn is_internal_status_route(route_key: &str) -> bool {
-    is_sink_status_query_request_route(route_key)
-        || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
+    is_sink_status_query_request_route(route_key) || is_source_status_request_route(route_key)
 }
 
 fn is_sink_status_query_request_route(route_key: &str) -> bool {
@@ -7217,7 +7238,7 @@ fn is_facade_dependent_query_route(route_key: &str) -> bool {
     route_key == format!("{}.req", ROUTE_KEY_QUERY)
         || is_materialized_query_request_route(route_key)
         || is_sink_status_query_request_route(route_key)
-        || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
+        || is_source_status_request_route(route_key)
 }
 
 fn is_serving_facade_business_read_route(route_key: &str) -> bool {
@@ -7230,7 +7251,7 @@ fn is_uninitialized_cleanup_query_route_with_policy(
     route_key: &str,
     recovery_lane_policy: ControlFailureRecoveryLanePolicy,
 ) -> bool {
-    route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
+    is_source_status_request_route(route_key)
         && recovery_lane_policy == ControlFailureRecoveryLanePolicy::WithdrawInternalStatus
         || is_materialized_query_request_route(route_key)
             && matches!(
@@ -10221,7 +10242,7 @@ impl FSMetaApp {
         let Some(generation) = generation else {
             return Vec::new();
         };
-        let route_key = format!("{}.stream", ROUTE_KEY_EVENTS);
+        let route_key = events_stream_route_for_scope(&self.node_id.0).0;
         let tick = SinkControlSignal::Tick {
             unit: SinkRuntimeUnit::Sink,
             route_key: route_key.clone(),
@@ -12235,7 +12256,7 @@ impl FSMetaApp {
         else {
             return false;
         };
-        if route_key != &format!("{}.stream", ROUTE_KEY_EVENTS)
+        if !is_events_stream_route_key(route_key)
             && !is_per_peer_sink_query_request_route(route_key)
         {
             return false;
@@ -12255,12 +12276,15 @@ impl FSMetaApp {
     fn sink_signal_requires_fail_closed_retry_after_generation_cutover(
         signal: &SinkControlSignal,
     ) -> bool {
-        matches!(
-            signal,
+        match signal {
             SinkControlSignal::Activate { route_key, .. }
-                | SinkControlSignal::Deactivate { route_key, .. }
-                if route_key == &format!("{}.stream", ROUTE_KEY_EVENTS)
-        ) || Self::sink_signal_is_restart_deferred_retire_pending(signal)
+            | SinkControlSignal::Deactivate { route_key, .. }
+                if is_events_stream_route_key(route_key) =>
+            {
+                true
+            }
+            _ => Self::sink_signal_is_restart_deferred_retire_pending(signal),
+        }
     }
 
     fn facade_signal_can_initialize(signal: &FacadeControlSignal) -> bool {
@@ -20644,6 +20668,7 @@ impl FSMetaApp {
                             );
                         }
                         let replay_signals = current_generation_sink_replay_tick(
+                            &self.node_id.0,
                             &source_signals,
                             &facade_publication_signals,
                         )

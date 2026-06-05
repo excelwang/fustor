@@ -16,12 +16,12 @@ use fs_meta::product_model::routes::{
     ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_ROOTS_CONTROL,
     ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
     ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
-    ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, sink_query_request_route_for,
-    sink_query_route_key_for, sink_roots_control_route_key_for, sink_status_request_route_for,
-    sink_status_route_key_for, source_find_request_route_for, source_find_route_key_for,
-    source_rescan_request_route_for, source_rescan_route_key_for,
-    source_roots_control_route_key_for, source_status_request_route_for,
-    source_status_route_key_for,
+    ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, events_route_key_for_scope,
+    events_stream_route_for_scope, sink_query_request_route_for, sink_query_route_key_for,
+    sink_roots_control_route_key_for, sink_status_request_route_for, sink_status_route_key_for,
+    source_find_request_route_for, source_find_route_key_for, source_rescan_request_route_for,
+    source_rescan_route_key_for, source_roots_control_route_key_for,
+    source_status_request_route_for, source_status_route_key_for,
 };
 
 const EMPTY_ROOTS_BOOTSTRAP_CONTROL_SCOPE_ID: &str = "__fsmeta_empty_roots_bootstrap";
@@ -349,6 +349,18 @@ fn ensure_scoped_internal_request_reply_ports(
                 ROUTE_KEY_SINK_ROOTS_CONTROL
             ))
         })?;
+    let events_template = ports
+        .iter()
+        .find(|port| {
+            port.get("route_key").and_then(serde_yaml::Value::as_str) == Some(ROUTE_KEY_EVENTS)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            CnxError::InvalidInput(format!(
+                "fs-meta startup manifest missing events stream port {}",
+                ROUTE_KEY_EVENTS
+            ))
+        })?;
     for node_id in spec
         .route_plan_node_ids
         .iter()
@@ -384,6 +396,10 @@ fn ensure_scoped_internal_request_reply_ports(
                 sink_roots_control_route_key_for(&node_id),
                 sink_roots_control_template.clone(),
             ),
+            (
+                events_route_key_for_scope(&node_id),
+                events_template.clone(),
+            ),
         ] {
             let already_present = ports.iter().any(|port| {
                 port.get("route_key").and_then(serde_yaml::Value::as_str)
@@ -404,6 +420,7 @@ fn ensure_scoped_internal_request_reply_ports(
                         | ROUTE_KEY_SINK_STATUS_INTERNAL
                         | ROUTE_KEY_SOURCE_ROOTS_CONTROL
                         | ROUTE_KEY_SINK_ROOTS_CONTROL
+                        | ROUTE_KEY_EVENTS
                 )
             );
             let base_use_port = if scoped_identity_template {
@@ -591,10 +608,6 @@ fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
         Vec::new(),
     ));
     plans.push(route_plan_json(
-        RouteKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
-        all_route_plan_peers.clone(),
-    ));
-    plans.push(route_plan_json(
         RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL)),
         Vec::new(),
     ));
@@ -653,6 +666,10 @@ fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
         plans.push(route_plan_json(
             RouteKey(format!("{}:reply", sink_status_route.0)),
             all_route_plan_peers.clone(),
+        ));
+        plans.push(route_plan_json(
+            events_stream_route_for_scope(&node_id),
+            vec![route_plan_peer_for_node_id(&node_id)],
         ));
     }
     plans.push(route_plan_json(
@@ -843,6 +860,13 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
             sink_status_request_route_for(&node_id).0,
             sink_owner_request_route_units_json(),
         );
+        route_units.insert(
+            events_stream_route_for_scope(&node_id).0,
+            serde_json::json!({
+                "send": [SOURCE_RUNTIME_UNIT_ID],
+                "recv": [SINK_RUNTIME_UNIT_ID]
+            }),
+        );
     }
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SINK_QUERY_PROXY),
@@ -859,13 +883,6 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_FORCE_FIND),
         sink_owner_request_route_units_json(),
-    );
-    route_units.insert(
-        stream_activation_route_key(ROUTE_KEY_EVENTS),
-        serde_json::json!({
-            "send": [SOURCE_RUNTIME_UNIT_ID],
-            "recv": [SINK_RUNTIME_UNIT_ID]
-        }),
     );
     serde_json::Value::Object(route_units)
 }
@@ -1407,30 +1424,35 @@ mod tests {
         };
 
         let plans = build_route_plans_json(&spec);
-        let expected_route = format!("{}.stream", ROUTE_KEY_EVENTS);
-        let events_plan = plans
-            .iter()
-            .find(|plan| {
+        assert!(
+            plans.iter().all(|plan| {
                 plan.get("route_key").and_then(serde_json::Value::as_str)
-                    == Some(expected_route.as_str())
-            })
-            .expect("events stream route plan");
-        let peer_ids = events_plan
-            .get("peers")
-            .and_then(serde_json::Value::as_array)
-            .expect("events stream peers")
-            .iter()
-            .filter_map(|peer| peer.get("node_id").and_then(serde_json::Value::as_str))
-            .collect::<std::collections::BTreeSet<_>>();
-        let expected_peer_ids = spec
-            .route_plan_node_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            peer_ids, expected_peer_ids,
-            "release route_plans must include the fs-meta events stream so sink placement can materialize assigned groups"
+                    != Some("fs-meta.events:v1.stream")
+            }),
+            "release route_plans must not publish a global fs-meta events stream; otherwise every sink receives every source event"
         );
+        for node_id in &spec.route_plan_node_ids {
+            let expected_route = events_stream_route_for_scope(node_id).0;
+            let events_plan = plans
+                .iter()
+                .find(|plan| {
+                    plan.get("route_key").and_then(serde_json::Value::as_str)
+                        == Some(expected_route.as_str())
+                })
+                .unwrap_or_else(|| panic!("events stream route plan for {node_id}"));
+            let peer_ids = events_plan
+                .get("peers")
+                .and_then(serde_json::Value::as_array)
+                .expect("events stream peers")
+                .iter()
+                .filter_map(|peer| peer.get("node_id").and_then(serde_json::Value::as_str))
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                peer_ids,
+                std::collections::BTreeSet::from([node_id.as_str()]),
+                "events stream route {expected_route} must target only its owning node"
+            );
+        }
     }
 
     #[test]
@@ -1440,7 +1462,10 @@ mod tests {
             api_facade_resource_id: "listener".to_string(),
             auth: ApiAuthConfig::default(),
             roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
-            route_plan_node_ids: Vec::new(),
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
             worker_module_path: None,
             worker_modes: Default::default(),
         };
@@ -1455,36 +1480,42 @@ mod tests {
         let route_units = release_doc["units"][0]["runtime"]["route_units"]
             .as_object()
             .expect("route_units object");
-        let events_route = stream_activation_route_key(ROUTE_KEY_EVENTS);
-        let directional_units = route_units
-            .get(&events_route)
-            .and_then(serde_json::Value::as_object)
-            .expect("events route directional units");
-        let send_unit_ids = directional_units
-            .get("send")
-            .and_then(serde_json::Value::as_array)
-            .expect("events route send units")
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
-        let recv_unit_ids = directional_units
-            .get("recv")
-            .and_then(serde_json::Value::as_array)
-            .expect("events route recv units")
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            !route_units.contains_key("fs-meta.events:v1.stream"),
+            "release route_units must not retain the global fs-meta events stream"
+        );
+        for node_id in &spec.route_plan_node_ids {
+            let events_route = events_stream_route_for_scope(node_id).0;
+            let directional_units = route_units
+                .get(&events_route)
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("events route directional units for {node_id}"));
+            let send_unit_ids = directional_units
+                .get("send")
+                .and_then(serde_json::Value::as_array)
+                .expect("events route send units")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            let recv_unit_ids = directional_units
+                .get("recv")
+                .and_then(serde_json::Value::as_array)
+                .expect("events route recv units")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
 
-        assert_eq!(
-            send_unit_ids,
-            std::collections::BTreeSet::from([SOURCE_RUNTIME_UNIT_ID]),
-            "events stream must publish source as the sending side"
-        );
-        assert_eq!(
-            recv_unit_ids,
-            std::collections::BTreeSet::from([SINK_RUNTIME_UNIT_ID]),
-            "events stream must publish sink as the receiving side"
-        );
+            assert_eq!(
+                send_unit_ids,
+                std::collections::BTreeSet::from([SOURCE_RUNTIME_UNIT_ID]),
+                "events stream {events_route} must publish source as the sending side"
+            );
+            assert_eq!(
+                recv_unit_ids,
+                std::collections::BTreeSet::from([SINK_RUNTIME_UNIT_ID]),
+                "events stream {events_route} must publish sink as the receiving side"
+            );
+        }
     }
 
     #[test]
@@ -2392,29 +2423,39 @@ mod tests {
         let intent_route_units = intent["workers"][0]["runtime"]["route_units"]
             .as_object()
             .expect("compiled intent route_units object");
-        let events_route = stream_activation_route_key(ROUTE_KEY_EVENTS);
-        let directional_units = intent_route_units
-            .get(&events_route)
-            .and_then(serde_json::Value::as_object)
-            .expect("compiled intent must preserve directional events route_units");
-        assert_eq!(
-            directional_units
-                .get("send")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|units| units.first())
-                .and_then(serde_json::Value::as_str),
-            Some(SOURCE_RUNTIME_UNIT_ID),
-            "compiled intent must keep events source on send side"
+        assert!(
+            !intent_route_units.contains_key("fs-meta.events:v1.stream"),
+            "compiled intent must not retain the global fs-meta events route_units"
         );
-        assert_eq!(
-            directional_units
-                .get("recv")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|units| units.first())
-                .and_then(serde_json::Value::as_str),
-            Some(SINK_RUNTIME_UNIT_ID),
-            "compiled intent must keep events sink on recv side"
-        );
+        for node_id in &spec.route_plan_node_ids {
+            let events_route = events_stream_route_for_scope(node_id).0;
+            let directional_units = intent_route_units
+                .get(&events_route)
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "compiled intent must preserve directional events route_units for {node_id}"
+                    )
+                });
+            assert_eq!(
+                directional_units
+                    .get("send")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|units| units.first())
+                    .and_then(serde_json::Value::as_str),
+                Some(SOURCE_RUNTIME_UNIT_ID),
+                "compiled intent must keep events source on send side for {events_route}"
+            );
+            assert_eq!(
+                directional_units
+                    .get("recv")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|units| units.first())
+                    .and_then(serde_json::Value::as_str),
+                Some(SINK_RUNTIME_UNIT_ID),
+                "compiled intent must keep events sink on recv side for {events_route}"
+            );
+        }
     }
 
     #[test]

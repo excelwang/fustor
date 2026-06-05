@@ -653,6 +653,60 @@ async fn start_runtime_endpoints_restarts_after_finished_endpoint_task() {
 }
 
 #[tokio::test]
+async fn start_runtime_endpoints_fast_path_keeps_existing_boundary_tasks() {
+    let source = build_source(vec![test_export(
+        "node-a",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )]);
+    let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("start runtime endpoints");
+    let boundary_dyn: Arc<dyn ChannelIoSubset> = boundary.clone();
+    assert!(
+        source
+            .runtime_endpoints_current_on_boundary(&boundary_dyn)
+            .expect("same-boundary current check"),
+        "same-boundary endpoint set must be recognized as current"
+    );
+    let before_count = lock_or_recover(
+        &source.endpoint_tasks,
+        "test.source.fast_path.endpoint_tasks.before",
+    )
+    .len();
+
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("repeat runtime endpoints");
+
+    let after_count = lock_or_recover(
+        &source.endpoint_tasks,
+        "test.source.fast_path.endpoint_tasks.after",
+    )
+    .len();
+    assert_eq!(
+        after_count, before_count,
+        "same-boundary runtime endpoint ensure must not spawn duplicate tasks"
+    );
+    let other_boundary: Arc<dyn ChannelIoSubset> =
+        Arc::new(RouteCountingTimeoutBoundary::default());
+    assert!(
+        !source
+            .runtime_endpoints_current_on_boundary(&other_boundary)
+            .expect("other-boundary current check"),
+        "a different runtime boundary must still force endpoint rebinding"
+    );
+
+    source.close().await.expect("close source");
+}
+
+#[tokio::test]
 async fn control_stream_endpoints_stay_gated_until_route_activation() {
     let source = build_source(vec![test_export(
         "node-a",
@@ -4806,6 +4860,52 @@ fn manual_rescan_signal_intent_skips_completed_intent_but_accepts_direct_signal(
     assert_eq!(
         FSMetaSource::manual_rescan_signal_intent_for_root(&intents, "nfs1@node-a"),
         ManualRescanSignalIntent::AlreadyCompleted
+    );
+}
+
+#[test]
+fn initial_audit_manual_rescan_completion_only_satisfies_observed_target() {
+    let intents = Arc::new(Mutex::new(HashMap::<String, ManualRescanIntent>::new()));
+    {
+        let mut guard =
+            lock_or_recover(&intents, "test.initial_audit_manual_rescan_completion.seed");
+        guard.insert(
+            "nfs1@node-a".to_string(),
+            ManualRescanIntent {
+                requested: 2,
+                completed: 0,
+            },
+        );
+    }
+    let target = FSMetaSource::pending_manual_rescan_target_for_root(&intents, "nfs1@node-a")
+        .expect("pending target exists");
+    {
+        let mut guard = lock_or_recover(
+            &intents,
+            "test.initial_audit_manual_rescan_completion.new_request",
+        );
+        guard
+            .get_mut("nfs1@node-a")
+            .expect("intent exists")
+            .requested = 3;
+    }
+
+    FSMetaSource::mark_manual_rescan_intent_completed_up_to(&intents, "nfs1@node-a", target);
+
+    let (completed, requested) = {
+        let guard = lock_or_recover(
+            &intents,
+            "test.initial_audit_manual_rescan_completion.verify",
+        );
+        let intent = guard.get("nfs1@node-a").expect("intent exists");
+        (intent.completed, intent.requested)
+    };
+    assert_eq!(completed, 2);
+    assert_eq!(requested, 3);
+    assert_eq!(
+        FSMetaSource::manual_rescan_signal_intent_for_root(&intents, "nfs1@node-a"),
+        ManualRescanSignalIntent::Pending(3),
+        "a manual rescan requested after initial audit started must remain pending"
     );
 }
 

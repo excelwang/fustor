@@ -41970,19 +41970,46 @@ fn facade_route_key_matches_dual_owned_internal_query_routes_for_both_units() {
     let sink_query_proxy = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
     let sink_status = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
     let source_status = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+    let scoped_source_status = source_status_request_route_for("node-b").0;
     let source_find = format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL);
 
     for route in [
         sink_query_proxy.as_str(),
         sink_status.as_str(),
         source_status.as_str(),
+        scoped_source_status.as_str(),
     ] {
         assert!(facade_route_key_matches(FacadeRuntimeUnit::Query, route));
         assert!(facade_route_key_matches(
             FacadeRuntimeUnit::QueryPeer,
             route
         ));
+        assert!(
+            is_facade_dependent_query_route(route),
+            "dual-owned internal query route must stay facade-dependent: {route}"
+        );
+        assert!(
+            is_dual_lane_internal_query_route(route),
+            "dual-owned internal query route must stay query/query-peer owned: {route}"
+        );
     }
+    assert!(is_internal_status_route(&scoped_source_status));
+    assert!(is_uninitialized_cleanup_query_route_with_policy(
+        &scoped_source_status,
+        ControlFailureRecoveryLanePolicy::WithdrawInternalStatus,
+    ));
+    assert!(!is_uninitialized_cleanup_query_route_with_policy(
+        &scoped_source_status,
+        ControlFailureRecoveryLanePolicy::PreserveSourceStatus,
+    ));
+    assert!(facade_publication_signal_is_source_status_activate(
+        &FacadeControlSignal::Activate {
+            unit: FacadeRuntimeUnit::QueryPeer,
+            route_key: scoped_source_status.clone(),
+            generation: 7,
+            bound_scopes: Vec::new(),
+        }
+    ));
     assert!(
         !facade_route_key_matches(FacadeRuntimeUnit::Query, &source_find)
             && !facade_route_key_matches(FacadeRuntimeUnit::QueryPeer, &source_find),

@@ -1558,7 +1558,6 @@ fn snapshot_control_signal_scope_ids(
 fn retained_sink_state_has_complete_materialized_replay_routes(
     retained: &RetainedSinkWorkerControlState,
 ) -> bool {
-    let events_stream_route = format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS);
     let roots_control_stream_route = format!(
         "{}.stream",
         crate::runtime::routes::ROUTE_KEY_SINK_ROOTS_CONTROL
@@ -1569,8 +1568,14 @@ fn retained_sink_state_has_complete_materialized_replay_routes(
             .keys()
             .any(|(_, active_route_key)| active_route_key == route_key)
     };
+    let has_events_stream_route = retained
+        .active_by_route
+        .keys()
+        .any(|(_, active_route_key)| {
+            crate::runtime::routes::is_events_stream_route_key(active_route_key)
+        });
     has_route(crate::runtime::routes::ROUTE_KEY_QUERY)
-        && has_route(&events_stream_route)
+        && has_events_stream_route
         && has_route(&roots_control_stream_route)
 }
 

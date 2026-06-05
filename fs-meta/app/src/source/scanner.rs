@@ -11,7 +11,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use bytes::Bytes;
 use crossbeam_channel as cb;
@@ -253,6 +253,24 @@ mod tests {
             "audit scan must visit the full directory tree before closing the epoch"
         );
     }
+
+    #[test]
+    fn directory_fingerprint_is_order_independent_for_wide_directories() {
+        let mut entries = (0..4096)
+            .map(|idx| HostFsDirEntry {
+                path: PathBuf::from(format!("/root/child-{idx:04}")),
+                is_dir: idx % 17 == 0,
+            })
+            .collect::<Vec<_>>();
+        let forward = directory_fingerprint(&entries);
+        entries.reverse();
+        let reverse = directory_fingerprint(&entries);
+
+        assert_eq!(
+            forward, reverse,
+            "directory fingerprint must not depend on read_dir entry order"
+        );
+    }
 }
 
 fn derived_ino_for_path(path: &Path) -> u64 {
@@ -270,6 +288,8 @@ fn to_epoch_us(t: Option<std::time::SystemTime>) -> u64 {
 const HOST_FS_RETRY_ATTEMPTS: usize = 4;
 const HOST_FS_OP_TIMEOUT_ENV: &str = "FS_META_SOURCE_HOST_FS_OP_TIMEOUT_SECS";
 const HOST_FS_OP_TIMEOUT_DEFAULT_SECS: u64 = 15;
+const HOST_FS_OP_WORKERS_ENV: &str = "FS_META_SOURCE_HOST_FS_OP_WORKERS";
+const HOST_FS_OP_WORKERS_MAX: usize = 256;
 
 const AUDIT_DEEP_INTERVAL_ROUNDS_ENV: &str = "FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS";
 const AUDIT_DEEP_INTERVAL_ROUNDS_DEFAULT: u64 = 24;
@@ -311,27 +331,37 @@ fn audit_watch_schedule_enabled() -> bool {
 }
 
 fn directory_fingerprint(entries: &[HostFsDirEntry]) -> u64 {
-    let mut parts = entries
-        .iter()
-        .map(|entry| {
-            (
-                entry
-                    .path
-                    .file_name()
-                    .map(|n| n.as_bytes().to_vec())
-                    .unwrap_or_default(),
-                entry.is_dir,
-            )
-        })
-        .collect::<Vec<_>>();
-    parts.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    parts.len().hash(&mut hasher);
-    for (name, is_dir) in parts {
-        name.hash(&mut hasher);
-        is_dir.hash(&mut hasher);
+    let mut xor = 0_u64;
+    let mut sum = 0_u64;
+    let mut rotated_sum = 0_u64;
+    let mut dir_count = 0_usize;
+    let mut file_count = 0_usize;
+    for entry in entries {
+        let mut entry_hasher = std::collections::hash_map::DefaultHasher::new();
+        entry
+            .path
+            .file_name()
+            .map(|n| n.as_bytes())
+            .unwrap_or_default()
+            .hash(&mut entry_hasher);
+        entry.is_dir.hash(&mut entry_hasher);
+        let entry_hash = entry_hasher.finish();
+        xor ^= entry_hash;
+        sum = sum.wrapping_add(entry_hash);
+        rotated_sum = rotated_sum.wrapping_add(entry_hash.rotate_left((entry_hash & 63) as u32));
+        if entry.is_dir {
+            dir_count += 1;
+        } else {
+            file_count += 1;
+        }
     }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.len().hash(&mut hasher);
+    dir_count.hash(&mut hasher);
+    file_count.hash(&mut hasher);
+    xor.hash(&mut hasher);
+    sum.hash(&mut hasher);
+    rotated_sum.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -370,6 +400,18 @@ fn host_fs_op_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+fn normalize_host_fs_op_workers(raw: usize) -> usize {
+    raw.clamp(1, HOST_FS_OP_WORKERS_MAX)
+}
+
+fn host_fs_op_workers(scan_workers: usize) -> usize {
+    std::env::var(HOST_FS_OP_WORKERS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(normalize_host_fs_op_workers)
+        .unwrap_or_else(|| normalize_host_fs_op_workers(scan_workers))
+}
+
 fn host_fs_timeout_error(op: &str, path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::TimedOut,
@@ -381,52 +423,92 @@ fn host_fs_timeout_error(op: &str, path: &Path) -> io::Error {
     )
 }
 
+type HostFsJob = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Clone)]
+struct HostFsOpPool {
+    tx: cb::Sender<HostFsJob>,
+    timeout: Duration,
+}
+
+impl HostFsOpPool {
+    fn new(worker_count: usize, timeout: Duration) -> Self {
+        let (tx, rx) = cb::bounded::<HostFsJob>(worker_count.saturating_mul(2).max(1));
+        for _ in 0..worker_count {
+            let rx = rx.clone();
+            std::thread::spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job();
+                }
+            });
+        }
+        Self { tx, timeout }
+    }
+
+    fn run<T, F>(&self, op: &str, path: &Path, f: F) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> io::Result<T> + Send + 'static,
+    {
+        let display_path = path.to_path_buf();
+        let (tx, rx) = cb::bounded(1);
+        let enqueue_started = Instant::now();
+        self.tx
+            .send_timeout(
+                Box::new(move || {
+                    let _ = tx.send(f());
+                }),
+                self.timeout,
+            )
+            .map_err(|err| match err {
+                cb::SendTimeoutError::Timeout(_) => host_fs_timeout_error(op, &display_path),
+                cb::SendTimeoutError::Disconnected(_) => io::Error::other(format!(
+                    "{op} worker pool disconnected for {}",
+                    display_path.display()
+                )),
+            })?;
+        let elapsed = enqueue_started.elapsed();
+        let remaining = self.timeout.checked_sub(elapsed).unwrap_or_default();
+        if remaining.is_zero() {
+            return Err(host_fs_timeout_error(op, &display_path));
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(cb::RecvTimeoutError::Timeout) => Err(host_fs_timeout_error(op, &display_path)),
+            Err(cb::RecvTimeoutError::Disconnected) => Err(io::Error::other(format!(
+                "{op} worker disconnected for {}",
+                display_path.display()
+            ))),
+        }
+    }
+}
+
 fn metadata_once_with_timeout(
+    host_fs_ops: &HostFsOpPool,
     host_fs: Arc<dyn HostFs>,
     path: PathBuf,
 ) -> io::Result<HostFsMetadata> {
     let display_path = path.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(host_fs.metadata(&path));
-    });
-    match rx.recv_timeout(host_fs_op_timeout()) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err(host_fs_timeout_error("metadata", &display_path))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(format!(
-            "metadata worker disconnected for {}",
-            display_path.display()
-        ))),
-    }
+    host_fs_ops.run("metadata", &display_path, move || host_fs.metadata(&path))
 }
 
 fn read_dir_once_with_timeout(
+    host_fs_ops: &HostFsOpPool,
     host_fs: Arc<dyn HostFs>,
     path: PathBuf,
 ) -> io::Result<Vec<HostFsDirEntry>> {
     let display_path = path.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(host_fs.read_dir(&path));
-    });
-    match rx.recv_timeout(host_fs_op_timeout()) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err(host_fs_timeout_error("read_dir", &display_path))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(format!(
-            "read_dir worker disconnected for {}",
-            display_path.display()
-        ))),
-    }
+    host_fs_ops.run("read_dir", &display_path, move || host_fs.read_dir(&path))
 }
 
-fn metadata_with_retry(host_fs: Arc<dyn HostFs>, path: &Path) -> io::Result<HostFsMetadata> {
+fn metadata_with_retry(
+    host_fs_ops: &HostFsOpPool,
+    host_fs: Arc<dyn HostFs>,
+    path: &Path,
+) -> io::Result<HostFsMetadata> {
     let mut last = None::<io::Error>;
     for attempt in 1..=HOST_FS_RETRY_ATTEMPTS {
-        match metadata_once_with_timeout(Arc::clone(&host_fs), path.to_path_buf()) {
+        match metadata_once_with_timeout(host_fs_ops, Arc::clone(&host_fs), path.to_path_buf()) {
             Ok(meta) => return Ok(meta),
             Err(err) if err.kind() == io::ErrorKind::TimedOut => return Err(err),
             Err(err)
@@ -440,10 +522,14 @@ fn metadata_with_retry(host_fs: Arc<dyn HostFs>, path: &Path) -> io::Result<Host
     Err(last.unwrap_or_else(|| io::Error::other("metadata retry exhausted")))
 }
 
-fn read_dir_with_retry(host_fs: Arc<dyn HostFs>, path: &Path) -> io::Result<Vec<HostFsDirEntry>> {
+fn read_dir_with_retry(
+    host_fs_ops: &HostFsOpPool,
+    host_fs: Arc<dyn HostFs>,
+    path: &Path,
+) -> io::Result<Vec<HostFsDirEntry>> {
     let mut last = None::<io::Error>;
     for attempt in 1..=HOST_FS_RETRY_ATTEMPTS {
-        match read_dir_once_with_timeout(Arc::clone(&host_fs), path.to_path_buf()) {
+        match read_dir_once_with_timeout(host_fs_ops, Arc::clone(&host_fs), path.to_path_buf()) {
             Ok(entries) => return Ok(entries),
             Err(err) if err.kind() == io::ErrorKind::TimedOut => return Err(err),
             Err(err)
@@ -466,6 +552,7 @@ pub struct ParallelScanner {
     max_scan_events: usize,
     node_id: NodeId,
     host_fs: Arc<dyn HostFs>,
+    host_fs_ops: HostFsOpPool,
     dir_state_cache: Arc<Mutex<HashMap<PathBuf, DirAuditState>>>,
     audit_round: Arc<AtomicU64>,
     deep_scan_interval_rounds: u64,
@@ -489,6 +576,7 @@ impl ParallelScanner {
             max_scan_events,
             node_id,
             host_fs,
+            host_fs_ops: HostFsOpPool::new(host_fs_op_workers(scan_workers), host_fs_op_timeout()),
             dir_state_cache: Arc::new(Mutex::new(HashMap::new())),
             audit_round: Arc::new(AtomicU64::new(0)),
             deep_scan_interval_rounds: deep_interval_rounds_from_env(),
@@ -620,7 +708,8 @@ impl ParallelScanner {
             self.root_path.join(path_str.trim_start_matches('/'))
         };
 
-        let meta = match metadata_with_retry(Arc::clone(&self.host_fs), &target) {
+        let meta = match metadata_with_retry(&self.host_fs_ops, Arc::clone(&self.host_fs), &target)
+        {
             Ok(meta) => meta,
             Err(err)
                 if err.kind() == io::ErrorKind::NotFound
@@ -756,6 +845,7 @@ impl ParallelScanner {
                     None
                 };
                 let host_fs = Arc::clone(&self.host_fs);
+                let host_fs_ops = self.host_fs_ops.clone();
                 std::thread::spawn(move || {
                     loop {
                         // Use recv_timeout instead of blocking recv to avoid deadlock.
@@ -785,7 +875,7 @@ impl ParallelScanner {
                                 }
 
                                 // Check symlink loop
-                                let identity = match metadata_with_retry(Arc::clone(&host_fs), &dir_path) {
+                                let identity = match metadata_with_retry(&host_fs_ops, Arc::clone(&host_fs), &dir_path) {
                                     Ok(meta) => {
                                         let id = (
                                             meta.dev.unwrap_or(0),
@@ -872,7 +962,7 @@ impl ParallelScanner {
                                         )
                                     };
 
-                                    let entries = match read_dir_with_retry(Arc::clone(&host_fs), &dir_path)
+                                    let entries = match read_dir_with_retry(&host_fs_ops, Arc::clone(&host_fs), &dir_path)
                                     {
                                         Ok(entries) => entries,
                                         Err(e) => {
@@ -936,7 +1026,7 @@ impl ParallelScanner {
 
                                         let entry_path = entry.path;
                                         let relative = watcher::make_relative(&entry_path, &root);
-                                        match metadata_with_retry(Arc::clone(&host_fs), &entry_path) {
+                                        match metadata_with_retry(&host_fs_ops, Arc::clone(&host_fs), &entry_path) {
                                             Ok(meta) => {
                                                 let mtime_us = to_epoch_us(meta.modified);
                                                 let ctime_us = to_epoch_us(meta.created);
@@ -1075,7 +1165,11 @@ impl ParallelScanner {
                 }
             }
 
-            let identity = match metadata_with_retry(Arc::clone(&self.host_fs), &dir_path) {
+            let identity = match metadata_with_retry(
+                &self.host_fs_ops,
+                Arc::clone(&self.host_fs),
+                &dir_path,
+            ) {
                 Ok(meta) => {
                     let id = (
                         meta.dev.unwrap_or(0),
@@ -1143,7 +1237,11 @@ impl ParallelScanner {
                     )
                 };
 
-                let entries = match read_dir_with_retry(Arc::clone(&self.host_fs), &dir_path) {
+                let entries = match read_dir_with_retry(
+                    &self.host_fs_ops,
+                    Arc::clone(&self.host_fs),
+                    &dir_path,
+                ) {
                     Ok(entries) => entries,
                     Err(e) => {
                         log::warn!("Skipping directory {:?}: read_dir failed: {}", dir_path, e);
@@ -1193,7 +1291,11 @@ impl ParallelScanner {
 
                     let entry_path = entry.path;
                     let relative = watcher::make_relative(&entry_path, &root);
-                    match metadata_with_retry(Arc::clone(&self.host_fs), &entry_path) {
+                    match metadata_with_retry(
+                        &self.host_fs_ops,
+                        Arc::clone(&self.host_fs),
+                        &entry_path,
+                    ) {
                         Ok(meta) => {
                             let mtime_us = to_epoch_us(meta.modified);
                             let ctime_us = to_epoch_us(meta.created);
@@ -1259,7 +1361,7 @@ impl ParallelScanner {
             records.push(rec);
         }
 
-        match read_dir_with_retry(Arc::clone(&self.host_fs), dir) {
+        match read_dir_with_retry(&self.host_fs_ops, Arc::clone(&self.host_fs), dir) {
             Ok(entries) => {
                 for entry in entries {
                     if entry.is_dir {
@@ -1277,7 +1379,7 @@ impl ParallelScanner {
 
     /// Stat a single path and produce a FileMetaRecord.
     fn stat_to_record(&self, path: &Path) -> Option<FileMetaRecord> {
-        let meta = match metadata_with_retry(Arc::clone(&self.host_fs), path) {
+        let meta = match metadata_with_retry(&self.host_fs_ops, Arc::clone(&self.host_fs), path) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!("Skipping path {:?}: metadata failed: {}", path, e);
@@ -1306,7 +1408,8 @@ impl ParallelScanner {
         let relative = watcher::make_relative_with_prefix(path, &self.root_path, &self.emit_prefix);
 
         let (parent_path, parent_mtime_us) = if let Some(parent) = path.parent() {
-            let parent_meta = metadata_with_retry(Arc::clone(&self.host_fs), parent).ok();
+            let parent_meta =
+                metadata_with_retry(&self.host_fs_ops, Arc::clone(&self.host_fs), parent).ok();
             let parent_mtime = parent_meta
                 .and_then(|m| m.modified)
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())

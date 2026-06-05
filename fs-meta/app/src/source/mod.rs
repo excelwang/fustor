@@ -3228,6 +3228,32 @@ impl FSMetaSource {
         }
     }
 
+    fn pending_manual_rescan_target_for_root(
+        manual_rescan_intents: &Arc<Mutex<HashMap<String, ManualRescanIntent>>>,
+        root_key: &str,
+    ) -> Option<u64> {
+        let intents = lock_or_recover(
+            manual_rescan_intents,
+            "source.root.manual_rescan_intents.pending_target",
+        );
+        intents
+            .get(root_key)
+            .and_then(|intent| (intent.requested > intent.completed).then_some(intent.requested))
+    }
+
+    fn mark_manual_rescan_intent_completed_up_to(
+        manual_rescan_intents: &Arc<Mutex<HashMap<String, ManualRescanIntent>>>,
+        root_key: &str,
+        completed_target: u64,
+    ) {
+        let mut intents = lock_or_recover(
+            manual_rescan_intents,
+            "source.root.manual_rescan_intents.mark_completed_up_to",
+        );
+        let entry = intents.entry(root_key.to_string()).or_default();
+        entry.completed = entry.completed.max(completed_target).min(entry.requested);
+    }
+
     /// Create a new source app with the given configuration.
     #[allow(dead_code)]
     pub fn new(config: SourceConfig, node_id: NodeId) -> Result<Self> {
@@ -3441,6 +3467,73 @@ impl FSMetaSource {
                     && task.finish_reason().is_none()
                     && !task.is_shutdown_requested()
             })
+    }
+
+    fn all_endpoint_task_routes_present_on_boundary(
+        &self,
+        route_keys: &BTreeSet<String>,
+        boundary: &Arc<dyn ChannelIoSubset>,
+        context: &str,
+    ) -> bool {
+        if route_keys.is_empty() {
+            return true;
+        }
+        let tasks = lock_or_recover(&self.endpoint_tasks, context);
+        route_keys.iter().all(|route_key| {
+            tasks.iter().any(|task| {
+                task.route_key() == route_key
+                    && task.belongs_to_boundary(boundary)
+                    && !task.is_finished()
+                    && task.finish_reason().is_none()
+                    && !task.is_shutdown_requested()
+            })
+        })
+    }
+
+    fn expected_runtime_endpoint_routes(&self) -> Result<BTreeSet<String>> {
+        let routes = source_find_route_bindings_for(&self.node_id.0);
+        let mut expected = BTreeSet::new();
+        if self.endpoint_runtime.owns_source_status_routes() {
+            if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+                && self.should_start_source_status_endpoint_for_route(&route.0)
+            {
+                expected.insert(route.0);
+            }
+            let scoped_status_route = source_status_request_route_for(&self.node_id.0);
+            if self.should_start_source_status_endpoint_for_route(&scoped_status_route.0) {
+                expected.insert(scoped_status_route.0);
+            }
+        }
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN) {
+            expected.insert(route.0);
+        }
+        if let Ok(route) =
+            routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN_CONTROL)
+        {
+            expected.insert(route.0);
+        }
+        if let Ok(route) = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_ROOTS_CONTROL)
+        {
+            expected.insert(route.0);
+        }
+        expected.insert(source_roots_control_stream_route_for(&self.node_id.0).0);
+        for route_key in self.active_source_rescan_request_routes()? {
+            expected.insert(route_key);
+        }
+        Ok(expected)
+    }
+
+    fn runtime_endpoints_current_on_boundary(
+        &self,
+        boundary: &Arc<dyn ChannelIoSubset>,
+    ) -> Result<bool> {
+        let expected = self.expected_runtime_endpoint_routes()?;
+        Ok(self.all_endpoint_task_routes_present_on_boundary(
+            &expected,
+            boundary,
+            "source.start_runtime_endpoints.fast_path",
+        ))
     }
 
     fn retire_endpoint_tasks_for_different_boundary(
@@ -4113,12 +4206,15 @@ impl FSMetaSource {
         &self,
         boundary: Arc<dyn ChannelIoSubset>,
     ) -> Result<()> {
+        self.start_manual_rescan_watch().await?;
+        if self.runtime_endpoints_current_on_boundary(&boundary)? {
+            return Ok(());
+        }
         self.prune_finished_endpoint_tasks("source.start_runtime_endpoints.prune");
         self.retire_endpoint_tasks_for_different_boundary(
             &boundary,
             "source.start_runtime_endpoints.retire_stale_boundary",
         );
-        self.start_manual_rescan_watch().await?;
 
         let rescan_roots = self.state_cell.roots_handle();
         let rescan_root_tasks = self.state_cell.root_tasks.clone();
@@ -6584,6 +6680,7 @@ impl FSMetaSource {
             let mut periodic_first_tick_discarded = !periodic_channel_open;
             let mut watch_channel_open = watch_handle.is_some();
             let mut last_manual_dispatch_target = 0_u64;
+            let mut initial_scan_satisfies_manual_target = None::<u64>;
             let mut first_loop_state_logged = false;
             if periodic_channel_open {
                 audit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -6700,6 +6797,12 @@ impl FSMetaSource {
                         let wm = Self::current_watch_manager(&initial_watch_slot);
                         let scan_sender = initial_scan_tx.clone();
                         let done_tx = audit_done_tx.clone();
+                        let pending_manual_target =
+                            Self::pending_manual_rescan_target_for_root(
+                                &manual_rescan_intents,
+                                &root_key,
+                            );
+                        initial_scan_satisfies_manual_target = pending_manual_target;
                         tokio::spawn(async move {
                             let scan_result = tokio::task::spawn_blocking(move || {
                                 let mut c = lock_or_recover(&cache, "source.root.scan_audit.mtime_cache");
@@ -6751,6 +6854,16 @@ impl FSMetaSource {
                                     if matches!(completion.kind, RootAuditKind::Initial) {
                                         initial_scan_pending = false;
                                         initial_scan_inflight = false;
+                                        if let Some(target) = initial_scan_satisfies_manual_target.take() {
+                                            Self::mark_manual_rescan_intent_completed_up_to(
+                                                &manual_rescan_intents,
+                                                &root_key,
+                                                target,
+                                            );
+                                            if target >= last_manual_dispatch_target {
+                                                last_manual_dispatch_target = target;
+                                            }
+                                        }
                                     }
                                     if let Some(target) = completion.manual_requested_target {
                                         let mut intents = lock_or_recover(

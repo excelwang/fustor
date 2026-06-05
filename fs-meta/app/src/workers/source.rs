@@ -16,10 +16,11 @@ use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::query::request::InternalQueryRequest;
+use crate::runtime::execution_units;
 use crate::runtime::orchestration::{
     SourceControlSignal, SourceRuntimeUnit, source_control_signals_from_envelopes,
 };
-use crate::runtime::routes::{ROUTE_KEY_EVENTS, source_rescan_route_key_for};
+use crate::runtime::routes::{events_stream_route_for_scope, source_rescan_route_key_for};
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
 use crate::source::{FSMetaSource, SourceStatusSnapshot, SourceTargetedRescanDeliveryAcceptance};
 use crate::workers::sink::SinkFacade;
@@ -11623,6 +11624,7 @@ async fn run_local_source_pump(
     stream: std::pin::Pin<Box<dyn futures_core::Stream<Item = Vec<Event>> + Send>>,
     sink: Arc<SinkFacade>,
     boundary: Option<Arc<dyn ChannelIoSubset>>,
+    event_route_scope: String,
 ) {
     if let Some(boundary) = boundary {
         tokio::pin!(stream);
@@ -11633,9 +11635,11 @@ async fn run_local_source_pump(
                 .unwrap_or_else(|| "__empty__".to_string());
             if let Err(err) = boundary
                 .channel_send(
-                    BoundaryContext::default(),
+                    BoundaryContext::for_unit(execution_units::SOURCE_RUNTIME_UNIT_ID),
                     ChannelSendRequest {
-                        channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+                        channel_key: ChannelKey(
+                            events_stream_route_for_scope(&event_route_scope).0,
+                        ),
                         events: batch,
                         timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
                     },
@@ -11668,6 +11672,7 @@ fn spawn_local_source_pump(
     sink: Arc<SinkFacade>,
     boundary: Option<Arc<dyn ChannelIoSubset>>,
 ) -> std::result::Result<SourcePumpHandle, SourceFailure> {
+    let event_route_scope = source.node_id().0;
     let shutdown = CancellationToken::new();
     let task_shutdown = shutdown.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -11687,7 +11692,7 @@ fn spawn_local_source_pump(
                 let _ = ready_tx.send(Ok(()));
                 tokio::select! {
                     _ = task_shutdown.cancelled() => {}
-                    _ = run_local_source_pump(stream, sink, boundary) => {}
+                    _ = run_local_source_pump(stream, sink, boundary, event_route_scope) => {}
                 }
             })
     });

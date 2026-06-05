@@ -1846,10 +1846,12 @@ async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
         }
 
         handler(events).await;
-        eprintln!(
-            "fs_meta_runtime_endpoint: stream loop handler returned route={} task={}",
-            stream_channel.0, join_name
-        );
+        if debug_stream_delivery_enabled() {
+            eprintln!(
+                "fs_meta_runtime_endpoint: stream loop handler returned route={} task={}",
+                stream_channel.0, join_name
+            );
+        }
     }
 
     if terminal_reason

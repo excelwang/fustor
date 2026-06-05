@@ -82,6 +82,26 @@ impl ApiAuthConfig {
         } else {
             None
         };
+        self.ensure_parent_dirs()?;
+        if let Some(bootstrap) = bootstrap {
+            self.write_bootstrap_login_files(bootstrap)?;
+        }
+        self.ensure_query_keys_materialized()
+    }
+
+    pub fn materialize_bootstrap_management(&self) -> Result<(), String> {
+        let Some(bootstrap) = &self.bootstrap_management else {
+            return Err(
+                "api.auth.bootstrap_management is required to materialize login files".into(),
+            );
+        };
+        bootstrap.validate()?;
+        self.ensure_parent_dirs()?;
+        self.write_bootstrap_login_files(bootstrap)?;
+        self.ensure_query_keys_materialized()
+    }
+
+    fn ensure_parent_dirs(&self) -> Result<(), String> {
         if let Some(parent) = self.passwd_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -104,31 +124,35 @@ impl ApiAuthConfig {
                 )
             })?;
         }
-        if let Some(bootstrap) = bootstrap {
-            let passwd = format!(
-                "{}:{}:{}:{}:{}:{}:0\n",
-                bootstrap.username,
-                bootstrap.uid,
-                bootstrap.gid,
-                self.management_group,
-                bootstrap.home,
-                bootstrap.shell,
-            );
-            let shadow = format!("{}:plain${}:0\n", bootstrap.username, bootstrap.password);
-            std::fs::write(&self.passwd_path, passwd).map_err(|e| {
-                format!(
-                    "write passwd file {} failed: {e}",
-                    self.passwd_path.display()
-                )
-            })?;
-            std::fs::write(&self.shadow_path, shadow).map_err(|e| {
-                format!(
-                    "write shadow file {} failed: {e}",
-                    self.shadow_path.display()
-                )
-            })?;
-        }
-        self.ensure_query_keys_materialized()
+        Ok(())
+    }
+
+    fn write_bootstrap_login_files(
+        &self,
+        bootstrap: &BootstrapManagementConfig,
+    ) -> Result<(), String> {
+        let passwd = format!(
+            "{}:{}:{}:{}:{}:{}:0\n",
+            bootstrap.username,
+            bootstrap.uid,
+            bootstrap.gid,
+            self.management_group,
+            bootstrap.home,
+            bootstrap.shell,
+        );
+        let shadow = format!("{}:plain${}:0\n", bootstrap.username, bootstrap.password);
+        std::fs::write(&self.passwd_path, passwd).map_err(|e| {
+            format!(
+                "write passwd file {} failed: {e}",
+                self.passwd_path.display()
+            )
+        })?;
+        std::fs::write(&self.shadow_path, shadow).map_err(|e| {
+            format!(
+                "write shadow file {} failed: {e}",
+                self.shadow_path.display()
+            )
+        })
     }
 
     fn ensure_query_keys_materialized(&self) -> Result<(), String> {
@@ -154,6 +178,54 @@ impl Default for BootstrapManagementConfig {
             home: "/home/fsmeta-admin".to_string(),
             shell: "/bin/bash".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("fsmeta-api-config-{name}-{nanos}"))
+    }
+
+    fn auth_config(dir: &std::path::Path, password: &str) -> ApiAuthConfig {
+        ApiAuthConfig {
+            passwd_path: dir.join("fs-meta.passwd"),
+            shadow_path: dir.join("fs-meta.shadow"),
+            query_keys_path: dir.join("fs-meta.query-keys.json"),
+            session_ttl_secs: 3600,
+            management_group: "fsmeta_management".to_string(),
+            bootstrap_management: Some(BootstrapManagementConfig {
+                username: "admin".to_string(),
+                password: password.to_string(),
+                uid: 1000,
+                gid: 1000,
+                home: "/home/admin".to_string(),
+                shell: "/bin/bash".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn force_materialize_bootstrap_management_overwrites_stale_login_files() {
+        let dir = unique_temp_dir("force-bootstrap");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let old = auth_config(&dir, "old-password");
+        old.ensure_materialized().expect("initial materialize");
+
+        let new = auth_config(&dir, "new-password");
+        new.materialize_bootstrap_management()
+            .expect("force materialize");
+
+        let shadow = std::fs::read_to_string(dir.join("fs-meta.shadow")).expect("read shadow");
+        assert_eq!(shadow, "admin:plain$new-password:0\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

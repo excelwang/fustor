@@ -423,6 +423,129 @@ fn sink_snapshot_statecell_write_disables_revision_retention() {
     assert_eq!(decoded.scope, SINK_RUNTIME_UNIT_ID);
 }
 
+#[tokio::test]
+async fn sink_data_batches_do_not_persist_full_tree_snapshot_until_checkpoint() {
+    let recording = Arc::new(RecordingStateBoundary::new());
+    let state_boundary: Arc<dyn StateBoundary> = recording.clone();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::exp",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let sink = SinkFileMeta::with_boundaries_and_state(
+        NodeId("node-a".to_string()),
+        None,
+        state_boundary,
+        cfg,
+    )
+    .expect("build sink");
+
+    sink.send(&[
+        mk_source_event(
+            "node-a::exp",
+            mk_record(b"/a.txt", "a.txt", 1, EventKind::Update),
+        ),
+        mk_source_event(
+            "node-a::exp",
+            mk_record(b"/b.txt", "b.txt", 2, EventKind::Update),
+        ),
+    ])
+    .await
+    .expect("apply first data batch");
+    sink.send(&[mk_source_event(
+        "node-a::exp",
+        mk_record(b"/c.txt", "c.txt", 3, EventKind::Update),
+    )])
+    .await
+    .expect("apply second data batch");
+
+    let sink_snapshot_writes = || {
+        recording
+            .writes()
+            .into_iter()
+            .filter(|request| request.handle == sink_state_handle(SINK_RUNTIME_UNIT_ID))
+            .count()
+    };
+    assert_eq!(
+        sink_snapshot_writes(),
+        0,
+        "ordinary data batches must not serialize the full sink tree into statecell on every batch"
+    );
+
+    sink.send(&[mk_control_event(
+        "node-a::exp",
+        ControlEvent::EpochEnd {
+            epoch_id: 0,
+            epoch_type: EpochType::Audit,
+        },
+        4,
+    )])
+    .await
+    .expect("apply control batch");
+
+    assert_eq!(
+        sink_snapshot_writes(),
+        1,
+        "control events must still force a sink tree checkpoint for restart recovery"
+    );
+}
+
+#[tokio::test]
+async fn sink_runtime_group_reconcile_does_not_persist_full_tree_snapshot() {
+    let recording = Arc::new(RecordingStateBoundary::new());
+    let state_boundary: Arc<dyn StateBoundary> = recording.clone();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::exp",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let sink = SinkFileMeta::with_boundaries_and_state(
+        NodeId("node-a".to_string()),
+        None,
+        state_boundary,
+        cfg,
+    )
+    .expect("build sink");
+
+    sink.send(&[mk_source_event(
+        "node-a::exp",
+        mk_record(b"/a.txt", "a.txt", 1, EventKind::Update),
+    )])
+    .await
+    .expect("seed materialized sink tree");
+
+    let events_route = crate::runtime::routes::events_stream_route_for_scope("node-a").0;
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: events_route,
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-a::exp"])],
+        },
+    ))
+    .expect("encode sink events activate")])
+        .await
+        .expect("apply runtime route activate");
+
+    assert!(
+        recording
+            .writes()
+            .into_iter()
+            .all(|request| request.handle != sink_state_handle(SINK_RUNTIME_UNIT_ID)),
+        "route/grant runtime reconcile must not serialize the full sink tree into statecell; checkpoints are reserved for recovery boundaries"
+    );
+}
+
 fn finished_endpoint_task_for_test(route_key: &str) -> ManagedEndpointTask {
     let shutdown = CancellationToken::new();
     shutdown.cancel();
@@ -531,6 +654,47 @@ async fn start_runtime_endpoints_restarts_after_finished_endpoint_task() {
     assert!(
         endpoint_count > 1,
         "sink runtime start must prune terminal endpoint tasks and restart endpoints instead of treating any non-empty task list as already-started"
+    );
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn start_runtime_endpoints_fast_path_keeps_existing_boundary_tasks() {
+    let sink = build_single_group_sink();
+    let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+    let node_id = NodeId("node-a".to_string());
+
+    sink.start_runtime_endpoints(boundary.clone(), node_id.clone())
+        .expect("start runtime endpoints");
+    let boundary_dyn: Arc<dyn ChannelIoSubset> = boundary.clone();
+    assert!(
+        sink.runtime_endpoints_current_on_boundary(&boundary_dyn, &node_id),
+        "same-boundary endpoint set must be recognized as current"
+    );
+    let before_count = lock_or_recover(
+        &sink.endpoint_tasks,
+        "test.sink.fast_path.endpoint_tasks.before",
+    )
+    .len();
+
+    sink.start_runtime_endpoints(boundary.clone(), node_id.clone())
+        .expect("repeat runtime endpoints");
+
+    let after_count = lock_or_recover(
+        &sink.endpoint_tasks,
+        "test.sink.fast_path.endpoint_tasks.after",
+    )
+    .len();
+    assert_eq!(
+        after_count, before_count,
+        "same-boundary runtime endpoint ensure must not spawn duplicate tasks"
+    );
+    let other_boundary: Arc<dyn ChannelIoSubset> =
+        Arc::new(RouteCountingTimeoutBoundary::default());
+    assert!(
+        !sink.runtime_endpoints_current_on_boundary(&other_boundary, &node_id),
+        "a different runtime boundary must still force endpoint rebinding"
     );
 
     sink.close().await.expect("close sink");
@@ -691,7 +855,7 @@ async fn events_stream_stays_gated_until_route_activation() {
     sink.start_runtime_endpoints(boundary.clone(), NodeId("node-a".to_string()))
         .expect("start runtime endpoints");
 
-    let events_route = format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS);
+    let events_route = crate::runtime::routes::events_stream_route_for_scope("node-a").0;
     let pre_activation_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     while tokio::time::Instant::now() < pre_activation_deadline {
         let recv = boundary.recv_count(&events_route);
@@ -740,7 +904,7 @@ async fn start_runtime_endpoints_rebinds_events_stream_on_new_boundary_after_cut
     let sink = build_single_group_sink();
     let old_boundary = Arc::new(RouteCountingTimeoutBoundary::default());
     let current_boundary = Arc::new(RouteCountingTimeoutBoundary::default());
-    let events_route = format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS);
+    let events_route = crate::runtime::routes::events_stream_route_for_scope("node-a").0;
 
     sink.start_runtime_endpoints(old_boundary.clone(), NodeId("node-a".to_string()))
         .expect("start sink endpoints on old boundary");
@@ -1253,6 +1417,22 @@ async fn scheduled_root_id_stream_events_materialize_ready_state_without_host_gr
     .expect("scheduled root-id stream events should apply");
 
     let snapshot = sink.status_snapshot().expect("sink status");
+    assert_eq!(
+        snapshot
+            .stream_applied_control_events_by_node
+            .get("node-a")
+            .copied(),
+        Some(4),
+        "stream stats must keep epoch control counts after single-pass sink payload decode"
+    );
+    assert_eq!(
+        snapshot
+            .stream_applied_data_events_by_node
+            .get("node-a")
+            .copied(),
+        Some(4),
+        "stream stats must keep file record counts after single-pass sink payload decode"
+    );
     let ready_groups = snapshot
         .groups
         .iter()
@@ -1264,6 +1444,22 @@ async fn scheduled_root_id_stream_events_materialize_ready_state_without_host_gr
         std::collections::BTreeSet::from(["nfs1", "nfs2"]),
         "scheduled root-id stream events must materialize ready state even when host grants are temporarily absent: {snapshot:?}"
     );
+}
+
+#[test]
+fn sink_event_payload_decode_prefers_file_meta_record_for_data_events() {
+    let record = mk_record(b"/hot-path.txt", "hot-path.txt", 1, EventKind::Update);
+    let payload = rmp_serde::to_vec_named(&record).expect("encode file-meta record");
+
+    match decode_sink_event_payload(&payload).expect("decode sink event payload") {
+        DecodedSinkEventPayload::Record(decoded) => {
+            assert_eq!(decoded.path, record.path);
+            assert_eq!(decoded.file_name, record.file_name);
+        }
+        DecodedSinkEventPayload::Control(control) => {
+            panic!("file-meta data event must not be classified as control: {control:?}")
+        }
+    }
 }
 
 #[tokio::test]

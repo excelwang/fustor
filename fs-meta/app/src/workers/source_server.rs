@@ -20,7 +20,9 @@ use tokio::task::JoinHandle;
 
 use crate::FileMetaRecord;
 use crate::query::path::is_under_query_path;
+use crate::runtime::execution_units;
 use crate::runtime::orchestration::{SourceControlSignal, source_control_signals_from_envelopes};
+use crate::runtime::routes::events_stream_route_for_scope;
 use crate::source::config::SourceConfig;
 use crate::source::{FSMetaSource, SourceTargetedRescanDeliveryAcceptance};
 use crate::workers::source::SourceFailure;
@@ -32,7 +34,6 @@ use crate::workers::source::{
 };
 use crate::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
 
-const ROUTE_KEY_EVENTS: &str = "fs-meta.events:v1";
 const SOURCE_WORKER_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SOURCE_WORKER_STOP_ABORT_TIMEOUT: Duration = Duration::from_millis(250);
 const SOURCE_WORKER_BOOTSTRAP_STATECELL_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -619,6 +620,7 @@ fn start_source_pump_with_stream<S>(
     boundary: Arc<StdMutex<Arc<dyn ChannelIoSubset>>>,
     published_stats: Arc<StdMutex<PublishedBatchStats>>,
     source: Option<Arc<FSMetaSource>>,
+    event_route_scope: String,
 ) -> JoinHandle<()>
 where
     S: futures_util::Stream<Item = Vec<Event>> + Send + 'static,
@@ -650,7 +652,10 @@ where
                     summarize_published_batch_path_counts(&batch, &target),
                 );
             }
-            if let Err(err) = publish_event_stream_batch(boundary.clone(), &batch, &origin).await {
+            if let Err(err) =
+                publish_event_stream_batch(boundary.clone(), &batch, &origin, &event_route_scope)
+                    .await
+            {
                 log::error!(
                     "source worker pump failed to publish source event stream origin={}: {:?}",
                     origin,
@@ -677,6 +682,7 @@ async fn publish_event_stream_batch(
     boundary: Arc<StdMutex<Arc<dyn ChannelIoSubset>>>,
     batch: &[Event],
     origin: &str,
+    event_route_scope: &str,
 ) -> Result<()> {
     let mut pending = std::collections::VecDeque::from([batch.to_vec()]);
     while let Some(window) = pending.pop_front() {
@@ -686,9 +692,9 @@ async fn publish_event_stream_batch(
             let target = clone_pump_boundary_target(&boundary);
             match target
                 .channel_send(
-                    BoundaryContext::default(),
+                    BoundaryContext::for_unit(execution_units::SOURCE_RUNTIME_UNIT_ID),
                     ChannelSendRequest {
-                        channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+                        channel_key: ChannelKey(events_stream_route_for_scope(event_route_scope).0),
                         events: window.clone(),
                         timeout_ms: Some(
                             SOURCE_WORKER_EVENT_STREAM_SEND_TIMEOUT.as_millis() as u64,
@@ -940,11 +946,13 @@ async fn bootstrap_start_source_runtime_with_failure(
         eprintln!("fs_meta_source_worker_server: bootstrap_start pub begin");
         let stream = source.pub_stream_with_failure().await?;
         eprintln!("fs_meta_source_worker_server: bootstrap_start pub ok");
+        let event_route_scope = source.node_id().0;
         state.pump_task = Some(start_source_pump_with_stream(
             stream,
             runtime_boundary,
             state.published_stats.clone(),
             Some(source),
+            event_route_scope,
         ));
         eprintln!("fs_meta_source_worker_server: bootstrap_start pump ok");
     }
@@ -1863,6 +1871,7 @@ mod tests {
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     struct SentBatchSummary {
         route: String,
+        unit_id: Option<String>,
         origins: std::collections::BTreeMap<String, u64>,
         control_events: u64,
         data_events: u64,
@@ -1878,6 +1887,7 @@ mod tests {
         capacity: usize,
         sent_lengths: StdMutex<Vec<usize>>,
         sent_payloads: StdMutex<Vec<String>>,
+        sent_unit_ids: StdMutex<Vec<Option<String>>>,
     }
 
     #[derive(Default)]
@@ -1937,6 +1947,7 @@ mod tests {
                 capacity,
                 sent_lengths: StdMutex::new(Vec::new()),
                 sent_payloads: StdMutex::new(Vec::new()),
+                sent_unit_ids: StdMutex::new(Vec::new()),
             }
         }
 
@@ -1951,6 +1962,13 @@ mod tests {
             self.sent_payloads
                 .lock()
                 .expect("capacity boundary sent_payloads lock")
+                .clone()
+        }
+
+        fn sent_unit_ids(&self) -> Vec<Option<String>> {
+            self.sent_unit_ids
+                .lock()
+                .expect("capacity boundary sent_unit_ids lock")
                 .clone()
         }
     }
@@ -1987,7 +2005,7 @@ mod tests {
 
         async fn channel_send(
             &self,
-            _ctx: BoundaryContext,
+            ctx: BoundaryContext,
             request: ChannelSendRequest,
         ) -> Result<()> {
             let mut origins = std::collections::BTreeMap::<String, u64>::new();
@@ -2008,6 +2026,7 @@ mod tests {
                 .expect("channel_send sent_batches lock")
                 .push(SentBatchSummary {
                     route: request.channel_key.0,
+                    unit_id: ctx.unit_id,
                     origins,
                     control_events,
                     data_events,
@@ -2020,7 +2039,7 @@ mod tests {
     impl ChannelIoSubset for CapacityBackpressureBoundary {
         async fn channel_send(
             &self,
-            _ctx: BoundaryContext,
+            ctx: BoundaryContext,
             request: ChannelSendRequest,
         ) -> Result<()> {
             if request.events.len() > self.capacity {
@@ -2039,6 +2058,10 @@ mod tests {
                         .iter()
                         .map(|event| String::from_utf8_lossy(event.payload_bytes()).to_string()),
                 );
+            self.sent_unit_ids
+                .lock()
+                .expect("capacity boundary sent_unit_ids lock")
+                .push(ctx.unit_id);
             Ok(())
         }
     }
@@ -2124,6 +2147,7 @@ mod tests {
             Arc::new(StdMutex::new(target)),
             published_stats,
             None,
+            "node-a".to_string(),
         );
 
         match tokio::time::timeout(Duration::from_millis(500), &mut handle).await {
@@ -2149,6 +2173,13 @@ mod tests {
                 "record-4".to_string(),
             ],
             "source pump must preserve event order while splitting oversized publication batches"
+        );
+        assert!(
+            boundary
+                .sent_unit_ids()
+                .iter()
+                .all(|unit_id| unit_id.as_deref() == Some(SOURCE_RUNTIME_UNIT_ID)),
+            "source pump must publish events through the source runtime unit lane"
         );
     }
 
@@ -2786,7 +2817,7 @@ mod tests {
         );
         run_deferred_after_reply_for_test(deferred_after_reply);
 
-        let event_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+        let event_route = events_stream_route_for_scope("node-c-local-sink-status-helper").0;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let origin_counts = boundary.sent_origin_counts_for_route(&event_route);
@@ -2956,7 +2987,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        let event_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+        let event_route = events_stream_route_for_scope("node-c-local-targeted-rescan").0;
         let data_events_before_submit = boundary.sent_data_events_for_route(&event_route);
         let (response, stop, deferred_after_reply) = execute_worker_action(plan_worker_request(
             SourceWorkerRequest::SubmitTargetedRescanRequestEpoch,
@@ -3139,7 +3170,7 @@ mod tests {
         );
         run_deferred_after_reply_for_test(deferred_after_reply);
 
-        let event_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+        let event_route = events_stream_route_for_scope("node-c-local-sink-status-helper").0;
         let baseline_target = b"/data";
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut counts = std::collections::BTreeMap::<String, usize>::new();
@@ -4759,7 +4790,7 @@ mod tests {
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
 
-        let event_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+        let event_route = events_stream_route_for_scope("node-a-bootstrap-publish-rebind").0;
         let first_boundary = Arc::new(PublishCaptureBoundary::default());
         bootstrap_start_source_runtime(
             &mut state,

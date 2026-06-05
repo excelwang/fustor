@@ -45,8 +45,8 @@ fn stream_route_key(base: &str) -> RouteKey {
     RouteKey(format!("{base}.stream"))
 }
 
-fn scoped_internal_route_key(base: &str, node_id: &str) -> String {
-    let suffix: String = node_id
+fn route_scope_suffix(value: &str) -> String {
+    value
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() {
@@ -55,11 +55,47 @@ fn scoped_internal_route_key(base: &str, node_id: &str) -> String {
                 "_".chars().next().unwrap()
             }
         })
-        .collect();
+        .collect()
+}
+
+fn scoped_internal_route_key(base: &str, node_id: &str) -> String {
+    let suffix = route_scope_suffix(node_id);
     match base.rsplit_once(':') {
         Some((stem, version)) => format!("{stem}.{suffix}:{version}"),
         None => format!("{base}.{suffix}"),
     }
+}
+
+pub fn events_route_key_for(object_ref: &str) -> String {
+    scoped_internal_route_key(ROUTE_KEY_EVENTS, object_ref)
+}
+
+pub fn events_stream_route_for(object_ref: &str) -> RouteKey {
+    stream_route_key(&events_route_key_for(object_ref))
+}
+
+pub fn events_route_key_for_scope(scope: &str) -> String {
+    scoped_internal_route_key(ROUTE_KEY_EVENTS, scope)
+}
+
+pub fn events_stream_route_for_scope(scope: &str) -> RouteKey {
+    stream_route_key(&events_route_key_for_scope(scope))
+}
+
+pub fn is_events_stream_route_key(route_key: &str) -> bool {
+    let Some(base) = route_key.strip_suffix(".stream") else {
+        return false;
+    };
+    if base == ROUTE_KEY_EVENTS {
+        return true;
+    }
+    let Some((events_stem, events_version)) = ROUTE_KEY_EVENTS.rsplit_once(':') else {
+        return base.starts_with(&format!("{ROUTE_KEY_EVENTS}."));
+    };
+    let Some((route_stem, route_version)) = base.rsplit_once(':') else {
+        return false;
+    };
+    route_version == events_version && route_stem.starts_with(&format!("{events_stem}."))
 }
 
 pub fn source_rescan_route_key_for(node_id: &str) -> String {
@@ -278,6 +314,27 @@ pub fn sink_status_route_bindings_for(node_id: &str) -> Arc<PostBindDispatchTabl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_stream_route_for_scope_builds_stable_node_lane() {
+        assert_eq!(
+            events_stream_route_for_scope("Panda-144::NFS-144").0,
+            "fs-meta.events.panda_144__nfs_144:v1.stream",
+            "events route scope suffix must be stable and route-key safe"
+        );
+    }
+
+    #[test]
+    fn is_events_stream_route_key_accepts_legacy_and_scoped_events_streams_only() {
+        assert!(is_events_stream_route_key("fs-meta.events:v1.stream"));
+        assert!(is_events_stream_route_key(
+            &events_stream_route_for_scope("node-a").0
+        ));
+        assert!(!is_events_stream_route_key("fs-meta.events.node-a:v1.req"));
+        assert!(!is_events_stream_route_key(
+            "fs-meta.internal.facade-control:v1.stream"
+        ));
+    }
 
     #[test]
     fn source_find_route_bindings_bind_scoped_source_roots_control_for_known_node() {

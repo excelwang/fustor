@@ -670,17 +670,8 @@ pub fn get_health_stats(tree: &MaterializedTree, clock: &SinkClock) -> HealthSta
     stats.live_nodes = subtree.total_nodes;
     stats.attested_count = subtree.attested_count;
     stats.blind_spot_count = subtree.blind_spot_count;
-
-    for (_path, node) in tree.iter() {
-        if node.is_tombstoned {
-            stats.tombstoned_count += 1;
-            continue;
-        }
-        if node.is_currently_suspect() {
-            stats.suspect_count += 1;
-        }
-    }
-
+    stats.tombstoned_count = tree.tombstoned_count();
+    stats.suspect_count = tree.current_suspect_count(std::time::Instant::now());
     stats.shadow_time_us = clock.now_us();
     stats
 }

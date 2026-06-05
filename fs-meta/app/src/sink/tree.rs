@@ -6,7 +6,7 @@
 //! the stored node so `/tree`, `/stats`, and PIT creation can read it directly.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
@@ -120,6 +120,11 @@ pub struct MaterializedTree {
     nodes: Vec<Option<TreeNode>>,
     path_index: HashMap<SharedPath, NodeId>,
     meta_count: usize,
+    path_bytes: u64,
+    tombstoned_count: usize,
+    suspect_until_by_path: HashMap<SharedPath, Instant>,
+    suspect_paths_by_expiry: BTreeMap<Instant, Vec<SharedPath>>,
+    suspect_count: usize,
 }
 
 struct TreeIter<'a> {
@@ -183,6 +188,11 @@ impl MaterializedTree {
             })],
             path_index: HashMap::from([(root_path, 0)]),
             meta_count: 0,
+            path_bytes: 1,
+            tombstoned_count: 0,
+            suspect_until_by_path: HashMap::new(),
+            suspect_paths_by_expiry: BTreeMap::new(),
+            suspect_count: 0,
         }
     }
 
@@ -202,7 +212,12 @@ impl MaterializedTree {
 
     pub fn insert(&mut self, path: Vec<u8>, node: FileMetaNode) {
         let id = self.ensure_path_node(&path);
-        let had_meta = self.node(id).is_some_and(|node| node.meta.is_some());
+        let before = self.node(id).and_then(|node| node.meta.clone());
+        let path = match self.node(id).map(|node| node.path.clone()) {
+            Some(path) => path,
+            None => return,
+        };
+        let had_meta = before.is_some();
         if let Some(target) = self.node_mut(id) {
             target.meta = Some(node);
         } else {
@@ -211,13 +226,17 @@ impl MaterializedTree {
         if !had_meta {
             self.meta_count += 1;
         }
+        let after = self.node(id).and_then(|node| node.meta.clone());
+        self.refresh_node_health_indexes(path, before.as_ref(), after.as_ref());
         self.refresh_aggregate_chain(id);
     }
 
     pub fn remove(&mut self, path: &[u8]) -> Option<FileMetaNode> {
         let id = self.lookup_id(path)?;
+        let path = self.node(id)?.path.clone();
         let removed = self.node_mut(id)?.meta.take()?;
         self.meta_count = self.meta_count.saturating_sub(1);
+        self.refresh_node_health_indexes(path, Some(&removed), None);
         let refresh_from = self.node(id).and_then(|node| {
             if node.children.is_empty() {
                 node.parent
@@ -238,10 +257,14 @@ impl MaterializedTree {
         update: impl FnOnce(&mut FileMetaNode) -> R,
     ) -> Option<R> {
         let id = self.lookup_id(path)?;
+        let path = self.node(id)?.path.clone();
+        let before = self.node(id)?.meta.clone()?;
         let result = {
             let meta = self.node_mut(id)?.meta.as_mut()?;
             update(meta)
         };
+        let after = self.node(id).and_then(|node| node.meta.clone());
+        self.refresh_node_health_indexes(path, Some(&before), after.as_ref());
         self.refresh_aggregate_chain(id);
         Some(result)
     }
@@ -268,33 +291,57 @@ impl MaterializedTree {
         self.meta_count
     }
 
+    pub fn tombstoned_count(&self) -> u64 {
+        self.tombstoned_count as u64
+    }
+
+    pub fn current_suspect_count(&self, now: Instant) -> u64 {
+        let expired = self
+            .suspect_paths_by_expiry
+            .range(..=now)
+            .map(|(_, paths)| paths.len())
+            .sum::<usize>();
+        self.suspect_count.saturating_sub(expired) as u64
+    }
+
+    pub fn prune_expired_suspects(&mut self, now: Instant) {
+        let expired_keys = self
+            .suspect_paths_by_expiry
+            .range(..=now)
+            .map(|(expiry, _)| *expiry)
+            .collect::<Vec<_>>();
+        for expiry in expired_keys {
+            let Some(paths) = self.suspect_paths_by_expiry.remove(&expiry) else {
+                continue;
+            };
+            for path in paths {
+                if self
+                    .suspect_until_by_path
+                    .get(path.as_ref())
+                    .is_some_and(|current| *current == expiry)
+                {
+                    self.suspect_until_by_path.remove(path.as_ref());
+                    self.suspect_count = self.suspect_count.saturating_sub(1);
+                }
+            }
+        }
+    }
+
     pub fn estimated_heap_bytes(&self) -> u64 {
-        let node_bytes = self
-            .nodes
-            .iter()
-            .filter_map(|node| node.as_ref())
-            .map(|node| {
-                let meta_bytes = node
-                    .meta
-                    .as_ref()
-                    .map(|_| size_of::<FileMetaNode>())
-                    .unwrap_or(0);
-                (size_of::<TreeNode>()
-                    + node.children.capacity() * size_of::<NodeId>()
-                    + meta_bytes) as u64
-            })
-            .sum::<u64>();
-        let index_bytes =
-            self.path_index
-                .len()
-                .saturating_mul(size_of::<SharedPath>() + size_of::<NodeId>()) as u64;
-        let shared_path_bytes = self
-            .nodes
-            .iter()
-            .filter_map(|node| node.as_ref())
-            .map(|node| node.path.len() as u64)
-            .sum::<u64>();
-        node_bytes + index_bytes + shared_path_bytes
+        let active_tree_nodes = self.path_index.len() as u64;
+        let meta_nodes = self.meta_count as u64;
+        let tree_node_bytes = active_tree_nodes.saturating_mul(size_of::<TreeNode>() as u64);
+        let meta_bytes = meta_nodes.saturating_mul(size_of::<FileMetaNode>() as u64);
+        let child_link_bytes = active_tree_nodes
+            .saturating_sub(1)
+            .saturating_mul(size_of::<NodeId>() as u64);
+        let index_bytes = active_tree_nodes
+            .saturating_mul((size_of::<SharedPath>() + size_of::<NodeId>()) as u64);
+        tree_node_bytes
+            .saturating_add(meta_bytes)
+            .saturating_add(child_link_bytes)
+            .saturating_add(index_bytes)
+            .saturating_add(self.path_bytes)
     }
 
     #[cfg(test)]
@@ -440,6 +487,7 @@ impl MaterializedTree {
             meta: None,
             aggregate: DirAggregate::default(),
         }));
+        self.path_bytes = self.path_bytes.saturating_add(path.len() as u64);
         self.path_index.insert(shared_path, id);
         self.insert_child_sorted(parent_id, id);
         id
@@ -547,6 +595,7 @@ impl MaterializedTree {
             let path = node.path.clone();
             self.remove_child_link(parent_id, id);
             self.path_index.remove(path.as_ref());
+            self.path_bytes = self.path_bytes.saturating_sub(path.len() as u64);
             self.nodes[id] = None;
             self.recompute_aggregate(parent_id);
             id = parent_id;
@@ -565,11 +614,68 @@ impl MaterializedTree {
             return;
         };
         let path = node.path.clone();
-        if node.meta.is_some() {
+        let before = node.meta.clone();
+        if before.is_some() {
             self.meta_count = self.meta_count.saturating_sub(1);
         }
+        self.refresh_node_health_indexes(path.clone(), before.as_ref(), None);
         self.path_index.remove(path.as_ref());
+        self.path_bytes = self.path_bytes.saturating_sub(path.len() as u64);
         self.nodes[id] = None;
+    }
+
+    fn refresh_node_health_indexes(
+        &mut self,
+        path: SharedPath,
+        before: Option<&FileMetaNode>,
+        after: Option<&FileMetaNode>,
+    ) {
+        if before.is_some_and(|node| node.is_tombstoned) {
+            self.tombstoned_count = self.tombstoned_count.saturating_sub(1);
+        }
+        if after.is_some_and(|node| node.is_tombstoned) {
+            self.tombstoned_count = self.tombstoned_count.saturating_add(1);
+        }
+
+        if before.is_some() {
+            self.remove_suspect_path(path.as_ref());
+        }
+        if let Some(node) = after
+            && !node.is_tombstoned
+            && let Some(expiry) = node.suspect_until
+        {
+            self.add_suspect_path(path, expiry);
+        }
+    }
+
+    fn add_suspect_path(&mut self, path: SharedPath, expiry: Instant) {
+        if self
+            .suspect_until_by_path
+            .insert(path.clone(), expiry)
+            .is_none()
+        {
+            self.suspect_count = self.suspect_count.saturating_add(1);
+        }
+        self.suspect_paths_by_expiry
+            .entry(expiry)
+            .or_default()
+            .push(path);
+    }
+
+    fn remove_suspect_path(&mut self, path: &[u8]) {
+        let Some(expiry) = self.suspect_until_by_path.remove(path) else {
+            return;
+        };
+        self.suspect_count = self.suspect_count.saturating_sub(1);
+        let should_remove = if let Some(paths) = self.suspect_paths_by_expiry.get_mut(&expiry) {
+            paths.retain(|candidate| candidate.as_ref() != path);
+            paths.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            self.suspect_paths_by_expiry.remove(&expiry);
+        }
     }
 }
 

@@ -54,10 +54,11 @@ use crate::runtime::orchestration::{
 };
 use crate::runtime::routes::{
     METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SINK_STATUS,
-    METHOD_SOURCE_FIND, METHOD_STREAM, ROUTE_KEY_EVENTS, ROUTE_KEY_QUERY, ROUTE_TOKEN_FS_META,
+    METHOD_SOURCE_FIND, METHOD_STREAM, ROUTE_KEY_QUERY, ROUTE_TOKEN_FS_META,
     ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
-    sink_query_request_route_for, sink_query_route_bindings_for,
-    sink_roots_control_stream_route_for, sink_status_request_route_for,
+    events_stream_route_for_scope, is_events_stream_route_key, sink_query_request_route_for,
+    sink_query_route_bindings_for, sink_roots_control_stream_route_for,
+    sink_status_request_route_for,
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -70,6 +71,8 @@ use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
 use crate::state::cell::{AuthorityJournal, LogicalRootsCell};
 use crate::state::commit_boundary::CommitBoundary;
 use crate::{ControlEvent, FileMetaRecord};
+
+const SINK_STATE_SNAPSHOT_CHECKPOINT_DATA_EVENTS: u64 = 5_000_000;
 
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -219,15 +222,15 @@ fn matching_endpoint_task_states(tasks: &[ManagedEndpointTask], route_key: &str)
         .collect()
 }
 
-fn sink_events_stream_route_key() -> String {
-    format!("{}.{}", ROUTE_KEY_EVENTS, METHOD_STREAM)
-}
-
 fn sink_signal_is_restart_deferred_events_stream_deactivate(signal: &SinkControlSignal) -> bool {
-    sink_signal_has_restart_deferred_events_stream_deactivate_reason(
-        signal,
-        &sink_events_stream_route_key(),
-    )
+    match signal {
+        SinkControlSignal::Deactivate { route_key, .. }
+            if is_events_stream_route_key(route_key) =>
+        {
+            sink_signal_has_restart_deferred_events_stream_deactivate_reason(signal, route_key)
+        }
+        _ => false,
+    }
 }
 
 fn per_peer_sink_query_route_locality(node_id: &NodeId, route_key: &str) -> &'static str {
@@ -1133,6 +1136,29 @@ struct StreamDeliveryStats {
     last_applied_at_us: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AppliedEventCounts {
+    control_events: u64,
+    data_events: u64,
+}
+
+enum DecodedSinkEventPayload {
+    Control(ControlEvent),
+    Record(FileMetaRecord),
+}
+
+fn decode_sink_event_payload(payload: &[u8]) -> Result<DecodedSinkEventPayload> {
+    if let Ok(record) = rmp_serde::from_slice::<FileMetaRecord>(payload) {
+        return Ok(DecodedSinkEventPayload::Record(record));
+    }
+    if let Ok(control) = rmp_serde::from_slice::<ControlEvent>(payload) {
+        return Ok(DecodedSinkEventPayload::Control(control));
+    }
+    Err(CnxError::InvalidInput(
+        "invalid sink stream payload: expected file-meta record or control event".into(),
+    ))
+}
+
 fn sample_visibility_lag(
     group_id: &str,
     object_ref: &str,
@@ -1731,6 +1757,7 @@ struct SinkStateCell {
     commit_boundary: CommitBoundary,
     snapshot_cell: Option<SinkStateSnapshotCell>,
     logical_roots_control_generation: Arc<AtomicU64>,
+    data_events_since_snapshot: Arc<AtomicU64>,
 }
 
 impl SinkStateCell {
@@ -1750,6 +1777,7 @@ impl SinkStateCell {
             commit_boundary,
             snapshot_cell,
             logical_roots_control_generation: Arc::new(AtomicU64::new(0)),
+            data_events_since_snapshot: Arc::new(AtomicU64::new(0)),
         };
         if record_bootstrap {
             cell.record_authoritative_commit(
@@ -1813,7 +1841,26 @@ impl SinkStateCell {
             return Ok(());
         };
         let snapshot = self.read()?.to_persisted_snapshot(SINK_RUNTIME_UNIT_ID);
-        snapshot_cell.persist(&snapshot)
+        snapshot_cell.persist(&snapshot)?;
+        self.data_events_since_snapshot.store(0, Ordering::Release);
+        Ok(())
+    }
+
+    fn persist_snapshot_after_apply(&self, counts: AppliedEventCounts) -> Result<()> {
+        if counts.control_events > 0 {
+            return self.persist_snapshot();
+        }
+        if counts.data_events == 0 {
+            return Ok(());
+        }
+        let previous = self
+            .data_events_since_snapshot
+            .fetch_add(counts.data_events, Ordering::AcqRel);
+        if previous.saturating_add(counts.data_events) >= SINK_STATE_SNAPSHOT_CHECKPOINT_DATA_EVENTS
+        {
+            return self.persist_snapshot();
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2514,58 +2561,50 @@ impl SinkFileMeta {
             let stream_visibility_lag = visibility_lag.clone();
             let stream_delivery_stats = stream_delivery_stats.clone();
             let stream_unit_control = unit_control.clone();
-            if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM) {
-                let stream_sink = Arc::new(SinkFileMeta {
-                    node_id: node_id.clone(),
-                    state: stream_state,
-                    root_specs: stream_root_specs,
-                    logical_roots_cell: stream_logical_roots_cell.clone(),
-                    host_object_grants: stream_host_object_grants,
-                    visibility_lag: stream_visibility_lag,
-                    stream_delivery_stats,
-                    pending_stream_events: pending_stream_events.clone(),
-                    stream_receive_enabled: stream_receive_enabled.clone(),
-                    unit_control: stream_unit_control,
-                    stream_recv_observer: Some(stream_recv_observer.clone()),
-                    stream_recv_ready_notify: Some(stream_recv_ready_notify.clone()),
-                    shutdown: CancellationToken::new(),
-                    endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-                });
-                let stream_sink_ready = stream_sink.clone();
-                let stream_sink_wait = stream_sink.clone();
-                let stream_sink_observe = stream_sink.clone();
-                let stream_sink_apply = stream_sink.clone();
-                let endpoint = ManagedEndpointTask::spawn_stream_with_before_recv_and_wait(
-                    sys,
-                    route,
-                    format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
-                    SINK_RUNTIME_UNIT_ID,
-                    sink.shutdown.clone(),
-                    move || stream_sink_ready.should_receive_stream_events(),
-                    move || {
-                        let stream_sink_wait = stream_sink_wait.clone();
-                        async move { stream_sink_wait.wait_until_stream_can_receive().await }
-                            .boxed()
-                    },
-                    move || stream_sink_observe.mark_before_stream_recv(),
-                    move |events| {
-                        let stream_sink_apply = stream_sink_apply.clone();
-                        async move {
-                            if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
-                                log::error!("sink stream ingest failed: {:?}", err);
-                            }
+            let route = events_stream_route_for_scope(&node_id.0);
+            let stream_sink = Arc::new(SinkFileMeta {
+                node_id: node_id.clone(),
+                state: stream_state,
+                root_specs: stream_root_specs,
+                logical_roots_cell: stream_logical_roots_cell.clone(),
+                host_object_grants: stream_host_object_grants,
+                visibility_lag: stream_visibility_lag,
+                stream_delivery_stats,
+                pending_stream_events: pending_stream_events.clone(),
+                stream_receive_enabled: stream_receive_enabled.clone(),
+                unit_control: stream_unit_control,
+                stream_recv_observer: Some(stream_recv_observer.clone()),
+                stream_recv_ready_notify: Some(stream_recv_ready_notify.clone()),
+                shutdown: CancellationToken::new(),
+                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+            });
+            let stream_sink_ready = stream_sink.clone();
+            let stream_sink_wait = stream_sink.clone();
+            let stream_sink_observe = stream_sink.clone();
+            let stream_sink_apply = stream_sink.clone();
+            let endpoint = ManagedEndpointTask::spawn_stream_with_before_recv_and_wait(
+                sys,
+                route,
+                format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
+                SINK_RUNTIME_UNIT_ID,
+                sink.shutdown.clone(),
+                move || stream_sink_ready.should_receive_stream_events(),
+                move || {
+                    let stream_sink_wait = stream_sink_wait.clone();
+                    async move { stream_sink_wait.wait_until_stream_can_receive().await }.boxed()
+                },
+                move || stream_sink_observe.mark_before_stream_recv(),
+                move |events| {
+                    let stream_sink_apply = stream_sink_apply.clone();
+                    async move {
+                        if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
+                            log::error!("sink stream ingest failed: {:?}", err);
                         }
-                    },
-                );
-                lock_or_recover(&sink.endpoint_tasks, "sink.with_boundaries.endpoint_tasks")
-                    .push(endpoint);
-            } else {
-                log::error!(
-                    "failed to resolve route lookup for {}.{}",
-                    ROUTE_TOKEN_FS_META_EVENTS,
-                    METHOD_STREAM
-                );
-            }
+                    }
+                },
+            );
+            lock_or_recover(&sink.endpoint_tasks, "sink.with_boundaries.endpoint_tasks")
+                .push(endpoint);
 
             sink.enable_stream_receive();
         }
@@ -2606,6 +2645,77 @@ impl SinkFileMeta {
             })
     }
 
+    fn all_endpoint_task_routes_present_on_boundary(
+        &self,
+        route_keys: &BTreeSet<String>,
+        boundary: &Arc<dyn ChannelIoSubset>,
+        context: &str,
+    ) -> bool {
+        if route_keys.is_empty() {
+            return true;
+        }
+        let tasks = lock_or_recover(&self.endpoint_tasks, context);
+        route_keys.iter().all(|route_key| {
+            tasks.iter().any(|task| {
+                task.route_key() == route_key
+                    && task.belongs_to_boundary(boundary)
+                    && !task.is_finished()
+                    && task.finish_reason().is_none()
+                    && !task.is_shutdown_requested()
+            })
+        })
+    }
+
+    fn expected_runtime_endpoint_routes(&self, node_id: &NodeId) -> BTreeSet<String> {
+        let routes = sink_query_route_bindings_for(&node_id.0);
+        let mut expected = BTreeSet::new();
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_QUERY) {
+            expected.insert(route.0);
+        }
+        if let Ok(route) =
+            default_route_bindings().resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY)
+        {
+            expected.insert(route.0);
+        }
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY) {
+            expected.insert(route.0);
+        }
+        expected.insert(sink_query_request_route_for(&node_id.0).0);
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            && self.should_start_sink_status_endpoint_for_route(&route.0)
+        {
+            expected.insert(route.0);
+        }
+        let scoped_status_route = sink_status_request_route_for(&node_id.0);
+        if self.should_start_sink_status_endpoint_for_route(&scoped_status_route.0) {
+            expected.insert(scoped_status_route.0);
+        }
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_FIND) {
+            expected.insert(route.0);
+        }
+        expected.insert(events_stream_route_for_scope(&node_id.0).0);
+        if let Ok(route) = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL)
+        {
+            expected.insert(route.0);
+        }
+        expected.insert(sink_roots_control_stream_route_for(&self.node_id.0).0);
+        expected
+    }
+
+    fn runtime_endpoints_current_on_boundary(
+        &self,
+        boundary: &Arc<dyn ChannelIoSubset>,
+        node_id: &NodeId,
+    ) -> bool {
+        let expected = self.expected_runtime_endpoint_routes(node_id);
+        self.all_endpoint_task_routes_present_on_boundary(
+            &expected,
+            boundary,
+            "sink.start_runtime_endpoints.fast_path",
+        )
+    }
+
     fn retire_endpoint_tasks_for_different_boundary(
         &self,
         boundary: &Arc<dyn ChannelIoSubset>,
@@ -2633,6 +2743,10 @@ impl SinkFileMeta {
         boundary: Arc<dyn ChannelIoSubset>,
         node_id: NodeId,
     ) -> Result<()> {
+        if self.runtime_endpoints_current_on_boundary(&boundary, &node_id) {
+            self.enable_stream_receive();
+            return Ok(());
+        }
         let start = Instant::now();
         eprintln!(
             "fs_meta_sink: start_runtime_endpoints begin node={}",
@@ -2643,8 +2757,6 @@ impl SinkFileMeta {
             &boundary,
             "sink.start_runtime_endpoints.retire_stale_boundary",
         );
-
-        self.disable_stream_receive();
 
         eprintln!(
             "fs_meta_sink: start_runtime_endpoints adapter begin node={} elapsed_ms={}",
@@ -3224,71 +3336,70 @@ impl SinkFileMeta {
         let stream_delivery_stats = self.stream_delivery_stats.clone();
         let stream_receive_enabled = self.stream_receive_enabled.clone();
         let stream_unit_control = self.unit_control.clone();
-        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM) {
-            if !self.endpoint_task_route_present_on_boundary(
-                &route.0,
-                &boundary,
-                "sink.start_runtime_endpoints.route_present.stream",
-            ) {
-                eprintln!(
-                    "fs_meta_sink: start_runtime_endpoints stream spawn begin node={} route={} elapsed_ms={}",
-                    node_id.0,
-                    route.0,
-                    start.elapsed().as_millis()
-                );
-                let stream_sink = Arc::new(SinkFileMeta {
-                    node_id: node_id.clone(),
-                    state: stream_state,
-                    root_specs: stream_root_specs,
-                    logical_roots_cell: stream_logical_roots_cell.clone(),
-                    host_object_grants: stream_host_object_grants,
-                    visibility_lag: stream_visibility_lag,
-                    stream_delivery_stats,
-                    pending_stream_events: self.pending_stream_events.clone(),
-                    stream_receive_enabled: stream_receive_enabled,
-                    unit_control: stream_unit_control,
-                    stream_recv_observer: self.stream_recv_observer.clone(),
-                    stream_recv_ready_notify: self.stream_recv_ready_notify.clone(),
-                    shutdown: CancellationToken::new(),
-                    endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-                });
-                let stream_sink_ready = stream_sink.clone();
-                let stream_sink_wait = stream_sink.clone();
-                let stream_sink_observe = stream_sink.clone();
-                let stream_sink_apply = stream_sink.clone();
-                let endpoint = ManagedEndpointTask::spawn_stream_with_before_recv_and_wait(
-                    boundary.clone(),
-                    route,
-                    format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
-                    SINK_RUNTIME_UNIT_ID,
-                    self.shutdown.clone(),
-                    move || stream_sink_ready.should_receive_stream_events(),
-                    move || {
-                        let stream_sink_wait = stream_sink_wait.clone();
-                        async move { stream_sink_wait.wait_until_stream_can_receive().await }
-                            .boxed()
-                    },
-                    move || stream_sink_observe.mark_before_stream_recv(),
-                    move |events| {
-                        let stream_sink_apply = stream_sink_apply.clone();
-                        async move {
-                            if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
-                                log::error!("sink stream ingest failed: {:?}", err);
-                            }
+        let route = events_stream_route_for_scope(&node_id.0);
+        if !self.endpoint_task_route_present_on_boundary(
+            &route.0,
+            &boundary,
+            "sink.start_runtime_endpoints.route_present.stream",
+        ) {
+            self.disable_stream_receive();
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints stream spawn begin node={} route={} elapsed_ms={}",
+                node_id.0,
+                route.0,
+                start.elapsed().as_millis()
+            );
+            let stream_sink = Arc::new(SinkFileMeta {
+                node_id: node_id.clone(),
+                state: stream_state,
+                root_specs: stream_root_specs,
+                logical_roots_cell: stream_logical_roots_cell.clone(),
+                host_object_grants: stream_host_object_grants,
+                visibility_lag: stream_visibility_lag,
+                stream_delivery_stats,
+                pending_stream_events: self.pending_stream_events.clone(),
+                stream_receive_enabled: stream_receive_enabled,
+                unit_control: stream_unit_control,
+                stream_recv_observer: self.stream_recv_observer.clone(),
+                stream_recv_ready_notify: self.stream_recv_ready_notify.clone(),
+                shutdown: CancellationToken::new(),
+                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+            });
+            let stream_sink_ready = stream_sink.clone();
+            let stream_sink_wait = stream_sink.clone();
+            let stream_sink_observe = stream_sink.clone();
+            let stream_sink_apply = stream_sink.clone();
+            let endpoint = ManagedEndpointTask::spawn_stream_with_before_recv_and_wait(
+                boundary.clone(),
+                route,
+                format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
+                SINK_RUNTIME_UNIT_ID,
+                self.shutdown.clone(),
+                move || stream_sink_ready.should_receive_stream_events(),
+                move || {
+                    let stream_sink_wait = stream_sink_wait.clone();
+                    async move { stream_sink_wait.wait_until_stream_can_receive().await }.boxed()
+                },
+                move || stream_sink_observe.mark_before_stream_recv(),
+                move |events| {
+                    let stream_sink_apply = stream_sink_apply.clone();
+                    async move {
+                        if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
+                            log::error!("sink stream ingest failed: {:?}", err);
                         }
-                    },
-                );
-                eprintln!(
-                    "fs_meta_sink: start_runtime_endpoints stream spawn ok node={} elapsed_ms={}",
-                    node_id.0,
-                    start.elapsed().as_millis()
-                );
-                lock_or_recover(
-                    &self.endpoint_tasks,
-                    "sink.start_runtime_endpoints.stream_tasks",
-                )
-                .push(endpoint);
-            }
+                    }
+                },
+            );
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints stream spawn ok node={} elapsed_ms={}",
+                node_id.0,
+                start.elapsed().as_millis()
+            );
+            lock_or_recover(
+                &self.endpoint_tasks,
+                "sink.start_runtime_endpoints.stream_tasks",
+            )
+            .push(endpoint);
         }
 
         let spawn_roots_control_stream = |route: RouteKey, route_label: String| {
@@ -3442,8 +3553,9 @@ impl SinkFileMeta {
             node_id.0
         );
         self.prune_finished_endpoint_tasks("sink.start_stream_endpoint.prune");
+        let route = events_stream_route_for_scope(&node_id.0);
         if self.endpoint_task_route_present_on_boundary(
-            &format!("{}.stream", ROUTE_TOKEN_FS_META_EVENTS),
+            &route.0,
             &boundary,
             "sink.start_stream_endpoint.route_present",
         ) {
@@ -3456,7 +3568,6 @@ impl SinkFileMeta {
 
         self.disable_stream_receive();
 
-        let routes = sink_query_route_bindings_for(&self.node_id.0);
         let stream_state = self.state.clone();
         let stream_root_specs = self.root_specs.clone();
         let stream_logical_roots_cell = self.logical_roots_cell.clone();
@@ -3464,64 +3575,62 @@ impl SinkFileMeta {
         let stream_visibility_lag = self.visibility_lag.clone();
         let stream_delivery_stats = self.stream_delivery_stats.clone();
         let stream_unit_control = self.unit_control.clone();
-        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM) {
-            eprintln!(
-                "fs_meta_sink: start_stream_endpoint binding route={} node={}",
-                route.0, node_id.0
-            );
-            log::info!(
-                "bound stream route listening on {}.{} for sink {}",
-                ROUTE_TOKEN_FS_META_EVENTS,
-                METHOD_STREAM,
-                node_id.0
-            );
-            let stream_sink = Arc::new(SinkFileMeta {
-                node_id: self.node_id.clone(),
-                state: stream_state,
-                root_specs: stream_root_specs,
-                logical_roots_cell: stream_logical_roots_cell.clone(),
-                host_object_grants: stream_host_object_grants,
-                visibility_lag: stream_visibility_lag,
-                stream_delivery_stats,
-                pending_stream_events: self.pending_stream_events.clone(),
-                stream_receive_enabled: self.stream_receive_enabled.clone(),
-                unit_control: stream_unit_control,
-                stream_recv_observer: self.stream_recv_observer.clone(),
-                stream_recv_ready_notify: self.stream_recv_ready_notify.clone(),
-                shutdown: self.shutdown.clone(),
-                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-            });
-            let stream_sink_ready = stream_sink.clone();
-            let stream_sink_wait = stream_sink.clone();
-            let stream_sink_observe = stream_sink.clone();
-            let stream_sink_apply = stream_sink.clone();
-            let endpoint = ManagedEndpointTask::spawn_stream_with_before_recv_and_wait(
-                boundary,
-                route,
-                format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
-                SINK_RUNTIME_UNIT_ID,
-                self.shutdown.clone(),
-                move || stream_sink_ready.should_receive_stream_events(),
-                move || {
-                    let stream_sink_wait = stream_sink_wait.clone();
-                    async move { stream_sink_wait.wait_until_stream_can_receive().await }.boxed()
-                },
-                move || stream_sink_observe.mark_before_stream_recv(),
-                move |events| {
-                    let stream_sink_apply = stream_sink_apply.clone();
-                    async move {
-                        if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
-                            log::error!("sink stream ingest failed: {:?}", err);
-                        }
+        eprintln!(
+            "fs_meta_sink: start_stream_endpoint binding route={} node={}",
+            route.0, node_id.0
+        );
+        log::info!(
+            "bound stream route listening on {}.{} for sink {}",
+            ROUTE_TOKEN_FS_META_EVENTS,
+            METHOD_STREAM,
+            node_id.0
+        );
+        let stream_sink = Arc::new(SinkFileMeta {
+            node_id: self.node_id.clone(),
+            state: stream_state,
+            root_specs: stream_root_specs,
+            logical_roots_cell: stream_logical_roots_cell.clone(),
+            host_object_grants: stream_host_object_grants,
+            visibility_lag: stream_visibility_lag,
+            stream_delivery_stats,
+            pending_stream_events: self.pending_stream_events.clone(),
+            stream_receive_enabled: self.stream_receive_enabled.clone(),
+            unit_control: stream_unit_control,
+            stream_recv_observer: self.stream_recv_observer.clone(),
+            stream_recv_ready_notify: self.stream_recv_ready_notify.clone(),
+            shutdown: self.shutdown.clone(),
+            endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+        });
+        let stream_sink_ready = stream_sink.clone();
+        let stream_sink_wait = stream_sink.clone();
+        let stream_sink_observe = stream_sink.clone();
+        let stream_sink_apply = stream_sink.clone();
+        let endpoint = ManagedEndpointTask::spawn_stream_with_before_recv_and_wait(
+            boundary,
+            route,
+            format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
+            SINK_RUNTIME_UNIT_ID,
+            self.shutdown.clone(),
+            move || stream_sink_ready.should_receive_stream_events(),
+            move || {
+                let stream_sink_wait = stream_sink_wait.clone();
+                async move { stream_sink_wait.wait_until_stream_can_receive().await }.boxed()
+            },
+            move || stream_sink_observe.mark_before_stream_recv(),
+            move |events| {
+                let stream_sink_apply = stream_sink_apply.clone();
+                async move {
+                    if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
+                        log::error!("sink stream ingest failed: {:?}", err);
                     }
-                },
-            );
-            lock_or_recover(
-                &self.endpoint_tasks,
-                "sink.start_stream_endpoint.endpoint_tasks",
-            )
-            .push(endpoint);
-        }
+                }
+            },
+        );
+        lock_or_recover(
+            &self.endpoint_tasks,
+            "sink.start_stream_endpoint.endpoint_tasks",
+        )
+        .push(endpoint);
 
         self.enable_stream_receive();
 
@@ -3773,7 +3882,10 @@ impl SinkFileMeta {
             let mut state = self.state.write()?;
             state.reconcile_host_object_grants(&roots, host_object_grants, allowed_groups.as_ref());
         }
-        self.state.persist_snapshot()?;
+        self.state.record_authoritative_commit(
+            "sink.reconcile_runtime_groups",
+            format!("roots={} grants={}", roots.len(), host_object_grants.len()),
+        );
         Ok(())
     }
 
@@ -3904,9 +4016,7 @@ impl SinkFileMeta {
                         );
                     }
                     self.apply_activate_signal(*unit, route_key, *generation, bound_scopes)?;
-                    if *unit == SinkRuntimeUnit::Sink
-                        && route_key == &sink_events_stream_route_key()
-                    {
+                    if *unit == SinkRuntimeUnit::Sink && is_events_stream_route_key(route_key) {
                         activated_events_stream_route = true;
                     }
                     validated += 1;
@@ -4190,9 +4300,11 @@ impl SinkFileMeta {
     /// suspect nodes, blind spots, and the current shadow time.
     #[allow(dead_code)]
     pub(crate) fn build_health_snapshot(&self) -> Result<HealthStats> {
-        let state = self.state.read()?;
+        let mut state = self.state.write()?;
+        let now = Instant::now();
         let mut out = HealthStats::default();
-        for group in state.groups.values() {
+        for group in state.groups.values_mut() {
+            group.tree.prune_expired_suspects(now);
             let stats = query::get_health_stats(&group.tree, &group.clock);
             accumulate_health_stats(&mut out, &stats);
         }
@@ -4204,11 +4316,13 @@ impl SinkFileMeta {
     }
 
     pub(crate) fn build_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
-        let state = self.state.read()?;
+        let mut state = self.state.write()?;
         let now = now_us();
+        let now_instant = Instant::now();
         let mut snapshot = SinkStatusSnapshot::default();
         let mut groups = Vec::with_capacity(state.groups.len());
-        for (group_id, group) in &state.groups {
+        for (group_id, group) in &mut state.groups {
+            group.tree.prune_expired_suspects(now_instant);
             let stats = query::get_health_stats(&group.tree, &group.clock);
             let estimated_heap_bytes = group.tree.estimated_heap_bytes();
             accumulate_status_snapshot(&mut snapshot, &stats, estimated_heap_bytes);
@@ -4429,7 +4543,7 @@ impl SinkFileMeta {
     }
 
     fn should_receive_stream_events(&self) -> bool {
-        let route_key = format!("{}.{}", ROUTE_KEY_EVENTS, METHOD_STREAM);
+        let route_key = events_stream_route_for_scope(&self.node_id.0).0;
         let enabled = self.stream_receive_enabled.load(Ordering::Acquire);
         let has_targets = self.has_scheduled_stream_targets();
         let gate = self.should_receive_control_stream_route(&route_key);
@@ -4468,9 +4582,7 @@ impl SinkFileMeta {
             .unit_control
             .accept_tick(SINK_RUNTIME_UNIT_ID, route_key, generation)
             .unwrap_or(false);
-        if debug_events_gate_enabled()
-            && route_key == &format!("{}.{}", ROUTE_KEY_EVENTS, METHOD_STREAM)
-        {
+        if debug_events_gate_enabled() && is_events_stream_route_key(route_key) {
             eprintln!(
                 "fs_meta_sink: events_gate accept node={} route={} generation={} accepted={}",
                 self.node_id.0, route_key, generation, accepted
@@ -4501,20 +4613,6 @@ impl SinkFileMeta {
         if events.is_empty() {
             return Ok(());
         }
-        let control_count = events
-            .iter()
-            .filter(|event| rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok())
-            .count();
-        eprintln!(
-            "fs_meta_sink: ingest_stream_events received={} control={} data={} first_origin={}",
-            events.len(),
-            control_count,
-            events.len().saturating_sub(control_count),
-            events
-                .first()
-                .map(|event| event.metadata().origin_id.0.as_str())
-                .unwrap_or("<none>")
-        );
 
         let configured = self.configured_stream_object_refs()?;
         let scheduled = self.scheduled_stream_object_refs()?.unwrap_or_default();
@@ -4544,11 +4642,6 @@ impl SinkFileMeta {
             .as_deref()
             .map(|target| collect_event_origin_counts_for_query_path(&ready, target))
             .unwrap_or_default();
-        let ready_control_count = ready
-            .iter()
-            .filter(|event| rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok())
-            .count() as u64;
-        let ready_data_count = ready.len() as u64 - ready_control_count;
         let deferred_events = deferred.iter().cloned().collect::<Vec<_>>();
         let deferred_counts = collect_event_origin_counts(&deferred_events);
         let dropped_counts = incoming_counts
@@ -4627,7 +4720,7 @@ impl SinkFileMeta {
             );
         }
         if !ready.is_empty() {
-            self.apply_events(&ready)?;
+            let applied_counts = self.apply_events_counted(&ready)?;
             let mut stats = lock_or_recover(
                 &self.stream_delivery_stats,
                 "sink.ingest_stream_events.stream_delivery_stats.applied",
@@ -4636,8 +4729,10 @@ impl SinkFileMeta {
             stats.applied_events = stats.applied_events.saturating_add(ready.len() as u64);
             stats.applied_control_events = stats
                 .applied_control_events
-                .saturating_add(ready_control_count);
-            stats.applied_data_events = stats.applied_data_events.saturating_add(ready_data_count);
+                .saturating_add(applied_counts.control_events);
+            stats.applied_data_events = stats
+                .applied_data_events
+                .saturating_add(applied_counts.data_events);
             accumulate_origin_counts(&mut stats.applied_origin_counts, &ready_counts);
             accumulate_origin_counts(&mut stats.applied_path_origin_counts, &ready_path_counts);
             stats.last_applied_at_us = now_us();
@@ -4678,19 +4773,12 @@ impl SinkFileMeta {
             );
         }
         if !ready.is_empty() {
-            self.apply_events(&ready)?;
+            let applied_counts = self.apply_events_counted(&ready)?;
             let ready_counts = collect_event_origin_counts(&ready);
             let ready_path_counts = debug_stream_path_capture_target()
                 .as_deref()
                 .map(|target| collect_event_origin_counts_for_query_path(&ready, target))
                 .unwrap_or_default();
-            let ready_control_count = ready
-                .iter()
-                .filter(|event| {
-                    rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok()
-                })
-                .count() as u64;
-            let ready_data_count = ready.len() as u64 - ready_control_count;
             let mut stats = lock_or_recover(
                 &self.stream_delivery_stats,
                 "sink.flush_buffered_stream_events.stream_delivery_stats.applied",
@@ -4699,8 +4787,10 @@ impl SinkFileMeta {
             stats.applied_events = stats.applied_events.saturating_add(ready.len() as u64);
             stats.applied_control_events = stats
                 .applied_control_events
-                .saturating_add(ready_control_count);
-            stats.applied_data_events = stats.applied_data_events.saturating_add(ready_data_count);
+                .saturating_add(applied_counts.control_events);
+            stats.applied_data_events = stats
+                .applied_data_events
+                .saturating_add(applied_counts.data_events);
             accumulate_origin_counts(&mut stats.applied_origin_counts, &ready_counts);
             accumulate_origin_counts(&mut stats.applied_path_origin_counts, &ready_path_counts);
             stats.last_applied_at_us = now_us();
@@ -4709,8 +4799,12 @@ impl SinkFileMeta {
     }
 
     pub(crate) fn apply_events(&self, events: &[Event]) -> Result<()> {
+        self.apply_events_counted(events).map(|_| ())
+    }
+
+    fn apply_events_counted(&self, events: &[Event]) -> Result<AppliedEventCounts> {
         if events.is_empty() {
-            return Ok(());
+            return Ok(AppliedEventCounts::default());
         }
 
         let debug_apply_events = std::env::var_os("FSMETA_DEBUG_SINK_APPLY_EVENTS").is_some();
@@ -4731,8 +4825,7 @@ impl SinkFileMeta {
         let runtime_scoped = self.unit_control.has_runtime_state();
         let mut skipped_events = 0usize;
         let mut pending_lag_samples = Vec::new();
-        let mut control_events = 0usize;
-        let mut data_events = 0usize;
+        let mut counts = AppliedEventCounts::default();
         let mut state = self.state.write()?;
         let mut accepted = Vec::with_capacity(events.len());
 
@@ -4760,50 +4853,53 @@ impl SinkFileMeta {
 
             let payload = event.payload_bytes();
 
-            if let Ok(control) = rmp_serde::from_slice::<ControlEvent>(payload) {
-                control_events += 1;
-                match &control {
-                    ControlEvent::WatchOverflow => {
-                        group_state.overflow_pending_materialization = true;
-                    }
-                    _ => {
-                        if is_group_primary {
-                            if let Some((completed_epoch_id, audit_start_time)) =
-                                group_state.epoch_manager.process_control_event(&control)
-                            {
-                                epoch::missing_item_detection(
-                                    &mut group_state.tree,
-                                    completed_epoch_id,
-                                    audit_start_time,
-                                    &group_state.epoch_manager,
-                                );
-                                group_state.epoch_manager.clear_completed_audit_skip_state();
-                                group_state.refresh_materialization_readiness();
-                            }
-                            if matches!(
-                                control,
-                                ControlEvent::EpochEnd {
-                                    epoch_type: crate::EpochType::Audit,
-                                    ..
+            let record = match decode_sink_event_payload(payload)? {
+                DecodedSinkEventPayload::Control(control) => {
+                    counts.control_events = counts.control_events.saturating_add(1);
+                    match &control {
+                        ControlEvent::WatchOverflow => {
+                            group_state.overflow_pending_materialization = true;
+                        }
+                        _ => {
+                            if is_group_primary {
+                                if let Some((completed_epoch_id, audit_start_time)) =
+                                    group_state.epoch_manager.process_control_event(&control)
+                                {
+                                    epoch::missing_item_detection(
+                                        &mut group_state.tree,
+                                        completed_epoch_id,
+                                        audit_start_time,
+                                        &group_state.epoch_manager,
+                                    );
+                                    group_state.epoch_manager.clear_completed_audit_skip_state();
+                                    group_state.refresh_materialization_readiness();
                                 }
-                            ) {
-                                group_state.mark_materialization_ready();
-                                if group_state.overflow_pending_materialization {
-                                    group_state.last_coverage_recovered_at = Some(Instant::now());
-                                    group_state.materialized_revision =
-                                        group_state.materialized_revision.saturating_add(1);
+                                if matches!(
+                                    control,
+                                    ControlEvent::EpochEnd {
+                                        epoch_type: crate::EpochType::Audit,
+                                        ..
+                                    }
+                                ) {
+                                    group_state.mark_materialization_ready();
+                                    if group_state.overflow_pending_materialization {
+                                        group_state.last_coverage_recovered_at =
+                                            Some(Instant::now());
+                                        group_state.materialized_revision =
+                                            group_state.materialized_revision.saturating_add(1);
+                                    }
+                                    group_state.overflow_pending_materialization = false;
                                 }
-                                group_state.overflow_pending_materialization = false;
                             }
                         }
                     }
+                    continue;
                 }
-                continue;
-            }
-
-            let record: crate::FileMetaRecord = rmp_serde::from_slice(payload)
-                .map_err(|e| CnxError::InvalidInput(format!("invalid file-meta payload: {e}")))?;
-            data_events += 1;
+                DecodedSinkEventPayload::Record(record) => {
+                    counts.data_events = counts.data_events.saturating_add(1);
+                    record
+                }
+            };
             if record.audit_skipped {
                 group_state
                     .epoch_manager
@@ -4859,8 +4955,8 @@ impl SinkFileMeta {
             eprintln!(
                 "fs_meta_sink: apply_events processed total={} control={} data={} skipped={}",
                 events.len(),
-                control_events,
-                data_events,
+                counts.control_events,
+                counts.data_events,
                 skipped_events
             );
         }
@@ -4870,11 +4966,11 @@ impl SinkFileMeta {
             format!(
                 "total={} control={} data={}",
                 events.len(),
-                control_events,
-                data_events
+                counts.control_events,
+                counts.data_events
             ),
         );
-        self.state.persist_snapshot()?;
+        self.state.persist_snapshot_after_apply(counts)?;
 
         if !pending_lag_samples.is_empty() {
             lock_or_recover(
@@ -4891,7 +4987,7 @@ impl SinkFileMeta {
             );
         }
 
-        Ok(())
+        Ok(counts)
     }
 
     pub(crate) fn perform_materialized_query(

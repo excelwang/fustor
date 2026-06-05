@@ -270,6 +270,9 @@ async fn deploy(args: DeployArgs) -> anyhow::Result<serde_json::Value> {
     let product = load_product_config(&args.config)?;
     let state_dir = prepare_state_dir(args.config.parent(), ".fsmeta-state")?;
     let (auth_cfg, username, password) = build_auth_config(&product.auth, &state_dir);
+    auth_cfg
+        .materialize_bootstrap_management()
+        .map_err(|err| anyhow::anyhow!("materialize bootstrap management auth failed: {err}"))?;
     let (app_target, manifest_path) = resolve_fs_meta_runtime_inputs()?;
     let control = ControlClient::from_args(&args.control)?;
     let route_plan_node_ids = control.discover_route_plan_node_ids().await?;
@@ -321,17 +324,9 @@ async fn local_start(args: LocalStartArgs) -> anyhow::Result<serde_json::Value> 
 
     let product = load_product_config(&args.config)?;
     let (auth_cfg, username, password) = build_auth_config(&product.auth, &args.workdir);
-    fs::write(
-        &auth_cfg.passwd_path,
-        format!(
-            "{}:{}:{}:{}:/home/{}:/bin/bash:0\n",
-            username, 1000, 1000, auth_cfg.management_group, username,
-        ),
-    )?;
-    fs::write(
-        &auth_cfg.shadow_path,
-        format!("{}:plain${}:0\n", username, password),
-    )?;
+    auth_cfg
+        .materialize_bootstrap_management()
+        .map_err(|err| anyhow::anyhow!("materialize local bootstrap auth failed: {err}"))?;
 
     let facade_resource_id = product.api.facade_resource_id.clone();
     let bind_addr = default_local_ingress_bind_addr();
@@ -1122,6 +1117,37 @@ mod tests {
                 .expect("bootstrap management")
                 .username,
             username
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_auth_config_force_materialization_keeps_deploy_password_current() {
+        let dir = std::env::temp_dir().join(format!(
+            "fsmeta-auth-force-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (old_auth_cfg, _, _) = build_auth_config(&ProductAuthConfig::default(), &dir);
+        old_auth_cfg
+            .materialize_bootstrap_management()
+            .expect("materialize old auth");
+
+        let (new_auth_cfg, username, password) =
+            build_auth_config(&ProductAuthConfig::default(), &dir);
+        new_auth_cfg
+            .materialize_bootstrap_management()
+            .expect("materialize new auth");
+
+        let shadow = fs::read_to_string(dir.join("fs-meta.shadow")).expect("read shadow");
+        assert_eq!(
+            shadow,
+            format!("{username}:plain${password}:0\n"),
+            "deploy must rewrite stale bootstrap login files so the returned password is immediately usable",
         );
 
         let _ = fs::remove_dir_all(&dir);
