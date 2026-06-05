@@ -1354,6 +1354,37 @@ struct SinkGenerationCutoverDecisionInput<'a> {
     sink_signals_in_shared_generation_cutover_lane: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkGenerationCutoverInlineAction {
+    DeferReplay,
+    ApplyAsInitialAuditCatchup,
+    Apply,
+}
+
+fn sink_generation_cutover_inline_action_from_evidence(
+    generation_cutover_disposition: SinkGenerationCutoverDisposition,
+    has_post_initial_single_route_activate: bool,
+    source_state_replay_required: bool,
+    sink_generation_cutover_replay_deferred: bool,
+    initial_materialization_catchup: bool,
+) -> SinkGenerationCutoverInlineAction {
+    let can_defer_replay = matches!(
+        generation_cutover_disposition,
+        SinkGenerationCutoverDisposition::FailClosedRetainedReplayOnRetryableReset
+    ) && has_post_initial_single_route_activate;
+    if !can_defer_replay {
+        return SinkGenerationCutoverInlineAction::Apply;
+    }
+    if !source_state_replay_required && initial_materialization_catchup {
+        return SinkGenerationCutoverInlineAction::ApplyAsInitialAuditCatchup;
+    }
+    if !sink_generation_cutover_replay_deferred && !source_state_replay_required {
+        SinkGenerationCutoverInlineAction::DeferReplay
+    } else {
+        SinkGenerationCutoverInlineAction::Apply
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SinkRecoveryGateReopenDisposition {
     None,
@@ -2209,6 +2240,22 @@ impl SinkRecoveryMachine {
                             &snapshot,
                             &converged_groups,
                         ) {
+                            return Ok(None);
+                        }
+                        if FSMetaApp::sink_status_snapshot_has_materialized_pending_progress_for_expected_groups(
+                            &snapshot,
+                            &converged_groups,
+                        ) && source
+                            .status_snapshot_with_failure()
+                            .await
+                            .ok()
+                            .is_some_and(|source_snapshot| {
+                                FSMetaApp::source_status_snapshot_has_inflight_initial_audit_for_expected_groups(
+                                    &source_snapshot,
+                                    &converged_groups,
+                                )
+                            })
+                        {
                             return Ok(None);
                         }
                         if FSMetaApp::sink_status_snapshot_should_defer_republish_after_retained_replay_timeout(&snapshot)
@@ -3381,6 +3428,255 @@ fn post_recovery_pending_materialization_with_delivery_progress_exits_replay_rep
             &expected_groups
         ),
         "post-recovery must classify delivered pending materialization as initial-audit catch-up, not as a new sink-generation-cutover repair trigger"
+    );
+}
+
+#[test]
+fn post_recovery_materialized_pending_exits_replay_repair_when_initial_audit_inflight() {
+    let expected_groups =
+        std::collections::BTreeSet::from([String::from("g1"), String::from("g2")]);
+    let sink_snapshot = crate::sink::SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            String::from("node-a"),
+            vec![String::from("g1"), String::from("g2")],
+        )]),
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: String::from("g1"),
+                primary_object_ref: String::from("node-a::g1"),
+                total_nodes: 12_000,
+                live_nodes: 11_999,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 12_001,
+                estimated_heap_bytes: 0,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: String::from("g2"),
+                primary_object_ref: String::from("node-a::g2"),
+                total_nodes: 15_000,
+                live_nodes: 14_999,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 15_001,
+                estimated_heap_bytes: 0,
+            },
+        ],
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    let mut source_snapshot = crate::source::SourceStatusSnapshot::default();
+    for group_id in ["g1", "g2"] {
+        source_snapshot
+            .concrete_roots
+            .push(crate::source::SourceConcreteRootHealthSnapshot {
+                root_key: format!("node-a::{group_id}"),
+                logical_root_id: group_id.to_string(),
+                object_ref: format!("node-a::{group_id}"),
+                status: "ready".to_string(),
+                coverage_mode: "local-primary".to_string(),
+                watch_enabled: true,
+                scan_enabled: true,
+                is_group_primary: true,
+                active: true,
+                watch_lru_capacity: 0,
+                audit_interval_ms: 0,
+                overflow_count: 0,
+                overflow_pending: false,
+                rescan_pending: false,
+                last_rescan_requested_at_us: None,
+                last_rescan_reason: Some("initial_scan".to_string()),
+                last_error: None,
+                last_audit_started_at_us: Some(10),
+                last_audit_completed_at_us: None,
+                last_audit_duration_ms: None,
+                emitted_batch_count: 0,
+                emitted_event_count: 0,
+                emitted_control_event_count: 0,
+                emitted_data_event_count: 0,
+                emitted_path_capture_target: None,
+                emitted_path_event_count: 0,
+                last_emitted_at_us: None,
+                last_emitted_origins: Vec::new(),
+                forwarded_batch_count: 0,
+                forwarded_event_count: 0,
+                forwarded_path_event_count: 0,
+                last_forwarded_at_us: None,
+                last_forwarded_origins: Vec::new(),
+                current_revision: None,
+                current_stream_generation: None,
+                candidate_revision: None,
+                candidate_stream_generation: None,
+                candidate_status: None,
+                draining_revision: None,
+                draining_stream_generation: None,
+                draining_status: None,
+            });
+    }
+
+    assert!(
+        !FSMetaApp::sink_status_snapshot_has_pending_materialization_progress_for_expected_groups(
+            &sink_snapshot,
+            &expected_groups,
+        ),
+        "precondition: this production-shaped snapshot has no stream delivery maps"
+    );
+    assert!(
+        FSMetaApp::sink_status_snapshot_has_materialized_pending_progress_for_expected_groups(
+            &sink_snapshot,
+            &expected_groups,
+        ),
+        "materialized pending rows are progress evidence while source audit is still running"
+    );
+    assert!(
+        FSMetaApp::source_status_snapshot_has_inflight_initial_audit_for_expected_groups(
+            &source_snapshot,
+            &expected_groups,
+        ),
+        "source audit started without completion is initial-audit catch-up evidence"
+    );
+}
+
+#[test]
+fn initial_audit_catchup_applies_first_post_initial_sink_cutover_without_deferring_replay() {
+    assert_eq!(
+        sink_generation_cutover_inline_action_from_evidence(
+            SinkGenerationCutoverDisposition::FailClosedRetainedReplayOnRetryableReset,
+            true,
+            false,
+            false,
+            true,
+        ),
+        SinkGenerationCutoverInlineAction::ApplyAsInitialAuditCatchup,
+        "online initial audit catch-up with materialized sink progress should not first schedule a sink-generation-cutover replay"
+    );
+    assert_eq!(
+        sink_generation_cutover_inline_action_from_evidence(
+            SinkGenerationCutoverDisposition::FailClosedRetainedReplayOnRetryableReset,
+            true,
+            false,
+            false,
+            false,
+        ),
+        SinkGenerationCutoverInlineAction::DeferReplay,
+        "without initial audit catch-up evidence, the fail-closed first-defer behavior is preserved"
+    );
+    assert_eq!(
+        sink_generation_cutover_inline_action_from_evidence(
+            SinkGenerationCutoverDisposition::FailClosedSharedGenerationCutover,
+            true,
+            false,
+            false,
+            true,
+        ),
+        SinkGenerationCutoverInlineAction::Apply,
+        "shared generation cutover is outside the initial-audit catch-up exception"
+    );
+    assert_eq!(
+        sink_generation_cutover_inline_action_from_evidence(
+            SinkGenerationCutoverDisposition::FailClosedRetainedReplayOnRetryableReset,
+            true,
+            true,
+            false,
+            true,
+        ),
+        SinkGenerationCutoverInlineAction::Apply,
+        "source replay still owns fail-closed recovery instead of being masked by sink catch-up evidence"
+    );
+}
+
+#[test]
+fn inflight_initial_audit_evidence_rejects_completed_or_error_roots() {
+    let expected_groups = std::collections::BTreeSet::from([String::from("g1")]);
+    let mut root = crate::source::SourceConcreteRootHealthSnapshot {
+        root_key: String::from("node-a::g1"),
+        logical_root_id: String::from("g1"),
+        object_ref: String::from("node-a::g1"),
+        status: String::from("ready"),
+        coverage_mode: String::from("local-primary"),
+        watch_enabled: true,
+        scan_enabled: true,
+        is_group_primary: true,
+        active: true,
+        watch_lru_capacity: 0,
+        audit_interval_ms: 0,
+        overflow_count: 0,
+        overflow_pending: false,
+        rescan_pending: false,
+        last_rescan_requested_at_us: None,
+        last_rescan_reason: Some(String::from("initial_scan")),
+        last_error: None,
+        last_audit_started_at_us: Some(10),
+        last_audit_completed_at_us: None,
+        last_audit_duration_ms: None,
+        emitted_batch_count: 0,
+        emitted_event_count: 0,
+        emitted_control_event_count: 0,
+        emitted_data_event_count: 0,
+        emitted_path_capture_target: None,
+        emitted_path_event_count: 0,
+        last_emitted_at_us: None,
+        last_emitted_origins: Vec::new(),
+        forwarded_batch_count: 0,
+        forwarded_event_count: 0,
+        forwarded_path_event_count: 0,
+        last_forwarded_at_us: None,
+        last_forwarded_origins: Vec::new(),
+        current_revision: None,
+        current_stream_generation: None,
+        candidate_revision: None,
+        candidate_stream_generation: None,
+        candidate_status: None,
+        draining_revision: None,
+        draining_stream_generation: None,
+        draining_status: None,
+    };
+    let inflight_snapshot = crate::source::SourceStatusSnapshot {
+        concrete_roots: vec![root.clone()],
+        ..crate::source::SourceStatusSnapshot::default()
+    };
+    assert!(
+        FSMetaApp::source_status_snapshot_has_inflight_initial_audit_for_expected_groups(
+            &inflight_snapshot,
+            &expected_groups,
+        )
+    );
+
+    root.last_audit_completed_at_us = Some(20);
+    let completed_snapshot = crate::source::SourceStatusSnapshot {
+        concrete_roots: vec![root.clone()],
+        ..crate::source::SourceStatusSnapshot::default()
+    };
+    assert!(
+        !FSMetaApp::source_status_snapshot_has_inflight_initial_audit_for_expected_groups(
+            &completed_snapshot,
+            &expected_groups,
+        )
+    );
+
+    root.last_audit_completed_at_us = None;
+    root.last_error = Some(String::from("scan failed"));
+    let error_snapshot = crate::source::SourceStatusSnapshot {
+        concrete_roots: vec![root],
+        ..crate::source::SourceStatusSnapshot::default()
+    };
+    assert!(
+        !FSMetaApp::source_status_snapshot_has_inflight_initial_audit_for_expected_groups(
+            &error_snapshot,
+            &expected_groups,
+        )
     );
 }
 
@@ -9463,6 +9759,45 @@ impl FSMetaApp {
             && expected_groups.is_disjoint(&projection.summary.missing_scheduled_groups)
             && !expected_groups.is_disjoint(&projection.summary.pending_materialization_groups)
             && FSMetaApp::sink_status_snapshot_has_delivery_evidence_for_republish(snapshot)
+    }
+
+    fn sink_status_snapshot_has_materialized_pending_progress_for_expected_groups(
+        snapshot: &crate::sink::SinkStatusSnapshot,
+        expected_groups: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        let projection = snapshot.concern_projection();
+        !expected_groups.is_empty()
+            && expected_groups.is_subset(&projection.summary.scheduled_groups)
+            && expected_groups.is_disjoint(&projection.summary.missing_scheduled_groups)
+            && !expected_groups.is_disjoint(&projection.summary.pending_materialization_groups)
+            && snapshot.groups.iter().any(|group| {
+                expected_groups.contains(&group.group_id)
+                    && matches!(
+                        group.normalized_readiness(),
+                        crate::sink::GroupReadinessState::PendingMaterialization
+                    )
+                    && (group.live_nodes > 0
+                        || group.total_nodes > 0
+                        || group.materialized_revision > 0)
+            })
+    }
+
+    fn source_status_snapshot_has_inflight_initial_audit_for_expected_groups(
+        snapshot: &crate::source::SourceStatusSnapshot,
+        expected_groups: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        !expected_groups.is_empty()
+            && expected_groups.iter().all(|expected_group| {
+                snapshot.concrete_roots.iter().any(|root| {
+                    root.logical_root_id == *expected_group
+                        && root.active
+                        && root.is_group_primary
+                        && root.scan_enabled
+                        && root.last_error.is_none()
+                        && root.last_audit_started_at_us.is_some()
+                        && root.last_audit_completed_at_us.is_none()
+                })
+            })
     }
 
     fn sink_status_snapshot_has_stale_group_republish_evidence(
@@ -18370,25 +18705,71 @@ impl FSMetaApp {
             == 1
     }
 
-    async fn sink_generation_cutover_apply_should_defer_inline(
+    async fn sink_generation_cutover_inline_action(
         &self,
         sink_signals: &[SinkControlSignal],
         generation_cutover_disposition: SinkGenerationCutoverDisposition,
-    ) -> bool {
-        if matches!(
-            generation_cutover_disposition,
-            SinkGenerationCutoverDisposition::FailClosedRetainedReplayOnRetryableReset
-        ) && sink_signals
+    ) -> SinkGenerationCutoverInlineAction {
+        let has_post_initial_single_route_activate = sink_signals
             .iter()
             .any(Self::sink_signal_is_post_initial_activate)
-            && Self::sink_signals_are_single_route_state_cutover(sink_signals)
-        {
-            return !self
-                .sink_generation_cutover_replay_deferred
-                .load(Ordering::Acquire)
-                || self.runtime_control_state().source_state_replay_required();
+            && Self::sink_signals_are_single_route_state_cutover(sink_signals);
+        let can_defer_replay = matches!(
+            generation_cutover_disposition,
+            SinkGenerationCutoverDisposition::FailClosedRetainedReplayOnRetryableReset
+        ) && has_post_initial_single_route_activate;
+        let initial_materialization_catchup = can_defer_replay
+            && !self.runtime_control_state().source_state_replay_required()
+            && self
+                .sink_status_and_source_audit_show_initial_materialization_catchup()
+                .await;
+        sink_generation_cutover_inline_action_from_evidence(
+            generation_cutover_disposition,
+            has_post_initial_single_route_activate,
+            self.runtime_control_state().source_state_replay_required(),
+            self.sink_generation_cutover_replay_deferred
+                .load(Ordering::Acquire),
+            initial_materialization_catchup,
+        )
+    }
+
+    async fn sink_status_and_source_audit_show_initial_materialization_catchup(&self) -> bool {
+        let Ok(expected_groups) = Self::runtime_scoped_facade_group_ids(&self.source, &self.sink)
+            .await
+            .map(|groups| {
+                groups
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+        else {
+            return false;
+        };
+        if expected_groups.is_empty() {
+            return false;
         }
-        false
+        let sink_has_materialized_pending_progress = self
+            .sink
+            .cached_status_snapshot_with_failure()
+            .ok()
+            .is_some_and(|snapshot| {
+                FSMetaApp::sink_status_snapshot_has_materialized_pending_progress_for_expected_groups(
+                    &snapshot,
+                    &expected_groups,
+                )
+            });
+        if !sink_has_materialized_pending_progress {
+            return false;
+        }
+        self.source
+            .status_snapshot_with_failure()
+            .await
+            .ok()
+            .is_some_and(|snapshot| {
+                FSMetaApp::source_status_snapshot_has_inflight_initial_audit_for_expected_groups(
+                    &snapshot,
+                    &expected_groups,
+                )
+            })
     }
 
     async fn defer_sink_generation_cutover_replay_inline(
@@ -20093,52 +20474,67 @@ impl FSMetaApp {
                         eprintln!(
                             "fs_meta_runtime_app: on_control_frame deferred sink cleanup wakeup after fail-closed generation cutover"
                         );
-                    } else if !apply_full_sink_recovery_synchronously
-                        && self
-                            .sink_generation_cutover_apply_should_defer_inline(
-                                &sink_signals,
-                                sink_generation_cutover_disposition,
-                            )
-                            .await
-                    {
-                        let mut deferred_sink_tail_plan = SinkRecoveryTailPlan::new();
-                        let deferred_local_sink_replay_signals = if sink_status_publication_present
-                        {
-                            self.current_generation_retained_sink_replay_signals_for_local_republish()
-                            .await
-                        } else {
-                            Vec::new()
-                        };
-                        if sink_status_publication_present {
-                            let expected_groups =
-                                Self::runtime_scoped_facade_group_ids(&self.source, &self.sink)
-                                    .await
-                                    .map_err(RuntimeWorkerObservationFailure::from)?
-                                    .into_iter()
-                                    .collect::<std::collections::BTreeSet<_>>();
-                            if !expected_groups.is_empty() {
-                                deferred_sink_tail_plan.gate_reopen_disposition =
-                                SinkRecoveryGateReopenDisposition::WaitForLocalSinkStatusRepublish {
-                                    expected_groups,
-                                };
+                    } else {
+                        let mut sink_apply_as_initial_audit_catchup = false;
+                        if !apply_full_sink_recovery_synchronously {
+                            match self
+                                .sink_generation_cutover_inline_action(
+                                    &sink_signals,
+                                    sink_generation_cutover_disposition,
+                                )
+                                .await
+                            {
+                                SinkGenerationCutoverInlineAction::DeferReplay => {
+                                    let mut deferred_sink_tail_plan = SinkRecoveryTailPlan::new();
+                                    let deferred_local_sink_replay_signals =
+                                        if sink_status_publication_present {
+                                            self.current_generation_retained_sink_replay_signals_for_local_republish()
+                                                .await
+                                        } else {
+                                            Vec::new()
+                                        };
+                                    if sink_status_publication_present {
+                                        let expected_groups =
+                                            Self::runtime_scoped_facade_group_ids(
+                                                &self.source,
+                                                &self.sink,
+                                            )
+                                            .await
+                                            .map_err(RuntimeWorkerObservationFailure::from)?
+                                            .into_iter()
+                                            .collect::<std::collections::BTreeSet<_>>();
+                                        if !expected_groups.is_empty() {
+                                            deferred_sink_tail_plan.gate_reopen_disposition =
+                                            SinkRecoveryGateReopenDisposition::WaitForLocalSinkStatusRepublish {
+                                                expected_groups,
+                                            };
+                                        }
+                                    }
+                                    self.defer_sink_generation_cutover_replay_inline(
+                                        &fixed_bind_session,
+                                        &sink_signals,
+                                    )
+                                    .await?;
+                                    self.apply_sink_recovery_tail_plan(
+                                        fixed_bind_session,
+                                        request_sensitive,
+                                        sink_cleanup_only_while_uninitialized,
+                                        deferred_sink_tail_plan,
+                                        deferred_local_sink_replay_signals,
+                                        facade_publication_signals,
+                                    )
+                                    .await?;
+                                    return Ok(());
+                                }
+                                SinkGenerationCutoverInlineAction::ApplyAsInitialAuditCatchup => {
+                                    sink_apply_as_initial_audit_catchup = true;
+                                    eprintln!(
+                                        "fs_meta_runtime_app: sink control applying post-initial route cutover as initial audit materialization catch-up"
+                                    );
+                                }
+                                SinkGenerationCutoverInlineAction::Apply => {}
                             }
                         }
-                        self.defer_sink_generation_cutover_replay_inline(
-                            &fixed_bind_session,
-                            &sink_signals,
-                        )
-                        .await?;
-                        self.apply_sink_recovery_tail_plan(
-                            fixed_bind_session,
-                            request_sensitive,
-                            sink_cleanup_only_while_uninitialized,
-                            deferred_sink_tail_plan,
-                            deferred_local_sink_replay_signals,
-                            facade_publication_signals,
-                        )
-                        .await?;
-                        return Ok(());
-                    } else {
                         #[cfg(test)]
                         note_sink_apply_entry_for_tests(self.instance_id);
                         #[cfg(test)]
@@ -20157,12 +20553,12 @@ impl FSMetaApp {
                                 sink_generation_cutover_disposition,
                                 SinkGenerationCutoverDisposition::FailClosedSharedGenerationCutover
                                     | SinkGenerationCutoverDisposition::FailClosedColdSuccessorCandidateOnRetryableReset
-                            ),
+                            ) && !sink_apply_as_initial_audit_catchup,
                             matches!(
                                 sink_generation_cutover_disposition,
                                 SinkGenerationCutoverDisposition::FailClosedRetainedReplayOnRetryableReset
                                     | SinkGenerationCutoverDisposition::FailClosedColdSuccessorCandidateOnRetryableReset
-                            ),
+                            ) && !sink_apply_as_initial_audit_catchup,
                         )
                         .await
                     {
