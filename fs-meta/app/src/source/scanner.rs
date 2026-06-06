@@ -271,6 +271,70 @@ mod tests {
             "directory fingerprint must not depend on read_dir entry order"
         );
     }
+
+    #[derive(Clone)]
+    struct ConcurrentMetadataHostFs {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    impl HostFs for ConcurrentMetadataHostFs {
+        fn metadata(&self, _path: &Path) -> io::Result<HostFsMetadata> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut observed = self.max_active.load(Ordering::SeqCst);
+            while active > observed {
+                match self.max_active.compare_exchange(
+                    observed,
+                    active,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => observed = next,
+                }
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(HostFsMetadata {
+                is_dir: false,
+                len: 1,
+                modified: Some(UNIX_EPOCH + Duration::from_secs(1)),
+                created: Some(UNIX_EPOCH + Duration::from_secs(1)),
+                dev: Some(1),
+                ino: Some(1),
+            })
+        }
+
+        fn symlink_metadata(&self, path: &Path) -> io::Result<HostFsMetadata> {
+            self.metadata(path)
+        }
+
+        fn read_dir(&self, _path: &Path) -> io::Result<Vec<HostFsDirEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn metadata_many_uses_host_fs_pool_concurrently() {
+        let host_fs = ConcurrentMetadataHostFs {
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+        };
+        let max_active = Arc::clone(&host_fs.max_active);
+        let pool = HostFsOpPool::new(4, Duration::from_secs(2));
+        let paths = (0..8)
+            .map(|idx| PathBuf::from(format!("/root/file-{idx}")))
+            .collect::<Vec<_>>();
+
+        let results = metadata_many_with_retry(&pool, Arc::new(host_fs), paths);
+
+        assert_eq!(results.len(), 8);
+        assert!(results.iter().all(|(_, result)| result.is_ok()));
+        assert!(
+            max_active.load(Ordering::SeqCst) > 1,
+            "bulk catch-up metadata must use the host-fs op pool concurrently"
+        );
+    }
 }
 
 fn derived_ino_for_path(path: &Path) -> u64 {
@@ -290,6 +354,9 @@ const HOST_FS_OP_TIMEOUT_ENV: &str = "FS_META_SOURCE_HOST_FS_OP_TIMEOUT_SECS";
 const HOST_FS_OP_TIMEOUT_DEFAULT_SECS: u64 = 15;
 const HOST_FS_OP_WORKERS_ENV: &str = "FS_META_SOURCE_HOST_FS_OP_WORKERS";
 const HOST_FS_OP_WORKERS_MAX: usize = 256;
+const HOST_FS_METADATA_BATCH_ENV: &str = "FS_META_SOURCE_METADATA_BATCH";
+const HOST_FS_METADATA_BATCH_DEFAULT: usize = 4096;
+const HOST_FS_METADATA_BATCH_MAX: usize = 65_536;
 
 const AUDIT_DEEP_INTERVAL_ROUNDS_ENV: &str = "FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS";
 const AUDIT_DEEP_INTERVAL_ROUNDS_DEFAULT: u64 = 24;
@@ -409,7 +476,15 @@ fn host_fs_op_workers(scan_workers: usize) -> usize {
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .map(normalize_host_fs_op_workers)
-        .unwrap_or_else(|| normalize_host_fs_op_workers(scan_workers))
+        .unwrap_or_else(|| normalize_host_fs_op_workers(scan_workers.saturating_mul(4)))
+}
+
+fn metadata_batch_size() -> usize {
+    std::env::var(HOST_FS_METADATA_BATCH_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(HOST_FS_METADATA_BATCH_DEFAULT)
+        .clamp(1, HOST_FS_METADATA_BATCH_MAX)
 }
 
 fn host_fs_timeout_error(op: &str, path: &Path) -> io::Error {
@@ -522,6 +597,93 @@ fn metadata_with_retry(
     Err(last.unwrap_or_else(|| io::Error::other("metadata retry exhausted")))
 }
 
+fn metadata_direct_with_retry(host_fs: Arc<dyn HostFs>, path: &Path) -> io::Result<HostFsMetadata> {
+    let mut last = None::<io::Error>;
+    for attempt in 1..=HOST_FS_RETRY_ATTEMPTS {
+        match host_fs.metadata(path) {
+            Ok(meta) => return Ok(meta),
+            Err(err)
+                if attempt < HOST_FS_RETRY_ATTEMPTS && should_retry_host_fs_error(err.kind()) =>
+            {
+                last = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::other("metadata retry exhausted")))
+}
+
+fn metadata_many_with_retry(
+    host_fs_ops: &HostFsOpPool,
+    host_fs: Arc<dyn HostFs>,
+    paths: Vec<PathBuf>,
+) -> Vec<(PathBuf, io::Result<HostFsMetadata>)> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+
+    let started = Instant::now();
+    let deadline = started + host_fs_ops.timeout;
+    let (tx, rx) = cb::bounded(paths.len());
+    let mut scheduled = HashSet::<PathBuf>::new();
+    let mut output = Vec::with_capacity(paths.len());
+
+    for path in paths {
+        let remaining = deadline.checked_duration_since(Instant::now());
+        let Some(remaining) = remaining else {
+            output.push((path.clone(), Err(host_fs_timeout_error("metadata", &path))));
+            continue;
+        };
+        let tx = tx.clone();
+        let job_path = path.clone();
+        let job_host_fs = Arc::clone(&host_fs);
+        match host_fs_ops.tx.send_timeout(
+            Box::new(move || {
+                let result = metadata_direct_with_retry(job_host_fs, &job_path);
+                let _ = tx.send((job_path, result));
+            }),
+            remaining,
+        ) {
+            Ok(()) => {
+                scheduled.insert(path);
+            }
+            Err(cb::SendTimeoutError::Timeout(_)) => {
+                output.push((path.clone(), Err(host_fs_timeout_error("metadata", &path))));
+            }
+            Err(cb::SendTimeoutError::Disconnected(_)) => {
+                output.push((
+                    path.clone(),
+                    Err(io::Error::other(format!(
+                        "metadata worker pool disconnected for {}",
+                        path.display()
+                    ))),
+                ));
+            }
+        }
+    }
+    drop(tx);
+
+    while !scheduled.is_empty() {
+        let remaining = deadline.checked_duration_since(Instant::now());
+        let Some(remaining) = remaining else {
+            break;
+        };
+        match rx.recv_timeout(remaining) {
+            Ok((path, result)) => {
+                scheduled.remove(&path);
+                output.push((path, result));
+            }
+            Err(cb::RecvTimeoutError::Timeout) => break,
+            Err(cb::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    for path in scheduled {
+        output.push((path.clone(), Err(host_fs_timeout_error("metadata", &path))));
+    }
+    output
+}
+
 fn read_dir_with_retry(
     host_fs_ops: &HostFsOpPool,
     host_fs: Arc<dyn HostFs>,
@@ -541,6 +703,17 @@ fn read_dir_with_retry(
         }
     }
     Err(last.unwrap_or_else(|| io::Error::other("read_dir retry exhausted")))
+}
+
+fn flush_scan_records(
+    result_tx: &cb::Sender<Vec<FileMetaRecord>>,
+    records: &mut Vec<FileMetaRecord>,
+    flush_at: usize,
+) -> bool {
+    if records.len() < flush_at {
+        return true;
+    }
+    result_tx.send(std::mem::take(records)).is_ok()
 }
 
 /// Parallel directory scanner with work-stealing.
@@ -826,6 +999,8 @@ impl ParallelScanner {
         let deep_scan_interval_rounds = self.deep_scan_interval_rounds;
         let root = self.root_path.clone();
         let schedule_audit_watches = audit_watch_schedule_enabled();
+        let metadata_batch = metadata_batch_size();
+        let flush_record_count = self.batch_size.max(1);
         // Spawn workers
         let handles: Vec<_> = (0..self.scan_workers)
             .map(|_| {
@@ -846,6 +1021,8 @@ impl ParallelScanner {
                 };
                 let host_fs = Arc::clone(&self.host_fs);
                 let host_fs_ops = self.host_fs_ops.clone();
+                let metadata_batch = metadata_batch;
+                let flush_record_count = flush_record_count;
                 std::thread::spawn(move || {
                     loop {
                         // Use recv_timeout instead of blocking recv to avoid deadlock.
@@ -1008,6 +1185,7 @@ impl ParallelScanner {
                                     let parent_relative =
                                         watcher::make_relative(&dir_path, &root);
                                     let parent_mtime_us = (current_mtime * 1_000_000.0) as u64;
+                                    let mut file_paths = Vec::new();
 
                                     for entry in entries {
                                         if stop_requested.load(Ordering::SeqCst) {
@@ -1024,36 +1202,61 @@ impl ParallelScanner {
                                             continue;
                                         }
 
-                                        let entry_path = entry.path;
-                                        let relative = watcher::make_relative(&entry_path, &root);
-                                        match metadata_with_retry(&host_fs_ops, Arc::clone(&host_fs), &entry_path) {
-                                            Ok(meta) => {
-                                                let mtime_us = to_epoch_us(meta.modified);
-                                                let ctime_us = to_epoch_us(meta.created);
-                                                records.push(FileMetaRecord::scan_update(
-                                                    relative,
-                                                    entry_path
-                                                        .file_name()
-                                                        .map(|n| n.as_bytes().to_vec())
-                                                        .unwrap_or_default(),
-                                                    UnixStat {
-                                                        is_dir: false,
-                                                        size: meta.len,
-                                                        mtime_us,
-                                                        ctime_us,
-                                                        dev: meta.dev,
-                                                        ino: meta.ino,
-                                                    },
-                                                    parent_relative.clone(),
-                                                    parent_mtime_us,
-                                                    false,
-                                                ));
+                                        file_paths.push(entry.path);
+                                    }
+
+                                    for chunk in file_paths.chunks(metadata_batch) {
+                                        if stop_requested.load(Ordering::SeqCst) {
+                                            break;
+                                        }
+                                        let metas = metadata_many_with_retry(
+                                            &host_fs_ops,
+                                            Arc::clone(&host_fs),
+                                            chunk.to_vec(),
+                                        );
+                                        for (entry_path, meta_result) in metas {
+                                            if stop_requested.load(Ordering::SeqCst) {
+                                                break;
                                             }
-                                            Err(e) => log::warn!(
-                                                "Skipping file {:?}: metadata failed: {}",
-                                                entry_path,
-                                                e
-                                            ),
+                                            let relative =
+                                                watcher::make_relative(&entry_path, &root);
+                                            match meta_result {
+                                                Ok(meta) => {
+                                                    let mtime_us = to_epoch_us(meta.modified);
+                                                    let ctime_us = to_epoch_us(meta.created);
+                                                    records.push(FileMetaRecord::scan_update(
+                                                        relative,
+                                                        entry_path
+                                                            .file_name()
+                                                            .map(|n| n.as_bytes().to_vec())
+                                                            .unwrap_or_default(),
+                                                        UnixStat {
+                                                            is_dir: false,
+                                                            size: meta.len,
+                                                            mtime_us,
+                                                            ctime_us,
+                                                            dev: meta.dev,
+                                                            ino: meta.ino,
+                                                        },
+                                                        parent_relative.clone(),
+                                                        parent_mtime_us,
+                                                        false,
+                                                    ));
+                                                }
+                                                Err(e) => log::warn!(
+                                                    "Skipping file {:?}: metadata failed: {}",
+                                                    entry_path,
+                                                    e
+                                                ),
+                                            }
+                                            if !flush_scan_records(
+                                                &result_tx,
+                                                &mut records,
+                                                flush_record_count,
+                                            ) {
+                                                stop_requested.store(true, Ordering::SeqCst);
+                                                break;
+                                            }
                                         }
                                     }
                                 }

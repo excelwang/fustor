@@ -152,6 +152,14 @@ struct ProductConfig {
     auth: ProductAuthConfig,
     #[serde(default)]
     workers: ProductWorkersConfig,
+    #[serde(default)]
+    scan_workers: Option<u64>,
+    #[serde(default)]
+    max_scan_events: Option<u64>,
+    #[serde(default)]
+    audit_interval_ms: Option<u64>,
+    #[serde(default)]
+    throttle_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -754,6 +762,7 @@ fn build_deploy_intent(
     write_startup_manifest(base_manifest_path, &spec, &generated_manifest_path)
         .map_err(|err| anyhow::anyhow!("generate fs-meta startup manifest failed: {err}"))?;
     let mut release_doc = build_release_doc_value(&spec);
+    apply_source_tuning(product, &mut release_doc)?;
     let target_generation = release_doc
         .get("target_generation")
         .and_then(serde_json::Value::as_u64)
@@ -779,6 +788,37 @@ fn build_deploy_intent(
     policy.insert("generation".into(), json!(target_generation));
     compile_release_doc_to_relation_target_intent(&release_doc)
         .map_err(|err| anyhow::anyhow!("invalid fs-meta deploy intent: {err}"))
+}
+
+fn apply_source_tuning(
+    product: &ProductConfig,
+    release_doc: &mut serde_json::Value,
+) -> anyhow::Result<()> {
+    let Some(config) = release_doc
+        .get_mut("units")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|units| units.first_mut())
+        .and_then(|unit| unit.get_mut("config"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        bail!("release document missing first unit config");
+    };
+
+    let mut set_int = |key: &str, value: Option<u64>| -> anyhow::Result<()> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let value = i64::try_from(value)
+            .with_context(|| format!("{key} exceeds fs-meta manifest integer range"))?;
+        config.insert(key.to_string(), json!(value));
+        Ok(())
+    };
+
+    set_int("scan_workers", product.scan_workers)?;
+    set_int("max_scan_events", product.max_scan_events)?;
+    set_int("audit_interval_ms", product.audit_interval_ms)?;
+    set_int("throttle_interval_ms", product.throttle_interval_ms)?;
+    Ok(())
 }
 
 fn ensure_fs_meta_app_runtime_path() -> anyhow::Result<PathBuf> {
@@ -1320,6 +1360,53 @@ mod tests {
                 "embedded source mode must not emit startup.path"
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_intent_carries_source_tuning_fields_into_app_config() {
+        let path = unique_temp_path("deploy-intent-source-tuning");
+        fs::write(
+            &path,
+            "api:\n  facade_resource_id: fs-meta-tcp-listener\nscan_workers: 16\nmax_scan_events: 10000000\naudit_interval_ms: 300000\nthrottle_interval_ms: 50\n",
+        )
+        .expect("write product config");
+        let product = load_product_config(&path).expect("product config should parse");
+        let _ = fs::remove_file(&path);
+
+        let dir = std::env::temp_dir().join(format!(
+            "fsmeta-intent-source-tuning-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (auth_cfg, ..) = build_auth_config(&ProductAuthConfig::default(), &dir);
+
+        let manifest = workspace_root()
+            .expect("workspace root")
+            .join("fs-meta/fixtures/manifests/fs-meta.yaml")
+            .canonicalize()
+            .expect("fixture manifest path");
+        let intent = build_deploy_intent(
+            &product,
+            auth_cfg,
+            &PathBuf::from("/tmp/fs-meta-runtime.so"),
+            &manifest,
+            &dir,
+            vec!["node-a".to_string()],
+        )
+        .expect("deploy intent should compile");
+        let config = intent["workers"][0]["config"]
+            .as_object()
+            .expect("compiled app config should be a map");
+
+        assert_eq!(config.get("scan_workers"), Some(&json!(16)));
+        assert_eq!(config.get("max_scan_events"), Some(&json!(10_000_000)));
+        assert_eq!(config.get("audit_interval_ms"), Some(&json!(300_000)));
+        assert_eq!(config.get("throttle_interval_ms"), Some(&json!(50)));
 
         let _ = fs::remove_dir_all(&dir);
     }

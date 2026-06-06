@@ -25,7 +25,7 @@ pub struct GrantedMountRoot {
 }
 
 const SOURCE_SCAN_WORKERS_ENV: &str = "FS_META_SOURCE_SCAN_WORKERS";
-const SOURCE_SCAN_WORKERS_DEFAULT: usize = 2;
+const SOURCE_SCAN_WORKERS_DEFAULT: usize = 16;
 const SOURCE_SCAN_WORKERS_MIN: usize = 1;
 const SOURCE_SCAN_WORKERS_MAX: usize = 16;
 
