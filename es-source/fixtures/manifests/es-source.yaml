@@ -1,0 +1,19 @@
+ports:
+  - route_token: es-source.internal
+    use_port: fetch
+    dispatch_tag: fetch
+    pattern: request_reply
+    route_key: es-source.fetch:v1
+    visibility: internal
+    roles:
+      - serve
+      - use
+  - route_token: es-source.internal
+    use_port: status
+    dispatch_tag: status
+    pattern: request_reply
+    route_key: es-source.status:v1
+    visibility: internal
+    roles:
+      - serve
+      - use

@@ -1,0 +1,49 @@
+{
+  "catalogs": [
+    {
+      "name": "NCBI",
+      "type": "postgresql",
+      "jdbc": {
+        "jdbcUri": "jdbc:postgresql://postgres:5432/postgres?user=demo"
+      }
+    }
+  ],
+  "graph": {
+    "vertices": [
+      {
+        "label": "gene",
+        "oneToOne": {
+          "tableSource": {
+            "catalog": "NCBI",
+            "schema": "public",
+            "table": "gene_info"
+          },
+          "id": {
+            "fields": [
+              {
+                "type": "LONG",
+                "field": "geneid",
+                "alias": "gene_id"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "label": "pubmed"
+      }
+    ],
+    "edges": [
+      {
+        "label": "gene2pubmed",
+        "fromVertex": "gene",
+        "toVertex": "pubmed",
+        "tableSource": {
+          "catalog": "NCBI",
+          "schema": "public",
+          "table": "gene2pubmed"
+        }
+      }
+    ]
+  }
+}

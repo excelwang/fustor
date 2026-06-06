@@ -1,0 +1,82 @@
+{
+  "catalogs": [
+    {
+      "name": "OMIX",
+      "type": "postgresql",
+      "jdbc": {
+        "jdbcUri": "jdbc:postgresql://postgres:5432/omix_graph?user=demo"
+      }
+    },
+    {
+      "name": "BRIDGE",
+      "type": "postgresql",
+      "jdbc": {
+        "jdbcUri": "jdbc:postgresql://postgres:5432/bridge_graph?user=demo"
+      }
+    }
+  ],
+  "graph": {
+    "vertices": [
+      {
+        "label": "cncb_dataset",
+        "oneToOne": {
+          "tableSource": {
+            "catalog": "OMIX",
+            "schema": "public",
+            "table": "cncb_dataset"
+          },
+          "id": {
+            "fields": [
+              {
+                "type": "STRING",
+                "field": "omix_accession",
+                "alias": "omix_accession"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "label": "cncb_article",
+        "oneToOne": {
+          "tableSource": {
+            "catalog": "OMIX",
+            "schema": "public",
+            "table": "cncb_article"
+          },
+          "id": {
+            "fields": [
+              {
+                "type": "STRING",
+                "field": "doi",
+                "alias": "doi"
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "label": "cncb_has_article",
+        "fromVertex": "cncb_dataset",
+        "toVertex": "cncb_article",
+        "tableSource": {
+          "catalog": "OMIX",
+          "schema": "public",
+          "table": "cncb_has_article"
+        }
+      },
+      {
+        "label": "br_same_publication_as",
+        "fromVertex": "cncb_article",
+        "toVertex": "pubmed",
+        "tableSource": {
+          "catalog": "BRIDGE",
+          "schema": "public",
+          "table": "br_same_publication_as"
+        }
+      }
+    ]
+  }
+}

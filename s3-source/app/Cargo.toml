@@ -1,0 +1,25 @@
+[package]
+name = "s3-source-runtime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "S3-compatible source deployable runtime artifact package"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+async-trait = { workspace = true }
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+capanix-app-sdk = { workspace = true }
+capanix-runtime-entry-sdk = { workspace = true }
+rmp-serde = { workspace = true }
+s3-source = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+source-kit = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+tokio-util = { workspace = true, features = ["rt"] }
