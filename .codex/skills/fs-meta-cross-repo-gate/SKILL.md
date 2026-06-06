@@ -41,6 +41,12 @@ One-click activation phrases:
 4. If the blocker is localized back to `capanix`, keep the worker dormant and continue locally as coordinator.
 5. Process worker control markers before giving any status summary.
 
+## Cluster Access
+
+- For the `wanghuajin@10.0.82.144~148` fs-meta cluster, the management shadow secret is on `10.0.82.145` at `/home/wanghuajin/fsmeta-stable/run/.fsmeta-state/fs-meta.shadow`.
+- Read that file over SSH only when API authentication is required for diagnostics or deployment validation.
+- Never write the secret value into repository files, logs, artifacts, shell history, or user-facing responses; report only safe authentication success/failure evidence.
+
 ## Fustor Iteration Rules
 
 When `fustor` owns the blocker:

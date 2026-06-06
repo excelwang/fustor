@@ -11621,6 +11621,7 @@ impl SourceFacade {
 }
 
 async fn run_local_source_pump(
+    source: Arc<FSMetaSource>,
     stream: std::pin::Pin<Box<dyn futures_core::Stream<Item = Vec<Event>> + Send>>,
     sink: Arc<SinkFacade>,
     boundary: Option<Arc<dyn ChannelIoSubset>>,
@@ -11651,6 +11652,7 @@ async fn run_local_source_pump(
                     origin,
                     err
                 );
+                source.mark_publication_output_closed(err.to_string());
                 break;
             }
         }
@@ -11692,7 +11694,7 @@ fn spawn_local_source_pump(
                 let _ = ready_tx.send(Ok(()));
                 tokio::select! {
                     _ = task_shutdown.cancelled() => {}
-                    _ = run_local_source_pump(stream, sink, boundary, event_route_scope) => {}
+                    _ = run_local_source_pump(source, stream, sink, boundary, event_route_scope) => {}
                 }
             })
     });

@@ -6,7 +6,7 @@ use capanix_app_sdk::raw::{
 };
 use capanix_app_sdk::route_proto::ExecLeaseMetadata;
 use capanix_app_sdk::runtime::{
-    ControlFrame, LogLevel, RuntimeWorkerBinding, RuntimeWorkerLauncherKind,
+    ControlFrame, EventMetadata, LogLevel, RuntimeWorkerBinding, RuntimeWorkerLauncherKind,
     in_memory_state_boundary,
 };
 use capanix_app_sdk::worker::WorkerMode;
@@ -59,6 +59,20 @@ struct LoopbackWorkerBoundary {
     closed: StdMutex<HashSet<String>>,
     close_history: StdMutex<Vec<String>>,
     changed: Notify,
+}
+
+#[derive(Default)]
+struct EmbeddedFailingPublishBoundary {
+    send_count: StdMutex<u64>,
+}
+
+impl EmbeddedFailingPublishBoundary {
+    fn send_count(&self) -> u64 {
+        *self
+            .send_count
+            .lock()
+            .expect("embedded failing publish send_count lock")
+    }
 }
 
 struct SourceWorkerUpdateRootsHookReset;
@@ -3335,6 +3349,124 @@ impl ChannelBoundary for LoopbackWorkerBoundary {
 }
 
 impl StateBoundary for LoopbackWorkerBoundary {}
+
+#[async_trait]
+impl ChannelIoSubset for EmbeddedFailingPublishBoundary {
+    async fn channel_send(
+        &self,
+        _ctx: BoundaryContext,
+        _request: ChannelSendRequest,
+    ) -> Result<()> {
+        let mut guard = self
+            .send_count
+            .lock()
+            .expect("embedded failing publish channel_send lock");
+        *guard += 1;
+        Err(CnxError::ChannelClosed)
+    }
+
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        _request: ChannelRecvRequest,
+    ) -> Result<Vec<Event>> {
+        Err(CnxError::ChannelClosed)
+    }
+}
+
+#[tokio::test]
+async fn embedded_source_pump_marks_publication_output_closed_on_stream_publish_failure() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![worker_source_root("nfs1", &nfs1)],
+        host_object_grants: vec![worker_source_export(
+            "node-a::nfs1",
+            "node-a",
+            "10.0.0.11",
+            nfs1,
+        )],
+        ..SourceConfig::default()
+    };
+    let source = Arc::new(
+        FSMetaSource::with_boundaries_and_state(
+            cfg.clone(),
+            NodeId("node-a".to_string()),
+            None,
+            in_memory_state_boundary(),
+        )
+        .expect("build source"),
+    );
+    let sink = Arc::new(SinkFacade::Local(Arc::new(
+        SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg.clone())
+            .expect("build sink"),
+    )));
+
+    let source_pub_stream = source
+        .pub_stream_with_failure()
+        .await
+        .expect("start source pub stream");
+    let root_key = source
+        .status_snapshot_with_failure()
+        .expect("source status before pump")
+        .concrete_roots
+        .first()
+        .expect("concrete root exists")
+        .root_key
+        .clone();
+
+    let failing_boundary = Arc::new(EmbeddedFailingPublishBoundary::default());
+    let failing_boundary_dyn: Arc<dyn ChannelIoSubset> = failing_boundary.clone();
+    let event = Event::new(
+        EventMetadata {
+            origin_id: NodeId("node-a::nfs1".to_string()),
+            timestamp_us: 1,
+            logical_ts: None,
+            correlation_id: None,
+            ingress_auth: None,
+            trace: None,
+        },
+        bytes::Bytes::from_static(b"seed"),
+    );
+    let test_stream = futures_util::stream::iter(vec![vec![event]]);
+
+    run_local_source_pump(
+        source.clone(),
+        Box::pin(test_stream),
+        sink,
+        Some(failing_boundary_dyn),
+        "node-a".to_string(),
+    )
+    .await;
+
+    let status = source
+        .status_snapshot_with_failure()
+        .expect("source status after pump failure");
+    let detail = status
+        .concrete_roots
+        .iter()
+        .find(|root| root.root_key == root_key)
+        .expect("concrete root still exists after pump failure");
+    assert_eq!(
+        failing_boundary.send_count(),
+        1,
+        "embedded source pump should attempt the runtime event-stream publish once"
+    );
+    assert_eq!(
+        detail.status, "output_closed",
+        "embedded source pump must mark source publication closed on runtime stream publish failure"
+    );
+    assert_eq!(
+        detail.last_error.as_deref(),
+        Some("channel closed"),
+        "embedded source pump must surface the publication failure reason in source health"
+    );
+
+    drop(source_pub_stream);
+    source.close_with_failure().await.expect("close source");
+}
 
 const WORKER_BOOTSTRAP_CONTROL_FRAME_KIND: &str = "capanix.worker.bootstrap:v1";
 

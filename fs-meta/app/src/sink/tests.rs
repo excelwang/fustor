@@ -2782,7 +2782,7 @@ async fn activate_limits_sink_state_to_bound_scopes_only() {
 }
 
 #[tokio::test]
-async fn sink_status_stops_publishing_scheduled_group_when_local_active_grant_is_withdrawn() {
+async fn sink_status_keeps_runtime_scheduled_group_when_local_grant_is_withdrawn() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![RootSpec::new("nfs2", "/mnt/nfs2")];
     cfg.host_object_grants = vec![granted_mount_root(
@@ -2831,17 +2831,15 @@ async fn sink_status_stops_publishing_scheduled_group_when_local_active_grant_is
         .expect("withdraw nfs2 grant should pass");
 
     let after = sink.status_snapshot().expect("status after withdraw");
-    assert!(
-        after
-            .scheduled_groups_by_node
-            .get("node-d")
-            .is_none_or(|groups| !groups.iter().any(|group| group == "nfs2")),
-        "withdrawn local grant must remove nfs2 from scheduled_groups_by_node instead of reporting node-d as a stale sink holder: {after:?}"
+    assert_eq!(
+        after.scheduled_groups_by_node.get("node-d"),
+        Some(&vec!["nfs2".to_string()]),
+        "grant withdrawal is not runtime deactivation; sink status must keep reporting the runtime-accepted schedule until Capanix updates the route: {after:?}"
     );
 }
 
 #[tokio::test]
-async fn sink_status_stops_publishing_explicit_local_resource_when_local_grant_is_withdrawn() {
+async fn sink_status_keeps_explicit_runtime_resource_when_local_grant_is_withdrawn() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![RootSpec::new("nfs2", "/mnt/nfs2")];
     cfg.host_object_grants = vec![granted_mount_root(
@@ -2890,17 +2888,15 @@ async fn sink_status_stops_publishing_explicit_local_resource_when_local_grant_i
         .expect("withdraw nfs2 grant should pass");
 
     let after = sink.status_snapshot().expect("status after withdraw");
-    assert!(
-        after
-            .scheduled_groups_by_node
-            .get("node-d")
-            .is_none_or(|groups| !groups.iter().any(|group| group == "nfs2")),
-        "withdrawn local grant must suppress an explicit local resource scope instead of reporting node-d as a stale sink holder: {after:?}"
+    assert_eq!(
+        after.scheduled_groups_by_node.get("node-d"),
+        Some(&vec!["nfs2".to_string()]),
+        "grant withdrawal is not runtime deactivation; an explicit runtime resource scope remains schedule evidence until Capanix updates the route: {after:?}"
     );
 }
 
 #[tokio::test]
-async fn sink_status_uses_management_apply_grants_when_filtering_scheduled_groups() {
+async fn sink_status_management_apply_grants_do_not_filter_runtime_schedule() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![RootSpec::new("nfs2", "/mnt/nfs2")];
     cfg.host_object_grants = vec![granted_mount_root(
@@ -2951,12 +2947,10 @@ async fn sink_status_uses_management_apply_grants_when_filtering_scheduled_group
     let after = sink
         .status_snapshot()
         .expect("status after management apply");
-    assert!(
-        after
-            .scheduled_groups_by_node
-            .get("node-d")
-            .is_none_or(|groups| !groups.iter().any(|group| group == "nfs2")),
-        "sink status must filter scheduled groups with management-applied current grants, not stale bootstrap grants: {after:?}"
+    assert_eq!(
+        after.scheduled_groups_by_node.get("node-d"),
+        Some(&vec!["nfs2".to_string()]),
+        "management-applied grants may explain drift, but they must not hide a runtime-accepted active sink schedule: {after:?}"
     );
 }
 
@@ -4803,11 +4797,8 @@ async fn roots_control_stream_ignores_older_declaration_after_newer_authoritativ
     assert_eq!(
         sink.scheduled_group_ids_snapshot()
             .expect("scheduled groups after roots-control stream"),
-        Some(std::collections::BTreeSet::from([
-            "nfs1".to_string(),
-            "nfs2".to_string()
-        ])),
-        "sink roots-control stream must derive sink scope only from local active grants that match the accepted logical roots",
+        Some(std::collections::BTreeSet::new()),
+        "sink roots-control refreshes logical roots only; it must not derive sink placement from local grants when Capanix has not assigned active sink scopes",
     );
 
     sink.close().await.expect("close sink");
@@ -4865,7 +4856,7 @@ async fn full_root_logical_roots_refresh_preserves_runtime_owned_single_sink_gro
         .expect("apply single-owner sink activate");
 
     sink.update_logical_roots_from_management_apply(roots.clone(), &grants)
-        .expect("full-root management refresh must derive only the local sink schedule");
+        .expect("full-root management refresh must not overwrite runtime sink schedule");
 
     let snapshot = sink
         .status_snapshot()
@@ -4883,7 +4874,7 @@ async fn full_root_logical_roots_refresh_preserves_runtime_owned_single_sink_gro
         sink.scheduled_group_ids_snapshot()
             .expect("scheduled groups after full-root refresh"),
         Some(std::collections::BTreeSet::from(["nfs-145".to_string()])),
-        "logical-roots refresh must derive sink placement from local active grants instead of expanding to every full-root group",
+        "logical-roots refresh must keep Capanix runtime placement instead of expanding to every full-root group",
     );
 
     sink.close().await.expect("close sink");
@@ -4939,6 +4930,10 @@ async fn status_snapshot_reports_runtime_scheduled_bare_group_even_when_grant_pr
         "sink status must report the runtime-owned bare scheduled group even when grant projection is not local: {snapshot:?}"
     );
     assert!(
+        scheduled.contains("nfs2"),
+        "explicit local resource scope must still publish the locally owned group: {snapshot:?}"
+    );
+    assert!(
         snapshot.groups.iter().any(|group| group.group_id == "nfs1"),
         "sink status must expose a pending row for a runtime-owned scheduled group without current materialized rows: {snapshot:?}"
     );
@@ -4947,7 +4942,87 @@ async fn status_snapshot_reports_runtime_scheduled_bare_group_even_when_grant_pr
 }
 
 #[tokio::test]
-async fn management_logical_roots_update_derives_local_grant_sink_scope() {
+async fn full_root_bare_runtime_scopes_are_reported_as_runtime_schedule_not_hidden_by_grants() {
+    let roots = ["nfs-144", "nfs-145", "nfs-146", "nfs-147", "nfs-148"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, group)| {
+            let host_ip = format!("10.0.82.{}", 144 + index);
+            let mount_point = format!("/mnt/fustor-peers/nfs{}", 145 + index);
+            let mut root = RootSpec::new(group, mount_point);
+            root.selector.host_ip = Some(host_ip);
+            root
+        })
+        .collect::<Vec<_>>();
+    let grants = roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| {
+            let host = format!("panda{}", 144 + index);
+            let host_ip = format!("10.0.82.{}", 144 + index);
+            let object_ref = format!("{host}::{}", root.id);
+            granted_mount_root(
+                &object_ref,
+                &host,
+                &host_ip,
+                root.selected_mount_point()
+                    .expect("root fixture mount point")
+                    .to_path_buf(),
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = roots;
+    cfg.host_object_grants = grants;
+    let sink = SinkFileMeta::with_boundaries(NodeId("panda145".to_string()), None, cfg)
+        .expect("init sink");
+
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs-144", &["nfs-144"]),
+                bound_scope_with_resources("nfs-145", &["nfs-145"]),
+                bound_scope_with_resources("nfs-146", &["nfs-146"]),
+                bound_scope_with_resources("nfs-147", &["nfs-147"]),
+                bound_scope_with_resources("nfs-148", &["nfs-148"]),
+            ],
+        },
+    ))
+    .expect("encode broad bare sink activate")])
+        .await
+        .expect("apply broad bare sink activate");
+
+    let snapshot = sink
+        .status_snapshot()
+        .expect("status after broad bare runtime scopes");
+    assert_eq!(
+        snapshot
+            .scheduled_groups_by_node
+            .get("panda145")
+            .cloned()
+            .unwrap_or_default(),
+        vec![
+            "nfs-144".to_string(),
+            "nfs-145".to_string(),
+            "nfs-146".to_string(),
+            "nfs-147".to_string(),
+            "nfs-148".to_string()
+        ],
+        "if runtime hands panda145 every bare root scope, status must expose that runtime scheduling error instead of hiding it through local grant projection: {snapshot:?}"
+    );
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn management_logical_roots_update_prunes_retired_runtime_scopes_without_adding_grant_scopes()
+{
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![
         RootSpec::new("nfs1", "/mnt/nfs1"),
@@ -4989,7 +5064,7 @@ async fn management_logical_roots_update_derives_local_grant_sink_scope() {
         ],
         &cfg.host_object_grants,
     )
-    .expect("management roots apply should update logical roots and derive local active-grant sink scope");
+    .expect("management roots apply should update logical roots without rewriting runtime sink placement");
 
     sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
         RuntimeExecActivate {
@@ -5011,11 +5086,8 @@ async fn management_logical_roots_update_derives_local_grant_sink_scope() {
     assert_eq!(
         sink.scheduled_group_ids_snapshot()
             .expect("scheduled groups after later runtime activate"),
-        Some(std::collections::BTreeSet::from([
-            "nfs2".to_string(),
-            "nfs4".to_string()
-        ])),
-        "management-accepted logical roots must filter retired nfs1 and add only local active-grant nfs4 instead of blindly trusting later route scopes",
+        Some(std::collections::BTreeSet::from(["nfs2".to_string()])),
+        "management-accepted logical roots may prune retired nfs1, but fs-meta must not add nfs4 until Capanix assigns that sink scope",
     );
 
     sink.close().await.expect("close sink");
@@ -5069,7 +5141,7 @@ async fn status_snapshot_refreshes_logical_roots_without_expanding_sink_schedule
         ],
         &cfg.host_object_grants,
     )
-    .expect("live-only roots apply should update logical roots and derive local active-grant sink scope");
+    .expect("live-only roots apply should update logical roots without rewriting runtime sink placement");
 
     sink.logical_roots_cell
         .replace(vec![
@@ -5112,12 +5184,10 @@ async fn status_snapshot_refreshes_logical_roots_without_expanding_sink_schedule
         scheduled,
         std::collections::BTreeSet::from([
             "nfs1".to_string(),
-            "nfs2".to_string(),
-            "nfs3".to_string(),
             "nfs4".to_string(),
             "nfs5".to_string()
         ]),
-        "status path must refresh logical roots and derive the local active-grant sink schedule without importing foreign roots: {snapshot:?}",
+        "status path must refresh logical roots while preserving the current runtime sink schedule instead of deriving placement from local grants: {snapshot:?}",
     );
 
     let group_ids = snapshot
@@ -5127,7 +5197,7 @@ async fn status_snapshot_refreshes_logical_roots_without_expanding_sink_schedule
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         group_ids, scheduled,
-        "status path must expose the refreshed local active-grant sink groups after refreshing logical roots: {snapshot:?}",
+        "status path must expose exactly the current runtime scheduled groups after refreshing logical roots: {snapshot:?}",
     );
 
     sink.close().await.expect("close sink");

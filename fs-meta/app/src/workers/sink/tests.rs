@@ -4539,7 +4539,7 @@ fn sink_status_scenario_outcome_fails_closed_after_retry_reset_replay_pending_wi
 }
 
 #[test]
-fn sink_status_scenario_outcome_returns_live_for_steady_replay_pending_without_cached_ready_truth_when_cached_truth_is_preactivate_unscheduled()
+fn sink_status_scenario_outcome_fails_closed_for_steady_replay_pending_without_cached_ready_truth_when_cached_truth_is_preactivate_unscheduled()
  {
     let outcome = reduce_sink_status_scenario_outcome_with_facts(
         SinkStatusScenario::Live(SinkStatusLiveScenario::Steady),
@@ -4547,14 +4547,14 @@ fn sink_status_scenario_outcome_returns_live_for_steady_replay_pending_without_c
             .with_cached_preactivate_unscheduled(true),
     );
 
-    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnLive);
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::FailClosed);
     assert_eq!(outcome.concern, Some(SinkStatusConcern::ReplayPending));
     assert!(outcome.should_mark_replay_required);
     assert!(!outcome.should_republish_zero_row_summary);
 }
 
 #[test]
-fn sink_status_scenario_outcome_returns_live_for_steady_replay_pending_without_cached_ready_truth_when_cached_truth_is_stale_empty()
+fn sink_status_scenario_outcome_fails_closed_for_steady_replay_pending_without_cached_ready_truth_when_cached_truth_is_stale_empty()
  {
     let outcome = reduce_sink_status_scenario_outcome(
         SinkStatusScenario::Live(SinkStatusLiveScenario::Steady),
@@ -4563,7 +4563,7 @@ fn sink_status_scenario_outcome_returns_live_for_steady_replay_pending_without_c
         false,
     );
 
-    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnLive);
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::FailClosed);
     assert_eq!(outcome.concern, Some(SinkStatusConcern::ReplayPending));
     assert!(outcome.should_mark_replay_required);
     assert!(!outcome.should_republish_zero_row_summary);

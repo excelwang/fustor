@@ -277,47 +277,6 @@ fn summarize_bound_scopes(bound_scopes: &[RuntimeBoundScope]) -> Vec<String> {
         .collect()
 }
 
-fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
-    host_ref == node_id.0
-        || node_id
-            .0
-            .strip_prefix(host_ref)
-            .is_some_and(|suffix| suffix.starts_with('-'))
-        || node_id.0.strip_prefix("cluster-").is_some_and(|scoped| {
-            scoped == host_ref
-                || scoped
-                    .strip_prefix(host_ref)
-                    .is_some_and(|suffix| suffix.starts_with('-'))
-        })
-}
-
-fn local_active_sink_scopes_from_roots_and_grants(
-    roots: &[RootSpec],
-    node_id: &NodeId,
-    grants: &[GrantedMountRoot],
-) -> Vec<RuntimeBoundScope> {
-    let mut scopes = Vec::new();
-    for root in roots {
-        let resource_ids = grants
-            .iter()
-            .filter(|grant| {
-                grant.active
-                    && host_ref_matches_node_id(&grant.host_ref, node_id)
-                    && root.selector.matches(grant)
-            })
-            .map(|grant| grant.object_ref.clone())
-            .collect::<BTreeSet<_>>();
-        if resource_ids.is_empty() {
-            continue;
-        }
-        scopes.push(RuntimeBoundScope {
-            scope_id: root.id.clone(),
-            resource_ids: resource_ids.into_iter().collect(),
-        });
-    }
-    scopes
-}
-
 fn collect_event_origin_counts(events: &[Event]) -> BTreeMap<String, u64> {
     let mut counts = BTreeMap::<String, u64>::new();
     for event in events {
@@ -3702,7 +3661,7 @@ impl SinkFileMeta {
     fn scheduled_group_ids_for_roots_and_grants(
         &self,
         roots: &[RootSpec],
-        grants: &[GrantedMountRoot],
+        _grants: &[GrantedMountRoot],
     ) -> Result<Option<BTreeSet<String>>> {
         let Some(bound_scopes) = self.scheduled_bound_scopes()? else {
             return Ok(None);
@@ -3710,7 +3669,6 @@ impl SinkFileMeta {
         Ok(Some(self.scheduled_group_ids_from_bound_scopes(
             &bound_scopes,
             roots,
-            grants,
         )))
     }
 
@@ -3718,12 +3676,11 @@ impl SinkFileMeta {
         &self,
         bound_scopes: &[RuntimeBoundScope],
         roots: &[RootSpec],
-        grants: &[GrantedMountRoot],
     ) -> BTreeSet<String> {
         let roots_by_id = roots
             .iter()
-            .map(|root| (root.id.as_str(), root))
-            .collect::<HashMap<_, _>>();
+            .map(|root| root.id.as_str())
+            .collect::<BTreeSet<_>>();
         bound_scopes
             .iter()
             .filter_map(|scope| {
@@ -3731,37 +3688,9 @@ impl SinkFileMeta {
                 if scope_id.is_empty() {
                     return None;
                 }
-                let root = roots_by_id.get(scope_id).copied()?;
-                self.scheduled_scope_has_active_or_unknown_grant(scope, root, grants)
-                    .then(|| scope_id.to_string())
+                roots_by_id.contains(scope_id).then(|| scope_id.to_string())
             })
             .collect()
-    }
-
-    fn scheduled_scope_has_active_or_unknown_grant(
-        &self,
-        scope: &RuntimeBoundScope,
-        root: &RootSpec,
-        grants: &[GrantedMountRoot],
-    ) -> bool {
-        let resource_ids = scope
-            .resource_ids
-            .iter()
-            .map(|resource_id| resource_id.trim())
-            .filter(|resource_id| !resource_id.is_empty())
-            .collect::<BTreeSet<_>>();
-        let mut matched_any_grant = false;
-        for grant in grants {
-            let resource_match = resource_ids.contains(grant.object_ref.as_str());
-            let root_match = root.selector.matches(grant);
-            if resource_match || root_match {
-                matched_any_grant = true;
-                if grant.active {
-                    return true;
-                }
-            }
-        }
-        !matched_any_grant
     }
 
     fn runtime_route_group_ids(&self, route_key: &str) -> Result<Option<BTreeSet<String>>> {
@@ -3779,11 +3708,9 @@ impl SinkFileMeta {
             .read()
             .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?
             .clone();
-        let grants = self.logical_grants_snapshot()?;
         Ok(Some(self.scheduled_group_ids_from_bound_scopes(
             &bound_scopes,
             &roots,
-            &grants,
         )))
     }
 
@@ -3840,8 +3767,7 @@ impl SinkFileMeta {
             .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?
             .clone();
         let grants = self.logical_grants_snapshot()?;
-        let allowed_groups =
-            self.scheduled_group_ids_from_bound_scopes(&bound_scopes, &roots, &grants);
+        let allowed_groups = self.scheduled_group_ids_from_bound_scopes(&bound_scopes, &roots);
         if allowed_groups.is_empty() {
             return Ok(Some(BTreeSet::new()));
         }
@@ -4217,15 +4143,6 @@ impl SinkFileMeta {
         );
         let root_count = roots.len();
         let grant_count = host_object_grants.len();
-        if self.unit_control.has_runtime_state() || self.unit_control.is_runtime_managed() {
-            let bound_scopes = local_active_sink_scopes_from_roots_and_grants(
-                &roots,
-                &self.node_id,
-                host_object_grants,
-            );
-            self.unit_control
-                .sync_active_scopes(SINK_RUNTIME_UNIT_ID, &bound_scopes)?;
-        }
         let mut root_specs = self
             .root_specs
             .write()

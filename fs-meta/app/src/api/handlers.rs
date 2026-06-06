@@ -3682,6 +3682,13 @@ pub async fn status(
         &sink_status,
         &source,
         &runner_sets,
+    ) || should_fail_closed_authoritative_status_fanin(
+        sink_outcome,
+        source_outcome,
+        published_facade_state,
+        &sink_status,
+        &source,
+        &authoritative_source_for_status_fanin,
     ) || should_fail_closed_partial_local_status_fallback(
         sink_outcome,
         source_outcome,
@@ -5822,6 +5829,52 @@ fn should_fail_closed_source_ready_sink_empty_status(
         && !source_ready_groups.is_subset(&sink_snapshot_live_materialized_groups(sink_status))
         && sink_status_snapshot_is_zeroish_for_active_source_groups(sink_status)
         && sink_status_snapshot_lacks_ingress_evidence(sink_status)
+}
+
+fn status_fanin_covers_authoritative_source_schedule(
+    source: &SourceObservabilitySnapshot,
+    expected_group_ids: &BTreeSet<String>,
+) -> bool {
+    expected_group_ids.is_empty()
+        || (expected_group_ids.is_subset(&source_status_current_health_root_ids(source))
+            && expected_group_ids.is_subset(&source_runtime_scope_scheduled_group_ids(source)))
+}
+
+fn status_fanin_covers_authoritative_sink_schedule(
+    sink: &SinkStatusSnapshot,
+    expected_group_ids: &BTreeSet<String>,
+) -> bool {
+    expected_group_ids.is_empty()
+        || (expected_group_ids.is_subset(&sink_status_reported_group_ids(sink))
+            && expected_group_ids.is_subset(&sink_snapshot_scheduled_groups(sink)))
+}
+
+fn should_fail_closed_authoritative_status_fanin(
+    sink_outcome: StatusRouteOutcome,
+    source_outcome: StatusRouteOutcome,
+    published_facade_state: FacadeServiceState,
+    sink_status: &SinkStatusSnapshot,
+    source: &SourceObservabilitySnapshot,
+    authoritative_source: &SourceObservabilitySnapshot,
+) -> bool {
+    if !matches!(
+        published_facade_state,
+        FacadeServiceState::Serving | FacadeServiceState::Degraded
+    ) {
+        return false;
+    }
+    if !status_route_collection_requested(sink_outcome, source_outcome) {
+        return false;
+    }
+    if status_route_collection_timeout_only(sink_outcome, source_outcome) {
+        return false;
+    }
+    let expected_group_ids = management_status_authoritative_source_root_ids(authoritative_source);
+    if expected_group_ids.is_empty() {
+        return false;
+    }
+    !status_fanin_covers_authoritative_source_schedule(source, &expected_group_ids)
+        || !status_fanin_covers_authoritative_sink_schedule(sink_status, &expected_group_ids)
 }
 
 fn status_route_collection_incomplete(
@@ -17734,6 +17787,136 @@ mod tests {
                 &source,
             ),
             "source health plus sink zero rows is not safe to report as a partial /status fallback even before source has published data batches"
+        );
+    }
+
+    #[test]
+    fn status_fail_closes_when_authoritative_owner_fanin_still_omits_active_groups_after_ok_routes()
+    {
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = (1..=5)
+            .map(|idx| RootSpec::new(format!("nfs{idx}"), format!("/mnt/nfs{idx}")))
+            .collect();
+        authoritative.grants = (1..=5)
+            .map(|idx| grant_for_node_root(&format!("node-{idx}"), &format!("nfs{idx}")))
+            .collect();
+        authoritative.status.logical_roots.clear();
+        authoritative.source_primary_by_group.clear();
+        authoritative.scheduled_source_groups_by_node.clear();
+        authoritative.scheduled_scan_groups_by_node.clear();
+        for idx in 1..=5 {
+            let group_id = format!("nfs{idx}");
+            let node_id = format!("node-{idx}");
+            set_live_group_primary_source_root(&mut authoritative, &group_id, &node_id);
+            authoritative
+                .source_primary_by_group
+                .insert(group_id.clone(), format!("{node_id}::{group_id}"));
+            authoritative
+                .scheduled_source_groups_by_node
+                .insert(node_id.clone(), vec![group_id.clone()]);
+            authoritative
+                .scheduled_scan_groups_by_node
+                .insert(node_id, vec![group_id]);
+        }
+
+        let mut partial_source = authoritative.clone();
+        partial_source
+            .status
+            .logical_roots
+            .retain(|root| matches!(root.root_id.as_str(), "nfs2" | "nfs4"));
+        partial_source
+            .status
+            .concrete_roots
+            .retain(|root| matches!(root.logical_root_id.as_str(), "nfs2" | "nfs4"));
+        partial_source
+            .source_primary_by_group
+            .retain(|group, _| matches!(group.as_str(), "nfs2" | "nfs4"));
+        partial_source.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-2".to_string(), vec!["nfs2".to_string()]),
+            ("node-4".to_string(), vec!["nfs4".to_string()]),
+        ]);
+        partial_source.scheduled_scan_groups_by_node =
+            partial_source.scheduled_source_groups_by_node.clone();
+
+        let partial_sink = SinkStatusSnapshot {
+            live_nodes: 39_000_000,
+            scheduled_groups_by_node: BTreeMap::from([
+                ("node-2".to_string(), vec!["nfs2".to_string()]),
+                ("node-4".to_string(), vec!["nfs4".to_string()]),
+            ]),
+            groups: vec![
+                status_test_sink_group(
+                    "nfs2",
+                    "node-2::nfs2",
+                    GroupReadinessState::Ready,
+                    19_000_000,
+                    19_000_000,
+                ),
+                status_test_sink_group(
+                    "nfs4",
+                    "node-4::nfs4",
+                    GroupReadinessState::Ready,
+                    20_000_000,
+                    20_000_000,
+                ),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+
+        assert!(
+            should_fail_closed_authoritative_status_fanin(
+                StatusRouteOutcome::Ok,
+                StatusRouteOutcome::Ok,
+                FacadeServiceState::Serving,
+                &partial_sink,
+                &partial_source,
+                &authoritative,
+            ),
+            "management /status must not publish a complete 200 when generic route collection succeeded but owner fan-in still covers only 2/5 authoritative roots"
+        );
+    }
+
+    #[test]
+    fn status_authoritative_fanin_complete_when_all_active_groups_have_source_and_sink_schedule() {
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+        ];
+        authoritative.grants = vec![
+            grant_for_node_root("node-a", "nfs1"),
+            grant_for_node_root("node-b", "nfs2"),
+        ];
+        set_live_group_primary_source_root(&mut authoritative, "nfs1", "node-a");
+        set_live_group_primary_source_root(&mut authoritative, "nfs2", "node-b");
+        authoritative.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs1".to_string()]),
+            ("node-b".to_string(), vec!["nfs2".to_string()]),
+        ]);
+        authoritative.scheduled_scan_groups_by_node =
+            authoritative.scheduled_source_groups_by_node.clone();
+        let sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([
+                ("node-a".to_string(), vec!["nfs1".to_string()]),
+                ("node-b".to_string(), vec!["nfs2".to_string()]),
+            ]),
+            groups: vec![
+                status_test_sink_group("nfs1", "node-a::nfs1", GroupReadinessState::Ready, 1, 1),
+                status_test_sink_group("nfs2", "node-b::nfs2", GroupReadinessState::Ready, 1, 1),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+
+        assert!(
+            !should_fail_closed_authoritative_status_fanin(
+                StatusRouteOutcome::Ok,
+                StatusRouteOutcome::Ok,
+                FacadeServiceState::Serving,
+                &sink,
+                &authoritative,
+                &authoritative,
+            ),
+            "complete owner fan-in for every authoritative root should remain a valid serving /status response"
         );
     }
 

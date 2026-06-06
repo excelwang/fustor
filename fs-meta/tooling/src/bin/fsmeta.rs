@@ -113,8 +113,8 @@ enum GrantsCommand {
 
 #[derive(Subcommand, Debug)]
 enum RootsCommand {
-    Preview(RootsCommandArgs),
-    Apply(RootsCommandArgs),
+    Preview(RootsPreviewArgs),
+    Apply(RootsApplyArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -127,14 +127,28 @@ struct ApiAuthArgs {
     username: Option<String>,
     #[arg(long)]
     password: Option<String>,
+    #[arg(long)]
+    password_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
-struct RootsCommandArgs {
+struct RootsPreviewArgs {
     #[command(flatten)]
     api: ApiAuthArgs,
     #[arg(long)]
     file: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct RootsApplyArgs {
+    #[command(flatten)]
+    api: ApiAuthArgs,
+    #[command(flatten)]
+    control: ControlAuthArgs,
+    #[arg(long)]
+    file: PathBuf,
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -479,7 +493,7 @@ async fn grants_list(args: ApiAuthArgs) -> anyhow::Result<serde_json::Value> {
     .await
 }
 
-async fn roots_preview(args: RootsCommandArgs) -> anyhow::Result<serde_json::Value> {
+async fn roots_preview(args: RootsPreviewArgs) -> anyhow::Result<serde_json::Value> {
     let client = reqwest::Client::new();
     let token = resolve_api_token(&client, &args.api).await?;
     let payload = load_roots_payload(&args.file)?;
@@ -493,18 +507,68 @@ async fn roots_preview(args: RootsCommandArgs) -> anyhow::Result<serde_json::Val
     .await
 }
 
-async fn roots_apply(args: RootsCommandArgs) -> anyhow::Result<serde_json::Value> {
+async fn roots_apply(args: RootsApplyArgs) -> anyhow::Result<serde_json::Value> {
     let client = reqwest::Client::new();
-    let token = resolve_api_token(&client, &args.api).await?;
     let payload = load_roots_payload(&args.file)?;
-    put_json(
+    let roots = roots_from_payload(&payload)?;
+    let runtime_apply = if let Some(config_path) = args.config.as_deref() {
+        ensure_api_credentials_for_generation_cutover(&args.api)?;
+        let preflight_token = resolve_api_login_token(&client, &args.api).await?;
+        let preview = post_json(
+            &client,
+            &args.api.api_base,
+            "/api/fs-meta/v1/monitoring/roots/preview",
+            &preflight_token,
+            &payload,
+        )
+        .await?;
+        ensure_roots_preview_has_no_unmatched(&preview)?;
+        let product = load_product_config(config_path)?;
+        let state_dir = prepare_state_dir(config_path.parent(), ".fsmeta-state")?;
+        let auth_cfg = load_deployed_auth_config(&state_dir)?;
+        let (app_target, manifest_path) = resolve_fs_meta_runtime_inputs()?;
+        let control = ControlClient::from_args(&args.control)?;
+        let route_plan_node_ids = control.discover_route_plan_node_ids().await?;
+        let intent = build_deploy_intent_for_roots(
+            &product,
+            auth_cfg,
+            &app_target,
+            &manifest_path,
+            &state_dir,
+            route_plan_node_ids.clone(),
+            roots,
+        )?;
+        Some(json!({
+            "route_plan_node_ids": route_plan_node_ids,
+            "result": control.apply_relation_target_intent(&intent).await?,
+        }))
+    } else {
+        None
+    };
+    let token = if args.config.is_some() {
+        resolve_api_login_token(&client, &args.api).await?
+    } else {
+        resolve_api_token(&client, &args.api).await?
+    };
+    let roots_result = put_json(
         &client,
         &args.api.api_base,
         "/api/fs-meta/v1/monitoring/roots",
         &token,
         &payload,
     )
-    .await
+    .await?;
+    match runtime_apply {
+        Some(runtime_apply) => Ok(json!({
+            "status": "ok",
+            "roots_count": roots_result
+                .get("roots_count")
+                .and_then(serde_json::Value::as_u64),
+            "runtime_apply": runtime_apply,
+            "roots_apply": roots_result,
+        })),
+        None => Ok(roots_result),
+    }
 }
 
 fn load_product_config(path: &Path) -> anyhow::Result<ProductConfig> {
@@ -551,6 +615,25 @@ fn build_auth_config(auth: &ProductAuthConfig, base_dir: &Path) -> (ApiAuthConfi
     )
 }
 
+fn load_deployed_auth_config(state_dir: &Path) -> anyhow::Result<ApiAuthConfig> {
+    let passwd_path = state_dir.join("fs-meta.passwd");
+    let shadow_path = state_dir.join("fs-meta.shadow");
+    if !passwd_path.exists() || !shadow_path.exists() {
+        bail!(
+            "deployed fs-meta auth files are missing under {}; run fsmeta deploy first or pass the deploy config whose parent owns .fsmeta-state",
+            state_dir.display()
+        );
+    }
+    Ok(ApiAuthConfig {
+        passwd_path,
+        shadow_path,
+        query_keys_path: state_dir.join("fs-meta.query-keys.json"),
+        session_ttl_secs: 3600,
+        management_group: "fsmeta_management".to_string(),
+        bootstrap_management: None,
+    })
+}
+
 fn load_roots_payload(path: &Path) -> anyhow::Result<serde_json::Value> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("read roots file {} failed", path.display()))?;
@@ -563,19 +646,116 @@ fn load_roots_payload(path: &Path) -> anyhow::Result<serde_json::Value> {
     Ok(json!({ "roots": roots }))
 }
 
+fn roots_from_payload(payload: &serde_json::Value) -> anyhow::Result<Vec<RootEntry>> {
+    let roots = payload
+        .get("roots")
+        .cloned()
+        .context("roots payload missing roots")?;
+    serde_json::from_value(roots).context("decode roots payload failed")
+}
+
+fn ensure_api_credentials_for_generation_cutover(args: &ApiAuthArgs) -> anyhow::Result<()> {
+    if args.username.is_some() && (args.password.is_some() || args.password_file.is_some()) {
+        return Ok(());
+    }
+    bail!(
+        "roots apply --config performs a runtime generation cutover and requires --username with --password or --password-file so the CLI can re-login after relation_target_apply"
+    )
+}
+
+fn ensure_roots_preview_has_no_unmatched(preview: &serde_json::Value) -> anyhow::Result<()> {
+    let unmatched = preview
+        .get("unmatched_roots")
+        .or_else(|| preview.get("unmatched"))
+        .and_then(serde_json::Value::as_array)
+        .context("roots preview response missing unmatched_roots array")?;
+    if unmatched.is_empty() {
+        return Ok(());
+    }
+    let ids = unmatched
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("roots apply preflight rejected unmatched runtime grants for roots [{ids}]")
+}
+
 async fn resolve_api_token(client: &reqwest::Client, args: &ApiAuthArgs) -> anyhow::Result<String> {
     if let Some(token) = &args.token {
         return Ok(token.clone());
     }
+    resolve_api_login_token(client, args).await
+}
+
+async fn resolve_api_login_token(
+    client: &reqwest::Client,
+    args: &ApiAuthArgs,
+) -> anyhow::Result<String> {
     let username = args
         .username
         .as_deref()
         .context("missing --token or --username")?;
-    let password = args
-        .password
+    let password = resolve_api_password(args, username)?;
+    login_api(client, &args.api_base, username, &password).await
+}
+
+fn resolve_api_password(args: &ApiAuthArgs, username: &str) -> anyhow::Result<String> {
+    if args.password.is_some() && args.password_file.is_some() {
+        bail!("pass only one of --password or --password-file");
+    }
+    if let Some(password) = &args.password {
+        return Ok(password.clone());
+    }
+    let path = args
+        .password_file
         .as_deref()
-        .context("missing --token or --password")?;
-    login_api(client, &args.api_base, username, password).await
+        .context("missing --token, --password, or --password-file")?;
+    load_password_file(path, username)
+}
+
+fn load_password_file(path: &Path, username: &str) -> anyhow::Result<String> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("read {} failed", path.display()))?;
+    if let Some(secret) = parse_shadow_password(&content, username)? {
+        return Ok(secret);
+    }
+    let password = content.trim();
+    if password.is_empty() {
+        bail!("password file {} is empty", path.display());
+    }
+    Ok(password.to_string())
+}
+
+fn parse_shadow_password(content: &str, username: &str) -> anyhow::Result<Option<String>> {
+    for (index, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split(':').collect::<Vec<_>>();
+        if fields.len() < 2 || fields[0] != username {
+            continue;
+        }
+        let password_hash = fields[1];
+        if let Some(password) = password_hash.strip_prefix("plain$") {
+            if password.is_empty() {
+                bail!(
+                    "shadow file line {} for user {username} has empty plain password",
+                    index + 1
+                );
+            }
+            return Ok(Some(password.to_string()));
+        }
+        bail!(
+            "password file looks like a shadow file but user {username} is not stored with a recoverable plain$ password"
+        );
+    }
+    Ok(None)
 }
 
 async fn login_api(
@@ -747,12 +927,32 @@ fn build_deploy_intent(
     generated_manifest_dir: &Path,
     route_plan_node_ids: Vec<String>,
 ) -> anyhow::Result<serde_json::Value> {
+    build_deploy_intent_for_roots(
+        product,
+        auth,
+        app_target,
+        base_manifest_path,
+        generated_manifest_dir,
+        route_plan_node_ids,
+        Vec::new(),
+    )
+}
+
+fn build_deploy_intent_for_roots(
+    product: &ProductConfig,
+    auth: ApiAuthConfig,
+    app_target: &Path,
+    base_manifest_path: &Path,
+    generated_manifest_dir: &Path,
+    route_plan_node_ids: Vec<String>,
+    roots: Vec<RootEntry>,
+) -> anyhow::Result<serde_json::Value> {
     let worker_modes = resolve_release_worker_modes(product)?;
     let spec = FsMetaReleaseSpec {
         app_id: DEFAULT_APP_ID.to_string(),
         api_facade_resource_id: product.api.facade_resource_id.clone(),
         auth,
-        roots: Vec::new(),
+        roots,
         route_plan_node_ids,
         worker_module_path: Some(app_target.to_path_buf()),
         worker_modes,
@@ -1069,10 +1269,12 @@ fn write_runtime_admin_temp_file(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProductAuthConfig, build_auth_config, build_deploy_intent,
-        derive_route_plan_node_ids_from_config_dump, load_product_config, prepare_state_dir,
-        workspace_root,
+        ApiAuthArgs, ProductAuthConfig, RootEntry, build_auth_config, build_deploy_intent,
+        build_deploy_intent_for_roots, derive_route_plan_node_ids_from_config_dump,
+        load_deployed_auth_config, load_password_file, load_product_config, prepare_state_dir,
+        resolve_api_password, workspace_root,
     };
+    use fs_meta::source::config::RootSelector;
     use serde_json::json;
     use std::fs;
     use std::path::Path;
@@ -1194,6 +1396,51 @@ mod tests {
     }
 
     #[test]
+    fn password_file_accepts_fsmeta_plain_shadow_format() {
+        let path = unique_temp_path("shadow-password");
+        fs::write(
+            &path,
+            "admin:plain$secret-from-shadow:0\nother:plain$wrong:0\n",
+        )
+        .expect("write shadow file");
+
+        let password = load_password_file(&path, "admin").expect("plain shadow password");
+
+        assert_eq!(password, "secret-from-shadow");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn password_file_accepts_raw_password_file() {
+        let path = unique_temp_path("raw-password");
+        fs::write(&path, "raw-secret\n").expect("write password file");
+
+        let password = load_password_file(&path, "admin").expect("raw password");
+
+        assert_eq!(password, "raw-secret");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn api_password_rejects_inline_and_file_together() {
+        let args = ApiAuthArgs {
+            api_base: "http://127.0.0.1:18080".to_string(),
+            token: None,
+            username: Some("admin".to_string()),
+            password: Some("inline".to_string()),
+            password_file: Some(PathBuf::from("/tmp/secret")),
+        };
+
+        let err =
+            resolve_api_password(&args, "admin").expect_err("conflicting password inputs fail");
+
+        assert!(
+            format!("{err:#}").contains("pass only one of --password or --password-file"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
     fn deploy_intent_uses_scope_worker_schema_and_shared_config_validation() {
         let path = unique_temp_path("deploy-intent-config");
         fs::write(
@@ -1282,6 +1529,116 @@ mod tests {
                 Some("/tmp/fs-meta-runtime.so")
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roots_apply_deploy_intent_carries_business_root_app_scopes() {
+        let path = unique_temp_path("roots-apply-intent-config");
+        fs::write(&path, "api:\n  facade_resource_id: fs-meta-tcp-listener\n")
+            .expect("write product config");
+        let product = load_product_config(&path).expect("product config should parse");
+        let _ = fs::remove_file(&path);
+
+        let dir = std::env::temp_dir().join(format!(
+            "fsmeta-roots-apply-intent-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (auth_cfg, ..) = build_auth_config(&ProductAuthConfig::default(), &dir);
+
+        let manifest = workspace_root()
+            .expect("workspace root")
+            .join("fs-meta/fixtures/manifests/fs-meta.yaml")
+            .canonicalize()
+            .expect("fixture manifest path");
+        let roots = vec![
+            RootEntry {
+                id: "nfs-144".to_string(),
+                selector: RootSelector {
+                    host_ref: Some("panda144".to_string()),
+                    ..RootSelector::default()
+                },
+                subpath_scope: PathBuf::from("/"),
+                watch: true,
+                scan: true,
+                audit_interval_ms: None,
+            },
+            RootEntry {
+                id: "nfs-145".to_string(),
+                selector: RootSelector {
+                    host_ref: Some("panda145".to_string()),
+                    ..RootSelector::default()
+                },
+                subpath_scope: PathBuf::from("/"),
+                watch: true,
+                scan: true,
+                audit_interval_ms: None,
+            },
+        ];
+        let intent = build_deploy_intent_for_roots(
+            &product,
+            auth_cfg,
+            &PathBuf::from("/tmp/fs-meta-runtime.so"),
+            &manifest,
+            &dir,
+            vec!["panda144".to_string(), "panda145".to_string()],
+            roots,
+        )
+        .expect("roots-bearing intent should compile");
+
+        let app_scopes = intent["workers"][0]["runtime"]["app_scopes"]
+            .as_array()
+            .expect("compiled intent should carry runtime app_scopes");
+        let scope_ids = app_scopes
+            .iter()
+            .filter_map(|scope| scope.get("scope_id").and_then(serde_json::Value::as_str))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(scope_ids.contains("nfs-144"));
+        assert!(scope_ids.contains("nfs-145"));
+        assert!(scope_ids.contains("fs-meta-tcp-listener"));
+        assert!(
+            !scope_ids.contains("__fsmeta_empty_roots_bootstrap"),
+            "roots-bearing relation target must replace bootstrap-only app scopes"
+        );
+        let nfs_144_scope = app_scopes
+            .iter()
+            .find(|scope| scope.get("scope_id") == Some(&json!("nfs-144")))
+            .expect("nfs-144 app scope");
+        let unit_scopes = nfs_144_scope["unit_scopes"]
+            .as_array()
+            .expect("nfs root unit scopes");
+        assert!(unit_scopes.iter().any(|unit| {
+            unit.get("unit_id") == Some(&json!("runtime.exec.sink"))
+                && unit.get("eligibility") == Some(&json!("resource_visible_nodes"))
+                && unit.get("cardinality") == Some(&json!("one"))
+        }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roots_apply_config_requires_existing_deployed_auth_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "fsmeta-missing-auth-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let err =
+            load_deployed_auth_config(&dir).expect_err("missing deployed auth files must fail");
+
+        assert!(
+            format!("{err:#}").contains("deployed fs-meta auth files are missing"),
+            "unexpected error: {err:#}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

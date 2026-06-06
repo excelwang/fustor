@@ -841,6 +841,10 @@ impl RootTaskHandle {
         self.join.as_ref().is_some_and(|join| join.is_finished())
     }
 
+    fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
     async fn cancel_and_join(mut self, timeout: Duration) {
         self.cancel.cancel();
         let Some(join) = self.join.take() else {
@@ -1343,13 +1347,19 @@ impl FSMetaSource {
             &self.state_cell.stream_binding,
             "source.publication_output_closed.stream_binding",
         ) = None;
-        let root_keys = lock_or_recover(
-            &self.state_cell.root_tasks,
-            "source.publication_output_closed.root_tasks",
-        )
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
+        let root_keys = {
+            let tasks = lock_or_recover(
+                &self.state_cell.root_tasks,
+                "source.publication_output_closed.root_tasks",
+            );
+            for entry in tasks.values() {
+                entry.active.handle.cancel();
+                if let Some(candidate) = entry.candidate.as_ref() {
+                    candidate.handle.cancel();
+                }
+            }
+            tasks.keys().cloned().collect::<Vec<_>>()
+        };
         for root_key in root_keys {
             Self::update_object_health(&self.state_cell.fanout_health, &root_key, "output_closed");
             Self::set_object_last_error(&self.state_cell.fanout_health, &root_key, reason.clone());
@@ -2318,14 +2328,14 @@ impl FSMetaSource {
     }
 
     fn root_tasks_need_reconcile(&self, desired_roots: &[RootRuntime]) -> bool {
-        if lock_or_recover(
+        let stream_binding = lock_or_recover(
             &self.state_cell.stream_binding,
             "source.root_tasks_need_reconcile.stream_binding",
         )
-        .is_none()
-        {
+        .clone();
+        let Some(stream_binding) = stream_binding else {
             return false;
-        }
+        };
 
         let desired = desired_roots
             .iter()
@@ -2348,11 +2358,16 @@ impl FSMetaSource {
             let Some(entry) = tasks.get(&key) else {
                 return true;
             };
-            if entry.active.signature != signature || entry.active.handle.is_finished() {
+            if entry.active.signature != signature
+                || entry.active.handle.is_finished()
+                || entry.active.stream_generation != stream_binding.generation
+            {
                 return true;
             }
             if entry.candidate.as_ref().is_some_and(|candidate| {
-                candidate.signature != signature || candidate.handle.is_finished()
+                candidate.signature != signature
+                    || candidate.handle.is_finished()
+                    || candidate.stream_generation != stream_binding.generation
             }) {
                 return true;
             }
@@ -2558,6 +2573,20 @@ impl FSMetaSource {
         let mut health = lock_or_recover(fanout_health, "source.object_health.slot");
         match role {
             RootTaskRole::Active => {
+                let keep_output_closed =
+                    health
+                        .object_ref_detail
+                        .get(root_key)
+                        .is_some_and(|detail| {
+                            detail.status == "output_closed"
+                                && status != "output_closed"
+                                && detail
+                                    .current_stream_generation
+                                    .is_none_or(|current| stream_generation <= current)
+                        });
+                if keep_output_closed {
+                    return;
+                }
                 health
                     .object_ref
                     .insert(root_key.to_string(), status.clone());
@@ -5826,6 +5855,13 @@ impl FSMetaSource {
                 if !desired_active_keys.contains(&key) {
                     if let Some(entry) = tasks.remove(&key) {
                         removed_absent.push((key, entry));
+                    }
+                } else if tasks
+                    .get(&key)
+                    .is_some_and(|entry| entry.active.stream_generation != stream_generation)
+                {
+                    if let Some(entry) = tasks.remove(&key) {
+                        removed_finished.push((key, entry));
                     }
                 } else if tasks
                     .get(&key)
