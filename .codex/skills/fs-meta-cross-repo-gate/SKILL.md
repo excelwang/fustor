@@ -1,6 +1,6 @@
 ---
 name: fs-meta-cross-repo-gate
-description: Coordinate fs-meta cross-repo blocker work between fustor and capanix with a coordinator-plus-one-worker baton loop. Use when the user says "fs-meta gate", "fustor cross-repo gate", "fustor blocker gate", wants one-click activation of the capanix-fustor repair workflow, or wants the current blocker handled through a shared blocker-state document instead of ad hoc coordination.
+description: Coordinate fs-meta cross-repo blocker work between fustor and capanix with a coordinator-plus-one-worker baton loop, including safe clean-log binary build/deploy gates for fs-meta clusters. Use when the user says "fs-meta gate", "fustor cross-repo gate", "fustor blocker gate", asks how to build or deploy capanix binaries for fs-meta, wants logs cleared before redeploy validation, wants one-click activation of the capanix-fustor repair workflow, or wants the current blocker handled through a shared blocker-state document instead of ad hoc coordination.
 ---
 
 # Fs-meta Cross-Repo Gate
@@ -17,6 +17,9 @@ One-click activation phrases:
 - `fs-meta gate`
 - `fustor cross-repo gate`
 - `fustor blocker gate`
+- `capanix binary deploy`
+- `fs-meta binary deploy`
+- `clear logs before redeploy`
 
 ## Shared State
 
@@ -79,8 +82,23 @@ When the coordinator is active:
 - handle the `capanix` side directly
 - only wake the worker again after `/root/repo/capanix/todo.md` clearly localizes the first raw failing boundary back to `fustor`
 
+## Capanix Binary Deploy Gate
+
+Use this gate before changing `capanixd` on an existing `fs-meta` cluster.
+
+- Treat remote cluster ABI as the deployment target. The `wanghuajin@10.0.82.144~148` cluster is CentOS 7 / glibc 2.17; do not deploy an aibox-built `capanixd` unless its GLIBC requirements are proven compatible.
+- Build on a target-compatible host, such as `panda145`, or in a toolchain/container that targets the remote glibc. For CentOS 7, every deployed ELF must require `GLIBC_2.17` or lower.
+- Before publishing, run the narrow tests for the changed layer on the compatible builder, then verify the exact artifact with `sha256sum`, `ldd`, and `objdump -T`.
+- Stage artifacts on every node first. Never overwrite a live file until the staged file hash matches across all target nodes.
+- Replace with an explicit rollback point: stop affected daemons/processes, copy the live file to `*.prev-<timestamp>-<hash-prefix>`, move the staged file into place, then restart.
+- Clean-log redeploy is mandatory: after stopping affected processes and before restarting daemons or re-applying app declarations, archive or truncate all live `*.log`, `*.out`, and `*.err` files under `nodes/`. If you cannot prove logs were cleared for the current redeploy window, clear them and restart validation.
+- After restart, verify binary hash, process health, `cluster status`, `peer_count`, duplicate peers, and app/process registration. If startup fails because of linker errors or missing GLIBC symbols, restore the `.prev-*` binary immediately.
+- Do not modify the `fs-meta` app to compensate for a `capanixd` deploy issue. Restore apps only by re-applying existing declarations or deployed operational scripts after the daemon layer is healthy.
+- For exact artifact names, build commands, staging commands, rollback commands, and source/app restore commands, load `references/binary-deploy.md`.
+
 ## References
 
 Load exactly what you need:
 
 - `references/workflow.md` for blocker-state usage, validation order, governing spec families, and acceptance discipline
+- `references/binary-deploy.md` when building, staging, deploying, rolling back, or validating `capanixd`, `cnxctl`, `capanix_worker_host`, source runtime `.so` files, union-graph runtime `.so`, `fsmeta`, or `libfs_meta_runtime.so`
