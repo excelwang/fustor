@@ -29,19 +29,22 @@ use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::execution_units;
 use crate::runtime::orchestration::{
     FacadeControlSignal, FacadeRuntimeUnit, SinkControlSignal, SinkRuntimeUnit,
-    SourceControlSignal, SourceRuntimeUnit,
-    manual_rescan_scoped_target_acceptance_timeout_from_payload, split_app_control_signals,
+    SourceControlSignal, SourceRuntimeUnit, decode_logical_roots_control_payload,
+    encode_logical_roots_control_payload_with_generation_and_sink_replay,
+    manual_rescan_scoped_target_acceptance_timeout_from_payload,
+    sink_control_signals_from_envelopes, split_app_control_signals,
 };
 use crate::runtime::routes::{
-    METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS,
-    METHOD_SOURCE_FIND, METHOD_SOURCE_RESCAN, METHOD_SOURCE_STATUS, ROUTE_KEY_FACADE_CONTROL,
-    ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_INTERNAL,
+    METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_ROOTS_CONTROL,
+    METHOD_SINK_STATUS, METHOD_SOURCE_FIND, METHOD_SOURCE_RESCAN, METHOD_SOURCE_STATUS,
+    ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_INTERNAL,
     ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SINK_STATUS_INTERNAL,
     ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
     ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_ROOTS_CONTROL,
     ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_INTERNAL,
     default_route_bindings, events_stream_route_for_scope, is_events_stream_route_key,
-    sink_query_request_route_for, sink_query_route_bindings_for, sink_status_request_route_for,
+    sink_query_request_route_for, sink_query_route_bindings_for,
+    sink_roots_control_stream_route_for, sink_status_request_route_for,
     source_find_route_bindings_for, source_rescan_request_route_for,
     source_status_request_route_for,
 };
@@ -50,6 +53,7 @@ use crate::workers::sink::{SinkFacade, SinkFailure, SinkWorkerClientHandle};
 use crate::workers::source::{
     SourceFacade, SourceFailure, SourcePumpHandle, SourceWorkerClientHandle,
     annotate_manual_rescan_route_receivable_evidence,
+    annotate_manual_rescan_route_receivable_evidence_for_current_groups_and_generation,
     annotate_manual_rescan_route_receivable_evidence_for_route_groups,
     source_observability_snapshot_is_degraded_worker_cache,
 };
@@ -93,6 +97,8 @@ use crate::source::config::SourceConfig;
 const ACTIVE_FACADE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+const SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_ATTEMPTS: usize = 3;
+const SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SOURCE_CONTROL_RECOVERY_MAX_RETRYABLE_RESETS: usize = 64;
 const DEFERRED_SOURCE_REPAIR_QUIET_WINDOW: Duration = Duration::from_millis(250);
 const DEFERRED_SOURCE_REPAIR_RETRY_INTERVAL: Duration = Duration::from_millis(20);
@@ -1252,6 +1258,7 @@ impl UninitializedCleanupDisposition {
 enum SourceControlWaveDisposition {
     Idle,
     CleanupOnlyWhileUninitialized,
+    EmptyRootRouteLivenessOnly,
     RetainedTickGateOnlyWhileSinkReplayPending,
     SteadyTickNoop,
     ApplySignals,
@@ -4799,6 +4806,76 @@ impl ManagementWriteRecoveryContext {
         }
     }
 
+    fn source_grant_from_runtime_host_grant(
+        grant: &RuntimeHostGrant,
+    ) -> Option<source::config::GrantedMountRoot> {
+        if !matches!(&grant.object_type, RuntimeHostObjectType::MountRoot) {
+            return None;
+        }
+        Some(source::config::GrantedMountRoot {
+            object_ref: grant.object_ref.clone(),
+            host_ref: grant.host.host_ref.clone(),
+            host_ip: grant.host.host_ip.clone(),
+            host_name: grant.host.host_name.clone(),
+            site: grant.host.site.clone(),
+            zone: grant.host.zone.clone(),
+            host_labels: grant.host.host_labels.clone(),
+            mount_point: std::path::PathBuf::from(&grant.object.mount_point),
+            fs_source: grant.object.fs_source.clone(),
+            fs_type: grant.object.fs_type.clone(),
+            mount_options: grant.object.mount_options.clone(),
+            interfaces: grant.interfaces.clone(),
+            active: matches!(&grant.grant_state, RuntimeHostGrantState::Active),
+        })
+    }
+
+    fn sink_roots_control_grants_from_replay_signals(
+        replay_signals: &[SinkControlSignal],
+    ) -> Option<Vec<source::config::GrantedMountRoot>> {
+        let grants = replay_signals
+            .iter()
+            .filter_map(|signal| match signal {
+                SinkControlSignal::RuntimeHostGrantChange { changed, .. } => Some(changed),
+                _ => None,
+            })
+            .flat_map(|changed| changed.grants.iter())
+            .filter_map(Self::source_grant_from_runtime_host_grant)
+            .collect::<Vec<_>>();
+        (!grants.is_empty()).then_some(grants)
+    }
+
+    fn sink_roots_control_generation_is_stale(
+        generation_cell: &AtomicU64,
+        generation: u64,
+    ) -> bool {
+        generation == 0 || generation <= generation_cell.load(Ordering::Acquire)
+    }
+
+    fn sink_roots_control_generation_can_replay_same_declaration(
+        generation_cell: &AtomicU64,
+        generation: u64,
+    ) -> bool {
+        generation != 0 && generation == generation_cell.load(Ordering::Acquire)
+    }
+
+    fn mark_sink_roots_control_generation(generation_cell: &AtomicU64, generation: u64) {
+        if generation == 0 {
+            return;
+        }
+        let mut current = generation_cell.load(Ordering::Acquire);
+        while generation > current {
+            match generation_cell.compare_exchange(
+                current,
+                generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
+    }
+
     fn source_scoped_sink_activate_signal(
         route_key: String,
         generation: u64,
@@ -4820,6 +4897,139 @@ impl ManagementWriteRecoveryContext {
                 },
             ))?,
         })
+    }
+
+    fn source_scoped_sink_replay_owner_node_ids(
+        bound_scopes: &[RuntimeBoundScope],
+    ) -> BTreeSet<String> {
+        bound_scopes
+            .iter()
+            .flat_map(|scope| scope.resource_ids.iter())
+            .filter_map(|resource_id| {
+                resource_id
+                    .split_once("::")
+                    .map(|(node_id, _)| node_id.trim())
+                    .filter(|node_id| !node_id.is_empty())
+                    .map(ToString::to_string)
+            })
+            .collect()
+    }
+
+    fn source_scoped_sink_replay_scopes_for_owner(
+        bound_scopes: &[RuntimeBoundScope],
+        owner_node_id: &str,
+    ) -> Vec<RuntimeBoundScope> {
+        bound_scopes
+            .iter()
+            .filter_map(|scope| {
+                let resource_ids = scope
+                    .resource_ids
+                    .iter()
+                    .filter(|resource_id| {
+                        resource_id
+                            .split_once("::")
+                            .map(|(node_id, _)| node_id.trim() == owner_node_id)
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!resource_ids.is_empty()).then(|| RuntimeBoundScope {
+                    scope_id: scope.scope_id.clone(),
+                    resource_ids,
+                })
+            })
+            .collect()
+    }
+
+    fn source_scoped_sink_replay_route_scopes(
+        local_node_id: &str,
+        bound_scopes: &[RuntimeBoundScope],
+    ) -> BTreeMap<String, Vec<RuntimeBoundScope>> {
+        let owner_node_ids = Self::source_scoped_sink_replay_owner_node_ids(bound_scopes);
+        let local_scopes =
+            Self::source_scoped_sink_replay_scopes_for_owner(bound_scopes, local_node_id);
+        let local_or_unowned_scopes = if local_scopes.is_empty() && owner_node_ids.is_empty() {
+            bound_scopes.to_vec()
+        } else {
+            local_scopes
+        };
+        let mut route_scopes = BTreeMap::from([
+            (
+                format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+                local_or_unowned_scopes.clone(),
+            ),
+            (
+                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                local_or_unowned_scopes.clone(),
+            ),
+            (
+                format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                local_or_unowned_scopes,
+            ),
+        ]);
+        for node_id in owner_node_ids {
+            let owner_scopes =
+                Self::source_scoped_sink_replay_scopes_for_owner(bound_scopes, &node_id);
+            if owner_scopes.is_empty() {
+                continue;
+            }
+            route_scopes.insert(
+                events_stream_route_for_scope(&node_id).0,
+                owner_scopes.clone(),
+            );
+            route_scopes.insert(
+                sink_query_request_route_for(&node_id).0,
+                owner_scopes.clone(),
+            );
+            route_scopes.insert(
+                sink_status_request_route_for(&node_id).0,
+                owner_scopes.clone(),
+            );
+            route_scopes.insert(
+                sink_roots_control_stream_route_for(&node_id).0,
+                owner_scopes,
+            );
+        }
+        route_scopes
+    }
+
+    fn source_scoped_sink_replay_roots_control_envelopes_by_route(
+        signals: &[SinkControlSignal],
+    ) -> BTreeMap<String, Vec<ControlEnvelope>> {
+        let shared_envelopes = signals
+            .iter()
+            .filter_map(|signal| match signal {
+                SinkControlSignal::RuntimeHostGrantChange { .. } => Some(signal.envelope()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut owner_scoped = BTreeMap::new();
+        let mut generic = None;
+        let generic_route_key = format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL);
+        for signal in signals {
+            let SinkControlSignal::Activate {
+                route_key,
+                bound_scopes,
+                ..
+            } = signal
+            else {
+                continue;
+            };
+            if bound_scopes.is_empty() {
+                continue;
+            }
+            let mut replay_envelopes = shared_envelopes.clone();
+            replay_envelopes.push(signal.envelope());
+            if is_per_peer_sink_roots_control_stream_route(route_key) {
+                owner_scoped.insert(route_key.clone(), replay_envelopes);
+            } else if route_key == &generic_route_key {
+                generic = Some((route_key.clone(), replay_envelopes));
+            }
+        }
+        if !owner_scoped.is_empty() {
+            return owner_scoped;
+        }
+        generic.into_iter().collect()
     }
 
     fn source_scoped_sink_replay_groups_from_retained_source_signals(
@@ -5018,18 +5228,13 @@ impl ManagementWriteRecoveryContext {
             });
         }
 
-        for route_key in [
-            format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
-            events_stream_route_for_scope(&self.node_id.0).0,
-            format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
-            format!("{}.req", ROUTE_KEY_FORCE_FIND),
-            sink_query_request_route_for(&self.node_id.0).0,
-            sink_status_request_route_for(&self.node_id.0).0,
-        ] {
+        for (route_key, route_bound_scopes) in
+            Self::source_scoped_sink_replay_route_scopes(&self.node_id.0, &bound_scopes)
+        {
             signals.push(Self::source_scoped_sink_activate_signal(
                 route_key,
                 generation,
-                &bound_scopes,
+                &route_bound_scopes,
             )?);
         }
         Ok(signals)
@@ -5051,6 +5256,82 @@ impl ManagementWriteRecoveryContext {
             )
             .await
             .map_err(SinkFailure::into_error)?;
+        self.publish_source_scoped_sink_roots_control_replay(&signals)
+            .await?;
+        Ok(true)
+    }
+
+    async fn publish_source_scoped_sink_roots_control_replay(
+        &self,
+        signals: &[SinkControlSignal],
+    ) -> std::result::Result<bool, CnxError> {
+        let Some(boundary) = self.runtime_boundary.clone() else {
+            return Ok(false);
+        };
+        let replay_by_route =
+            Self::source_scoped_sink_replay_roots_control_envelopes_by_route(signals);
+        if replay_by_route.is_empty() {
+            return Ok(false);
+        }
+        let roots = self
+            .source
+            .logical_roots_snapshot_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)?;
+        let generation = self
+            .source
+            .logical_roots_generation_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)?
+            .max(1);
+        for attempt in 1..=SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_ATTEMPTS {
+            if attempt > 1 {
+                tokio::time::sleep(SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_RETRY_INTERVAL).await;
+            }
+            for (route_key, replay_envelopes) in &replay_by_route {
+                let payload = encode_logical_roots_control_payload_with_generation_and_sink_replay(
+                    &roots,
+                    generation,
+                    replay_envelopes.clone(),
+                )?;
+                eprintln!(
+                    "fs_meta_runtime_app: source-scoped sink roots-control replay send begin route={} roots={} generation={} attempt={}/{}",
+                    route_key,
+                    roots.len(),
+                    generation,
+                    attempt,
+                    SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_ATTEMPTS
+                );
+                boundary
+                    .channel_send(
+                        BoundaryContext::default(),
+                        ChannelSendRequest {
+                            channel_key: ChannelKey(route_key.clone()),
+                            events: vec![Event::new(
+                                EventMetadata {
+                                    origin_id: self.node_id.clone(),
+                                    timestamp_us: now_us(),
+                                    logical_ts: None,
+                                    correlation_id: None,
+                                    ingress_auth: None,
+                                    trace: None,
+                                },
+                                bytes::Bytes::from(payload),
+                            )],
+                            timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
+                        },
+                    )
+                    .await?;
+                eprintln!(
+                    "fs_meta_runtime_app: source-scoped sink roots-control replay send ok route={} roots={} generation={} attempt={}/{}",
+                    route_key,
+                    roots.len(),
+                    generation,
+                    attempt,
+                    SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_ATTEMPTS
+                );
+            }
+        }
         Ok(true)
     }
 
@@ -5121,10 +5402,40 @@ impl ManagementWriteRecoveryContext {
         Ok(())
     }
 
+    async fn should_replay_source_scoped_sink_state_after_app_retained_replay(
+        &self,
+    ) -> std::result::Result<bool, CnxError> {
+        if self.sink.retained_replay_required() {
+            return Ok(false);
+        }
+        let scope_observation =
+            FSMetaApp::observe_runtime_scope_convergence(&self.source, &self.sink)
+                .await
+                .map_err(RuntimeWorkerObservationFailure::into_error)?;
+        let logical_roots = self
+            .source
+            .logical_roots_snapshot_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)?;
+        let expected_scope_groups =
+            scope_observation.expected_groups_for_logical_roots(&logical_roots);
+        Ok(!expected_scope_groups.sink_groups.is_empty()
+            && !scope_observation.matches_node_local_source_scope(&expected_scope_groups)
+            && self.source_scoped_sink_replay_has_route_evidence().await)
+    }
+
     fn restore_control_after_retained_replay_recovery(&self) {
+        self.restore_control_after_retained_replay_recovery_with_entry_replay(false);
+    }
+
+    fn restore_control_after_retained_replay_recovery_with_entry_replay(
+        &self,
+        entry_replay_required: bool,
+    ) {
         let state_after_repair = self.runtime_control_state();
         let recovery_can_reopen_control = state_after_repair.control_initialized()
-            || self.control_failure_uninitialized.load(Ordering::Acquire);
+            || self.control_failure_uninitialized.load(Ordering::Acquire)
+            || entry_replay_required;
         if state_after_repair.replay_fully_cleared() && recovery_can_reopen_control {
             self.update_runtime_control_state(|state| state.mark_initialized());
             self.control_failure_uninitialized
@@ -5342,6 +5653,12 @@ impl ManagementWriteRecoveryContext {
         if self.runtime_control_state().sink_state_replay_required() {
             if self.replay_app_retained_sink_state_if_present().await? {
                 if !self.sink.retained_replay_required() {
+                    if self
+                        .should_replay_source_scoped_sink_state_after_app_retained_replay()
+                        .await?
+                    {
+                        self.replay_source_scoped_sink_state_if_present().await?;
+                    }
                     self.wait_for_sink_replay_readiness_after_repair().await?;
                     self.clear_sink_replay_after_repair();
                 }
@@ -5397,7 +5714,10 @@ impl ManagementWriteRecoveryContext {
 
         self.repair_sink_replay_if_required().await?;
 
-        self.restore_control_after_retained_replay_recovery();
+        self.restore_control_after_retained_replay_recovery_with_entry_replay(
+            state_at_entry.source_state_replay_required()
+                || state_at_entry.sink_state_replay_required(),
+        );
         self.publish_recovered_facade_state().await;
         Ok(())
     }
@@ -5431,6 +5751,13 @@ impl ManagementWriteRecoveryContext {
             }
 
             if self.replay_app_retained_sink_state_if_present().await? {
+                if !self.sink.retained_replay_required()
+                    && self
+                        .should_replay_source_scoped_sink_state_after_app_retained_replay()
+                        .await?
+                {
+                    self.replay_source_scoped_sink_state_if_present().await?;
+                }
                 !self.sink.retained_replay_required()
             } else if !self.sink.retained_replay_required()
                 && self.replay_source_scoped_sink_state_if_present().await?
@@ -5692,10 +6019,7 @@ impl PendingFixedBindHandoffRegistrant {
         if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
             return None;
         }
-        let suppressed_dependent_routes_remain = self
-            .pending_fixed_bind_has_suppressed_dependent_routes
-            .load(Ordering::Acquire);
-        if pending.runtime_exposure_confirmed || !suppressed_dependent_routes_remain {
+        if pending.runtime_exposure_confirmed {
             Some(PendingFixedBindHandoffContinuation {
                 bind_addr: bind_addr.to_string(),
                 registrant: self.clone(),
@@ -6740,7 +7064,8 @@ fn source_rescan_route_groups_for_current_generation(
         .iter()
         .filter_map(|scope| {
             let scope_id = scope.scope_id.trim();
-            (!scope_id.is_empty()).then(|| scope_id.to_string())
+            (!scope_id.is_empty() && !scope_id.starts_with("__fsmeta_empty_roots_bootstrap"))
+                .then(|| scope_id.to_string())
         })
         .collect::<BTreeSet<_>>();
     if groups.is_empty() {
@@ -7239,6 +7564,11 @@ fn is_facade_dependent_query_route(route_key: &str) -> bool {
         || is_materialized_query_request_route(route_key)
         || is_sink_status_query_request_route(route_key)
         || is_source_status_request_route(route_key)
+}
+
+fn is_fixed_bind_facade_business_read_route(route_key: &str) -> bool {
+    route_key == format!("{}.req", ROUTE_KEY_QUERY)
+        || is_materialized_query_request_route(route_key)
 }
 
 fn is_serving_facade_business_read_route(route_key: &str) -> bool {
@@ -8919,6 +9249,7 @@ pub struct FSMetaApp {
     rollout_status: SharedRolloutStatusCell,
     facade_gate: RuntimeUnitGate,
     source_rescan_proxy_ready_generation: Arc<AtomicU64>,
+    sink_logical_roots_control_generation: Arc<AtomicU64>,
     mirrored_query_peer_routes: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
     runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
     retained_sink_control_state: Arc<Mutex<RetainedSinkControlState>>,
@@ -10936,6 +11267,7 @@ impl FSMetaApp {
                 ],
             ),
             source_rescan_proxy_ready_generation: Arc::new(AtomicU64::new(0)),
+            sink_logical_roots_control_generation: Arc::new(AtomicU64::new(0)),
             mirrored_query_peer_routes: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             runtime_gate_state: Arc::new(StdMutex::new(RuntimeControlState::bootstrapping(
                 false, false,
@@ -12209,6 +12541,36 @@ impl FSMetaApp {
         )
     }
 
+    fn source_signal_is_empty_scope_route_liveness(signal: &SourceControlSignal) -> bool {
+        match signal {
+            SourceControlSignal::Activate { bound_scopes, .. } => bound_scopes.is_empty(),
+            SourceControlSignal::Deactivate { .. } | SourceControlSignal::Tick { .. } => true,
+            SourceControlSignal::RuntimeHostGrantChange { .. }
+            | SourceControlSignal::ManualRescan { .. }
+            | SourceControlSignal::Passthrough(_) => false,
+        }
+    }
+
+    fn source_current_logical_roots_empty_nonblocking(&self) -> bool {
+        self.config.source.roots.is_empty()
+            && self
+                .source
+                .cached_logical_roots_snapshot_with_failure()
+                .is_ok_and(|roots| roots.is_empty())
+    }
+
+    fn source_signals_are_empty_root_route_liveness_only(
+        &self,
+        source_signals: &[SourceControlSignal],
+    ) -> bool {
+        !source_signals.is_empty()
+            && !self.runtime_control_state().source_state_replay_required()
+            && self.source_current_logical_roots_empty_nonblocking()
+            && source_signals
+                .iter()
+                .all(Self::source_signal_is_empty_scope_route_liveness)
+    }
+
     fn source_signal_is_source_control_route(signal: &SourceControlSignal) -> bool {
         let route_key = match signal {
             SourceControlSignal::Activate { route_key, .. }
@@ -12383,6 +12745,9 @@ impl FSMetaApp {
             }
             eprintln!("fs_meta_runtime_app: initialize_from_control sink.ensure_started ok");
         }
+        let skip_rootless_external_source_start = self.source.is_worker()
+            && self.source_current_logical_roots_empty_nonblocking()
+            && !wait_for_source_worker_handoff;
         let mut guard = self.pump_task.lock().await;
         if guard.is_none() {
             if wait_for_source_worker_handoff && wait_for_sink_worker_handoff {
@@ -12424,20 +12789,29 @@ impl FSMetaApp {
                     self.sink.wait_for_control_ops_to_drain_for_handoff().await;
                 }
             }
-            eprintln!("fs_meta_runtime_app: initialize_from_control source.start begin");
-            let start = self
-                .source
-                .start_with_failure(self.sink.clone(), self.runtime_boundary.clone());
-            *guard = if let Some(deadline) = deadline {
-                let start = Self::map_runtime_initialize_timeout_result(
-                    tokio::time::timeout(Self::remaining_initialize_budget(Some(deadline))?, start)
-                        .await,
-                )?;
-                start.map_err(RuntimeInitializeFailure::from)?
+            if skip_rootless_external_source_start {
+                eprintln!(
+                    "fs_meta_runtime_app: initialize_from_control source.start skipped reason=empty_root_external_source_liveness"
+                );
             } else {
-                start.await.map_err(RuntimeInitializeFailure::from)?
-            };
-            eprintln!("fs_meta_runtime_app: initialize_from_control source.start ok");
+                eprintln!("fs_meta_runtime_app: initialize_from_control source.start begin");
+                let start = self
+                    .source
+                    .start_with_failure(self.sink.clone(), self.runtime_boundary.clone());
+                *guard = if let Some(deadline) = deadline {
+                    let start = Self::map_runtime_initialize_timeout_result(
+                        tokio::time::timeout(
+                            Self::remaining_initialize_budget(Some(deadline))?,
+                            start,
+                        )
+                        .await,
+                    )?;
+                    start.map_err(RuntimeInitializeFailure::from)?
+                } else {
+                    start.await.map_err(RuntimeInitializeFailure::from)?
+                };
+                eprintln!("fs_meta_runtime_app: initialize_from_control source.start ok");
+            }
         }
         drop(guard);
 
@@ -12575,6 +12949,8 @@ impl FSMetaApp {
         let mut endpoint_tasks = std::mem::take(&mut *self.runtime_endpoint_tasks.lock().await);
         let mut retained_tasks = Vec::with_capacity(endpoint_tasks.len());
         let scoped_source_rescan_route_key = source_rescan_request_route_for(&self.node_id.0).0;
+        let scoped_sink_roots_control_route_key =
+            sink_roots_control_stream_route_for(&self.node_id.0).0;
         let scoped_source_rescan_generation = source_rescan_route_semantic_generation(
             &self.facade_gate,
             &scoped_source_rescan_route_key,
@@ -12582,6 +12958,8 @@ impl FSMetaApp {
         let runtime_state = self.runtime_control_state();
         let allow_unmanaged_local_source_rescan_proxy =
             source_rescan_proxy_allowed_for_runtime_state(&self.source, runtime_state);
+        let allow_unmanaged_worker_sink_roots_control_proxy =
+            matches!(&*self.sink, SinkFacade::Worker(_));
         for task in endpoint_tasks.drain(..) {
             if task.is_finished() {
                 eprintln!(
@@ -12607,8 +12985,12 @@ impl FSMetaApp {
             }
             let unmanaged_local_source_rescan_proxy = allow_unmanaged_local_source_rescan_proxy
                 && task.route_key() == scoped_source_rescan_route_key;
+            let unmanaged_worker_sink_roots_control_proxy =
+                allow_unmanaged_worker_sink_roots_control_proxy
+                    && task.route_key() == scoped_sink_roots_control_route_key;
             if !runtime_endpoint_task_route_still_active(&self.facade_gate, &task)
                 && !unmanaged_local_source_rescan_proxy
+                && !unmanaged_worker_sink_roots_control_proxy
             {
                 eprintln!(
                     "fs_meta_runtime_app: retiring inactive runtime endpoint route={}",
@@ -12644,11 +13026,15 @@ impl FSMetaApp {
         for task in tasks.iter() {
             let unmanaged_local_source_rescan_proxy = allow_unmanaged_local_source_rescan_proxy
                 && task.route_key() == scoped_source_rescan_route_key;
+            let unmanaged_worker_sink_roots_control_proxy =
+                allow_unmanaged_worker_sink_roots_control_proxy
+                    && task.route_key() == scoped_sink_roots_control_route_key;
             if !task.is_finished()
                 && task.finish_reason().is_none()
                 && !task.is_shutdown_requested()
                 && (runtime_endpoint_task_route_still_active(&self.facade_gate, task)
-                    || unmanaged_local_source_rescan_proxy)
+                    || unmanaged_local_source_rescan_proxy
+                    || unmanaged_worker_sink_roots_control_proxy)
             {
                 if task.route_key() == scoped_source_rescan_route_key
                     && task
@@ -12685,6 +13071,166 @@ impl FSMetaApp {
             .unit_state(execution_units::SOURCE_RUNTIME_UNIT_ID)?
             .map(|(active, _)| active)
             .unwrap_or(false);
+        if matches!(&*self.sink, SinkFacade::Worker(_)) {
+            let mut sink_roots_control_routes = Vec::new();
+            if let Ok(route) =
+                routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL)
+                && self
+                    .facade_gate
+                    .route_active(execution_units::SINK_RUNTIME_UNIT_ID, &route.0)
+                    .unwrap_or(false)
+            {
+                sink_roots_control_routes.push(route.0);
+            }
+            sink_roots_control_routes.push(scoped_sink_roots_control_route_key.clone());
+            for route_key in sink_roots_control_routes {
+                if !spawned_routes.insert(route_key.clone()) {
+                    continue;
+                }
+                eprintln!(
+                    "fs_meta_runtime_app: spawning worker-backed sink roots-control endpoint route={}",
+                    route_key
+                );
+                let route_for_gate = route_key.clone();
+                let scoped_route_for_gate = scoped_sink_roots_control_route_key.clone();
+                let facade_gate = self.facade_gate.clone();
+                let sink = self.sink.clone();
+                let config_host_object_grants = self.config.source.host_object_grants.clone();
+                let retained_sink_control_state = self.retained_sink_control_state.clone();
+                let generation_cell = self.sink_logical_roots_control_generation.clone();
+                let endpoint = ManagedEndpointTask::spawn_stream(
+                    boundary.clone(),
+                    RouteKey(route_key.clone()),
+                    format!(
+                        "app:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL
+                    ),
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    tokio_util::sync::CancellationToken::new(),
+                    move || match facade_gate
+                        .route_generation(execution_units::SINK_RUNTIME_UNIT_ID, &route_for_gate)
+                    {
+                        Ok(Some(generation)) => facade_gate
+                            .accept_tick(
+                                execution_units::SINK_RUNTIME_UNIT_ID,
+                                &route_for_gate,
+                                generation,
+                            )
+                            .unwrap_or(false),
+                        Ok(None) => route_for_gate == scoped_route_for_gate,
+                        Err(_) => false,
+                    },
+                    move |events| {
+                        let sink = sink.clone();
+                        let config_host_object_grants = config_host_object_grants.clone();
+                        let retained_sink_control_state = retained_sink_control_state.clone();
+                        let generation_cell = generation_cell.clone();
+                        async move {
+                            for event in events {
+                                let payload = match decode_logical_roots_control_payload(
+                                    event.payload_bytes(),
+                                ) {
+                                    Ok(payload) => payload,
+                                    Err(err) => {
+                                        log::warn!(
+                                            "worker-backed sink logical-roots control decode failed: {:?}",
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let replay_envelopes = payload.sink_replay_envelopes;
+                                let replay_signals = match sink_control_signals_from_envelopes(
+                                    &replay_envelopes,
+                                ) {
+                                    Ok(signals) => signals,
+                                    Err(err) => {
+                                        log::warn!(
+                                            "worker-backed sink logical-roots replay decode failed: {:?}",
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                };
+                                if ManagementWriteRecoveryContext::sink_roots_control_generation_is_stale(
+                                    &generation_cell,
+                                    payload.generation,
+                                ) {
+                                    if ManagementWriteRecoveryContext::sink_roots_control_generation_can_replay_same_declaration(
+                                        &generation_cell,
+                                        payload.generation,
+                                    ) && !replay_signals.is_empty()
+                                    {
+                                        if let Err(err) = sink
+                                            .apply_retained_orchestration_signals_with_total_timeout_with_failure(
+                                                &replay_signals,
+                                                SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
+                                            )
+                                            .await
+                                        {
+                                            log::warn!(
+                                                "worker-backed sink logical-roots stale replay apply failed: {:?}",
+                                                err.as_error()
+                                            );
+                                        }
+                                    } else {
+                                        log::warn!(
+                                            "worker-backed sink logical-roots control stale: payload_generation={}",
+                                            payload.generation
+                                        );
+                                    }
+                                    continue;
+                                }
+                                let host_object_grants =
+                                    ManagementWriteRecoveryContext::sink_roots_control_grants_from_replay_signals(
+                                        &replay_signals,
+                                    )
+                                    .unwrap_or_else(|| config_host_object_grants.clone());
+                                if let Err(err) = sink
+                                    .update_logical_roots_with_failure(
+                                        payload.roots,
+                                        &host_object_grants,
+                                    )
+                                    .await
+                                {
+                                    log::warn!(
+                                        "worker-backed sink logical-roots control apply failed: {:?}",
+                                        err.as_error()
+                                    );
+                                    continue;
+                                }
+                                ManagementWriteRecoveryContext::mark_sink_roots_control_generation(
+                                    &generation_cell,
+                                    payload.generation,
+                                );
+                                if !replay_signals.is_empty() {
+                                    {
+                                        let mut retained = retained_sink_control_state.lock().await;
+                                        Self::apply_sink_signals_to_state(
+                                            &mut retained,
+                                            &replay_signals,
+                                        );
+                                    }
+                                    if let Err(err) = sink
+                                        .apply_retained_orchestration_signals_with_total_timeout_with_failure(
+                                            &replay_signals,
+                                            SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
+                                        )
+                                        .await
+                                    {
+                                        log::warn!(
+                                            "worker-backed sink logical-roots replay apply failed: {:?}",
+                                            err.as_error()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    },
+                );
+                tasks.push(endpoint);
+            }
+        }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_QUERY) {
             let route_active = self
                 .facade_gate
@@ -13511,10 +14057,24 @@ impl FSMetaApp {
                                                             groups,
                                                         );
                                                         } else {
-                                                            annotate_manual_rescan_route_receivable_evidence(
-                                                            &mut snapshot,
-                                                            &node_id,
-                                                        );
+                                                            let generation =
+                                                                source_rescan_route_semantic_generation(
+                                                                    &facade_gate_for_source_status,
+                                                                    &source_rescan_proxy_route_key,
+                                                                );
+                                                            if generation == 0 {
+                                                                annotate_manual_rescan_route_receivable_evidence(
+                                                                    &mut snapshot,
+                                                                    &node_id,
+                                                                );
+                                                            } else {
+                                                                annotate_manual_rescan_route_receivable_evidence_for_current_groups_and_generation(
+                                                                    &mut snapshot,
+                                                                    &node_id,
+                                                                    &source_rescan_proxy_route_key,
+                                                                    generation,
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                     Some((snapshot, used_cached_fallback))
@@ -15903,17 +16463,9 @@ impl FSMetaApp {
         unit: FacadeRuntimeUnit,
         route_key: &str,
     ) -> bool {
-        let public_find_route = format!("{}.req", ROUTE_KEY_QUERY);
-        let materialized_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
         match unit {
-            FacadeRuntimeUnit::Query => {
-                route_key == public_find_route || route_key == materialized_proxy_route
-            }
-            FacadeRuntimeUnit::QueryPeer => {
-                route_key == materialized_proxy_route
-                    || is_sink_status_query_request_route(route_key)
-                    || is_per_peer_sink_query_request_route(route_key)
-            }
+            FacadeRuntimeUnit::Query => is_fixed_bind_facade_business_read_route(route_key),
+            FacadeRuntimeUnit::QueryPeer => is_materialized_query_request_route(route_key),
             FacadeRuntimeUnit::Facade => false,
         }
     }
@@ -16206,7 +16758,8 @@ impl FSMetaApp {
         if matches!(
             unit,
             FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
-        ) {
+        ) && is_fixed_bind_facade_business_read_route(route_key)
+        {
             let (followup_snapshot, next_session) = self
                 .settle_fixed_bind_claim_release_followup_with_session(session)
                 .await?;
@@ -19286,7 +19839,19 @@ impl FSMetaApp {
                         && !pending.runtime_exposure_confirmed
                         && pending.generation >= generation
                 });
-            if pending_fixed_bind_successor_unready && active_facade_controls_public_listener {
+            let pending_external_fixed_bind_successor_unready =
+                !pending_fixed_bind_successor_unready
+                    && self
+                        .pending_external_fixed_bind_successor_unready_for_active_facade(
+                            route_key, generation,
+                        )
+                        .await;
+            if (pending_fixed_bind_successor_unready
+                || pending_external_fixed_bind_successor_unready)
+                && active_facade_controls_public_listener
+            {
+                self.retained_active_facade_continuity
+                    .store(true, Ordering::Release);
                 eprintln!(
                     "fs_meta_runtime_app: retain active facade during pending successor cleanup deactivate route_key={} generation={}",
                     route_key, generation
@@ -19516,6 +20081,49 @@ impl FSMetaApp {
         }
     }
 
+    async fn pending_external_fixed_bind_successor_unready_for_active_facade(
+        &self,
+        route_key: &str,
+        generation: u64,
+    ) -> bool {
+        if route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
+            return false;
+        }
+        let bind_addr = {
+            let api_task = self.api_task.lock().await;
+            api_task.as_ref().and_then(|active| {
+                (active.route_key == route_key)
+                    .then(|| {
+                        self.config
+                            .api
+                            .resolve_for_candidate_ids(&active.resource_ids)
+                    })
+                    .flatten()
+                    .map(|resolved| resolved.bind_addr)
+                    .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr))
+            })
+        };
+        let Some(bind_addr) = bind_addr else {
+            return false;
+        };
+        let Some(registrant) = pending_fixed_bind_handoff_ready_for(&bind_addr) else {
+            return false;
+        };
+        if registrant.instance_id == self.instance_id {
+            return false;
+        }
+        registrant
+            .pending_facade
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.route_key == route_key
+                    && pending.generation >= generation
+                    && !pending.runtime_exposure_confirmed
+            })
+    }
+
     async fn pending_spawn_in_flight_for_route_key(&self, route_key: &str) -> bool {
         let pending = self.pending_facade.lock().await.clone();
         let Some(pending) = pending else {
@@ -19669,7 +20277,10 @@ impl FSMetaApp {
                     .load(Ordering::Acquire)
                     || (source_replay_required_at_entry
                         && source_status_recovery_followup_present));
-            let initialize_wait_for_source_worker_handoff = !source_signals.is_empty();
+            let source_empty_root_route_liveness_only =
+                self.source_signals_are_empty_root_route_liveness_only(&source_signals);
+            let initialize_wait_for_source_worker_handoff =
+                !source_signals.is_empty() && !source_empty_root_route_liveness_only;
             let initialize_wait_for_sink_worker_handoff = !sink_signals.is_empty();
             let request_sensitive = !source_signals.is_empty()
                 || !sink_signals.is_empty()
@@ -19914,10 +20525,14 @@ impl FSMetaApp {
                 source_signals_present: !source_signals.is_empty(),
                 sink_signals_present: !sink_signals.is_empty(),
             };
-            let source_wave_disposition = Self::classify_source_control_wave_disposition(
-                control_wave_observation,
-                &source_signals,
-            );
+            let source_wave_disposition = if source_empty_root_route_liveness_only {
+                SourceControlWaveDisposition::EmptyRootRouteLivenessOnly
+            } else {
+                Self::classify_source_control_wave_disposition(
+                    control_wave_observation,
+                    &source_signals,
+                )
+            };
             let sink_wave_disposition = Self::classify_sink_control_wave_disposition(
                 control_wave_observation,
                 source_wave_disposition,
@@ -20027,6 +20642,19 @@ impl FSMetaApp {
                         .await;
                     self.apply_source_signals_to_runtime_endpoint_gate(&source_signals)
                         .map_err(RuntimeWorkerControlApplyFailure::from)?;
+                }
+                SourceControlWaveDisposition::EmptyRootRouteLivenessOnly => {
+                    self.record_retained_source_control_state(&source_signals)
+                        .await;
+                    self.record_shared_source_route_claims(&source_signals)
+                        .await;
+                    self.apply_source_signals_to_runtime_endpoint_gate(&source_signals)
+                        .map_err(RuntimeWorkerControlApplyFailure::from)?;
+                    self.finish_source_control_apply_and_publish_source_repair(
+                        &mut source_control_apply_inflight,
+                        true,
+                    )
+                    .await?;
                 }
                 SourceControlWaveDisposition::ApplySignals => {
                     if (sink_signals.is_empty()

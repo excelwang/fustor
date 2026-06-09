@@ -36,7 +36,8 @@ const SINK_WORKER_CONTROL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const SINK_WORKER_CLOSE_DRAIN_TIMEOUT: Duration = SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT;
-const SINK_WORKER_STALE_CLIENT_BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const SINK_WORKER_REPLACEMENT_CLOSE_RPC_TIMEOUT: Duration = Duration::from_millis(250);
+const SINK_WORKER_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const SINK_WORKER_STATUS_NONBLOCKING_PROBE_BUDGET: Duration = Duration::from_millis(350);
 const SINK_WORKER_STATUS_NONBLOCKING_SETTLE_SLACK: Duration = Duration::from_millis(50);
 const SINK_WORKER_STATUS_RETRY_RESET_FINAL_PROBE_BUDGET: Duration = Duration::from_millis(100);
@@ -1314,6 +1315,7 @@ fn apply_live_sink_status_snapshot_outcome_side_effects(
     Ok(())
 }
 
+#[cfg(test)]
 fn republish_scheduled_group_ids_into_status_summary(
     snapshot: &mut SinkStatusSnapshot,
     node_id: &NodeId,
@@ -1466,7 +1468,7 @@ pub struct SinkWorkerClientHandle {
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
     logical_roots_generation: Arc<AtomicU64>,
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
-    scheduled_groups_cache: Arc<Mutex<Option<std::collections::BTreeSet<String>>>>,
+    scheduled_groups_cache: Arc<Mutex<Option<CachedSinkScheduleEvidence>>>,
     retained_control_state: Arc<tokio::sync::Mutex<RetainedSinkWorkerControlState>>,
     control_state_replay_required: Arc<AtomicUsize>,
     control_ops_inflight: Arc<AtomicUsize>,
@@ -1481,7 +1483,7 @@ struct SharedSinkWorkerHandleState {
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
     logical_roots_generation: Arc<AtomicU64>,
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
-    scheduled_groups_cache: Arc<Mutex<Option<std::collections::BTreeSet<String>>>>,
+    scheduled_groups_cache: Arc<Mutex<Option<CachedSinkScheduleEvidence>>>,
     retained_control_state: Arc<tokio::sync::Mutex<RetainedSinkWorkerControlState>>,
     control_state_replay_required: Arc<AtomicUsize>,
     control_ops_inflight: Arc<AtomicUsize>,
@@ -1500,6 +1502,110 @@ struct RetainedSinkWorkerControlState {
     active_by_route: std::collections::BTreeMap<(String, String), SinkControlSignal>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CachedSinkScheduleEvidence {
+    scheduled_groups: std::collections::BTreeSet<String>,
+    scheduled_groups_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    primary_host_ref_by_group: std::collections::BTreeMap<String, String>,
+}
+
+impl CachedSinkScheduleEvidence {
+    fn from_group_ids_for_node(
+        node_id: &NodeId,
+        groups: std::collections::BTreeSet<String>,
+    ) -> Option<Self> {
+        if groups.is_empty() {
+            return None;
+        }
+        Some(Self {
+            scheduled_groups_by_node: std::collections::BTreeMap::from([(
+                node_id.0.clone(),
+                groups.iter().cloned().collect(),
+            )]),
+            scheduled_groups: groups,
+            primary_host_ref_by_group: std::collections::BTreeMap::new(),
+        })
+    }
+
+    fn from_status_snapshot(snapshot: &SinkStatusSnapshot) -> Option<Self> {
+        let scheduled_groups = snapshot.scheduled_groups();
+        if scheduled_groups.is_empty() {
+            return None;
+        }
+        Some(Self {
+            scheduled_groups,
+            scheduled_groups_by_node: snapshot.scheduled_groups_by_node.clone(),
+            primary_host_ref_by_group: snapshot.primary_host_ref_by_group.clone(),
+        })
+    }
+
+    fn retain_groups(&mut self, surviving_groups: &std::collections::BTreeSet<String>) {
+        self.scheduled_groups
+            .retain(|group_id| surviving_groups.contains(group_id));
+        self.scheduled_groups_by_node.retain(|_, groups| {
+            groups.retain(|group_id| surviving_groups.contains(group_id));
+            !groups.is_empty()
+        });
+        self.primary_host_ref_by_group
+            .retain(|group_id, _| surviving_groups.contains(group_id));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.scheduled_groups.is_empty()
+    }
+}
+
+fn cached_sink_schedule_host_ref(resource_id: &str) -> Option<String> {
+    resource_id
+        .trim()
+        .split_once("::")
+        .and_then(|(host_ref, _)| {
+            let host_ref = host_ref.trim();
+            (!host_ref.is_empty()).then(|| host_ref.to_string())
+        })
+}
+
+fn cached_sink_schedule_evidence_from_bound_scopes<'a>(
+    bound_scopes: impl Iterator<Item = &'a capanix_runtime_entry_sdk::control::RuntimeBoundScope>,
+    fallback_node_id: &NodeId,
+) -> CachedSinkScheduleEvidence {
+    let mut evidence = CachedSinkScheduleEvidence::default();
+    for scope in bound_scopes {
+        let group_id = scope.scope_id.trim();
+        if group_id.is_empty() {
+            continue;
+        }
+        let group_id = group_id.to_string();
+        evidence.scheduled_groups.insert(group_id.clone());
+        let mut host_refs = scope
+            .resource_ids
+            .iter()
+            .filter_map(|resource_id| cached_sink_schedule_host_ref(resource_id))
+            .collect::<std::collections::BTreeSet<_>>();
+        if host_refs.is_empty() {
+            host_refs.insert(fallback_node_id.0.clone());
+        }
+        if let Some(host_ref) = host_refs.iter().next().cloned() {
+            evidence
+                .primary_host_ref_by_group
+                .entry(group_id.clone())
+                .or_insert(host_ref);
+        }
+        for host_ref in host_refs {
+            evidence
+                .scheduled_groups_by_node
+                .entry(host_ref)
+                .or_default()
+                .push(group_id.clone());
+        }
+    }
+    for groups in evidence.scheduled_groups_by_node.values_mut() {
+        groups.sort();
+        groups.dedup();
+    }
+    evidence
+}
+
 fn retained_scheduled_group_ids(
     retained: &RetainedSinkWorkerControlState,
 ) -> Option<std::collections::BTreeSet<String>> {
@@ -1516,6 +1622,24 @@ fn retained_scheduled_group_ids(
         .map(|scope_id| scope_id.to_string())
         .collect::<std::collections::BTreeSet<_>>();
     (!groups.is_empty()).then_some(groups)
+}
+
+fn retained_sink_schedule_evidence(
+    retained: &RetainedSinkWorkerControlState,
+    fallback_node_id: &NodeId,
+) -> Option<CachedSinkScheduleEvidence> {
+    let evidence = cached_sink_schedule_evidence_from_bound_scopes(
+        retained
+            .active_by_route
+            .values()
+            .filter_map(|signal| match signal {
+                SinkControlSignal::Activate { bound_scopes, .. } => Some(bound_scopes.as_slice()),
+                _ => None,
+            })
+            .flat_map(|bound_scopes| bound_scopes.iter()),
+        fallback_node_id,
+    );
+    (!evidence.is_empty()).then_some(evidence)
 }
 
 fn control_signal_summary_scope_ids(signal: &str) -> std::collections::BTreeSet<String> {
@@ -1854,6 +1978,13 @@ pub(crate) struct SinkWorkerRetryResetHook {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SinkWorkerReplacementShutdownHook {
+    pub entered: Arc<tokio::sync::Notify>,
+    pub release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
 fn sink_worker_close_hook_cell() -> &'static Mutex<Option<SinkWorkerCloseHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerCloseHook>>> =
         std::sync::OnceLock::new();
@@ -1942,6 +2073,14 @@ fn sink_worker_status_nonblocking_cache_fallback_hook_cell()
 #[cfg(test)]
 fn sink_worker_retry_reset_hook_cell() -> &'static Mutex<Option<SinkWorkerRetryResetHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerRetryResetHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn sink_worker_replacement_shutdown_hook_cell()
+-> &'static Mutex<Option<SinkWorkerReplacementShutdownHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerReplacementShutdownHook>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
@@ -2142,6 +2281,17 @@ pub(crate) fn install_sink_worker_retry_reset_hook(hook: SinkWorkerRetryResetHoo
 }
 
 #[cfg(test)]
+pub(crate) fn install_sink_worker_replacement_shutdown_hook(
+    hook: SinkWorkerReplacementShutdownHook,
+) {
+    let mut guard = match sink_worker_replacement_shutdown_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn clear_sink_worker_control_frame_error_hook() {
     let mut guard = match sink_worker_control_frame_error_hook_cell().lock() {
         Ok(guard) => guard,
@@ -2177,6 +2327,15 @@ pub(crate) fn clear_sink_worker_status_nonblocking_cache_fallback_hook() {
 #[cfg(test)]
 pub(crate) fn clear_sink_worker_retry_reset_hook() {
     let mut guard = match sink_worker_retry_reset_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_sink_worker_replacement_shutdown_hook() {
+    let mut guard = match sink_worker_replacement_shutdown_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -2399,6 +2558,30 @@ fn notify_sink_worker_retry_reset() {
     if let Some(hook) = hook {
         hook.reset_count.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+async fn shutdown_stale_sink_worker_client_for_replacement(
+    stale_client: Arc<TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>>,
+    timeout: Duration,
+) -> Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = {
+        let guard = match sink_worker_replacement_shutdown_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    } {
+        hook.entered.notify_waiters();
+        hook.release.notified().await;
+    }
+
+    SinkWorkerClientHandle::checkpoint_stale_worker_client_before_replacement(
+        &stale_client,
+        timeout,
+    )
+    .await;
+    stale_client.shutdown(timeout).await
 }
 
 #[cfg(test)]
@@ -2624,7 +2807,9 @@ impl SinkWorkerClientHandle {
 
     #[cfg(test)]
     async fn shutdown_shared_worker_for_tests(&self, timeout: Duration) -> Result<()> {
-        self.worker_client().await.shutdown(timeout).await
+        let worker = self.worker_client().await;
+        Self::checkpoint_stale_worker_client_before_replacement(&worker, timeout).await;
+        worker.shutdown(timeout).await
     }
 
     fn update_cached_logical_roots(
@@ -2667,10 +2852,15 @@ impl SinkWorkerClientHandle {
         Ok(())
     }
 
+    #[cfg(test)]
     fn cached_scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
         self.scheduled_groups_cache
             .lock()
-            .map(|guard| guard.clone())
+            .map(|guard| {
+                guard
+                    .as_ref()
+                    .map(|evidence| evidence.scheduled_groups.clone())
+            })
             .map_err(|_| {
                 CnxError::Internal("sink worker scheduled groups cache lock poisoned".into())
             })
@@ -2681,7 +2871,11 @@ impl SinkWorkerClientHandle {
     ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SinkFailure> {
         self.scheduled_groups_cache
             .lock()
-            .map(|guard| guard.clone())
+            .map(|guard| {
+                guard
+                    .as_ref()
+                    .map(|evidence| evidence.scheduled_groups.clone())
+            })
             .map_err(|_| {
                 SinkFailure::from_cause(CnxError::Internal(
                     "sink worker scheduled groups cache lock poisoned".into(),
@@ -2689,15 +2883,24 @@ impl SinkWorkerClientHandle {
             })
     }
 
-    fn replace_cached_scheduled_group_ids(
+    fn replace_cached_schedule_evidence(
         &self,
-        groups: Option<std::collections::BTreeSet<String>>,
+        evidence: Option<CachedSinkScheduleEvidence>,
     ) -> Result<()> {
         let mut guard = self.scheduled_groups_cache.lock().map_err(|_| {
             CnxError::Internal("sink worker scheduled groups cache lock poisoned".into())
         })?;
-        *guard = groups;
+        *guard = evidence;
         Ok(())
+    }
+
+    fn replace_cached_scheduled_group_ids(
+        &self,
+        groups: Option<std::collections::BTreeSet<String>>,
+    ) -> Result<()> {
+        self.replace_cached_schedule_evidence(groups.and_then(|groups| {
+            CachedSinkScheduleEvidence::from_group_ids_for_node(&self.node_id, groups)
+        }))
     }
 
     fn update_cached_scheduled_group_ids(
@@ -2707,24 +2910,94 @@ impl SinkWorkerClientHandle {
         self.replace_cached_scheduled_group_ids(Some(groups.clone()))
     }
 
-    fn republish_cached_scheduled_groups_into_empty_status_summary(&self) -> Result<()> {
-        let Some(groups) = self.cached_scheduled_group_ids()? else {
-            return Ok(());
+    fn update_cached_schedule_evidence_from_snapshot(
+        &self,
+        snapshot: &SinkStatusSnapshot,
+    ) -> Result<()> {
+        self.replace_cached_schedule_evidence(CachedSinkScheduleEvidence::from_status_snapshot(
+            snapshot,
+        ))
+    }
+
+    fn republish_cached_schedule_evidence_into_status_summary(
+        snapshot: &mut SinkStatusSnapshot,
+        evidence: &CachedSinkScheduleEvidence,
+    ) {
+        if evidence.is_empty() {
+            return;
+        }
+        let has_owner_evidence = !evidence.scheduled_groups_by_node.is_empty()
+            || !evidence.primary_host_ref_by_group.is_empty();
+        if has_owner_evidence {
+            for groups in snapshot.scheduled_groups_by_node.values_mut() {
+                groups.retain(|group_id| !evidence.scheduled_groups.contains(group_id));
+            }
+            snapshot
+                .scheduled_groups_by_node
+                .retain(|_, groups| !groups.is_empty());
+        }
+        for (node_id, groups) in &evidence.scheduled_groups_by_node {
+            let entry = snapshot
+                .scheduled_groups_by_node
+                .entry(node_id.clone())
+                .or_default();
+            entry.extend(groups.iter().cloned());
+            entry.sort();
+            entry.dedup();
+        }
+        for (group_id, host_ref) in &evidence.primary_host_ref_by_group {
+            snapshot
+                .primary_host_ref_by_group
+                .insert(group_id.clone(), host_ref.clone());
+        }
+    }
+
+    fn status_snapshot_with_republished_scheduled_groups(
+        &self,
+        mut snapshot: SinkStatusSnapshot,
+    ) -> Result<SinkStatusSnapshot> {
+        let schedule_evidence = self.scheduled_groups_cache.lock().map_err(|_| {
+            CnxError::Internal("sink worker scheduled groups cache lock poisoned".into())
+        })?;
+        let Some(schedule_evidence) = schedule_evidence.clone() else {
+            return Ok(snapshot);
         };
+        Self::republish_cached_schedule_evidence_into_status_summary(
+            &mut snapshot,
+            &schedule_evidence,
+        );
+        Ok(snapshot)
+    }
+
+    fn update_cached_status_snapshot_with_republished_scheduled_groups(
+        &self,
+        snapshot: SinkStatusSnapshot,
+    ) -> Result<SinkStatusSnapshot> {
+        let snapshot = self.status_snapshot_with_republished_scheduled_groups(snapshot)?;
         let mut guard = self
             .status_cache
             .lock()
             .map_err(|_| CnxError::Internal("sink worker status cache lock poisoned".into()))?;
-        republish_scheduled_group_ids_into_status_summary(&mut guard, &self.node_id, &groups);
+        *guard = snapshot.clone();
+        Ok(snapshot)
+    }
+
+    fn republish_cached_scheduled_groups_into_empty_status_summary(&self) -> Result<()> {
+        let snapshot = self
+            .status_cache
+            .lock()
+            .map_err(|_| CnxError::Internal("sink worker status cache lock poisoned".into()))?
+            .clone();
+        self.update_cached_status_snapshot_with_republished_scheduled_groups(snapshot)?;
         Ok(())
     }
 
     fn cached_status_snapshot_with_republished_scheduled_groups(
         &self,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
-        self.republish_cached_scheduled_groups_into_empty_status_summary()
-            .map_err(SinkFailure::from)?;
-        self.cached_status_snapshot_with_failure()
+        let snapshot = self.cached_status_snapshot_with_failure()?;
+        self.update_cached_status_snapshot_with_republished_scheduled_groups(snapshot)
+            .map_err(SinkFailure::from)
     }
 
     fn retain_status_snapshot_for_groups(
@@ -2808,7 +3081,12 @@ impl SinkWorkerClientHandle {
             let mut guard = self.scheduled_groups_cache.lock().map_err(|_| {
                 CnxError::Internal("sink worker scheduled groups cache lock poisoned".into())
             })?;
-            *guard = (!surviving_groups.is_empty()).then_some(surviving_groups.clone());
+            if let Some(evidence) = guard.as_mut() {
+                evidence.retain_groups(&surviving_groups);
+                if evidence.is_empty() {
+                    *guard = None;
+                }
+            }
         }
 
         let mut guard = self
@@ -2819,28 +3097,77 @@ impl SinkWorkerClientHandle {
         Ok(())
     }
 
-    async fn replace_shared_worker_client(
-        &self,
-    ) -> Result<Arc<TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>>> {
-        #[cfg(test)]
-        notify_sink_worker_retry_reset();
-        let replacement = SharedSinkWorkerClient {
+    fn build_shared_worker_client_replacement(&self) -> Result<SharedSinkWorkerClient> {
+        Ok(SharedSinkWorkerClient {
             instance_id: next_shared_sink_worker_instance_id(),
             client: Arc::new(self.worker_factory.connect(
                 self.node_id.clone(),
                 self.current_config()?,
                 self.worker_binding.clone(),
             )?),
-        };
-        let stale_client = {
+        })
+    }
+
+    async fn install_shared_worker_client_after_stale_shutdown(
+        &self,
+        replacement: SharedSinkWorkerClient,
+        stale_close_rpc_timeout: Duration,
+        stale_shutdown_timeout: Duration,
+    ) -> Result<()> {
+        #[cfg(test)]
+        notify_sink_worker_retry_reset();
+        {
             let mut guard = self.worker.lock().await;
-            let stale = guard.client.clone();
+            let stale_client = guard.client.clone();
+            let shutdown_result = tokio::time::timeout(
+                stale_shutdown_timeout,
+                shutdown_stale_sink_worker_client_for_replacement(
+                    stale_client,
+                    stale_close_rpc_timeout,
+                ),
+            )
+            .await;
+            match shutdown_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    return Err(CnxError::Internal(format!(
+                        "stale sink worker shutdown timed out after {:?}; refusing to publish successor",
+                        stale_shutdown_timeout
+                    )));
+                }
+            }
             *guard = replacement;
-            stale
-        };
+        }
         self.control_state_replay_required
             .store(1, Ordering::Release);
-        Ok(stale_client)
+        Ok(())
+    }
+
+    async fn replace_shared_worker_client_after_stale_shutdown(
+        &self,
+        stale_close_rpc_timeout: Duration,
+        stale_shutdown_timeout: Duration,
+    ) -> Result<()> {
+        let replacement = self.build_shared_worker_client_replacement()?;
+        self.install_shared_worker_client_after_stale_shutdown(
+            replacement,
+            stale_close_rpc_timeout,
+            stale_shutdown_timeout,
+        )
+        .await
+    }
+
+    async fn checkpoint_stale_worker_client_before_replacement(
+        stale_client: &Arc<TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>>,
+        timeout: Duration,
+    ) {
+        let Ok(Some(client)) = stale_client.existing_client().await else {
+            return;
+        };
+        let _ =
+            Self::call_worker_with_failure(&client, SinkWorkerRequest::CheckpointSnapshot, timeout)
+                .await;
     }
 
     async fn restart_shared_worker_client_for_retry_until(
@@ -2848,15 +3175,16 @@ impl SinkWorkerClientHandle {
         deadline: std::time::Instant,
         exhaustion_kind: SinkRetryBudgetExhaustionKind,
     ) -> std::result::Result<(), SinkFailure> {
-        let stale_client = self
-            .replace_shared_worker_client()
-            .await
-            .map_err(SinkFailure::from)?;
-        tokio::spawn(async move {
-            let _ = stale_client
-                .shutdown(SINK_WORKER_STALE_CLIENT_BACKGROUND_SHUTDOWN_TIMEOUT)
-                .await;
-        });
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(SinkFailure::retry_budget_exhausted(exhaustion_kind));
+        }
+        self.replace_shared_worker_client_after_stale_shutdown(
+            SINK_WORKER_REPLACEMENT_CLOSE_RPC_TIMEOUT.min(remaining),
+            SINK_WORKER_REPLACEMENT_SHUTDOWN_TIMEOUT.min(remaining),
+        )
+        .await
+        .map_err(SinkFailure::from)?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err(SinkFailure::retry_budget_exhausted(exhaustion_kind));
@@ -2892,13 +3220,13 @@ impl SinkWorkerClientHandle {
     }
 
     async fn retain_control_signals(&self, signals: &[SinkControlSignal]) -> Result<()> {
-        let (scheduled_groups, retained_replay_current) = {
+        let (schedule_evidence, retained_replay_current) = {
             let mut retained = self.retained_control_state.lock().await;
             let retained_replay_current =
                 control_frame_covers_retained_sink_state_after_apply(&retained, signals);
             *retained = retained_sink_state_after_signals(&retained, signals);
             (
-                retained_scheduled_group_ids(&retained),
+                retained_sink_schedule_evidence(&retained, &self.node_id),
                 retained_replay_current,
             )
         };
@@ -2906,7 +3234,7 @@ impl SinkWorkerClientHandle {
             self.control_state_replay_required
                 .store(0, Ordering::Release);
         }
-        self.replace_cached_scheduled_group_ids(scheduled_groups)
+        self.replace_cached_schedule_evidence(schedule_evidence)
     }
 
     async fn replay_retained_control_state_if_needed_with_timeouts(
@@ -3092,7 +3420,6 @@ impl SinkWorkerClientHandle {
             .map_err(SinkFailure::from)
     }
 
-    #[cfg(test)]
     async fn update_logical_roots_with_failure(
         &self,
         roots: Vec<crate::source::config::RootSpec>,
@@ -3199,13 +3526,19 @@ impl SinkWorkerClientHandle {
         normalize_sink_status_snapshot_node_keys(&mut snapshot, &self.node_id, &grants);
         let scheduled_groups = snapshot.readiness_summary().scheduled_groups;
         if !scheduled_groups.is_empty() {
-            self.update_cached_scheduled_group_ids(&scheduled_groups)?;
+            self.update_cached_schedule_evidence_from_snapshot(&snapshot)?;
         }
-        if let Some(groups) = self.cached_scheduled_group_ids()? {
-            republish_scheduled_group_ids_into_status_summary(
+        if let Some(schedule_evidence) = self
+            .scheduled_groups_cache
+            .lock()
+            .map_err(|_| {
+                CnxError::Internal("sink worker scheduled groups cache lock poisoned".into())
+            })?
+            .clone()
+        {
+            Self::republish_cached_schedule_evidence_into_status_summary(
                 &mut snapshot,
-                &self.node_id,
-                &groups,
+                &schedule_evidence,
             );
         }
         if debug_control_scope_capture_enabled() {
@@ -3731,9 +4064,9 @@ impl SinkWorkerClientHandle {
         let outcome = evaluate_cached_sink_status_snapshot(&snapshot, access_path);
         let mut snapshot = snapshot;
         if outcome.should_republish_zero_row_summary {
-            self.republish_cached_scheduled_groups_into_empty_status_summary()
+            snapshot = self
+                .update_cached_status_snapshot_with_republished_scheduled_groups(snapshot)
                 .map_err(SinkFailure::from)?;
-            snapshot = self.cached_status_snapshot_with_failure()?;
         }
         let err_cause = err.as_ref().map(SinkFailure::as_error);
         let reason =
@@ -5085,6 +5418,21 @@ impl SinkFacade {
         match self {
             Self::Local(_) => Ok(()),
             Self::Worker(client) => client.ensure_started_with_failure().await,
+        }
+    }
+
+    pub(crate) async fn update_logical_roots_with_failure(
+        &self,
+        roots: Vec<crate::source::config::RootSpec>,
+        host_object_grants: &[GrantedMountRoot],
+    ) -> std::result::Result<(), SinkFailure> {
+        match self {
+            Self::Local(sink) => sink.update_logical_roots_with_failure(roots, host_object_grants),
+            Self::Worker(client) => {
+                client
+                    .update_logical_roots_with_failure(roots, host_object_grants.to_vec())
+                    .await
+            }
         }
     }
 

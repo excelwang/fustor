@@ -40,6 +40,8 @@ const SOURCE_WORKER_TARGETED_RESCAN_ACCEPTANCE_RETRY_BACKOFF: Duration = Duratio
 const SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
 const SOURCE_WORKER_CLOSE_DRAIN_TIMEOUT: Duration = SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
+const SOURCE_WORKER_REPLACEMENT_CLOSE_RPC_TIMEOUT: Duration = Duration::from_millis(250);
+const SOURCE_WORKER_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT: Duration = Duration::from_secs(4);
 const SOURCE_WORKER_SCHEDULE_REFRESH_RPC_TIMEOUT: Duration = Duration::from_secs(1);
 const SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2764,6 +2766,7 @@ fn update_cached_scheduled_groups_from_refresh(
     union_cached_groups(&mut scheduled_scan, &cache.scheduled_scan_groups_by_node);
     cache.scheduled_source_groups_by_node = Some(scheduled_source);
     cache.scheduled_scan_groups_by_node = Some(scheduled_scan);
+    cache.runtime_scope_control_cache_bootstrap_served = false;
 }
 
 fn stable_host_ref_from_cached_scheduled_groups(
@@ -2963,6 +2966,9 @@ fn prime_cached_schedule_from_control_signals(
             stable_host_ref,
             scheduled_scan.into_iter().collect::<Vec<_>>(),
         )]));
+    }
+    if has_local_runnable_groups {
+        cache.runtime_scope_control_cache_bootstrap_served = false;
     }
     PrimedLocalScheduleSummary {
         saw_activate_with_bound_scopes: saw_source_activate || saw_scan_activate,
@@ -3874,6 +3880,9 @@ fn apply_observability_snapshot_to_cache(
     cache.grants = Some(snapshot.grants.clone());
     cache.logical_roots = Some(snapshot.logical_roots.clone());
     cache.status = Some(snapshot.status.clone());
+    if source_status_has_active_observability_truth(&snapshot.status) {
+        cache.runtime_scope_control_cache_bootstrap_served = false;
+    }
     cache.source_primary_by_group = Some(snapshot.source_primary_by_group.clone());
     cache.last_force_find_runner_by_group = Some(snapshot.last_force_find_runner_by_group.clone());
     cache.force_find_inflight_groups = Some(snapshot.force_find_inflight_groups.clone());
@@ -4122,6 +4131,7 @@ struct SourceWorkerSnapshotCache {
     rescan_request_last_published_at_us: u64,
     rescan_request_last_audit_completed_at_us: u64,
     rescan_observed_epoch: u64,
+    runtime_scope_control_cache_bootstrap_served: bool,
 }
 
 #[derive(Clone)]
@@ -4233,6 +4243,7 @@ impl SourceControlState {
         self.replay_state = SourceControlReplayState::Required;
     }
 
+    #[cfg(test)]
     fn take_replay_state(&mut self) -> SourceControlReplayState {
         let replay_state = self.replay_state;
         if matches!(replay_state, SourceControlReplayState::Required) {
@@ -4698,6 +4709,13 @@ pub(crate) struct SourceWorkerStartPauseHook {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SourceWorkerReplacementShutdownHook {
+    pub entered: Arc<tokio::sync::Notify>,
+    pub release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
 pub(crate) struct SourceWorkerStartDelayHook {
     pub delays: std::collections::VecDeque<Duration>,
 }
@@ -4888,6 +4906,14 @@ fn source_worker_start_pause_hook_cell() -> &'static Mutex<Option<SourceWorkerSt
 }
 
 #[cfg(test)]
+fn source_worker_replacement_shutdown_hook_cell()
+-> &'static Mutex<Option<SourceWorkerReplacementShutdownHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerReplacementShutdownHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
 fn source_worker_start_delay_hook_cell() -> &'static Mutex<Option<SourceWorkerStartDelayHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerStartDelayHook>>> =
         std::sync::OnceLock::new();
@@ -4959,6 +4985,17 @@ pub(crate) fn install_source_worker_control_frame_pause_hook(
 #[cfg(test)]
 pub(crate) fn install_source_worker_start_pause_hook(hook: SourceWorkerStartPauseHook) {
     let mut guard = match source_worker_start_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn install_source_worker_replacement_shutdown_hook(
+    hook: SourceWorkerReplacementShutdownHook,
+) {
+    let mut guard = match source_worker_replacement_shutdown_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -5048,6 +5085,15 @@ pub(crate) fn clear_source_worker_control_frame_error_queue_hook() {
 #[cfg(test)]
 pub(crate) fn clear_source_worker_start_pause_hook() {
     let mut guard = match source_worker_start_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_source_worker_replacement_shutdown_hook() {
+    let mut guard = match source_worker_replacement_shutdown_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -5452,6 +5498,25 @@ pub(crate) fn clear_source_worker_start_error_queue_hook() {
         Err(poisoned) => poisoned.into_inner(),
     };
     *guard = None;
+}
+
+async fn shutdown_stale_source_worker_client_for_replacement(
+    stale_client: Arc<TypedRuntimeWorkerClient<SourceWorkerRpc, SourceConfig>>,
+    timeout: Duration,
+) -> Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = {
+        let guard = match source_worker_replacement_shutdown_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    } {
+        hook.entered.notify_waiters();
+        hook.release.notified().await;
+    }
+
+    stale_client.shutdown(timeout).await
 }
 
 #[cfg(test)]
@@ -5938,43 +6003,84 @@ impl SourceWorkerClientHandle {
         self.shared_worker().await.0
     }
 
-    async fn replace_shared_worker_client(
-        &self,
-    ) -> Result<Arc<TypedRuntimeWorkerClient<SourceWorkerRpc, SourceConfig>>> {
-        let replacement = SharedSourceWorkerClient {
+    fn build_shared_worker_client_replacement(&self) -> Result<SharedSourceWorkerClient> {
+        Ok(SharedSourceWorkerClient {
             instance_id: next_shared_source_worker_instance_id(),
             client: Arc::new(self.worker_factory.connect(
                 self.node_id.clone(),
                 self.config.clone(),
                 self.worker_binding.clone(),
             )?),
-        };
-        let stale_client = {
+        })
+    }
+
+    async fn install_shared_worker_client_after_stale_shutdown(
+        &self,
+        replacement: SharedSourceWorkerClient,
+        stale_close_rpc_timeout: Duration,
+        stale_shutdown_timeout: Duration,
+    ) -> Result<()> {
+        {
             let mut guard = self._shared.worker.lock().await;
-            let stale = guard.client.clone();
+            let stale_client = guard.client.clone();
+            let shutdown_result = tokio::time::timeout(
+                stale_shutdown_timeout,
+                shutdown_stale_source_worker_client_for_replacement(
+                    stale_client,
+                    stale_close_rpc_timeout,
+                ),
+            )
+            .await;
+            match shutdown_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    return Err(CnxError::Internal(format!(
+                        "stale source worker shutdown timed out after {:?}; refusing to publish successor",
+                        stale_shutdown_timeout
+                    )));
+                }
+            }
             *guard = replacement;
-            stale
-        };
+        }
         self.control_state.lock().await.arm_replay();
         self.bump_source_progress(SourceProgressReason::WorkerClientReplaced);
-        Ok(stale_client)
+        Ok(())
+    }
+
+    async fn replace_shared_worker_client_after_stale_shutdown(
+        &self,
+        stale_close_rpc_timeout: Duration,
+        stale_shutdown_timeout: Duration,
+    ) -> Result<()> {
+        let replacement = self.build_shared_worker_client_replacement()?;
+        self.install_shared_worker_client_after_stale_shutdown(
+            replacement,
+            stale_close_rpc_timeout,
+            stale_shutdown_timeout,
+        )
+        .await
     }
 
     async fn reconnect_shared_worker_client_with_failure(
         &self,
     ) -> std::result::Result<(), SourceFailure> {
-        let stale_client = self.replace_shared_worker_client().await?;
-        let _ = stale_client.shutdown(Duration::from_millis(250)).await;
+        self.replace_shared_worker_client_after_stale_shutdown(
+            SOURCE_WORKER_REPLACEMENT_CLOSE_RPC_TIMEOUT,
+            SOURCE_WORKER_REPLACEMENT_SHUTDOWN_TIMEOUT,
+        )
+        .await?;
         Ok(())
     }
 
     async fn replace_worker_client_for_fail_closed_control_frame(
         &self,
     ) -> std::result::Result<(), SourceFailure> {
-        let stale_client = self.replace_shared_worker_client().await?;
-        tokio::spawn(async move {
-            let _ = stale_client.shutdown(Duration::from_millis(250)).await;
-        });
+        self.replace_shared_worker_client_after_stale_shutdown(
+            SOURCE_WORKER_REPLACEMENT_CLOSE_RPC_TIMEOUT,
+            SOURCE_WORKER_REPLACEMENT_SHUTDOWN_TIMEOUT,
+        )
+        .await?;
         Ok(())
     }
 
@@ -6127,9 +6233,9 @@ impl SourceWorkerClientHandle {
         rpc_timeout: Duration,
     ) -> std::result::Result<(), SourceFailure> {
         let (envelopes, retained_control_revision) = {
-            let mut control_state = self.control_state.lock().await;
+            let control_state = self.control_state.lock().await;
             if !matches!(
-                control_state.take_replay_state(),
+                control_state.replay_state(),
                 SourceControlReplayState::Required
             ) {
                 return Ok(());
@@ -6140,6 +6246,10 @@ impl SourceWorkerClientHandle {
             )
         };
         if envelopes.is_empty() {
+            self.control_state
+                .lock()
+                .await
+                .clear_replay_if_retained_control_revision_is_current(retained_control_revision);
             return Ok(());
         }
         let decoded_signals = source_control_signals_from_envelopes(&envelopes).ok();
@@ -7144,6 +7254,7 @@ impl SourceWorkerClientHandle {
                             cache.logical_roots = Some(roots.clone());
                             cache.logical_roots_generation =
                                 cache.logical_roots_generation.saturating_add(1);
+                            cache.runtime_scope_control_cache_bootstrap_served = false;
                         });
                         self.bump_source_progress(SourceProgressReason::LogicalRootsUpdated);
                         eprintln!(
@@ -8815,9 +8926,14 @@ impl SourceWorkerClientHandle {
         &self,
     ) -> Option<SourceObservabilitySnapshot> {
         self.with_cache_mut(|cache| {
-            runtime_scope_control_cache_can_skip_live_probe(cache)
-                .then(|| build_runtime_scope_control_cache_observability_snapshot(cache))
-                .flatten()
+            if !runtime_scope_control_cache_can_skip_live_probe(cache) {
+                return None;
+            }
+            let snapshot = build_runtime_scope_control_cache_observability_snapshot(cache)?;
+            if !runtime_scope_control_cache_has_active_observability_truth(cache) {
+                cache.runtime_scope_control_cache_bootstrap_served = true;
+            }
+            Some(snapshot)
         })
     }
 
@@ -9277,6 +9393,25 @@ pub(crate) fn annotate_manual_rescan_route_receivable_evidence(
         &mut snapshot.last_control_frame_signals_by_node,
         node_id.0.clone(),
         node_id,
+        &scheduled_scan_groups,
+    );
+}
+
+pub(crate) fn annotate_manual_rescan_route_receivable_evidence_for_current_groups_and_generation(
+    snapshot: &mut SourceObservabilitySnapshot,
+    node_id: &NodeId,
+    route: &str,
+    generation: u64,
+) {
+    if generation == 0 {
+        return;
+    }
+    let scheduled_scan_groups = observability_local_scheduled_scan_groups(snapshot, node_id);
+    annotate_manual_rescan_route_receivable_evidence_by_key_and_route(
+        &mut snapshot.last_control_frame_signals_by_node,
+        node_id.0.clone(),
+        route,
+        Some(generation),
         &scheduled_scan_groups,
     );
 }
@@ -10431,8 +10566,24 @@ fn source_cache_has_pending_post_rescan_publication_refresh(
         && cache.last_live_observability_snapshot_at.is_none()
 }
 
+fn runtime_scope_control_cache_has_active_observability_truth(
+    cache: &SourceWorkerSnapshotCache,
+) -> bool {
+    cache
+        .status
+        .as_ref()
+        .is_some_and(source_status_has_active_observability_truth)
+        || {
+            let (published_batches, last_published_at_us) = cached_source_publication_marker(cache);
+            published_batches > 0 || last_published_at_us > 0
+        }
+}
+
 fn runtime_scope_control_cache_can_skip_live_probe(cache: &SourceWorkerSnapshotCache) -> bool {
-    cache.status.is_some() && !source_cache_has_pending_post_rescan_publication_refresh(cache)
+    cache.status.is_some()
+        && !source_cache_has_pending_post_rescan_publication_refresh(cache)
+        && (runtime_scope_control_cache_has_active_observability_truth(cache)
+            || !cache.runtime_scope_control_cache_bootstrap_served)
 }
 
 fn source_stable_status_cache_can_skip_live_refresh(cache: &SourceWorkerSnapshotCache) -> bool {

@@ -33,6 +33,7 @@ pub enum SinkWorkerRequest {
     VisibilityLagSamplesSince {
         since_us: u64,
     },
+    CheckpointSnapshot,
     MaterializedQuery {
         request: InternalQueryRequest,
     },

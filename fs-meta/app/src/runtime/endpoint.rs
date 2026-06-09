@@ -1702,6 +1702,8 @@ async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
             wait_until_receivable().await;
             continue;
         }
+        #[cfg(test)]
+        maybe_delay_stream_endpoint_before_first_recv(&route, &join_name);
         if debug_stream_recv
             && should_emit_endpoint_retry_log(&format!(
                 "recv_begin:{}:{}",
@@ -1939,6 +1941,49 @@ fn maybe_run_endpoint_before_first_recv_poll_hook(route: &RouteKey, join_name: &
     };
     if let Some(hook) = hook {
         hook();
+    }
+}
+
+#[cfg(test)]
+fn stream_endpoint_before_first_recv_delay_hook_cell()
+-> &'static StdMutex<Option<(String, String, Duration)>> {
+    static CELL: std::sync::OnceLock<StdMutex<Option<(String, String, Duration)>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_stream_endpoint_before_first_recv_delay_hook(
+    route_key: &str,
+    join_name: &str,
+    delay: Duration,
+) {
+    let mut guard = stream_endpoint_before_first_recv_delay_hook_cell()
+        .lock()
+        .expect("stream_endpoint_before_first_recv_delay_hook lock");
+    *guard = Some((route_key.to_string(), join_name.to_string(), delay));
+}
+
+#[cfg(test)]
+fn maybe_delay_stream_endpoint_before_first_recv(route: &RouteKey, join_name: &str) {
+    let delay = {
+        let mut guard = stream_endpoint_before_first_recv_delay_hook_cell()
+            .lock()
+            .expect("stream_endpoint_before_first_recv_delay_hook lock");
+        let Some((hook_route, hook_name, _)) = guard.as_ref() else {
+            return;
+        };
+        if hook_route == &route.0 && hook_name == join_name {
+            let (_, _, delay) = guard
+                .take()
+                .expect("stream_endpoint_before_first_recv_delay_hook present");
+            Some(delay)
+        } else {
+            None
+        }
+    };
+    if let Some(delay) = delay {
+        std::thread::sleep(delay);
     }
 }
 

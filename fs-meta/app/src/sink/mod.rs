@@ -54,7 +54,8 @@ use crate::runtime::orchestration::{
 };
 use crate::runtime::routes::{
     METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SINK_STATUS,
-    METHOD_SOURCE_FIND, METHOD_STREAM, ROUTE_KEY_QUERY, ROUTE_TOKEN_FS_META,
+    METHOD_SOURCE_FIND, METHOD_STREAM, ROUTE_KEY_EVENTS, ROUTE_KEY_QUERY,
+    ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_TOKEN_FS_META,
     ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
     events_stream_route_for_scope, is_events_stream_route_key, sink_query_request_route_for,
     sink_query_route_bindings_for, sink_roots_control_stream_route_for,
@@ -194,6 +195,34 @@ fn is_per_peer_sink_query_request_route(route_key: &str) -> bool {
     route_stem.starts_with(&format!("{stem}."))
 }
 
+fn is_scoped_route_variant(route_key: &str, base: &str, suffix: &str) -> bool {
+    let Some(route) = route_key.strip_suffix(suffix) else {
+        return false;
+    };
+    if route == base {
+        return false;
+    }
+    let Some((stem, version)) = base.rsplit_once(':') else {
+        return route.starts_with(&format!("{base}."));
+    };
+    let Some((route_stem, route_version)) = route.rsplit_once(':') else {
+        return false;
+    };
+    route_version == version && route_stem.starts_with(&format!("{stem}."))
+}
+
+fn is_per_peer_sink_status_request_route(route_key: &str) -> bool {
+    is_scoped_route_variant(route_key, ROUTE_KEY_SINK_STATUS_INTERNAL, ".req")
+}
+
+fn is_per_peer_sink_roots_control_stream_route(route_key: &str) -> bool {
+    is_scoped_route_variant(route_key, ROUTE_KEY_SINK_ROOTS_CONTROL, ".stream")
+}
+
+fn is_per_peer_events_stream_route(route_key: &str) -> bool {
+    is_events_stream_route_key(route_key) && route_key != format!("{}.stream", ROUTE_KEY_EVENTS)
+}
+
 fn legacy_public_query_sink_route_aliases(node_id: &NodeId, route_key: &str) -> Vec<String> {
     if route_key != ROUTE_KEY_QUERY {
         return Vec::new();
@@ -206,6 +235,16 @@ fn legacy_public_query_sink_route_aliases(node_id: &NodeId, route_key: &str) -> 
     aliases.sort();
     aliases.dedup();
     aliases
+}
+
+fn accepted_scope_resource_host_ref(resource_id: &str) -> Option<String> {
+    resource_id
+        .trim()
+        .split_once("::")
+        .and_then(|(host_ref, _)| {
+            let host_ref = host_ref.trim();
+            (!host_ref.is_empty()).then(|| host_ref.to_string())
+        })
 }
 
 fn matching_endpoint_task_states(tasks: &[ManagedEndpointTask], route_key: &str) -> Vec<String> {
@@ -728,6 +767,13 @@ pub struct SinkStatusSnapshot {
     pub stream_applied_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub stream_applied_path_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub stream_last_applied_at_us_by_node: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SinkAcceptedScopeStatusEvidence {
+    scheduled_groups: Option<BTreeSet<String>>,
+    scheduled_groups_by_node: BTreeMap<String, Vec<String>>,
+    primary_host_ref_by_group: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1775,6 +1821,11 @@ impl SinkStateCell {
                     .load(Ordering::Acquire)
     }
 
+    fn last_logical_roots_control_generation(&self) -> u64 {
+        self.logical_roots_control_generation
+            .load(Ordering::Acquire)
+    }
+
     fn mark_logical_roots_control_generation(&self, generation: u64) {
         if generation == 0 {
             return;
@@ -1840,29 +1891,9 @@ struct StreamRecvObserver {
 }
 
 impl StreamRecvObserver {
-    fn observed_epoch(&self) -> u64 {
-        self.observed_epoch.load(Ordering::Acquire)
-    }
-
     fn mark_before_recv(&self) {
         self.observed_epoch.fetch_add(1, Ordering::AcqRel);
         self.notify.notify_waiters();
-    }
-
-    async fn wait_for_epoch_after(&self, epoch: u64) {
-        if self.observed_epoch() > epoch {
-            return;
-        }
-        loop {
-            let notified = self.notify.notified();
-            if self.observed_epoch() > epoch {
-                return;
-            }
-            notified.await;
-            if self.observed_epoch() > epoch {
-                return;
-            }
-        }
     }
 }
 
@@ -1897,15 +1928,32 @@ impl SinkFileMeta {
                 .logical_roots_control_generation_is_stale(generation)
     }
 
+    fn logical_roots_control_generation_can_replay_same_declaration(
+        &self,
+        generation: u64,
+    ) -> bool {
+        generation != 0
+            && generation == self.state.last_logical_roots_control_generation()
+            && generation >= self.current_logical_roots_generation()
+    }
+
     fn mark_logical_roots_control_generation(&self, generation: u64) {
         self.state.mark_logical_roots_control_generation(generation);
     }
 
-    fn stream_recv_epoch(&self) -> u64 {
-        self.stream_recv_observer
-            .as_ref()
-            .map(|observer| observer.observed_epoch())
-            .unwrap_or(0)
+    async fn apply_logical_roots_control_sink_replay(&self, replay_envelopes: &[ControlEnvelope]) {
+        if replay_envelopes.is_empty() {
+            return;
+        }
+        match self.on_control_frame(replay_envelopes).await {
+            Ok(()) => {}
+            Err(err) => {
+                log::warn!(
+                    "sink logical-roots control sink replay apply failed: {:?}",
+                    err
+                );
+            }
+        }
     }
 
     fn mark_before_stream_recv(&self) {
@@ -1937,29 +1985,6 @@ impl SinkFileMeta {
                 return;
             }
         }
-    }
-
-    async fn wait_until_stream_recv_observed_after_activation(
-        &self,
-        was_receivable: bool,
-        observed_epoch_before: u64,
-    ) {
-        if !self.unit_control.has_runtime_state()
-            || lock_or_recover(
-                &self.endpoint_tasks,
-                "sink.wait_until_stream_recv_observed_after_activation.endpoint_tasks",
-            )
-            .is_empty()
-        {
-            return;
-        }
-        if was_receivable || !self.should_receive_stream_events() {
-            return;
-        }
-        let Some(observer) = self.stream_recv_observer.clone() else {
-            return;
-        };
-        observer.wait_for_epoch_after(observed_epoch_before).await;
     }
 
     pub(crate) fn debug_traced_route_state(&self, route_key: &str) -> Result<String> {
@@ -3143,14 +3168,16 @@ impl SinkFileMeta {
                                         continue;
                                     }
                                 }
-                                let snapshot = sink_impl.status_snapshot().unwrap_or_else(|err| {
-                                    log::warn!(
-                                        "sink status route snapshot failed route={}: {:?}",
-                                        route_key_for_trace,
-                                        err
-                                    );
-                                    SinkStatusSnapshot::default()
-                                });
+                                let snapshot = sink_impl
+                                    .status_snapshot_for_route(&route_key_for_trace)
+                                    .unwrap_or_else(|err| {
+                                        log::warn!(
+                                            "sink status route snapshot failed route={}: {:?}",
+                                            route_key_for_trace,
+                                            err
+                                        );
+                                        SinkStatusSnapshot::default()
+                                    });
                                 match sink_status_reply(
                                     &snapshot,
                                     &req.metadata().origin_id,
@@ -3412,11 +3439,22 @@ impl SinkFileMeta {
                                         continue;
                                     }
                                 };
+                            let replay_envelopes = payload.sink_replay_envelopes;
                             if sink.logical_roots_control_generation_is_stale(payload.generation) {
-                                log::warn!(
-                                    "sink logical-roots control stale: payload_generation={}",
-                                    payload.generation,
-                                );
+                                if sink
+                                    .logical_roots_control_generation_can_replay_same_declaration(
+                                        payload.generation,
+                                    )
+                                    && !replay_envelopes.is_empty()
+                                {
+                                    sink.apply_logical_roots_control_sink_replay(&replay_envelopes)
+                                        .await;
+                                } else {
+                                    log::warn!(
+                                        "sink logical-roots control stale: payload_generation={}",
+                                        payload.generation,
+                                    );
+                                }
                                 continue;
                             }
                             let grants = match sink.logical_grants_snapshot() {
@@ -3434,7 +3472,9 @@ impl SinkFileMeta {
                                 &grants,
                             ) {
                                 Ok(()) => {
-                                    sink.mark_logical_roots_control_generation(payload.generation)
+                                    sink.mark_logical_roots_control_generation(payload.generation);
+                                    sink.apply_logical_roots_control_sink_replay(&replay_envelopes)
+                                        .await;
                                 }
                                 Err(err) => {
                                     log::warn!(
@@ -3636,16 +3676,73 @@ impl SinkFileMeta {
         Ok(())
     }
 
+    fn route_contributes_to_local_schedule(&self, route_key: &str) -> bool {
+        if route_key == events_stream_route_for_scope(&self.node_id.0).0
+            || route_key == sink_query_request_route_for(&self.node_id.0).0
+            || route_key == sink_status_request_route_for(&self.node_id.0).0
+            || route_key == sink_roots_control_stream_route_for(&self.node_id.0).0
+        {
+            return true;
+        }
+        !(is_per_peer_events_stream_route(route_key)
+            || is_per_peer_sink_query_request_route(route_key)
+            || is_per_peer_sink_status_request_route(route_key)
+            || is_per_peer_sink_roots_control_stream_route(route_key))
+    }
+
+    fn merge_scheduled_bound_scope(
+        merged: &mut BTreeMap<String, (u64, BTreeSet<String>)>,
+        generation: u64,
+        scope: RuntimeBoundScope,
+    ) {
+        let incoming = scope.resource_ids.into_iter().collect::<BTreeSet<_>>();
+        match merged.entry(scope.scope_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((generation, incoming));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let (current_generation, current_resources) = entry.get_mut();
+                if generation > *current_generation {
+                    *current_generation = generation;
+                    *current_resources = incoming;
+                } else if generation == *current_generation {
+                    current_resources.extend(incoming);
+                }
+            }
+        }
+    }
+
     fn scheduled_bound_scopes(&self) -> Result<Option<Vec<RuntimeBoundScope>>> {
         if !self.unit_control.has_runtime_state() {
             return Ok(None);
         }
-        let scopes = match self.unit_control.unit_state(SINK_RUNTIME_UNIT_ID)? {
-            Some((true, rows)) => rows,
-            Some((false, _)) => Vec::new(),
-            None => return Ok(None),
+        let Some((_active, _)) = self.unit_control.unit_state(SINK_RUNTIME_UNIT_ID)? else {
+            return Ok(None);
         };
-        Ok(Some(scopes))
+        let mut merged = BTreeMap::<String, (u64, BTreeSet<String>)>::new();
+        for route_key in self.unit_control.active_route_keys(SINK_RUNTIME_UNIT_ID)? {
+            if !self.route_contributes_to_local_schedule(&route_key) {
+                continue;
+            }
+            let Some((generation, bound_scopes)) = self
+                .unit_control
+                .active_route_state(SINK_RUNTIME_UNIT_ID, &route_key)?
+            else {
+                continue;
+            };
+            for scope in bound_scopes {
+                Self::merge_scheduled_bound_scope(&mut merged, generation, scope);
+            }
+        }
+        Ok(Some(
+            merged
+                .into_iter()
+                .map(|(scope_id, (_, resource_ids))| RuntimeBoundScope {
+                    scope_id,
+                    resource_ids: resource_ids.into_iter().collect(),
+                })
+                .collect(),
+        ))
     }
 
     fn scheduled_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
@@ -3691,6 +3788,92 @@ impl SinkFileMeta {
                 roots_by_id.contains(scope_id).then(|| scope_id.to_string())
             })
             .collect()
+    }
+
+    fn accepted_scope_status_evidence_from_bound_scopes(
+        &self,
+        bound_scopes: &[RuntimeBoundScope],
+        roots: &[RootSpec],
+    ) -> SinkAcceptedScopeStatusEvidence {
+        let scheduled_groups = self.scheduled_group_ids_from_bound_scopes(bound_scopes, roots);
+        let mut scheduled_groups_by_node = BTreeMap::<String, Vec<String>>::new();
+        let mut primary_host_ref_by_group = BTreeMap::new();
+        for scope in bound_scopes {
+            let group_id = scope.scope_id.trim();
+            if group_id.is_empty() || !scheduled_groups.contains(group_id) {
+                continue;
+            }
+            let host_refs = self.accepted_scope_owner_host_refs(scope);
+            let Some(host_ref) = host_refs.iter().next().cloned() else {
+                continue;
+            };
+            primary_host_ref_by_group
+                .entry(group_id.to_string())
+                .or_insert(host_ref);
+            for host_ref in host_refs {
+                scheduled_groups_by_node
+                    .entry(host_ref)
+                    .or_default()
+                    .push(group_id.to_string());
+            }
+        }
+        for groups in scheduled_groups_by_node.values_mut() {
+            groups.sort();
+            groups.dedup();
+        }
+        SinkAcceptedScopeStatusEvidence {
+            scheduled_groups: Some(scheduled_groups),
+            scheduled_groups_by_node,
+            primary_host_ref_by_group,
+        }
+    }
+
+    fn accepted_scope_owner_host_refs(&self, scope: &RuntimeBoundScope) -> BTreeSet<String> {
+        let mut host_refs = scope
+            .resource_ids
+            .iter()
+            .filter_map(|resource_id| accepted_scope_resource_host_ref(resource_id))
+            .collect::<BTreeSet<_>>();
+        if host_refs.is_empty() {
+            host_refs.insert(self.node_id.0.clone());
+        }
+        host_refs
+    }
+
+    fn scheduled_scope_status_evidence(&self) -> Result<SinkAcceptedScopeStatusEvidence> {
+        let Some(bound_scopes) = self.scheduled_bound_scopes()? else {
+            return Ok(SinkAcceptedScopeStatusEvidence::default());
+        };
+        let roots = self
+            .root_specs
+            .read()
+            .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?
+            .clone();
+        Ok(self.accepted_scope_status_evidence_from_bound_scopes(&bound_scopes, &roots))
+    }
+
+    fn route_scope_status_evidence(
+        &self,
+        route_key: &str,
+    ) -> Result<SinkAcceptedScopeStatusEvidence> {
+        if !self.unit_control.has_runtime_state() {
+            return Ok(SinkAcceptedScopeStatusEvidence::default());
+        }
+        let Some((_, bound_scopes)) = self
+            .unit_control
+            .active_route_state(SINK_RUNTIME_UNIT_ID, route_key)?
+        else {
+            return Ok(SinkAcceptedScopeStatusEvidence {
+                scheduled_groups: Some(BTreeSet::new()),
+                ..SinkAcceptedScopeStatusEvidence::default()
+            });
+        };
+        let roots = self
+            .root_specs
+            .read()
+            .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?
+            .clone();
+        Ok(self.accepted_scope_status_evidence_from_bound_scopes(&bound_scopes, &roots))
     }
 
     fn runtime_route_group_ids(&self, route_key: &str) -> Result<Option<BTreeSet<String>>> {
@@ -3914,9 +4097,6 @@ impl SinkFileMeta {
         let mut validated = 0usize;
         let mut pending_host_object_grants: Option<Vec<GrantedMountRoot>> = None;
         let mut refresh_runtime_groups = false;
-        let mut activated_events_stream_route = false;
-        let stream_recv_epoch_before = self.stream_recv_epoch();
-        let stream_receivable_before = self.should_receive_stream_events();
         eprintln!(
             "fs_meta_sink: apply_orchestration_signals count={} has_runtime_state={}",
             signals.len(),
@@ -3942,9 +4122,6 @@ impl SinkFileMeta {
                         );
                     }
                     self.apply_activate_signal(*unit, route_key, *generation, bound_scopes)?;
-                    if *unit == SinkRuntimeUnit::Sink && is_events_stream_route_key(route_key) {
-                        activated_events_stream_route = true;
-                    }
                     validated += 1;
                     refresh_runtime_groups = true;
                 }
@@ -4038,13 +4215,6 @@ impl SinkFileMeta {
             self.flush_buffered_stream_events()?;
         }
         self.notify_stream_recv_waiters();
-        if activated_events_stream_route {
-            self.wait_until_stream_recv_observed_after_activation(
-                stream_receivable_before,
-                stream_recv_epoch_before,
-            )
-            .await;
-        }
         log::debug!("sink-file-meta accepted {} control envelope(s)", validated);
         Ok(())
     }
@@ -4232,18 +4402,32 @@ impl SinkFileMeta {
         self.build_health_snapshot()
     }
 
-    pub(crate) fn build_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+    fn build_status_snapshot_for_scope_evidence(
+        &self,
+        scope_evidence: SinkAcceptedScopeStatusEvidence,
+    ) -> Result<SinkStatusSnapshot> {
+        let accepted_scope_primary_host_ref_by_group = &scope_evidence.primary_host_ref_by_group;
+        let scheduled_groups = scope_evidence.scheduled_groups;
         let mut state = self.state.write()?;
         let now = now_us();
         let now_instant = Instant::now();
         let mut snapshot = SinkStatusSnapshot::default();
         let mut groups = Vec::with_capacity(state.groups.len());
         for (group_id, group) in &mut state.groups {
+            if let Some(scheduled_groups) = scheduled_groups.as_ref()
+                && !scheduled_groups.contains(group_id)
+            {
+                continue;
+            }
             group.tree.prune_expired_suspects(now_instant);
             let stats = query::get_health_stats(&group.tree, &group.clock);
             let estimated_heap_bytes = group.tree.estimated_heap_bytes();
             accumulate_status_snapshot(&mut snapshot, &stats, estimated_heap_bytes);
-            if !group.primary_host_ref.is_empty() {
+            if let Some(host_ref) = accepted_scope_primary_host_ref_by_group.get(group_id) {
+                snapshot
+                    .primary_host_ref_by_group
+                    .insert(group_id.clone(), host_ref.clone());
+            } else if !group.primary_host_ref.is_empty() {
                 snapshot
                     .primary_host_ref_by_group
                     .insert(group_id.clone(), group.primary_host_ref.clone());
@@ -4269,7 +4453,7 @@ impl SinkFileMeta {
                 estimated_heap_bytes,
             ));
         }
-        if let Some(scheduled_groups) = self.scheduled_group_ids()?
+        if let Some(scheduled_groups) = scheduled_groups
             && !scheduled_groups.is_empty()
         {
             let present_groups = groups
@@ -4279,6 +4463,12 @@ impl SinkFileMeta {
             for group_id in &scheduled_groups {
                 if present_groups.contains(group_id) {
                     continue;
+                }
+                if let Some(host_ref) = accepted_scope_primary_host_ref_by_group.get(group_id) {
+                    snapshot
+                        .primary_host_ref_by_group
+                        .entry(group_id.clone())
+                        .or_insert_with(|| host_ref.clone());
                 }
                 groups.push(SinkGroupStatusSnapshot::from_status_fields(
                     group_id.clone(),
@@ -4297,10 +4487,7 @@ impl SinkFileMeta {
                     0,
                 ));
             }
-            snapshot.scheduled_groups_by_node.insert(
-                self.node_id.0.clone(),
-                scheduled_groups.into_iter().collect(),
-            );
+            snapshot.scheduled_groups_by_node = scope_evidence.scheduled_groups_by_node;
         }
         groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
         snapshot.groups = groups;
@@ -4394,6 +4581,10 @@ impl SinkFileMeta {
         Ok(snapshot)
     }
 
+    pub(crate) fn build_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+        self.build_status_snapshot_for_scope_evidence(self.scheduled_scope_status_evidence()?)
+    }
+
     pub(crate) fn build_cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
         self.build_status_snapshot()
     }
@@ -4401,6 +4592,11 @@ impl SinkFileMeta {
     pub fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
         let _ = self.sync_logical_roots_from_authoritative_cell_if_changed();
         self.build_status_snapshot()
+    }
+
+    pub(crate) fn status_snapshot_for_route(&self, route_key: &str) -> Result<SinkStatusSnapshot> {
+        let _ = self.sync_logical_roots_from_authoritative_cell_if_changed();
+        self.build_status_snapshot_for_scope_evidence(self.route_scope_status_evidence(route_key)?)
     }
 
     pub(crate) fn snapshot_visibility_lag_samples_since(
@@ -4479,6 +4675,8 @@ impl SinkFileMeta {
     }
 
     fn should_receive_control_stream_route(&self, route_key: &str) -> bool {
+        let owner_scoped_roots_control_route =
+            sink_roots_control_stream_route_for(&self.node_id.0).0;
         let generation = self
             .unit_control
             .route_generation(SINK_RUNTIME_UNIT_ID, route_key)
@@ -4493,7 +4691,7 @@ impl SinkFileMeta {
             );
         }
         let Some(generation) = generation else {
-            return false;
+            return route_key == owner_scoped_roots_control_route;
         };
         let accepted = self
             .unit_control
@@ -5063,6 +5261,10 @@ impl SinkFileMeta {
     pub async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         let signals = sink_control_signals_from_envelopes(envelopes)?;
         self.apply_orchestration_signals(&signals).await.map(|_| ())
+    }
+
+    pub(crate) fn checkpoint_snapshot(&self) -> Result<()> {
+        self.state.persist_snapshot()
     }
 
     pub(crate) async fn perform_close(&self) -> Result<()> {

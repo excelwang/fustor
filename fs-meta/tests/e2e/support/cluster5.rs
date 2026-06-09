@@ -223,6 +223,13 @@ fn managed_pid_kill_transport() -> ManagedPidKillTransport {
 
 impl Cluster5 {
     pub fn start() -> Result<Self, String> {
+        Self::start_with_node_names(NODE_NAMES)
+    }
+
+    pub fn start_with_node_names(node_names: &[&str]) -> Result<Self, String> {
+        if node_names.is_empty() {
+            return Err("cluster start requires at least one node".into());
+        }
         let _guard = cluster_lock();
         let Some(capanixd_bin) = try_find_capanixd_bin() else {
             return Err(
@@ -232,14 +239,14 @@ impl Cluster5 {
         retry_cluster_start_after_bind_transport_conflict(|| {
             cleanup_stale_cluster_artifacts_before_start()?;
             let suffix = unique_suffix();
-            let identities = NODE_NAMES
+            let identities = node_names
                 .iter()
                 .map(|name| generate_node_identity(name, suffix))
                 .collect::<Vec<_>>();
             let admin_pub_b64 = admin_public_key_b64();
-            let bind_addrs = reserve_distinct_bind_addrs(NODE_NAMES.len())?;
+            let bind_addrs = reserve_distinct_bind_addrs(node_names.len())?;
             let start_result = (|| {
-                let mut nodes = Vec::with_capacity(NODE_NAMES.len());
+                let mut nodes = Vec::with_capacity(node_names.len());
                 for (index, identity) in identities.iter().enumerate() {
                     let seeds = bind_addrs
                         .iter()
@@ -697,6 +704,25 @@ impl Cluster5 {
         generation: i64,
         bootstrap_management: bool,
     ) -> Result<Value, String> {
+        self.build_fs_meta_release_for_node_names(
+            app_id,
+            facade_resource_id,
+            roots,
+            generation,
+            bootstrap_management,
+            NODE_NAMES,
+        )
+    }
+
+    pub fn build_fs_meta_release_for_node_names(
+        &self,
+        app_id: &str,
+        facade_resource_id: &str,
+        roots: Vec<RootSpec>,
+        generation: i64,
+        bootstrap_management: bool,
+        route_node_names: &[&str],
+    ) -> Result<Value, String> {
         let app_path = self.fs_meta_app_runtime_path()?;
         let worker_module_path = try_find_fs_meta_worker_module()
             .ok_or_else(|| "fs-meta shared worker module not found".to_string())?;
@@ -725,7 +751,7 @@ impl Cluster5 {
                 shell: "/bin/bash".to_string(),
             });
         }
-        let route_plan_node_ids = NODE_NAMES
+        let route_plan_node_ids = route_node_names
             .iter()
             .map(|node_name| self.node_id(node_name))
             .collect::<Result<Vec<_>, _>>()?;

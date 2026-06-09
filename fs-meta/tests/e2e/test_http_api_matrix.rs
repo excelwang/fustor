@@ -8,7 +8,8 @@ use crate::support::oracle::FsTreeOracle;
 use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_until};
 use fs_meta::{RootSelector, RootSpec};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -81,6 +82,16 @@ const MINI_EXPORTS: [&str; 5] = [
 ];
 
 const FULL_EXPORTS: [&str; 5] = ["nfs1", "nfs2", "nfs3", "nfs4", "nfs5"];
+const ACTIVE_THREE_EXPORTS: [&str; 3] = ["nfs-144", "nfs-145", "nfs-146"];
+const ACTIVE_THREE_MOUNTS: [(&str, &str); 3] = [
+    ("node-a", "nfs-144"),
+    ("node-b", "nfs-145"),
+    ("node-c", "nfs-146"),
+];
+const ACTIVE_THREE_NODES: [&str; 3] = ["node-a", "node-b", "node-c"];
+const ACTIVE_THREE_FILES_PER_ROOT_ENV: &str = "FSMETA_ACTIVE_THREE_FILES_PER_ROOT";
+const ACTIVE_THREE_DIRS_PER_ROOT_ENV: &str = "FSMETA_ACTIVE_THREE_DIRS_PER_ROOT";
+const ACTIVE_THREE_MATERIALIZATION_TIMEOUT: Duration = Duration::from_secs(240);
 
 const FULL_MOUNTS: [(&str, &str); 15] = [
     ("node-a", "nfs1"),
@@ -163,6 +174,139 @@ pub fn run_mini_real_nfs_smoke() -> Result<(), String> {
     run_mini_roots_management_smoke(&mut session, &harness.lab)?;
     eprintln!("[fs-meta-api-matrix-mini] step=query-and-key-api");
     run_mini_query_and_key_smoke(&mut session, &harness.lab)?;
+    Ok(())
+}
+
+pub fn run_active_three_external_worker_replay() -> Result<(), String> {
+    if let Some(reason) = skip_unless_real_nfs_enabled() {
+        eprintln!("[fs-meta-active3-replay] skipped: {reason}");
+        return Ok(());
+    }
+    std::env::set_var("DATANIX_KEEP_E2E_ARTIFACTS", "1");
+
+    eprintln!("[fs-meta-active3-replay] step=start-lab");
+    let mut lab = NfsLab::start_with_exports(ACTIVE_THREE_EXPORTS)?;
+    seed_active_three_content(&lab)?;
+    eprintln!("[fs-meta-active3-replay] step=start-cluster");
+    let cluster = Cluster5::start_with_node_names(&ACTIVE_THREE_NODES)?;
+    let app_id = format!("fs-meta-active3-replay-{}", unique_suffix());
+    let facade_resource_id = format!("fs-meta-tcp-listener-{app_id}");
+    let facade_addrs = reserve_http_addrs(1)?;
+
+    eprintln!("[fs-meta-active3-replay] step=announce-active3-resources");
+    install_active_three_resources(&cluster, &mut lab, &facade_resource_id, &facade_addrs)?;
+
+    eprintln!("[fs-meta-active3-replay] step=deploy-empty-roots");
+    let release = cluster.build_fs_meta_release_for_node_names(
+        &app_id,
+        &facade_resource_id,
+        Vec::new(),
+        1,
+        true,
+        &ACTIVE_THREE_NODES,
+    )?;
+    cluster.apply_release("node-b", release)?;
+
+    let candidate_base_urls = facade_addrs
+        .iter()
+        .map(|addr| format!("http://{addr}"))
+        .collect::<Vec<_>>();
+    let base_url = cluster.wait_http_login_ready(
+        &candidate_base_urls,
+        "operator",
+        "operator123",
+        Duration::from_secs(120),
+    )?;
+    eprintln!("[fs-meta-active3-replay] facade={base_url}");
+    let mut session = OperatorSession::login_many(candidate_base_urls, "operator", "operator123")?;
+
+    eprintln!("[fs-meta-active3-replay] step=roots-apply-active3");
+    let roots = active_three_roots(&lab);
+    let roots_payload = roots_payload(&roots);
+    let mut last_apply = None::<ApiResponse>;
+    for attempt in 1..=4 {
+        let response = session.update_roots_raw(&roots_payload)?;
+        eprintln!(
+            "[fs-meta-active3-replay] roots_apply_attempt={} status={} body={}",
+            attempt, response.status, response.body
+        );
+        let ok = (200..300).contains(&response.status)
+            && response.body.get("roots_count").and_then(Value::as_u64)
+                == Some(ACTIVE_THREE_EXPORTS.len() as u64);
+        last_apply = Some(response);
+        if ok {
+            break;
+        }
+        thread::sleep(Duration::from_secs(5));
+    }
+
+    let mut evidence = collect_active_three_evidence(&cluster, &app_id)?;
+    eprintln!(
+        "[fs-meta-active3-replay] evidence_after_roots_apply={}",
+        serde_json::to_string_pretty(&evidence).unwrap_or_else(|_| evidence.to_string())
+    );
+    let apply_ok = last_apply.as_ref().is_some_and(|response| {
+        (200..300).contains(&response.status)
+            && response.body.get("roots_count").and_then(Value::as_u64)
+                == Some(ACTIVE_THREE_EXPORTS.len() as u64)
+    });
+    if !apply_ok {
+        return Err(format!(
+            "active-three roots apply failed before convergence; last_apply={:?}; evidence={}",
+            last_apply.as_ref().map(|response| json!({
+                "status": response.status,
+                "body": response.body,
+            })),
+            evidence
+        ));
+    }
+
+    eprintln!("[fs-meta-active3-replay] step=source-repair-rescan");
+    wait_for_rescan_accepted(
+        &mut session,
+        CURRENT_ROOTS_RESCAN_ACCEPTED_TIMEOUT,
+        "active-three source repair rescan accepted",
+    )?;
+
+    eprintln!("[fs-meta-active3-replay] step=status-poll");
+    let mut final_status = Value::Null;
+    let expected_owner_by_group = active_three_expected_owner_by_group(&cluster)?;
+    wait_until(
+        Duration::from_secs(120),
+        "active-three status has expected ownership",
+        || {
+            let status = session.status()?;
+            validate_active_three_status_ownership(&status, &expected_owner_by_group)?;
+            final_status = status;
+            Ok(true)
+        },
+    )?;
+    eprintln!("[fs-meta-active3-replay] step=materialization-poll");
+    wait_until(
+        ACTIVE_THREE_MATERIALIZATION_TIMEOUT,
+        "active-three source/sink materialization has transport evidence",
+        || {
+            let status = session.status()?;
+            validate_active_three_status_ownership(&status, &expected_owner_by_group)?;
+            validate_active_three_status_materialization(&status, &expected_owner_by_group)?;
+            final_status = status;
+            Ok(true)
+        },
+    )?;
+    eprintln!(
+        "[fs-meta-active3-replay] final_status={}",
+        serde_json::to_string_pretty(&final_status).unwrap_or_else(|_| final_status.to_string())
+    );
+
+    evidence = collect_active_three_evidence(&cluster, &app_id)?;
+    if let Some(evidence) = evidence.as_object_mut() {
+        evidence.insert("status".to_string(), final_status);
+    }
+    eprintln!(
+        "[fs-meta-active3-replay] evidence_after_status={}",
+        serde_json::to_string_pretty(&evidence).unwrap_or_else(|_| evidence.to_string())
+    );
+    reject_active_three_blocker_evidence(&evidence)?;
     Ok(())
 }
 
@@ -1989,6 +2133,45 @@ fn seed_mini_content(lab: &NfsLab) -> Result<(), String> {
     Ok(())
 }
 
+fn seed_active_three_content(lab: &NfsLab) -> Result<(), String> {
+    let files_per_root = active_three_seed_env_usize(ACTIVE_THREE_FILES_PER_ROOT_ENV, 9)?;
+    let dirs_per_root = active_three_seed_env_usize(ACTIVE_THREE_DIRS_PER_ROOT_ENV, 1)?.max(1);
+    eprintln!(
+        "[fs-meta-active3-replay] seed files_per_root={files_per_root} dirs_per_root={dirs_per_root}"
+    );
+    for export_name in ACTIVE_THREE_EXPORTS {
+        if files_per_root == 9 && dirs_per_root == 1 {
+            for index in 1..=9 {
+                lab.write_file(
+                    export_name,
+                    &format!("active3/file-{index:02}.txt"),
+                    &format!("{export_name}-file-{index:02}\n"),
+                )?;
+            }
+            continue;
+        }
+        for index in 0..files_per_root {
+            let dir_index = index % dirs_per_root;
+            lab.write_file(
+                export_name,
+                &format!("active3/dir-{dir_index:04}/file-{index:08}.txt"),
+                &format!("{export_name}-file-{index:08}\n"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn active_three_seed_env_usize(name: &str, default: usize) -> Result<usize, String> {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .map_err(|err| format!("parse {name}={raw:?} as usize failed: {err}")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(err) => Err(format!("read {name} failed: {err}")),
+    }
+}
+
 fn install_baseline_resources(
     cluster: &Cluster5,
     lab: &mut NfsLab,
@@ -2080,6 +2263,37 @@ fn install_mini_resources(
             "bind_addr": bind_addr,
         })])?;
     }
+    Ok(())
+}
+
+fn install_active_three_resources(
+    cluster: &Cluster5,
+    lab: &mut NfsLab,
+    facade_resource_id: &str,
+    facade_addrs: &[String],
+) -> Result<(), String> {
+    for (node_name, export_name) in ACTIVE_THREE_MOUNTS {
+        let mount_path = lab.mount_export(node_name, export_name)?;
+        let node_id = cluster.node_id(node_name)?;
+        cluster.announce_resources_clusterwide(vec![json!({
+            "resource_id": export_name,
+            "node_id": node_id,
+            "resource_kind": "nfs",
+            "source": lab.export_source(export_name),
+            "mount_hint": mount_path.display().to_string(),
+        })])?;
+    }
+    let bind_addr = facade_addrs
+        .first()
+        .ok_or_else(|| "active-three replay requires one facade bind addr".to_string())?;
+    let node_id = cluster.node_id("node-b")?;
+    cluster.announce_resources_clusterwide(vec![json!({
+        "resource_id": facade_resource_id,
+        "node_id": node_id,
+        "resource_kind": "tcp_listener",
+        "source": format!("http://node-b/listener/{facade_resource_id}"),
+        "bind_addr": bind_addr,
+    })])?;
     Ok(())
 }
 
@@ -2224,6 +2438,13 @@ fn baseline_roots(lab: &NfsLab) -> Vec<RootSpec> {
 
 fn mini_roots(lab: &NfsLab) -> Vec<RootSpec> {
     MINI_EXPORTS
+        .iter()
+        .map(|export_name| root_spec(export_name, &lab.export_source(export_name)))
+        .collect()
+}
+
+fn active_three_roots(lab: &NfsLab) -> Vec<RootSpec> {
+    ACTIVE_THREE_EXPORTS
         .iter()
         .map(|export_name| root_spec(export_name, &lab.export_source(export_name)))
         .collect()
@@ -2899,4 +3120,740 @@ fn unique_suffix() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0)
+}
+
+fn active_three_status_covers_roots(status: &Value) -> bool {
+    let expected = ACTIVE_THREE_EXPORTS.len() as u64;
+    let roots_count = status
+        .get("source")
+        .and_then(|source| source.get("roots_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let sink_groups = status
+        .get("sink")
+        .and_then(|sink| sink.get("groups"))
+        .and_then(Value::as_array)
+        .map(|groups| groups.len())
+        .unwrap_or(0);
+    roots_count >= expected && sink_groups >= ACTIVE_THREE_EXPORTS.len()
+}
+
+fn validate_active_three_status_ownership(
+    status: &Value,
+    expected: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut blockers = Vec::new();
+    if !active_three_status_covers_roots(status) {
+        blockers.push(format!(
+            "status does not yet cover all active-three roots: {status}"
+        ));
+    }
+
+    let source_debug = status
+        .get("source")
+        .and_then(|source| source.get("debug"))
+        .ok_or_else(|| format!("status.source.debug missing: {status}"))?;
+    let sink = status
+        .get("sink")
+        .ok_or_else(|| format!("status.sink missing: {status}"))?;
+    let sink_debug = sink
+        .get("debug")
+        .ok_or_else(|| format!("status.sink.debug missing: {status}"))?;
+
+    let active_nodes = expected.values().cloned().collect::<BTreeSet<_>>();
+
+    validate_primary_owner_map(
+        "source.debug.source_primary_by_group",
+        &status_string_map(source_debug, "source_primary_by_group", status)?,
+        expected,
+        &mut blockers,
+    );
+    validate_primary_owner_map(
+        "sink.primary_host_ref_by_group",
+        &status_string_map(sink, "primary_host_ref_by_group", status)?,
+        expected,
+        &mut blockers,
+    );
+    validate_scheduled_owner_map(
+        "source.debug.scheduled_source_groups_by_node",
+        &status_group_map(source_debug, "scheduled_source_groups_by_node", status)?,
+        expected,
+        &active_nodes,
+        &mut blockers,
+    );
+    validate_scheduled_owner_map(
+        "source.debug.scheduled_scan_groups_by_node",
+        &status_group_map(source_debug, "scheduled_scan_groups_by_node", status)?,
+        expected,
+        &active_nodes,
+        &mut blockers,
+    );
+    validate_scheduled_owner_map(
+        "sink.debug.scheduled_groups_by_node",
+        &status_group_map(sink_debug, "scheduled_groups_by_node", status)?,
+        expected,
+        &active_nodes,
+        &mut blockers,
+    );
+
+    if blockers.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "active-three status ownership not converged: {}; status={}",
+            blockers.join("; "),
+            status
+        ))
+    }
+}
+
+fn validate_active_three_status_materialization(
+    status: &Value,
+    expected: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut blockers = Vec::new();
+    let active_nodes = expected.values().cloned().collect::<BTreeSet<_>>();
+
+    let readiness_planes = status
+        .get("readiness_planes")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("status.readiness_planes missing object: {status}"))?;
+    if readiness_planes
+        .get("trusted_observation_readiness")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        blockers.push("trusted_observation_readiness is not true".to_string());
+    }
+
+    validate_active_three_source_audit_complete(status, expected, &mut blockers)?;
+    validate_active_three_sink_materialized(status, expected, &mut blockers)?;
+    validate_active_three_publish_receive_transport(status, expected, &active_nodes, &mut blockers)?;
+
+    if blockers.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "active-three materialization not converged: {}; summary={}",
+            blockers.join("; "),
+            active_three_status_debug_summary(status)
+        ))
+    }
+}
+
+fn validate_active_three_source_audit_complete(
+    status: &Value,
+    expected: &BTreeMap<String, String>,
+    blockers: &mut Vec<String>,
+) -> Result<(), String> {
+    let roots = status
+        .get("source")
+        .and_then(|source| source.get("concrete_roots"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("status.source.concrete_roots missing array: {status}"))?;
+    let mut primaries_by_group = BTreeMap::<String, Vec<&Value>>::new();
+    for root in roots {
+        let Some(group_id) = root.get("logical_root_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !expected.contains_key(group_id) {
+            continue;
+        }
+        if root
+            .get("is_group_primary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            primaries_by_group
+                .entry(group_id.to_string())
+                .or_default()
+                .push(root);
+        }
+    }
+
+    for (group, expected_node) in expected {
+        let Some(roots) = primaries_by_group.get(group) else {
+            blockers.push(format!("source concrete root {group} missing primary"));
+            continue;
+        };
+        if roots.len() != 1 {
+            blockers.push(format!(
+                "source concrete root {group} expected one primary, got {}",
+                roots.len()
+            ));
+            continue;
+        }
+        let root = roots[0];
+        let object_ref = root
+            .get("object_ref")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if !host_ref_matches_expected_node(object_ref, expected_node) {
+            blockers.push(format!(
+                "source concrete root {group} expected owner {expected_node}, got {object_ref}"
+            ));
+        }
+        if root.get("active").and_then(Value::as_bool) != Some(true) {
+            blockers.push(format!("source concrete root {group} is not active"));
+        }
+        if root.get("scan_enabled").and_then(Value::as_bool) != Some(true) {
+            blockers.push(format!("source concrete root {group} scan is not enabled"));
+        }
+        if root.get("participation_state").and_then(Value::as_str) != Some("serving") {
+            blockers.push(format!(
+                "source concrete root {group} participation_state is {:?}",
+                root.get("participation_state")
+            ));
+        }
+        let started = root
+            .get("last_audit_started_at_us")
+            .and_then(Value::as_u64);
+        let completed = root
+            .get("last_audit_completed_at_us")
+            .and_then(Value::as_u64);
+        match (started, completed) {
+            (Some(started), Some(completed)) if completed >= started => {}
+            (Some(started), Some(completed)) => blockers.push(format!(
+                "source concrete root {group} audit completion {completed} is before start {started}"
+            )),
+            (started, completed) => blockers.push(format!(
+                "source concrete root {group} audit incomplete started={started:?} completed={completed:?}"
+            )),
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_active_three_sink_materialized(
+    status: &Value,
+    expected: &BTreeMap<String, String>,
+    blockers: &mut Vec<String>,
+) -> Result<(), String> {
+    let groups = status
+        .get("sink")
+        .and_then(|sink| sink.get("groups"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("status.sink.groups missing array: {status}"))?;
+    let groups_by_id = groups
+        .iter()
+        .filter_map(|group| {
+            group
+                .get("group_id")
+                .and_then(Value::as_str)
+                .map(|group_id| (group_id.to_string(), group))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for (group_id, expected_node) in expected {
+        let Some(group) = groups_by_id.get(group_id) else {
+            blockers.push(format!("sink group {group_id} missing"));
+            continue;
+        };
+        let primary = group
+            .get("primary_object_ref")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if !host_ref_matches_expected_node(primary, expected_node) {
+            blockers.push(format!(
+                "sink group {group_id} expected primary owner {expected_node}, got {primary}"
+            ));
+        }
+        if group
+            .get("initial_audit_completed")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            blockers.push(format!("sink group {group_id} initial audit is not complete"));
+        }
+        if group
+            .get("materialization_readiness")
+            .and_then(Value::as_str)
+            != Some("ready")
+        {
+            blockers.push(format!(
+                "sink group {group_id} materialization_readiness is {:?}",
+                group.get("materialization_readiness")
+            ));
+        }
+        if group.get("live_nodes").and_then(Value::as_u64).unwrap_or(0) == 0 {
+            blockers.push(format!("sink group {group_id} has zero live_nodes"));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_active_three_publish_receive_transport(
+    status: &Value,
+    expected: &BTreeMap<String, String>,
+    active_nodes: &BTreeSet<String>,
+    blockers: &mut Vec<String>,
+) -> Result<(), String> {
+    let source_debug = status
+        .get("source")
+        .and_then(|source| source.get("debug"))
+        .ok_or_else(|| format!("status.source.debug missing: {status}"))?;
+    let sink_debug = status
+        .get("sink")
+        .and_then(|sink| sink.get("debug"))
+        .ok_or_else(|| format!("status.sink.debug missing: {status}"))?;
+
+    let published_events = status_count_map(source_debug, "published_events_by_node", status)?;
+    let published_batches = status_count_map(source_debug, "published_batches_by_node", status)?;
+    let received_events = status_count_map(sink_debug, "received_events_by_node", status)?;
+    let received_batches = status_count_map(sink_debug, "received_batches_by_node", status)?;
+
+    let total_published_events = published_events.values().sum::<u64>();
+    let total_received_events = received_events.values().sum::<u64>();
+    if total_published_events > 0 && total_received_events == 0 {
+        blockers.push(format!(
+            "source published {total_published_events} events but sink received zero events"
+        ));
+    }
+
+    for node in active_nodes {
+        let source_events = published_events.get(node).copied().unwrap_or(0);
+        let source_batches = published_batches.get(node).copied().unwrap_or(0);
+        if source_events == 0 || source_batches == 0 {
+            blockers.push(format!(
+                "source node {node} has insufficient published transport evidence events={source_events} batches={source_batches}"
+            ));
+        }
+        let sink_events = received_events.get(node).copied().unwrap_or(0);
+        let sink_batches = received_batches.get(node).copied().unwrap_or(0);
+        if sink_events == 0 || sink_batches == 0 {
+            blockers.push(format!(
+                "sink node {node} has insufficient received transport evidence events={sink_events} batches={sink_batches}"
+            ));
+        }
+    }
+
+    let published_nodes = published_events
+        .iter()
+        .filter(|(node, count)| active_nodes.contains(*node) && **count > 0)
+        .count();
+    let received_nodes = received_events
+        .iter()
+        .filter(|(node, count)| active_nodes.contains(*node) && **count > 0)
+        .count();
+    if published_nodes != expected.len() || received_nodes != expected.len() {
+        blockers.push(format!(
+            "transport node coverage incomplete published_nodes={published_nodes} received_nodes={received_nodes} expected={}",
+            expected.len()
+        ));
+    }
+
+    Ok(())
+}
+
+fn active_three_status_debug_summary(status: &Value) -> Value {
+    json!({
+        "trusted_observation_readiness": status
+            .pointer("/readiness_planes/trusted_observation_readiness")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "source_roots": status
+            .pointer("/source/concrete_roots")
+            .and_then(Value::as_array)
+            .map(|roots| {
+                roots
+                    .iter()
+                    .filter_map(|root| {
+                        let group = root.get("logical_root_id").and_then(Value::as_str)?;
+                        if !ACTIVE_THREE_EXPORTS.contains(&group) {
+                            return None;
+                        }
+                        Some(json!({
+                            "group": group,
+                            "object_ref": root.get("object_ref").cloned().unwrap_or(Value::Null),
+                            "active": root.get("active").cloned().unwrap_or(Value::Null),
+                            "scan_enabled": root.get("scan_enabled").cloned().unwrap_or(Value::Null),
+                            "is_group_primary": root.get("is_group_primary").cloned().unwrap_or(Value::Null),
+                            "last_audit_started_at_us": root.get("last_audit_started_at_us").cloned().unwrap_or(Value::Null),
+                            "last_audit_completed_at_us": root.get("last_audit_completed_at_us").cloned().unwrap_or(Value::Null),
+                            "emitted_event_count": root.get("emitted_event_count").cloned().unwrap_or(Value::Null),
+                            "forwarded_event_count": root.get("forwarded_event_count").cloned().unwrap_or(Value::Null),
+                        }))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        "sink_groups": status
+            .pointer("/sink/groups")
+            .and_then(Value::as_array)
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter_map(|group| {
+                        let group_id = group.get("group_id").and_then(Value::as_str)?;
+                        if !ACTIVE_THREE_EXPORTS.contains(&group_id) {
+                            return None;
+                        }
+                        Some(json!({
+                            "group": group_id,
+                            "primary_object_ref": group.get("primary_object_ref").cloned().unwrap_or(Value::Null),
+                            "live_nodes": group.get("live_nodes").cloned().unwrap_or(Value::Null),
+                            "total_nodes": group.get("total_nodes").cloned().unwrap_or(Value::Null),
+                            "initial_audit_completed": group.get("initial_audit_completed").cloned().unwrap_or(Value::Null),
+                            "materialization_readiness": group.get("materialization_readiness").cloned().unwrap_or(Value::Null),
+                        }))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        "source_published_events_by_node": status
+            .pointer("/source/debug/published_events_by_node")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "sink_received_events_by_node": status
+            .pointer("/sink/debug/received_events_by_node")
+            .cloned()
+            .unwrap_or(Value::Null),
+    })
+}
+
+fn active_three_expected_owner_by_group(
+    cluster: &Cluster5,
+) -> Result<BTreeMap<String, String>, String> {
+    ACTIVE_THREE_MOUNTS
+        .iter()
+        .map(|(node, group)| {
+            cluster
+                .node_id(node)
+                .map(|node_id| ((*group).to_string(), node_id))
+        })
+        .collect()
+}
+
+fn status_string_map(
+    section: &Value,
+    key: &str,
+    status: &Value,
+) -> Result<BTreeMap<String, String>, String> {
+    let object = section
+        .get(key)
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("status field {key} missing object value: {status}"))?;
+    let mut out = BTreeMap::new();
+    for (entry_key, value) in object {
+        let Some(value) = value.as_str() else {
+            return Err(format!(
+                "status field {key}.{entry_key} missing string value: {status}"
+            ));
+        };
+        out.insert(entry_key.clone(), value.to_string());
+    }
+    Ok(out)
+}
+
+fn status_group_map(
+    section: &Value,
+    key: &str,
+    status: &Value,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let object = section
+        .get(key)
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("status field {key} missing object value: {status}"))?;
+    let mut out = BTreeMap::new();
+    for (node, groups) in object {
+        let Some(groups) = groups.as_array() else {
+            return Err(format!(
+                "status field {key}.{node} missing array value: {status}"
+            ));
+        };
+        let mut parsed = Vec::with_capacity(groups.len());
+        for group in groups {
+            let Some(group) = group.as_str() else {
+                return Err(format!(
+                    "status field {key}.{node} contains non-string group: {status}"
+                ));
+            };
+            parsed.push(group.to_string());
+        }
+        parsed.sort();
+        parsed.dedup();
+        out.insert(node.clone(), parsed);
+    }
+    Ok(out)
+}
+
+fn status_count_map(
+    section: &Value,
+    key: &str,
+    status: &Value,
+) -> Result<BTreeMap<String, u64>, String> {
+    let object = section
+        .get(key)
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("status field {key} missing object value: {status}"))?;
+    let mut out = BTreeMap::new();
+    for (entry_key, value) in object {
+        let Some(value) = value.as_u64() else {
+            return Err(format!(
+                "status field {key}.{entry_key} missing u64 value: {status}"
+            ));
+        };
+        out.insert(entry_key.clone(), value);
+    }
+    Ok(out)
+}
+
+fn validate_primary_owner_map(
+    label: &str,
+    actual: &BTreeMap<String, String>,
+    expected: &BTreeMap<String, String>,
+    blockers: &mut Vec<String>,
+) {
+    for (group, expected_node) in expected {
+        match actual.get(group) {
+            Some(owner) if host_ref_matches_expected_node(owner, expected_node) => {}
+            Some(owner) => blockers.push(format!(
+                "{label}.{group} expected owner {expected_node}, got {owner}"
+            )),
+            None => blockers.push(format!("{label}.{group} missing owner")),
+        }
+    }
+}
+
+fn validate_scheduled_owner_map(
+    label: &str,
+    actual: &BTreeMap<String, Vec<String>>,
+    expected: &BTreeMap<String, String>,
+    active_nodes: &BTreeSet<String>,
+    blockers: &mut Vec<String>,
+) {
+    let mut owners_by_group = BTreeMap::<String, Vec<String>>::new();
+    for (node, groups) in actual {
+        let active_groups = groups
+            .iter()
+            .filter(|group| expected.contains_key(*group))
+            .cloned()
+            .collect::<Vec<_>>();
+        if active_groups.is_empty() {
+            continue;
+        }
+        if !active_nodes.contains(node) {
+            blockers.push(format!(
+                "{label}.{node} is inactive but claims active groups {active_groups:?}"
+            ));
+        }
+        if active_groups.len() == expected.len() && expected.len() > 1 {
+            blockers.push(format!(
+                "{label}.{node} claims all active groups {active_groups:?}"
+            ));
+        }
+        for group in active_groups {
+            if expected.get(&group) != Some(node) {
+                let expected_node = expected.get(&group).map(String::as_str).unwrap_or("<none>");
+                blockers.push(format!(
+                    "{label}.{group} scheduled on {node}, expected {expected_node}"
+                ));
+            }
+            owners_by_group.entry(group).or_default().push(node.clone());
+        }
+    }
+
+    for (group, expected_node) in expected {
+        match owners_by_group.get(group) {
+            Some(nodes) if nodes.len() == 1 && nodes.first() == Some(expected_node) => {}
+            Some(nodes) => blockers.push(format!(
+                "{label}.{group} expected unique owner {expected_node}, got {nodes:?}"
+            )),
+            None => blockers.push(format!("{label}.{group} missing scheduled owner")),
+        }
+    }
+}
+
+fn host_ref_matches_expected_node(owner: &str, expected_node: &str) -> bool {
+    owner == expected_node
+        || owner
+            .strip_prefix(expected_node)
+            .is_some_and(|suffix| suffix.starts_with("::"))
+}
+
+fn collect_active_three_evidence(cluster: &Cluster5, app_id: &str) -> Result<Value, String> {
+    let mut nodes = Vec::new();
+    for node in &cluster.nodes {
+        let registry = read_json_or_empty(&node.home_dir.join("registry.json"));
+        let current_entries = registry_entry_count(&registry, "current_entries", app_id);
+        let draining_entries = registry_entry_count(&registry, "draining_entries", app_id);
+        let descendants = cluster
+            .daemon_host_descendant_pids(&node.name)
+            .map(|pids| pids.into_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut worker_host_pids = Vec::new();
+        let mut fs_meta_cmd_pids = Vec::new();
+        for pid in descendants {
+            let cmdline = proc_cmdline(pid);
+            if cmdline.contains("capanix_worker_host") {
+                worker_host_pids.push(pid);
+            }
+            if cmdline.contains("libfs_meta_runtime") || cmdline.contains("fs-meta-runtime") {
+                fs_meta_cmd_pids.push(pid);
+            }
+        }
+        nodes.push(json!({
+            "node": node.name,
+            "home_dir": node.home_dir.display().to_string(),
+            "registry_current_entries": current_entries,
+            "registry_draining_entries": draining_entries,
+            "worker_host_pids": worker_host_pids,
+            "fs_meta_cmd_pids": fs_meta_cmd_pids,
+            "log_counts": count_log_patterns(&node.home_dir),
+        }));
+    }
+    Ok(json!({
+        "app_id": app_id,
+        "nodes": nodes,
+    }))
+}
+
+fn read_json_or_empty(path: &std::path::Path) -> Value {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn registry_entry_count(registry: &Value, field: &str, app_id: &str) -> usize {
+    registry
+        .get(field)
+        .and_then(Value::as_object)
+        .map(|entries| entries.keys().filter(|key| key.as_str() == app_id).count())
+        .unwrap_or(0)
+}
+
+fn proc_cmdline(pid: u32) -> String {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|raw| {
+            raw.split(|byte| *byte == 0)
+                .filter(|part| !part.is_empty())
+                .map(|part| String::from_utf8_lossy(part).to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+fn count_log_patterns(root: &std::path::Path) -> Value {
+    let patterns = [
+        "operation timed out",
+        "worker sidecar bind failed",
+        "statecell_read failed",
+        "drained/fenced",
+        "route activation backpressure",
+        "sidecar_control_bridge",
+        "ipc_read_len: early eof",
+    ];
+    let mut counts = serde_json::Map::new();
+    for pattern in patterns {
+        counts.insert(pattern.to_string(), json!(0_u64));
+    }
+    count_log_patterns_recursive(root, &patterns, &mut counts);
+    Value::Object(counts)
+}
+
+fn count_log_patterns_recursive(
+    root: &std::path::Path,
+    patterns: &[&str],
+    counts: &mut serde_json::Map<String, Value>,
+) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            count_log_patterns_recursive(&path, patterns, counts);
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        if !matches!(ext, "log" | "out" | "err") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for pattern in patterns {
+            let add = raw.matches(pattern).count() as u64;
+            if add == 0 {
+                continue;
+            }
+            let current = counts.get(*pattern).and_then(Value::as_u64).unwrap_or(0);
+            counts.insert((*pattern).to_string(), json!(current + add));
+        }
+    }
+}
+
+fn reject_active_three_blocker_evidence(evidence: &Value) -> Result<(), String> {
+    let mut blockers = Vec::new();
+    let Some(nodes) = evidence.get("nodes").and_then(Value::as_array) else {
+        return Err(format!("active-three evidence missing nodes: {evidence}"));
+    };
+    for node in nodes {
+        let name = node
+            .get("node")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let current = node
+            .get("registry_current_entries")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let draining = node
+            .get("registry_draining_entries")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let worker_hosts = node
+            .get("worker_host_pids")
+            .and_then(Value::as_array)
+            .map(|pids| pids.len())
+            .unwrap_or(0);
+        let active = matches!(name, "node-a" | "node-b" | "node-c");
+        if active && current != 1 {
+            blockers.push(format!(
+                "{name}: expected one current runtime, got {current}"
+            ));
+        }
+        if !active && current != 0 {
+            blockers.push(format!(
+                "{name}: inactive node unexpectedly has current runtime count {current}"
+            ));
+        }
+        if draining > 0 {
+            blockers.push(format!(
+                "{name}: draining runtime entries present count={draining}"
+            ));
+        }
+        if active && worker_hosts > 2 {
+            blockers.push(format!(
+                "{name}: expected at most source+sink worker hosts, got {worker_hosts}"
+            ));
+        }
+        if let Some(log_counts) = node.get("log_counts").and_then(Value::as_object) {
+            for pattern in [
+                "operation timed out",
+                "worker sidecar bind failed",
+                "statecell_read failed",
+                "route activation backpressure",
+            ] {
+                let count = log_counts.get(pattern).and_then(Value::as_u64).unwrap_or(0);
+                if count > 0 {
+                    blockers.push(format!("{name}: log pattern `{pattern}` count={count}"));
+                }
+            }
+        }
+    }
+    if blockers.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "active-three replay saw blocker evidence: {}; evidence={}",
+            blockers.join("; "),
+            evidence
+        ))
+    }
 }

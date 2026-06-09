@@ -632,6 +632,18 @@ fn plan_worker_request(
                 false,
             ),
         },
+        SinkWorkerRequest::CheckpointSnapshot => match state.sink.as_ref() {
+            Some(sink) => match sink.checkpoint_snapshot() {
+                Ok(()) => SinkWorkerAction::Immediate(SinkWorkerResponse::Ack, false),
+                Err(err) => {
+                    SinkWorkerAction::Immediate(classify_sink_worker_failure(err.into()), false)
+                }
+            },
+            None => SinkWorkerAction::Immediate(
+                SinkWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
         SinkWorkerRequest::MaterializedQuery { request } => match state.sink.as_ref() {
             Some(sink) => {
                 if debug_sink_query_flow_enabled()
@@ -987,9 +999,7 @@ impl TypedWorkerBootstrapSession<SinkWorkerInitConfig> for SinkWorkerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::routes::{
-        METHOD_STREAM, ROUTE_KEY_QUERY, ROUTE_TOKEN_FS_META_EVENTS, default_route_bindings,
-    };
+    use crate::runtime::routes::{METHOD_STREAM, ROUTE_KEY_QUERY, ROUTE_TOKEN_FS_META_EVENTS};
     use crate::source::config::{GrantedMountRoot, RootSpec};
     use bytes::Bytes;
     use capanix_app_sdk::runtime::EventMetadata;
@@ -1170,7 +1180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_on_control_frame_ack_waits_until_events_stream_enters_first_recv_after_deferred_authority_startup_for_local_split_primary_scope()
+    async fn worker_on_control_frame_ack_does_not_wait_for_delayed_events_stream_first_recv_after_deferred_authority_startup_for_local_split_primary_scope()
      {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
@@ -1219,10 +1229,12 @@ mod tests {
         )
         .expect("bootstrap start sink runtime");
 
-        let events_route = default_route_bindings()
-            .resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM)
-            .expect("resolve events route")
-            .0;
+        let events_route = crate::runtime::routes::events_stream_route_for_scope(&node_id.0).0;
+        crate::runtime::endpoint::install_stream_endpoint_before_first_recv_delay_hook(
+            &events_route,
+            &format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
+            Duration::from_millis(400),
+        );
         let action = plan_worker_request(
             SinkWorkerRequest::OnControlFrame {
                 envelopes: vec![
@@ -1261,15 +1273,32 @@ mod tests {
             &mut state,
         );
 
-        let (response, stop) = execute_worker_action(action).await;
+        let (response, stop) = tokio::time::timeout(
+            Duration::from_millis(100),
+            execute_worker_action(action),
+        )
+        .await
+        .expect(
+            "worker-backed sink control ACK must not wait for events stream first recv observation",
+        );
         assert!(!stop, "worker on_control_frame should not stop the session");
         assert!(
             matches!(response, SinkWorkerResponse::Ack),
-            "worker on_control_frame should still succeed in the narrow first-recv seam: {response:?}"
+            "worker on_control_frame should accept retained control state before events stream first recv: {response:?}"
         );
         assert!(
+            boundary.recv_count(&events_route) == 0,
+            "worker-backed sink server on_control_frame must not be coupled to first stream recv: route={} recv_count={}",
+            events_route,
+            boundary.recv_count(&events_route),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while boundary.recv_count(&events_route) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
             boundary.recv_count(&events_route) > 0,
-            "worker-backed sink server on_control_frame must not Ack before the local events stream enters its first recv attempt after deferred-authority startup: route={} recv_count={}",
+            "events stream should still arm asynchronously after control ACK: route={} recv_count={}",
             events_route,
             boundary.recv_count(&events_route),
         );
@@ -1298,10 +1327,7 @@ mod tests {
         sink.start_stream_endpoint(Arc::new(FailingBoundary), node_id.clone())
             .expect("seed terminal stream endpoint");
 
-        let stream_route = default_route_bindings()
-            .resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM)
-            .expect("resolve stream route")
-            .0;
+        let stream_route = crate::runtime::routes::events_stream_route_for_scope(&node_id.0).0;
         sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
             RuntimeExecActivate {
                 route_key: stream_route.clone(),
@@ -1382,10 +1408,7 @@ mod tests {
             SinkFileMeta::with_boundaries(node_id.clone(), None, source_cfg)
                 .expect("build sink runtime"),
         );
-        let stream_route = default_route_bindings()
-            .resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM)
-            .expect("resolve stream route")
-            .0;
+        let stream_route = crate::runtime::routes::events_stream_route_for_scope(&node_id.0).0;
 
         sink.start_stream_endpoint(Arc::new(FailingBoundary), node_id.clone())
             .expect("seed terminal stream endpoint");

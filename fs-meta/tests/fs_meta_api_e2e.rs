@@ -25,6 +25,12 @@ fn fs_meta_business_mini_real_nfs() {
 
 #[test]
 #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_active_three_external_worker_replay_real_nfs() {
+    test_http_api_matrix::run_active_three_external_worker_replay().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
 fn fs_meta_environment_full_real_nfs() {
     test_http_api_matrix::run().unwrap();
 }

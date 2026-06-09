@@ -73,7 +73,7 @@ struct DropUntilFirstEventsRecvBoundary {
 
 impl DropUntilFirstEventsRecvBoundary {
     fn events_route() -> String {
-        format!("{}.stream", ROUTE_KEY_EVENTS)
+        crate::runtime::routes::events_stream_route_for_scope("node-b").0
     }
 
     fn events_recv_armed(&self) -> bool {
@@ -1828,7 +1828,7 @@ async fn external_sink_worker_stream_endpoint_materializes_split_primary_mixed_c
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn external_sink_worker_on_control_frame_waits_until_events_stream_enters_first_recv_for_local_split_primary_scope()
+async fn external_sink_worker_on_control_frame_ack_does_not_wait_for_events_stream_first_recv_for_local_split_primary_scope()
  {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
@@ -1870,32 +1870,43 @@ async fn external_sink_worker_on_control_frame_waits_until_events_stream_enters_
         .expect("start sink worker");
 
     let events_route = DropUntilFirstEventsRecvBoundary::events_route();
-    sink.on_control_frame(vec![
-        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.sink".to_string(),
-            lease: None,
-            generation: 1,
-            expires_at_ms: 1,
-            bound_scopes: vec![bound_scope_with_resources("nfs3", &["node-b::nfs3"])],
-        }))
-        .expect("encode sink query activate"),
-        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
-            route_key: events_route.clone(),
-            unit_id: "runtime.exec.sink".to_string(),
-            lease: None,
-            generation: 1,
-            expires_at_ms: 1,
-            bound_scopes: vec![bound_scope_with_resources("nfs3", &["node-b::nfs3"])],
-        }))
-        .expect("encode sink stream activate"),
-    ])
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs3", &["node-b::nfs3"])],
+            }))
+            .expect("encode sink query activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: events_route.clone(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs3", &["node-b::nfs3"])],
+            }))
+            .expect("encode sink stream activate"),
+        ]),
+    )
     .await
+    .expect("sink control ACK must not wait for events stream first recv")
     .expect("activate split-primary sink routes");
 
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if boundary.events_recv_armed() && boundary.recv_count(&events_route) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert!(
         boundary.events_recv_armed() && boundary.recv_count(&events_route) > 0,
-        "worker-backed sink on_control_frame must not return before the split-primary local events stream enters its first real boundary recv attempt: armed={} recv_count={} route={}",
+        "worker-backed sink events stream should arm asynchronously after control ACK: armed={} recv_count={} route={}",
         boundary.events_recv_armed(),
         boundary.recv_count(&events_route),
         events_route,
@@ -2857,6 +2868,14 @@ impl Drop for SinkWorkerRetryResetHookReset {
     }
 }
 
+struct SinkWorkerReplacementShutdownHookReset;
+
+impl Drop for SinkWorkerReplacementShutdownHookReset {
+    fn drop(&mut self) {
+        clear_sink_worker_replacement_shutdown_hook();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_error_hook_scoped_to_target_worker_instance_is_not_consumed_by_unrelated_status_probe()
  {
@@ -3773,8 +3792,227 @@ async fn status_snapshot_nonblocking_returns_cached_ready_selected_group_from_pa
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_summary_when_control_is_marked_inflight_and_live_status_probe_fails_after_schedule_convergence()
- {
+async fn status_route_cache_fallback_preserves_owner_scoped_sink_schedule_and_primary_owner() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs144 = tmp.path().join("nfs-144");
+    std::fs::create_dir_all(&nfs144).expect("create nfs-144 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs-144", &nfs144)],
+        host_object_grants: vec![sink_worker_export(
+            "node-a::nfs-144",
+            "node-a",
+            "10.0.82.144",
+            nfs144.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: crate::runtime::routes::sink_roots_control_stream_route_for("node-a").0,
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 7,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs-144", &["node-a::nfs-144"])],
+        }))
+        .expect("encode owner-scoped sink roots-control activate"),
+    ])
+    .await
+    .expect("owner-scoped sink roots-control must be accepted");
+
+    sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
+        .expect("seed stale empty cached sink status");
+
+    let _inflight = sink.begin_control_op();
+    let (snapshot, from_cache) = sink.status_snapshot_nonblocking_for_status_route().await;
+
+    assert!(
+        from_cache,
+        "precondition: status-route seam must exercise the control-inflight cached fallback"
+    );
+    assert_eq!(
+        snapshot.scheduled_groups_by_node.get("node-a"),
+        Some(&vec!["nfs-144".to_string()]),
+        "status-route cached fallback must publish the owner-scoped runtime-accepted sink schedule, not lose the remote owner group: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.primary_host_ref_by_group.get("nfs-144"),
+        Some(&"node-a".to_string()),
+        "status-route cached fallback must publish the runtime-accepted primary sink owner; status must not rely on grants to infer this later: {snapshot:?}"
+    );
+    assert!(
+        snapshot.groups.is_empty(),
+        "status-route cached fallback must keep materialized group rows zero-state when only runtime schedule/owner evidence is current: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.live_nodes, 0,
+        "status-route cached fallback must not carry stale live-node counters when only runtime schedule/owner evidence is current: {snapshot:?}"
+    );
+
+    drop(_inflight);
+    tokio::time::timeout(Duration::from_secs(5), sink.close())
+        .await
+        .expect("close sink worker timed out")
+        .expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn logical_roots_replay_does_not_project_all_roots_into_sink_status_schedule() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs144 = tmp.path().join("nfs-144");
+    let nfs145 = tmp.path().join("nfs-145");
+    let nfs146 = tmp.path().join("nfs-146");
+    std::fs::create_dir_all(&nfs144).expect("create nfs-144 dir");
+    std::fs::create_dir_all(&nfs145).expect("create nfs-145 dir");
+    std::fs::create_dir_all(&nfs146).expect("create nfs-146 dir");
+
+    let roots = vec![
+        sink_worker_root("nfs-144", &nfs144),
+        sink_worker_root("nfs-145", &nfs145),
+        sink_worker_root("nfs-146", &nfs146),
+    ];
+    let grants = vec![
+        sink_worker_export(
+            "node-a::nfs-144",
+            "node-a",
+            "10.0.82.144",
+            nfs144.clone(),
+        ),
+        sink_worker_export(
+            "node-b::nfs-145",
+            "node-b",
+            "10.0.82.145",
+            nfs145.clone(),
+        ),
+        sink_worker_export(
+            "node-c::nfs-146",
+            "node-c",
+            "10.0.82.146",
+            nfs146.clone(),
+        ),
+    ];
+    let cfg = SourceConfig {
+        roots: roots.clone(),
+        host_object_grants: grants.clone(),
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    sink.update_logical_roots_with_failure(roots.clone(), grants.clone())
+        .await
+        .expect("worker-backed logical roots replay");
+
+    sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
+        .expect("seed empty cached sink status");
+    let _inflight = sink.begin_control_op();
+    let (without_schedule, from_cache) =
+        sink.status_snapshot_nonblocking_for_status_route().await;
+    assert!(
+        from_cache,
+        "precondition: status-route seam must exercise cached fallback while control is inflight"
+    );
+    assert!(
+        without_schedule.scheduled_groups_by_node.is_empty(),
+        "logical-roots replay must not fabricate a sink runtime schedule from all accepted roots/grants: {without_schedule:?}"
+    );
+    assert!(
+        without_schedule.primary_host_ref_by_group.is_empty(),
+        "logical-roots replay must not fabricate primary sink owners from grants: {without_schedule:?}"
+    );
+    drop(_inflight);
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: crate::runtime::routes::sink_roots_control_stream_route_for("node-a").0,
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 7,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs-144", &["node-a::nfs-144"])],
+        }))
+        .expect("encode owner-scoped sink roots-control activate"),
+    ])
+    .await
+    .expect("owner-scoped sink roots-control must be accepted");
+
+    sink.update_logical_roots_with_failure(roots, grants)
+        .await
+        .expect("logical-roots replay after owner schedule");
+    sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
+        .expect("seed empty cached sink status after accepted owner schedule");
+
+    let _inflight = sink.begin_control_op();
+    let (with_owner_schedule, from_cache) =
+        sink.status_snapshot_nonblocking_for_status_route().await;
+    assert!(
+        from_cache,
+        "precondition: owner schedule must be read from cached status-route fallback"
+    );
+    assert_eq!(
+        with_owner_schedule.scheduled_groups_by_node.get("node-a"),
+        Some(&vec!["nfs-144".to_string()]),
+        "owner-scoped sink-status must publish only the runtime-accepted owner schedule after logical-roots replay: {with_owner_schedule:?}"
+    );
+    assert_eq!(
+        with_owner_schedule.primary_host_ref_by_group.get("nfs-144"),
+        Some(&"node-a".to_string()),
+        "owner-scoped sink-status must preserve the runtime-accepted primary owner after logical-roots replay: {with_owner_schedule:?}"
+    );
+    let scheduled_groups = with_owner_schedule
+        .scheduled_groups_by_node
+        .values()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        scheduled_groups,
+        std::collections::BTreeSet::from(["nfs-144".to_string()]),
+        "logical-roots replay must not expand owner-scoped sink-status to unscheduled peer groups: {with_owner_schedule:?}"
+    );
+
+    drop(_inflight);
+    tokio::time::timeout(Duration::from_secs(5), sink.close())
+        .await
+        .expect("close sink worker timed out")
+        .expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_summary_when_control_is_marked_inflight_and_live_status_probe_fails_after_schedule_convergence() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -4081,6 +4319,176 @@ include!("tests/status_snapshot_fold.rs");
 include!("tests/status_snapshot_replay.rs");
 include!("tests/control_frame_recovery.rs");
 include!("tests/shared_handle_nine_wave.rs");
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_shared_sink_worker_does_not_publish_successor_until_stale_shutdown_finishes() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs1", &nfs1)],
+        host_object_grants: vec![sink_worker_export(
+            "node-d::nfs1",
+            "node-d",
+            "10.0.0.41",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = Arc::new(
+        SinkWorkerClientHandle::new(
+            NodeId("node-d-sink-replacement".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client"),
+    );
+
+    tokio::time::timeout(Duration::from_secs(8), client.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    let previous_instance_id = client.worker_instance_id_for_tests().await;
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let _reset = SinkWorkerReplacementShutdownHookReset;
+    install_sink_worker_replacement_shutdown_hook(SinkWorkerReplacementShutdownHook {
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+
+    let restart = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .restart_shared_worker_client_for_retry_until(
+                    std::time::Instant::now() + Duration::from_secs(4),
+                    SinkRetryBudgetExhaustionKind::ControlFrameRetry,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("stale sink worker shutdown should start");
+
+    match tokio::time::timeout(
+        Duration::from_millis(150),
+        client.worker_instance_id_for_tests(),
+    )
+    .await
+    {
+        Ok(observed_instance_id) => assert_eq!(
+            observed_instance_id, previous_instance_id,
+            "sink shared-worker replacement must not publish a successor instance while stale shutdown is still in progress",
+        ),
+        Err(_) => {}
+    }
+
+    release.notify_waiters();
+
+    tokio::time::timeout(Duration::from_secs(4), restart)
+        .await
+        .expect("sink shared-worker replacement should finish after stale shutdown release")
+        .expect("join sink shared-worker replacement")
+        .expect("sink shared-worker replacement should succeed");
+
+    assert_ne!(
+        client.worker_instance_id_for_tests().await,
+        previous_instance_id,
+        "sink shared-worker replacement should publish the successor after stale shutdown completes",
+    );
+
+    client.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_shared_sink_worker_fails_closed_when_stale_shutdown_does_not_finish() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs1", &nfs1)],
+        host_object_grants: vec![sink_worker_export(
+            "node-d::nfs1",
+            "node-d",
+            "10.0.0.41",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = Arc::new(
+        SinkWorkerClientHandle::new(
+            NodeId("node-d-sink-replacement-timeout".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client"),
+    );
+
+    tokio::time::timeout(Duration::from_secs(8), client.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    let previous_instance_id = client.worker_instance_id_for_tests().await;
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let _reset = SinkWorkerReplacementShutdownHookReset;
+    install_sink_worker_replacement_shutdown_hook(SinkWorkerReplacementShutdownHook {
+        entered: entered.clone(),
+        release,
+    });
+
+    let replacement = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .replace_shared_worker_client_after_stale_shutdown(
+                    Duration::from_millis(1),
+                    Duration::from_millis(50),
+                )
+                .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("stale sink worker shutdown should have been attempted");
+    let result = tokio::time::timeout(Duration::from_secs(2), replacement)
+        .await
+        .expect("replacement fail-closed result should stay bounded")
+        .expect("replacement task should not panic");
+    let err = result.expect_err("replacement must fail closed when stale shutdown cannot finish");
+    assert!(
+        err.to_string()
+            .contains("stale sink worker shutdown timed out"),
+        "stale shutdown timeout should surface at the raw replacement boundary: {err}",
+    );
+    assert_eq!(
+        client.worker_instance_id_for_tests().await,
+        previous_instance_id,
+        "sink shared-worker replacement must not publish a successor when stale shutdown does not finish",
+    );
+
+    client.close().await.expect("close sink worker");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn second_on_control_frame_reacquires_worker_client_after_first_wave_succeeded_without_external_ensure_started()
  {

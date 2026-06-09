@@ -9,6 +9,7 @@
 //! boundary only; trusted external observation remains gated by app-owned
 //! `observation_eligible` after replay and rebuild.
 
+use std::fmt;
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,7 @@ use fs_meta_deploy::{
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -230,6 +232,8 @@ enum RootsFile {
 }
 
 const DEFAULT_APP_ID: &str = "fs-meta";
+const DEFAULT_CNXCTL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const CNXCTL_TIMEOUT_ENV: &str = "FSMETA_CNXCTL_TIMEOUT_MS";
 
 fn default_local_ingress_bind_addr() -> String {
     "127.0.0.1:19180".to_string()
@@ -510,10 +514,9 @@ async fn roots_preview(args: RootsPreviewArgs) -> anyhow::Result<serde_json::Val
 async fn roots_apply(args: RootsApplyArgs) -> anyhow::Result<serde_json::Value> {
     let client = reqwest::Client::new();
     let payload = load_roots_payload(&args.file)?;
-    let roots = roots_from_payload(&payload)?;
     let runtime_apply = if let Some(config_path) = args.config.as_deref() {
-        ensure_api_credentials_for_generation_cutover(&args.api)?;
-        let preflight_token = resolve_api_login_token(&client, &args.api).await?;
+        let _product = load_product_config(config_path)?;
+        let preflight_token = resolve_api_token(&client, &args.api).await?;
         let preview = post_json(
             &client,
             &args.api.api_base,
@@ -523,33 +526,16 @@ async fn roots_apply(args: RootsApplyArgs) -> anyhow::Result<serde_json::Value> 
         )
         .await?;
         ensure_roots_preview_has_no_unmatched(&preview)?;
-        let product = load_product_config(config_path)?;
-        let state_dir = prepare_state_dir(config_path.parent(), ".fsmeta-state")?;
-        let auth_cfg = load_deployed_auth_config(&state_dir)?;
-        let (app_target, manifest_path) = resolve_fs_meta_runtime_inputs()?;
-        let control = ControlClient::from_args(&args.control)?;
-        let route_plan_node_ids = control.discover_route_plan_node_ids().await?;
-        let intent = build_deploy_intent_for_roots(
-            &product,
-            auth_cfg,
-            &app_target,
-            &manifest_path,
-            &state_dir,
-            route_plan_node_ids.clone(),
-            roots,
-        )?;
         Some(json!({
-            "route_plan_node_ids": route_plan_node_ids,
-            "result": control.apply_relation_target_intent(&intent).await?,
+            "mode": "management_api_only",
+            "relation_target_apply": "skipped",
+            "tx_busy_retries": 0,
+            "reason": "online_root_reconfiguration_without_restart",
         }))
     } else {
         None
     };
-    let token = if args.config.is_some() {
-        resolve_api_login_token(&client, &args.api).await?
-    } else {
-        resolve_api_token(&client, &args.api).await?
-    };
+    let token = resolve_api_token(&client, &args.api).await?;
     let roots_result = put_json(
         &client,
         &args.api.api_base,
@@ -615,25 +601,6 @@ fn build_auth_config(auth: &ProductAuthConfig, base_dir: &Path) -> (ApiAuthConfi
     )
 }
 
-fn load_deployed_auth_config(state_dir: &Path) -> anyhow::Result<ApiAuthConfig> {
-    let passwd_path = state_dir.join("fs-meta.passwd");
-    let shadow_path = state_dir.join("fs-meta.shadow");
-    if !passwd_path.exists() || !shadow_path.exists() {
-        bail!(
-            "deployed fs-meta auth files are missing under {}; run fsmeta deploy first or pass the deploy config whose parent owns .fsmeta-state",
-            state_dir.display()
-        );
-    }
-    Ok(ApiAuthConfig {
-        passwd_path,
-        shadow_path,
-        query_keys_path: state_dir.join("fs-meta.query-keys.json"),
-        session_ttl_secs: 3600,
-        management_group: "fsmeta_management".to_string(),
-        bootstrap_management: None,
-    })
-}
-
 fn load_roots_payload(path: &Path) -> anyhow::Result<serde_json::Value> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("read roots file {} failed", path.display()))?;
@@ -644,23 +611,6 @@ fn load_roots_payload(path: &Path) -> anyhow::Result<serde_json::Value> {
         RootsFile::Bare(roots) => roots,
     };
     Ok(json!({ "roots": roots }))
-}
-
-fn roots_from_payload(payload: &serde_json::Value) -> anyhow::Result<Vec<RootEntry>> {
-    let roots = payload
-        .get("roots")
-        .cloned()
-        .context("roots payload missing roots")?;
-    serde_json::from_value(roots).context("decode roots payload failed")
-}
-
-fn ensure_api_credentials_for_generation_cutover(args: &ApiAuthArgs) -> anyhow::Result<()> {
-    if args.username.is_some() && (args.password.is_some() || args.password_file.is_some()) {
-        return Ok(());
-    }
-    bail!(
-        "roots apply --config performs a runtime generation cutover and requires --username with --password or --password-file so the CLI can re-login after relation_target_apply"
-    )
 }
 
 fn ensure_roots_preview_has_no_unmatched(preview: &serde_json::Value) -> anyhow::Result<()> {
@@ -962,6 +912,7 @@ fn build_deploy_intent_for_roots(
     write_startup_manifest(base_manifest_path, &spec, &generated_manifest_path)
         .map_err(|err| anyhow::anyhow!("generate fs-meta startup manifest failed: {err}"))?;
     let mut release_doc = build_release_doc_value(&spec);
+    apply_worker_runtime_dirs(&mut release_doc, generated_manifest_dir)?;
     apply_source_tuning(product, &mut release_doc)?;
     let target_generation = release_doc
         .get("target_generation")
@@ -988,6 +939,42 @@ fn build_deploy_intent_for_roots(
     policy.insert("generation".into(), json!(target_generation));
     compile_release_doc_to_relation_target_intent(&release_doc)
         .map_err(|err| anyhow::anyhow!("invalid fs-meta deploy intent: {err}"))
+}
+
+fn apply_worker_runtime_dirs(
+    release_doc: &mut serde_json::Value,
+    state_dir: &Path,
+) -> anyhow::Result<()> {
+    let workers = release_doc
+        .get_mut("units")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|units| units.first_mut())
+        .and_then(|unit| unit.get_mut("config"))
+        .and_then(|config| config.get_mut("workers"))
+        .and_then(serde_json::Value::as_object_mut)
+        .context("release document missing first unit worker config")?;
+
+    for role in ["source", "sink"] {
+        let Some(row) = workers
+            .get_mut(role)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if row
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|mode| mode == "external")
+        {
+            let socket_dir = state_dir.join("worker-runtime").join(role);
+            fs::create_dir_all(&socket_dir).with_context(|| {
+                format!("create worker runtime dir {} failed", socket_dir.display())
+            })?;
+            row.entry("socket_dir")
+                .or_insert_with(|| json!(socket_dir.display().to_string()));
+        }
+    }
+    Ok(())
 }
 
 fn apply_source_tuning(
@@ -1090,6 +1077,58 @@ struct ControlClient {
     admin_sk_b64: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CnxctlCommandError {
+    code: Option<String>,
+    category: Option<String>,
+    message: String,
+}
+
+impl CnxctlCommandError {
+    fn new(code: Option<String>, category: Option<String>, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            category,
+            message: message.into(),
+        }
+    }
+
+    fn other(message: impl Into<String>) -> Self {
+        Self::new(None, None, message)
+    }
+
+    fn from_cnxctl_json(value: &serde_json::Value) -> Option<Self> {
+        let error = value.get("error")?;
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("cnxctl command failed");
+        let code = error
+            .get("code")
+            .or_else(|| error.get("error_code"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let category = error
+            .get("category")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        Some(Self::new(code, category, message))
+    }
+}
+
+impl fmt::Display for CnxctlCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.code, &self.category) {
+            (Some(code), Some(category)) => write!(f, "[{category}/{code}] {}", self.message),
+            (Some(code), None) => write!(f, "[{code}] {}", self.message),
+            (None, Some(category)) => write!(f, "[{category}] {}", self.message),
+            (None, None) => f.write_str(&self.message),
+        }
+    }
+}
+
+impl std::error::Error for CnxctlCommandError {}
+
 impl ControlClient {
     fn from_args(args: &ControlAuthArgs) -> anyhow::Result<Self> {
         let admin_sk_b64 = args
@@ -1114,14 +1153,23 @@ impl ControlClient {
         &self,
         intent: &serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
-        let path = write_runtime_admin_temp_file("fsmeta-intent", intent)?;
-        let output = self
-            .run_cnxctl(&[
-                "app",
-                "apply",
-                path.to_str().context("non-utf8 intent path")?,
-            ])
-            .await;
+        self.apply_relation_target_intent_once(intent)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    async fn apply_relation_target_intent_once(
+        &self,
+        intent: &serde_json::Value,
+    ) -> Result<serde_json::Value, CnxctlCommandError> {
+        let path = write_runtime_admin_temp_file("fsmeta-intent", intent).map_err(|err| {
+            CnxctlCommandError::other(format!("write runtime-admin intent failed: {err:#}"))
+        })?;
+        let intent_path = path
+            .to_str()
+            .ok_or_else(|| CnxctlCommandError::other("non-utf8 intent path"))?
+            .to_string();
+        let output = self.run_cnxctl(&["app", "apply", &intent_path]).await;
         let _ = fs::remove_file(&path);
         output
     }
@@ -1129,6 +1177,7 @@ impl ControlClient {
     async fn clear_relation_target(&self, target_id: String) -> anyhow::Result<serde_json::Value> {
         self.run_cnxctl(&["config", "relation-target-clear", &target_id])
             .await
+            .map_err(anyhow::Error::from)
     }
 
     async fn discover_route_plan_node_ids(&self) -> anyhow::Result<Vec<String>> {
@@ -1143,9 +1192,12 @@ impl ControlClient {
         Ok(node_ids)
     }
 
-    async fn run_cnxctl(&self, args: &[&str]) -> anyhow::Result<serde_json::Value> {
+    async fn run_cnxctl(&self, args: &[&str]) -> Result<serde_json::Value, CnxctlCommandError> {
         let bin = resolve_cnxctl_bin();
-        let output = Command::new(&bin)
+        let timeout = cnxctl_command_timeout();
+        let summary = cnxctl_command_summary(args);
+        let mut command = TokioCommand::new(&bin);
+        command
             .arg("--output")
             .arg("json")
             .arg("--socket")
@@ -1159,11 +1211,28 @@ impl ControlClient {
             .arg("--admin-sk-b64")
             .arg(&self.admin_sk_b64)
             .args(args)
-            .output()
-            .with_context(|| format!("spawn {} failed", bin.display()))?;
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(timeout, command.output())
+            .await
+            .map_err(|_| {
+                CnxctlCommandError::new(
+                    Some("child_timeout".to_string()),
+                    Some("runtime_admin".to_string()),
+                    format!("{} timed out after {}ms", summary, timeout.as_millis()),
+                )
+            })?
+            .map_err(|err| {
+                CnxctlCommandError::other(format!(
+                    "spawn {} via {} failed: {err}",
+                    summary,
+                    bin.display()
+                ))
+            })?;
         if output.status.success() {
-            let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
-                .context("parse cnxctl stdout json failed")?;
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&output.stdout).map_err(|err| {
+                    CnxctlCommandError::other(format!("parse cnxctl stdout json failed: {err}"))
+                })?;
             return Ok(parsed
                 .get("result")
                 .cloned()
@@ -1175,20 +1244,38 @@ impl ControlClient {
             String::from_utf8_lossy(&output.stderr).into_owned()
         };
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stderr) {
-            if let Some(message) = parsed
-                .get("error")
-                .and_then(|value| value.get("message"))
-                .and_then(serde_json::Value::as_str)
-            {
-                bail!(message.to_string());
+            if let Some(error) = CnxctlCommandError::from_cnxctl_json(&parsed) {
+                return Err(error);
             }
         }
-        bail!(
+        Err(CnxctlCommandError::other(format!(
             "{} failed with status {}: {}",
             bin.display(),
             output.status,
             stderr.trim()
-        );
+        )))
+    }
+}
+
+fn cnxctl_command_timeout() -> Duration {
+    std::env::var(CNXCTL_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_CNXCTL_COMMAND_TIMEOUT)
+}
+
+fn cnxctl_command_summary(args: &[&str]) -> String {
+    match args {
+        ["app", "apply", ..] => "cnxctl app apply".to_string(),
+        ["config", "dump"] => "cnxctl config dump".to_string(),
+        ["config", "relation-target-clear", ..] => {
+            "cnxctl config relation-target-clear".to_string()
+        }
+        [first, second, ..] => format!("cnxctl {first} {second}"),
+        [first] => format!("cnxctl {first}"),
+        [] => "cnxctl".to_string(),
     }
 }
 
@@ -1206,10 +1293,24 @@ fn resolve_socket_path(cli_path: Option<&str>) -> String {
 }
 
 fn resolve_cnxctl_bin() -> PathBuf {
-    if let Ok(path) = std::env::var("CNXCTL_BIN") {
+    let env_path = std::env::var("CNXCTL_BIN").ok();
+    let current_exe = std::env::current_exe().ok();
+    resolve_cnxctl_bin_from(env_path.as_deref(), current_exe.as_deref())
+}
+
+fn resolve_cnxctl_bin_from(env_path: Option<&str>, current_exe: Option<&Path>) -> PathBuf {
+    if let Some(path) = env_path {
         let path = PathBuf::from(path);
         if path.exists() {
             return path;
+        }
+    }
+    if let Some(current_exe) = current_exe {
+        if let Some(dir) = current_exe.parent() {
+            let sibling = dir.join("cnxctl");
+            if sibling.exists() {
+                return sibling;
+            }
         }
     }
     PathBuf::from("cnxctl")
@@ -1269,17 +1370,24 @@ fn write_runtime_admin_temp_file(
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiAuthArgs, ProductAuthConfig, RootEntry, build_auth_config, build_deploy_intent,
-        build_deploy_intent_for_roots, derive_route_plan_node_ids_from_config_dump,
-        load_deployed_auth_config, load_password_file, load_product_config, prepare_state_dir,
-        resolve_api_password, workspace_root,
+        ApiAuthArgs, ControlAuthArgs, ControlClient, ProductAuthConfig, RootEntry, RootsApplyArgs,
+        build_auth_config, build_deploy_intent, build_deploy_intent_for_roots,
+        derive_route_plan_node_ids_from_config_dump, load_password_file, load_product_config,
+        prepare_state_dir, resolve_api_password, resolve_cnxctl_bin_from, roots_apply,
+        workspace_root,
     };
     use fs_meta::source::config::RootSelector;
     use serde_json::json;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1441,6 +1549,41 @@ mod tests {
     }
 
     #[test]
+    fn cnxctl_resolution_prefers_env_then_fsmeta_sibling_then_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "fsmeta-cnxctl-resolution-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fsmeta = dir.join("fsmeta");
+        let sibling = dir.join("cnxctl");
+        let env_bin = dir.join("custom-cnxctl");
+        fs::write(&sibling, "").expect("write sibling cnxctl");
+        fs::write(&env_bin, "").expect("write env cnxctl");
+
+        assert_eq!(
+            resolve_cnxctl_bin_from(Some(env_bin.to_str().expect("utf8 env bin")), Some(&fsmeta)),
+            env_bin,
+            "CNXCTL_BIN should remain the explicit override"
+        );
+        assert_eq!(
+            resolve_cnxctl_bin_from(Some("/missing/cnxctl"), Some(&fsmeta)),
+            sibling,
+            "installed fsmeta should find cnxctl from the same bin directory without requiring PATH"
+        );
+        assert_eq!(
+            resolve_cnxctl_bin_from(Some("/missing/cnxctl"), Some(&dir.join("nested/fsmeta"))),
+            PathBuf::from("cnxctl"),
+            "PATH fallback remains available when no explicit or sibling binary exists"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn deploy_intent_uses_scope_worker_schema_and_shared_config_validation() {
         let path = unique_temp_path("deploy-intent-config");
         fs::write(
@@ -1527,6 +1670,19 @@ mod tests {
             assert_eq!(
                 module_path.and_then(serde_json::Value::as_str),
                 Some("/tmp/fs-meta-runtime.so")
+            );
+            let socket_dir = row
+                .get("socket_dir")
+                .and_then(serde_json::Value::as_str)
+                .expect("external worker config must carry a managed socket/log dir");
+            assert_eq!(
+                PathBuf::from(socket_dir),
+                dir.join("worker-runtime").join(role),
+                "external worker socket/log dir should live under deploy state dir"
+            );
+            assert!(
+                PathBuf::from(socket_dir).exists(),
+                "external worker socket/log dir must be created before deployment"
             );
         }
 
@@ -1621,23 +1777,215 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn roots_apply_config_requires_existing_deployed_auth_files() {
+    #[tokio::test]
+    async fn roots_apply_bounds_hung_child_cnxctl_app_apply_as_non_tx_busy() {
+        let _guard = ENV_LOCK.lock().expect("test env lock");
+        let dir = unique_temp_path("cnxctl-hang");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let cnxctl = dir.join("cnxctl");
+        fs::write(&cnxctl, "#!/bin/sh\nsleep 2\n").expect("write fake cnxctl");
+        let mut perms = fs::metadata(&cnxctl)
+            .expect("fake cnxctl metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&cnxctl, perms).expect("chmod fake cnxctl");
+        let previous_cnxctl = std::env::var_os("CNXCTL_BIN");
+        let previous_timeout = std::env::var_os("FSMETA_CNXCTL_TIMEOUT_MS");
+        unsafe {
+            std::env::set_var("CNXCTL_BIN", &cnxctl);
+            std::env::set_var("FSMETA_CNXCTL_TIMEOUT_MS", "50");
+        }
+
+        let client = ControlClient {
+            socket_path: "test.sock".to_string(),
+            actor_id: "tester".to_string(),
+            domain_id: "fsmeta-test".to_string(),
+            key_id: "test-key".to_string(),
+            admin_sk_b64: "redacted".to_string(),
+        };
+        let err = client
+            .run_cnxctl(&["app", "apply", "/tmp/fsmeta-intent-test.yaml"])
+            .await
+            .expect_err("hung cnxctl child must return a bounded timeout error");
+
+        unsafe {
+            match previous_cnxctl {
+                Some(value) => std::env::set_var("CNXCTL_BIN", value),
+                None => std::env::remove_var("CNXCTL_BIN"),
+            }
+            match previous_timeout {
+                Some(value) => std::env::set_var("FSMETA_CNXCTL_TIMEOUT_MS", value),
+                None => std::env::remove_var("FSMETA_CNXCTL_TIMEOUT_MS"),
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(err.code.as_deref(), Some("child_timeout"));
+        assert_eq!(err.category.as_deref(), Some("runtime_admin"));
+        assert!(
+            err.message.contains("cnxctl app apply timed out"),
+            "unexpected timeout message: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn roots_apply_config_does_not_submit_relation_target_intent_for_online_reconfiguration()
+    {
+        let _guard = ENV_LOCK.lock().expect("test env lock");
         let dir = std::env::temp_dir().join(format!(
-            "fsmeta-missing-auth-{}",
+            "fsmeta-roots-online-no-relation-target-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
+        let config_path = dir.join("fs-meta.yaml");
+        fs::write(
+            &config_path,
+            "api:\n  facade_resource_id: fs-meta-tcp-listener\n",
+        )
+        .expect("write product config");
+        let state_dir = dir.join(".fsmeta-state");
+        fs::create_dir_all(&state_dir).expect("create deployed state dir");
+        fs::write(
+            state_dir.join("fs-meta.passwd"),
+            "operator:x:1000:1000::/home/operator:/bin/bash\n",
+        )
+        .expect("write deployed passwd");
+        fs::write(
+            state_dir.join("fs-meta.shadow"),
+            "operator:plain$operator123:0\n",
+        )
+        .expect("write deployed shadow");
+        let roots_path = dir.join("roots.json");
+        fs::write(
+            &roots_path,
+            serde_json::to_string(&json!({
+                "roots": [{
+                    "id": "nfs-144",
+                    "selector": { "host_ref": "panda144" },
+                    "subpath_scope": "/",
+                    "watch": true,
+                    "scan": true
+                }]
+            }))
+            .expect("encode roots"),
+        )
+        .expect("write roots file");
 
-        let err =
-            load_deployed_auth_config(&dir).expect_err("missing deployed auth files must fail");
+        let cnxctl_marker = dir.join("cnxctl-app-apply-called");
+        let cnxctl = dir.join("cnxctl");
+        fs::write(
+            &cnxctl,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *\" config dump \"*) printf '%s\\n' '{{\"result\":{{\"announced_resources\":[{{\"node_id\":\"panda144\"}}],\"management_peers\":[]}}}}' ;;\n  *\" app apply \"*) printf 'called\\n' >> '{}' ; printf '%s\\n' '{{\"result\":{{\"ok\":true}}}}' ;;\n  *) printf '%s\\n' '{{\"result\":{{\"ok\":true}}}}' ;;\nesac\n",
+                cnxctl_marker.display()
+            ),
+        )
+        .expect("write fake cnxctl");
+        let mut perms = fs::metadata(&cnxctl)
+            .expect("fake cnxctl metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&cnxctl, perms).expect("chmod fake cnxctl");
 
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test api");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("test api local addr")
+        );
+        let api_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0_u8; 8192];
+                let Ok(n) = stream.read(&mut buf).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, body) = match path {
+                    "/api/fs-meta/v1/session/login" => (
+                        "200 OK",
+                        json!({
+                            "token": "test-token",
+                            "expires_in_secs": 3600,
+                            "user": {"username": "operator"}
+                        }),
+                    ),
+                    "/api/fs-meta/v1/monitoring/roots/preview" => (
+                        "200 OK",
+                        json!({
+                            "preview": [{"id": "nfs-144"}],
+                            "unmatched_roots": []
+                        }),
+                    ),
+                    "/api/fs-meta/v1/monitoring/roots" => ("200 OK", json!({"roots_count": 1})),
+                    _ => (
+                        "404 Not Found",
+                        json!({"error": format!("unexpected {path}")}),
+                    ),
+                };
+                let body = serde_json::to_string(&body).expect("encode response");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let previous_cnxctl = std::env::var_os("CNXCTL_BIN");
+        unsafe {
+            std::env::set_var("CNXCTL_BIN", &cnxctl);
+        }
+        let result = roots_apply(RootsApplyArgs {
+            api: ApiAuthArgs {
+                api_base,
+                token: None,
+                username: Some("operator".to_string()),
+                password: Some("operator123".to_string()),
+                password_file: None,
+            },
+            control: ControlAuthArgs {
+                socket: Some("test.sock".to_string()),
+                actor_id: Some("tester".to_string()),
+                domain_id: "fsmeta-test".to_string(),
+                key_id: "test-key".to_string(),
+                admin_sk_b64: Some("redacted".to_string()),
+            },
+            file: roots_path,
+            config: Some(config_path),
+        })
+        .await
+        .expect("roots apply --config should succeed through management API");
+        unsafe {
+            match previous_cnxctl {
+                Some(value) => std::env::set_var("CNXCTL_BIN", value),
+                None => std::env::remove_var("CNXCTL_BIN"),
+            }
+        }
+        api_task.abort();
+
+        assert_eq!(result["status"], json!("ok"));
+        assert_eq!(result["roots_count"], json!(1));
+        assert_eq!(
+            result["runtime_apply"]["mode"],
+            json!("management_api_only"),
+            "online roots apply should report management-API-only reconfiguration"
+        );
         assert!(
-            format!("{err:#}").contains("deployed fs-meta auth files are missing"),
-            "unexpected error: {err:#}"
+            !cnxctl_marker.exists(),
+            "roots apply --config must not submit a relation-target intent that can change the fs-meta manifest config fingerprint"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -1715,6 +2063,10 @@ mod tests {
             assert!(
                 row.get("startup").is_none(),
                 "embedded source mode must not emit startup.path"
+            );
+            assert!(
+                row.get("socket_dir").is_none(),
+                "embedded source mode must not emit worker socket_dir"
             );
         }
 
