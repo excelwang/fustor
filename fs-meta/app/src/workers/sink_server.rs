@@ -299,6 +299,65 @@ fn summarize_sink_snapshot_groups(snapshot: &crate::sink::SinkStatusSnapshot) ->
         .collect()
 }
 
+fn annotate_sink_status_snapshot_with_worker_stats(
+    snapshot: &mut crate::sink::SinkStatusSnapshot,
+    state: &SinkWorkerState,
+) {
+    if let Some(node_id) = state.node_id.as_ref() {
+        let (
+            received_batches,
+            received_events,
+            received_control,
+            received_data,
+            last_received_at_us,
+            last_received_origins,
+            received_origin_counts,
+        ) = received_stats_snapshot(&state.received_stats);
+        snapshot.last_control_frame_signals_by_node = if state.last_control_frame_signals.is_empty()
+        {
+            std::collections::BTreeMap::new()
+        } else {
+            std::collections::BTreeMap::from([(
+                node_id.0.clone(),
+                state.last_control_frame_signals.clone(),
+            )])
+        };
+        snapshot.received_batches_by_node = if received_batches == 0 {
+            std::collections::BTreeMap::new()
+        } else {
+            std::collections::BTreeMap::from([(node_id.0.clone(), received_batches)])
+        };
+        snapshot.received_events_by_node = if received_events == 0 {
+            std::collections::BTreeMap::new()
+        } else {
+            std::collections::BTreeMap::from([(node_id.0.clone(), received_events)])
+        };
+        snapshot.received_control_events_by_node = if received_control == 0 {
+            std::collections::BTreeMap::new()
+        } else {
+            std::collections::BTreeMap::from([(node_id.0.clone(), received_control)])
+        };
+        snapshot.received_data_events_by_node = if received_data == 0 {
+            std::collections::BTreeMap::new()
+        } else {
+            std::collections::BTreeMap::from([(node_id.0.clone(), received_data)])
+        };
+        snapshot.last_received_at_us_by_node = last_received_at_us
+            .map(|value| std::collections::BTreeMap::from([(node_id.0.clone(), value)]))
+            .unwrap_or_default();
+        snapshot.last_received_origins_by_node = if last_received_origins.is_empty() {
+            std::collections::BTreeMap::new()
+        } else {
+            std::collections::BTreeMap::from([(node_id.0.clone(), last_received_origins)])
+        };
+        snapshot.received_origin_counts_by_node = if received_origin_counts.is_empty() {
+            std::collections::BTreeMap::new()
+        } else {
+            std::collections::BTreeMap::from([(node_id.0.clone(), received_origin_counts)])
+        };
+    }
+}
+
 async fn stop_sink_runtime(state: &mut SinkWorkerState) {
     bootstrap_stop_sink_runtime(state).await;
     state.pending_init = None;
@@ -541,75 +600,20 @@ fn plan_worker_request(
         SinkWorkerRequest::StatusSnapshot => match state.sink.as_ref() {
             Some(sink) => match sink.status_snapshot_with_failure() {
                 Ok(mut snapshot) => {
-                    if let Some(node_id) = state.node_id.as_ref() {
-                        let (
-                            received_batches,
-                            received_events,
-                            received_control,
-                            received_data,
-                            last_received_at_us,
-                            last_received_origins,
-                            received_origin_counts,
-                        ) = received_stats_snapshot(&state.received_stats);
-                        snapshot.last_control_frame_signals_by_node =
-                            if state.last_control_frame_signals.is_empty() {
-                                std::collections::BTreeMap::new()
-                            } else {
-                                std::collections::BTreeMap::from([(
-                                    node_id.0.clone(),
-                                    state.last_control_frame_signals.clone(),
-                                )])
-                            };
-                        snapshot.received_batches_by_node = if received_batches == 0 {
-                            std::collections::BTreeMap::new()
-                        } else {
-                            std::collections::BTreeMap::from([(
-                                node_id.0.clone(),
-                                received_batches,
-                            )])
-                        };
-                        snapshot.received_events_by_node = if received_events == 0 {
-                            std::collections::BTreeMap::new()
-                        } else {
-                            std::collections::BTreeMap::from([(node_id.0.clone(), received_events)])
-                        };
-                        snapshot.received_control_events_by_node = if received_control == 0 {
-                            std::collections::BTreeMap::new()
-                        } else {
-                            std::collections::BTreeMap::from([(
-                                node_id.0.clone(),
-                                received_control,
-                            )])
-                        };
-                        snapshot.received_data_events_by_node = if received_data == 0 {
-                            std::collections::BTreeMap::new()
-                        } else {
-                            std::collections::BTreeMap::from([(node_id.0.clone(), received_data)])
-                        };
-                        snapshot.last_received_at_us_by_node = last_received_at_us
-                            .map(|value| {
-                                std::collections::BTreeMap::from([(node_id.0.clone(), value)])
-                            })
-                            .unwrap_or_default();
-                        snapshot.last_received_origins_by_node = if last_received_origins.is_empty()
-                        {
-                            std::collections::BTreeMap::new()
-                        } else {
-                            std::collections::BTreeMap::from([(
-                                node_id.0.clone(),
-                                last_received_origins,
-                            )])
-                        };
-                        snapshot.received_origin_counts_by_node =
-                            if received_origin_counts.is_empty() {
-                                std::collections::BTreeMap::new()
-                            } else {
-                                std::collections::BTreeMap::from([(
-                                    node_id.0.clone(),
-                                    received_origin_counts,
-                                )])
-                            };
-                    }
+                    annotate_sink_status_snapshot_with_worker_stats(&mut snapshot, state);
+                    SinkWorkerAction::Immediate(SinkWorkerResponse::StatusSnapshot(snapshot), false)
+                }
+                Err(err) => SinkWorkerAction::Immediate(classify_sink_worker_failure(err), false),
+            },
+            None => SinkWorkerAction::Immediate(
+                SinkWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
+        SinkWorkerRequest::StatusSnapshotForRoute { route_key } => match state.sink.as_ref() {
+            Some(sink) => match sink.status_snapshot_for_route_with_failure(&route_key) {
+                Ok(mut snapshot) => {
+                    annotate_sink_status_snapshot_with_worker_stats(&mut snapshot, state);
                     SinkWorkerAction::Immediate(SinkWorkerResponse::StatusSnapshot(snapshot), false)
                 }
                 Err(err) => SinkWorkerAction::Immediate(classify_sink_worker_failure(err), false),

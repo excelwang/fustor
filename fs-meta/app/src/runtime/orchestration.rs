@@ -82,8 +82,14 @@ pub(crate) struct LogicalRootsControlPayload {
     pub roots: Vec<RootSpec>,
     #[serde(default)]
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub defer_scan_audit: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sink_replay_envelopes: Vec<ControlEnvelope>,
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[allow(dead_code)]
@@ -102,14 +108,42 @@ pub(crate) fn encode_logical_roots_control_payload_with_generation(
     )
 }
 
+pub(crate) fn encode_logical_roots_control_payload_with_generation_and_defer_scan_audit(
+    roots: &[RootSpec],
+    generation: u64,
+    defer_scan_audit: bool,
+) -> Result<Vec<u8>> {
+    encode_logical_roots_control_payload_with_generation_sink_replay_and_defer_scan_audit(
+        roots,
+        generation,
+        Vec::new(),
+        defer_scan_audit,
+    )
+}
+
 pub(crate) fn encode_logical_roots_control_payload_with_generation_and_sink_replay(
     roots: &[RootSpec],
     generation: u64,
     sink_replay_envelopes: Vec<ControlEnvelope>,
 ) -> Result<Vec<u8>> {
+    encode_logical_roots_control_payload_with_generation_sink_replay_and_defer_scan_audit(
+        roots,
+        generation,
+        sink_replay_envelopes,
+        false,
+    )
+}
+
+fn encode_logical_roots_control_payload_with_generation_sink_replay_and_defer_scan_audit(
+    roots: &[RootSpec],
+    generation: u64,
+    sink_replay_envelopes: Vec<ControlEnvelope>,
+    defer_scan_audit: bool,
+) -> Result<Vec<u8>> {
     rmp_serde::to_vec_named(&LogicalRootsControlPayload {
         roots: roots.to_vec(),
         generation,
+        defer_scan_audit,
         sink_replay_envelopes,
     })
     .map_err(|err| {

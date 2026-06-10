@@ -30,6 +30,9 @@ pub enum SinkWorkerRequest {
     ScheduledGroupIds,
     Health,
     StatusSnapshot,
+    StatusSnapshotForRoute {
+        route_key: String,
+    },
     VisibilityLagSamplesSince {
         since_us: u64,
     },

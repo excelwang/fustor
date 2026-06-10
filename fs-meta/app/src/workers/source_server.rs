@@ -120,6 +120,7 @@ enum SourceWorkerAction {
     UpdateLogicalRoots {
         source: Arc<FSMetaSource>,
         roots: Vec<crate::source::config::RootSpec>,
+        defer_scan_audit: bool,
     },
     PublishManualRescanSignal {
         source: Arc<FSMetaSource>,
@@ -128,6 +129,9 @@ enum SourceWorkerAction {
         source: Arc<FSMetaSource>,
     },
     TriggerRescanWhenReadyEpoch {
+        source: Arc<FSMetaSource>,
+    },
+    OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch {
         source: Arc<FSMetaSource>,
     },
     SubmitTargetedRescanRequestEpoch {
@@ -172,6 +176,9 @@ fn is_transient_logical_roots_fenced_write_error(err: &CnxError) -> bool {
 fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
     match request {
         SourceWorkerRequest::UpdateLogicalRoots { .. } => "UpdateLogicalRoots",
+        SourceWorkerRequest::UpdateLogicalRootsDeferScanAudit { .. } => {
+            "UpdateLogicalRootsDeferScanAudit"
+        }
         SourceWorkerRequest::LogicalRootsSnapshot => "LogicalRootsSnapshot",
         SourceWorkerRequest::LogicalRootsGenerationSnapshot => "LogicalRootsGenerationSnapshot",
         SourceWorkerRequest::HostObjectGrantsSnapshot => "HostObjectGrantsSnapshot",
@@ -195,6 +202,9 @@ fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
         SourceWorkerRequest::SubmitRescanRequestEpoch => "SubmitRescanRequestEpoch",
         SourceWorkerRequest::SubmitTargetedRescanRequestEpoch => "SubmitTargetedRescanRequestEpoch",
         SourceWorkerRequest::TriggerRescanWhenReadyEpoch => "TriggerRescanWhenReadyEpoch",
+        SourceWorkerRequest::OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch => {
+            "OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch"
+        }
         SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch => {
             "TriggerTargetedRescanWhenReadyEpoch"
         }
@@ -668,6 +678,9 @@ where
             }
             record_summarized_path_stats(&published_stats, &publish_update);
             update_published_stats(&published_stats, &publish_update);
+            if let Some(source) = source.as_ref() {
+                source.record_batch_downstream_accepted(&batch);
+            }
             if let Some(summary) = &summary {
                 eprintln!(
                     "fs_meta_source_worker_server: publish_batch ok origin={} {}",
@@ -760,10 +773,12 @@ fn request_requires_live_publish_pump(request: &SourceWorkerRequest) -> bool {
     matches!(
         request,
         SourceWorkerRequest::UpdateLogicalRoots { .. }
+            | SourceWorkerRequest::UpdateLogicalRootsDeferScanAudit { .. }
             | SourceWorkerRequest::PublishManualRescanSignal
             | SourceWorkerRequest::SubmitRescanRequestEpoch
             | SourceWorkerRequest::SubmitTargetedRescanRequestEpoch
             | SourceWorkerRequest::TriggerRescanWhenReadyEpoch
+            | SourceWorkerRequest::OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch
             | SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch
             | SourceWorkerRequest::CheckTargetedRescanDeliveryAcceptance
             | SourceWorkerRequest::AcceptTargetedRescanDelivery
@@ -976,12 +991,29 @@ fn plan_worker_request(
 ) -> SourceWorkerAction {
     match request {
         SourceWorkerRequest::UpdateLogicalRoots { roots } => match state.source.clone() {
-            Some(source) => SourceWorkerAction::UpdateLogicalRoots { source, roots },
+            Some(source) => SourceWorkerAction::UpdateLogicalRoots {
+                source,
+                roots,
+                defer_scan_audit: false,
+            },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
+        SourceWorkerRequest::UpdateLogicalRootsDeferScanAudit { roots } => {
+            match state.source.clone() {
+                Some(source) => SourceWorkerAction::UpdateLogicalRoots {
+                    source,
+                    roots,
+                    defer_scan_audit: true,
+                },
+                None => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::Error("worker not initialized".into()),
+                    false,
+                ),
+            }
+        }
         SourceWorkerRequest::LogicalRootsSnapshot => match state.source.as_ref() {
             Some(source) => match source.logical_roots_snapshot_with_failure() {
                 Ok(roots) => {
@@ -1291,6 +1323,19 @@ fn plan_worker_request(
                 false,
             ),
         },
+        SourceWorkerRequest::OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch => {
+            match state.source.clone() {
+                Some(source) => {
+                    SourceWorkerAction::OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch {
+                        source,
+                    }
+                }
+                None => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::Error("worker not initialized".into()),
+                    false,
+                ),
+            }
+        }
         SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch => match state.source.clone() {
             Some(source) => SourceWorkerAction::TriggerTargetedRescanWhenReadyEpoch { source },
             None => SourceWorkerAction::Immediate(
@@ -1381,18 +1426,29 @@ async fn execute_worker_action(
                 Err(err) => (classify_source_worker_error(err), false, None),
             }
         }
-        SourceWorkerAction::UpdateLogicalRoots { source, roots } => {
+        SourceWorkerAction::UpdateLogicalRoots {
+            source,
+            roots,
+            defer_scan_audit,
+        } => {
             eprintln!(
-                "fs_meta_source_worker_server: update_logical_roots begin roots={}",
-                roots.len()
+                "fs_meta_source_worker_server: update_logical_roots begin roots={} defer_scan_audit={}",
+                roots.len(),
+                defer_scan_audit,
             );
             let deadline =
                 tokio::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_FENCED_RETRY_TIMEOUT;
             loop {
-                match source
-                    .update_logical_roots_with_failure(roots.clone())
-                    .await
-                {
+                let update_result = if defer_scan_audit {
+                    source
+                        .update_logical_roots_defer_scan_audit_with_failure(roots.clone())
+                        .await
+                } else {
+                    source
+                        .update_logical_roots_with_failure(roots.clone())
+                        .await
+                };
+                match update_result {
                     Ok(_) => {
                         eprintln!("fs_meta_source_worker_server: update_logical_roots ok");
                         return (SourceWorkerResponse::Ack, false, None);
@@ -1435,6 +1491,16 @@ async fn execute_worker_action(
             match source.submit_rescan_request_epoch_with_failure() {
                 Ok(epoch) => (SourceWorkerResponse::RescanRequestEpoch(epoch), false, None),
                 Err(err) => (classify_source_worker_failure(err), false, None),
+            }
+        }
+        SourceWorkerAction::OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch { source } => {
+            if source.open_scan_audit_admission_if_closed() {
+                match source.submit_rescan_request_epoch_with_failure() {
+                    Ok(epoch) => (SourceWorkerResponse::RescanRequestEpoch(epoch), false, None),
+                    Err(err) => (classify_source_worker_failure(err), false, None),
+                }
+            } else {
+                (SourceWorkerResponse::RescanRequestEpoch(0), false, None)
             }
         }
         SourceWorkerAction::SubmitTargetedRescanRequestEpoch { source } => {
@@ -3662,6 +3728,36 @@ mod tests {
         assert!(
             matches!(non_target_reply, Err(CnxError::Timeout)),
             "source worker runtime must not own peer scoped source-status drains: {non_target_reply:?}"
+        );
+
+        let generic_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+        boundary
+            .channel_send(
+                BoundaryContext::default(),
+                ChannelSendRequest {
+                    channel_key: ChannelKey(generic_status_route.clone()),
+                    events: vec![Event::new(
+                        EventMetadata {
+                            origin_id: NodeId("api-node".to_string()),
+                            timestamp_us: 0,
+                            logical_ts: None,
+                            correlation_id: Some(79),
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        crate::query::api::manual_rescan_source_status_request_payload(),
+                    )],
+                    timeout_ms: Some(100),
+                },
+            )
+            .await
+            .expect("send generic source status request");
+        let generic_reply = boundary
+            .recv_route(&format!("{generic_status_route}:reply"), 100)
+            .await;
+        assert!(
+            matches!(generic_reply, Err(CnxError::Timeout)),
+            "source worker runtime must leave generic source-status to the app proxy in worker-backed mode: {generic_reply:?}"
         );
 
         session

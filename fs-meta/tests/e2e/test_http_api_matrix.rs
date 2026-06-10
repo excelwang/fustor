@@ -3228,7 +3228,12 @@ fn validate_active_three_status_materialization(
 
     validate_active_three_source_audit_complete(status, expected, &mut blockers)?;
     validate_active_three_sink_materialized(status, expected, &mut blockers)?;
-    validate_active_three_publish_receive_transport(status, expected, &active_nodes, &mut blockers)?;
+    validate_active_three_publish_receive_transport(
+        status,
+        expected,
+        &active_nodes,
+        &mut blockers,
+    )?;
 
     if blockers.is_empty() {
         Ok(())
@@ -3305,9 +3310,7 @@ fn validate_active_three_source_audit_complete(
                 root.get("participation_state")
             ));
         }
-        let started = root
-            .get("last_audit_started_at_us")
-            .and_then(Value::as_u64);
+        let started = root.get("last_audit_started_at_us").and_then(Value::as_u64);
         let completed = root
             .get("last_audit_completed_at_us")
             .and_then(Value::as_u64);
@@ -3364,7 +3367,9 @@ fn validate_active_three_sink_materialized(
             .and_then(Value::as_bool)
             != Some(true)
         {
-            blockers.push(format!("sink group {group_id} initial audit is not complete"));
+            blockers.push(format!(
+                "sink group {group_id} initial audit is not complete"
+            ));
         }
         if group
             .get("materialization_readiness")

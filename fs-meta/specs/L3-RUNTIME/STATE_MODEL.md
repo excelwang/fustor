@@ -174,6 +174,10 @@ QueryObservationState =
 2. timeout and backpressure are observation evidence and MUST be visible as degraded, partial, or not-ready status.
 3. repeated timeout for a root or group MUST produce degraded reason `HOST_FS_TIMEOUT`; repeated backpressure MUST produce degraded reason `HOST_FS_BACKPRESSURE`.
 4. unbounded thread spawning is not an acceptable routine policy for handling slow host-fs operations.
+5. scan/audit publication backpressure is valid flow-control evidence: source MUST bound scan/audit read-ahead and let downstream sink/channel pressure throttle scan/audit concurrency/admission state instead of hiding it in unbounded source-side buffers.
+6. source MUST NOT advance scan/audit progress or release source-side scan/audit concurrency as if a batch were downstream-accepted while that batch is only waiting in an unbounded or fairness-only publication buffer.
+7. realtime watch ingestion is a separate evidence lane. Backpressure from the scan/audit publication lane MUST NOT block host watch event ingestion or force realtime events to wait behind scan/audit backlog.
+8. if realtime watch publication itself is full or unavailable, fs-meta MUST surface explicit overflow/backpressure evidence and keep trusted materialized readiness closed until audit/repair recovery evidence arrives; silent loss with trusted readiness is not an allowed state transition, and the host watch loop MUST NOT be blocked on sink progress as the recovery mechanism.
 
 ## [state-machine] FacadeServiceState
 

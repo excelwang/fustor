@@ -1,9 +1,9 @@
 use super::*;
-use crate::ControlEvent;
 use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
 use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID};
 use crate::runtime::orchestration::{
     encode_logical_roots_control_payload_with_generation,
+    encode_logical_roots_control_payload_with_generation_and_defer_scan_audit,
     encode_manual_rescan_envelope_with_request_id_and_scoped_target_acceptance_timeout,
     encode_manual_rescan_envelope_with_scoped_target_acceptance_timeout,
 };
@@ -15,6 +15,7 @@ use crate::runtime::routes::{
 };
 use crate::sink::SinkFileMeta;
 use crate::state::cell::LogicalRootsCell;
+use crate::{ControlEvent, SyncTrack};
 use bytes::Bytes;
 use capanix_app_sdk::runtime::ControlEnvelope;
 use capanix_app_sdk::runtime::RouteKey;
@@ -510,6 +511,33 @@ fn mk_source_record_event(origin: &str, path: &[u8], file_name: &[u8], ts: u64) 
             trace: None,
         },
         bytes::Bytes::from(rmp_serde::to_vec_named(&record).expect("encode source record event")),
+    )
+}
+
+fn mk_realtime_record_event(origin: &str, path: &[u8], file_name: &[u8], ts: u64) -> Event {
+    let record = FileMetaRecord::realtime_update(
+        path.to_vec(),
+        file_name.to_vec(),
+        capanix_host_fs_types::UnixStat {
+            is_dir: false,
+            size: 1,
+            mtime_us: ts,
+            ctime_us: ts,
+            dev: None,
+            ino: None,
+        },
+        true,
+    );
+    Event::new(
+        EventMetadata {
+            origin_id: NodeId(origin.to_string()),
+            timestamp_us: ts,
+            logical_ts: None,
+            correlation_id: None,
+            ingress_auth: None,
+            trace: None,
+        },
+        bytes::Bytes::from(rmp_serde::to_vec_named(&record).expect("encode realtime record event")),
     )
 }
 
@@ -2343,6 +2371,126 @@ async fn roots_control_stream_persists_authoritative_roots_for_followup_status_a
         !changed,
         "once roots-control applies the authoritative declaration locally, followup status/force-find sync should not observe stale logical-root drift",
     );
+}
+
+#[tokio::test]
+async fn roots_control_stream_defer_scan_audit_waits_for_explicit_admission_release() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 root");
+    std::fs::write(nfs1.join("ready.txt"), b"ready").expect("seed nfs1 source file");
+
+    let state_boundary = in_memory_state_boundary();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = Vec::new();
+    cfg.host_object_grants = vec![test_export(
+        "node-a::nfs1",
+        "node-a",
+        "10.0.0.11",
+        nfs1.clone(),
+        true,
+    )];
+
+    let source = FSMetaSource::with_boundaries_and_state(
+        cfg,
+        NodeId("node-a".to_string()),
+        None,
+        state_boundary,
+    )
+    .expect("build source");
+    let mut stream = source.pub_().await.expect("start source pub stream");
+
+    let route_key = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let mut deferred_root = RootSpec::new("nfs1", nfs1.clone());
+    deferred_root.watch = false;
+    let payload = encode_logical_roots_control_payload_with_generation_and_defer_scan_audit(
+        &[deferred_root],
+        1,
+        true,
+    )
+    .expect("encode deferred logical-roots control payload");
+    let boundary = Arc::new(SingleRootsControlEventBoundary::new(
+        route_key.clone(),
+        payload,
+    ));
+
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("start runtime endpoints");
+    source
+        .on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
+                route_key,
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            },
+        ))
+        .expect("encode source roots-control activate")])
+        .await
+        .expect("activate source roots-control route");
+
+    let applied_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let root_ids = source
+            .logical_roots_snapshot()
+            .into_iter()
+            .map(|root| root.id)
+            .collect::<Vec<_>>();
+        if boundary.delivered() && root_ids == vec!["nfs1".to_string()] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < applied_deadline,
+            "deferred roots-control should update logical roots before timeout; delivered={} logical_roots={root_ids:?}",
+            boundary.delivered(),
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), stream.next())
+            .await
+            .is_err(),
+        "deferred source roots-control must not let initial scan/audit publish before sink-scope admission release"
+    );
+
+    assert!(
+        source.open_scan_audit_admission_if_closed(),
+        "test must reopen a previously closed scan/audit admission gate"
+    );
+    let _ = source.perform_trigger_rescan_when_ready_epoch().await;
+
+    let scan_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut data_events = 0_usize;
+    while tokio::time::Instant::now() < scan_deadline {
+        let batch = match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => panic!("pub stream should remain open"),
+            Err(_) => continue,
+        };
+        data_events += batch
+            .iter()
+            .filter(|event| rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_err())
+            .count();
+        if data_events > 0 {
+            break;
+        }
+    }
+
+    assert!(
+        data_events > 0,
+        "source scan/audit should publish after explicit admission release"
+    );
+
+    source.close().await.expect("close source");
 }
 
 #[tokio::test]
@@ -5798,6 +5946,8 @@ async fn slow_watch_setup_does_not_block_initial_scan_stream() {
         Arc::new(Mutex::new(HashMap::new())),
         tokio::sync::watch::channel(0).1,
         root_key,
+        None,
+        Arc::new(AtomicBool::new(true)),
     )
     .await
     .expect("root stream should start");
@@ -5906,6 +6056,8 @@ async fn initial_scan_waits_for_late_scan_enabled_group_primary_ownership() {
         Arc::new(Mutex::new(HashMap::new())),
         tokio::sync::watch::channel(0).1,
         root_key,
+        None,
+        Arc::new(AtomicBool::new(true)),
     )
     .await
     .expect("root stream should start before primary ownership is visible");
@@ -6407,6 +6559,193 @@ async fn current_pub_stream_preserves_mixed_origin_target_membership_once_batch_
 }
 
 #[tokio::test]
+async fn current_pub_stream_yield_does_not_advance_publication_progress_before_downstream_accept() {
+    let source = build_source(vec![test_export(
+        "node-a::nfs1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )]);
+    let request_epoch = source.state_cell.begin_rescan_request_epoch(0, 0, 0);
+    let (tx, rx) = mpsc::channel::<Vec<Event>>(4);
+    let (realtime_tx, realtime_rx) = mpsc::channel::<Vec<Event>>(4);
+    *lock_or_recover(
+        &source.state_cell.stream_binding,
+        "test.current_pub_stream_progress.stream_binding",
+    ) = Some(SourceStreamBinding {
+        generation: 11,
+        tx: tx.clone(),
+        rx: Arc::new(AsyncMutex::new(rx)),
+        realtime_tx,
+        realtime_rx: Arc::new(AsyncMutex::new(realtime_rx)),
+    });
+    let mut stream = source.pub_().await.expect("start source pub stream");
+    let batch = vec![mk_source_record_event(
+        "node-a::nfs1",
+        b"/bounded-backpressure.txt",
+        b"bounded-backpressure.txt",
+        123,
+    )];
+    tx.send(batch.clone())
+        .await
+        .expect("enqueue source output batch");
+
+    let yielded = tokio::time::timeout(Duration::from_millis(250), stream.next())
+        .await
+        .expect("pub stream should yield injected batch")
+        .expect("pub stream batch");
+    assert_eq!(
+        event_origin_ids(&yielded),
+        BTreeSet::from(["node-a::nfs1".to_string()])
+    );
+    let before_accept = source.progress_snapshot();
+    assert!(
+        !before_accept
+            .published_expected_groups_since(request_epoch, &BTreeSet::from(["nfs1".to_string()])),
+        "source progress must not advance merely because pub_() yielded a scan/audit batch before downstream acceptance: {before_accept:?}"
+    );
+
+    source.record_batch_downstream_accepted(&yielded);
+    let after_accept = source.progress_snapshot();
+    source.close().await.expect("close source");
+    assert!(
+        after_accept
+            .published_expected_groups_since(request_epoch, &BTreeSet::from(["nfs1".to_string()])),
+        "source progress should advance after runtime/sink downstream acceptance: {after_accept:?}"
+    );
+}
+
+#[tokio::test]
+async fn current_pub_stream_read_ahead_is_bounded_by_backpressure_window() {
+    let source =
+        FSMetaSource::with_boundaries(SourceConfig::default(), NodeId("node-a".to_string()), None)
+            .expect("init source");
+    let channel_capacity = SOURCE_PUB_STREAM_PENDING_BATCH_LIMIT + 1;
+    let (tx, rx) = mpsc::channel::<Vec<Event>>(channel_capacity);
+    let (realtime_tx, realtime_rx) = mpsc::channel::<Vec<Event>>(channel_capacity);
+    *lock_or_recover(
+        &source.state_cell.stream_binding,
+        "test.current_pub_stream_bounded.stream_binding",
+    ) = Some(SourceStreamBinding {
+        generation: 7,
+        tx: tx.clone(),
+        rx: Arc::new(AsyncMutex::new(rx)),
+        realtime_tx,
+        realtime_rx: Arc::new(AsyncMutex::new(realtime_rx)),
+    });
+    let mut stream = source.pub_().await.expect("start source pub stream");
+
+    for ts in 1..=(channel_capacity as u64) {
+        tx.send(vec![mk_source_record_event(
+            "node-a::nfs1",
+            b"/bounded-backpressure.txt",
+            b"bounded-backpressure.txt",
+            ts,
+        )])
+        .await
+        .expect("fill source output channel");
+    }
+    assert_eq!(tx.capacity(), 0, "precondition: source output channel full");
+
+    let first = tokio::time::timeout(Duration::from_millis(250), stream.next())
+        .await
+        .expect("first pub stream batch should be yielded")
+        .expect("pub stream should yield first batch");
+    assert_eq!(
+        event_origin_ids(&first),
+        BTreeSet::from(["node-a::nfs1".to_string()])
+    );
+
+    let remaining_capacity = tx.capacity();
+    source.close().await.expect("close source");
+
+    assert!(
+        remaining_capacity < channel_capacity,
+        "pub_() must not drain the whole bounded source output channel into an unbounded internal fairness queue after a single downstream poll: remaining_capacity={remaining_capacity} channel_capacity={channel_capacity}"
+    );
+}
+
+#[tokio::test]
+async fn current_pub_stream_realtime_lane_bypasses_scan_backpressure_window() {
+    let source =
+        FSMetaSource::with_boundaries(SourceConfig::default(), NodeId("node-a".to_string()), None)
+            .expect("init source");
+    let channel_capacity = SOURCE_PUB_STREAM_PENDING_BATCH_LIMIT + 1;
+    let (scan_tx, scan_rx) = mpsc::channel::<Vec<Event>>(channel_capacity);
+    let (realtime_tx, realtime_rx) = mpsc::channel::<Vec<Event>>(channel_capacity);
+    *lock_or_recover(
+        &source.state_cell.stream_binding,
+        "test.current_pub_stream_realtime_bypass.stream_binding",
+    ) = Some(SourceStreamBinding {
+        generation: 8,
+        tx: scan_tx.clone(),
+        rx: Arc::new(AsyncMutex::new(scan_rx)),
+        realtime_tx: realtime_tx.clone(),
+        realtime_rx: Arc::new(AsyncMutex::new(realtime_rx)),
+    });
+    let mut stream = source.pub_().await.expect("start source pub stream");
+
+    for ts in 1..=(channel_capacity as u64) {
+        scan_tx
+            .send(vec![mk_source_record_event(
+                "node-a::nfs1",
+                b"/scan-backlog.txt",
+                b"scan-backlog.txt",
+                ts,
+            )])
+            .await
+            .expect("fill scan output channel");
+    }
+    assert_eq!(
+        scan_tx.capacity(),
+        0,
+        "precondition: scan output channel full"
+    );
+
+    let first = tokio::time::timeout(Duration::from_millis(250), stream.next())
+        .await
+        .expect("first pub stream batch should be yielded")
+        .expect("pub stream should yield first scan batch");
+    assert_eq!(
+        event_origin_ids(&first),
+        BTreeSet::from(["node-a::nfs1".to_string()])
+    );
+
+    realtime_tx
+        .send(vec![mk_realtime_record_event(
+            "node-a::nfs2",
+            b"/watch-update.txt",
+            b"watch-update.txt",
+            99_000,
+        )])
+        .await
+        .expect("enqueue realtime watch batch");
+
+    let next = tokio::time::timeout(Duration::from_millis(250), stream.next())
+        .await
+        .expect("realtime pub stream batch should not wait behind scan backlog")
+        .expect("pub stream should yield realtime batch");
+    let record = rmp_serde::from_slice::<FileMetaRecord>(
+        next.first()
+            .expect("realtime batch has event")
+            .payload_bytes(),
+    )
+    .expect("decode realtime record");
+    assert_eq!(
+        record.source,
+        SyncTrack::Realtime,
+        "realtime watch batch must bypass queued scan/audit batches"
+    );
+    assert_eq!(
+        event_origin_ids(&next),
+        BTreeSet::from(["node-a::nfs2".to_string()])
+    );
+
+    source.close().await.expect("close source");
+}
+
+#[tokio::test]
 async fn current_pub_stream_surfaces_ready_later_origin_within_bounded_fairness_window() {
     let previous = std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE").ok();
     unsafe {
@@ -6874,6 +7213,7 @@ async fn reconcile_root_tasks_falls_back_to_controlled_replace_when_candidate_ne
     stale_signature.watch = !desired_signature.watch;
 
     let (out_tx, out_rx) = mpsc::channel::<Vec<Event>>(16);
+    let (realtime_tx, realtime_rx) = mpsc::channel::<Vec<Event>>(16);
     *lock_or_recover(
         &source.state_cell.stream_binding,
         "test.fallback.stream_binding",
@@ -6881,6 +7221,8 @@ async fn reconcile_root_tasks_falls_back_to_controlled_replace_when_candidate_ne
         generation: 4,
         tx: out_tx,
         rx: Arc::new(AsyncMutex::new(out_rx)),
+        realtime_tx,
+        realtime_rx: Arc::new(AsyncMutex::new(realtime_rx)),
     });
     source
         .state_cell

@@ -1017,11 +1017,12 @@ fn status_paths_use_nonblocking_worker_observation_reads() {
     assert!(runtime_app.contains(
         "preferred_internal_query_endpoint_units(query_active, query_peer_active, false)"
     ));
-    assert!(runtime_app.contains("route_key == source_status_route"));
+    assert!(runtime_app.contains("fn is_source_status_request_route(route_key: &str)"));
     assert!(runtime_app.contains("source_find_route_bindings_for(&self.node_id.0)"));
     assert!(runtime_app.contains("spawning source find proxy endpoint"));
     assert!(runtime_app.contains("vec![execution_units::SINK_RUNTIME_UNIT_ID]"));
-    assert!(runtime_app.contains("sink.status_snapshot_nonblocking_for_status_route().await"));
+    assert!(runtime_app.contains(".status_snapshot_nonblocking_for_status_route_key("));
+    assert!(runtime_app.contains(".status_snapshot_nonblocking_for_status_route()"));
     assert!(
         !source_mod.contains("routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)"),
         "source runtime endpoints must not bind source-find; query/query-peer facade owns that route"
@@ -1071,6 +1072,42 @@ fn source_stream_pumps_do_not_spawn_parallel_lane_writers() {
             "source stream pumps must not retain per-lane sender queues for the shared events route"
         );
     }
+}
+
+#[test]
+// @verify_spec("CONTRACTS.INDEX_LIFECYCLE.REALTIME_PLUS_BASELINE_PLUS_AUDIT_PLUS_SENTINEL", mode="system")
+// @verify_spec("CONTRACTS.INDEX_LIFECYCLE.HOST_FS_OPERATION_TIMEOUT_IS_OBSERVATION_EVIDENCE", mode="system")
+fn source_scan_audit_backpressure_reaches_concurrency_state_without_blocking_realtime() {
+    let l1 = read_app_spec("specs/L1-CONTRACTS.md");
+    let state_model = read_app_spec("specs/L3-RUNTIME/STATE_MODEL.md");
+    let workflows = read_app_spec("specs/L3-RUNTIME/WORKFLOWS.md");
+    let source_mod = read_app_spec("src/source/mod.rs");
+    let scanner = read_app_spec("src/source/scanner.rs");
+    let worker_source = read_app_spec("src/workers/source.rs");
+    let worker_source_server = read_app_spec("src/workers/source_server.rs");
+
+    assert!(l1.contains("sink/channel backpressure on scan/audit publication MUST propagate into source scan/audit read-ahead and concurrency/admission state"));
+    assert!(l1.contains(
+        "scan/audit backpressure MUST NOT be applied to realtime watch/listen ingestion"
+    ));
+    assert!(state_model.contains("source MUST bound scan/audit read-ahead"));
+    assert!(state_model.contains("realtime watch ingestion is a separate evidence lane"));
+    assert!(workflows.contains("source publication backpressure is lane-specific"));
+    assert!(scanner.contains("cb::bounded::<PathBuf>(scan_work_queue_capacity(self.scan_workers))"));
+    assert!(scanner
+        .contains("cb::bounded::<ScanRecordBatch>(scan_result_queue_capacity(self.scan_workers))"));
+    assert!(scanner.contains("accepted_rx.recv().unwrap_or(false)"));
+    assert!(scanner
+        .contains("audit_scan_backpressure_stops_directory_read_ahead_before_child_expansion"));
+    assert!(source_mod.contains("SOURCE_PUB_STREAM_PENDING_BATCH_LIMIT"));
+    assert!(source_mod.contains("realtime_out_tx.try_send(batch)"));
+    assert!(source_mod.contains("record_batch_downstream_accepted"));
+    assert!(source_mod.contains(".filter_map(|entry| entry.last_forwarded_at_us)"));
+    assert!(!source_mod.contains("last_forwarded_at_us.or(entry.last_emitted_at_us)"));
+    assert!(worker_source.contains("source.record_batch_downstream_accepted(&accepted_batch);"));
+    assert!(worker_source.contains(".filter_map(|entry| entry.last_forwarded_at_us)"));
+    assert!(!worker_source.contains("last_forwarded_at_us.or(entry.last_emitted_at_us)"));
+    assert!(worker_source_server.contains("source.record_batch_downstream_accepted(&batch);"));
 }
 
 #[test]

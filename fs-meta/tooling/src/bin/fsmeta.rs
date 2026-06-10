@@ -21,8 +21,10 @@ use clap::{Args, Parser, Subcommand};
 use fs_meta::RootSpec as RootEntry;
 use fs_meta::api::{ApiAuthConfig, BootstrapManagementConfig};
 use fs_meta_deploy::{
-    FsMetaReleaseSpec, FsMetaReleaseWorkerMode, FsMetaReleaseWorkerModes, build_release_doc_value,
-    compile_release_doc_to_relation_target_intent, write_startup_manifest,
+    FsMetaReleaseSpec, FsMetaReleaseWorkerMode, FsMetaReleaseWorkerModes,
+    build_app_scopes_json_for_roots, build_release_doc_value,
+    compile_release_doc_to_relation_target_intent, compile_scope_worker_relation_target_intent,
+    write_startup_manifest,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -500,7 +502,8 @@ async fn grants_list(args: ApiAuthArgs) -> anyhow::Result<serde_json::Value> {
 async fn roots_preview(args: RootsPreviewArgs) -> anyhow::Result<serde_json::Value> {
     let client = reqwest::Client::new();
     let token = resolve_api_token(&client, &args.api).await?;
-    let payload = load_roots_payload(&args.file)?;
+    let roots = load_roots_file(&args.file)?;
+    let payload = roots_payload(&roots);
     post_json(
         &client,
         &args.api.api_base,
@@ -513,9 +516,11 @@ async fn roots_preview(args: RootsPreviewArgs) -> anyhow::Result<serde_json::Val
 
 async fn roots_apply(args: RootsApplyArgs) -> anyhow::Result<serde_json::Value> {
     let client = reqwest::Client::new();
-    let payload = load_roots_payload(&args.file)?;
-    let runtime_apply = if let Some(config_path) = args.config.as_deref() {
-        let _product = load_product_config(config_path)?;
+    let roots = load_roots_file(&args.file)?;
+    let payload = roots_payload(&roots);
+    let scope_followup = if let Some(config_path) = args.config.as_deref() {
+        let product = load_product_config(config_path)?;
+        let state_dir = prepare_state_dir(config_path.parent(), ".fsmeta-state")?;
         let preflight_token = resolve_api_token(&client, &args.api).await?;
         let preview = post_json(
             &client,
@@ -526,12 +531,15 @@ async fn roots_apply(args: RootsApplyArgs) -> anyhow::Result<serde_json::Value> 
         )
         .await?;
         ensure_roots_preview_has_no_unmatched(&preview)?;
-        Some(json!({
-            "mode": "management_api_only",
-            "relation_target_apply": "skipped",
-            "tx_busy_retries": 0,
-            "reason": "online_root_reconfiguration_without_restart",
-        }))
+        let control = ControlClient::from_args(&args.control)?;
+        let config_dump = control.config_dump().await?;
+        let intent = build_scope_only_app_scopes_followup_intent(
+            &product,
+            &roots,
+            &state_dir,
+            &config_dump,
+        )?;
+        Some((control, intent))
     } else {
         None
     };
@@ -544,6 +552,26 @@ async fn roots_apply(args: RootsApplyArgs) -> anyhow::Result<serde_json::Value> 
         &payload,
     )
     .await?;
+    let runtime_apply = if let Some((control, intent)) = scope_followup {
+        let app_scope_count = intent["workers"][0]["runtime"]["app_scopes"]
+            .as_array()
+            .map_or(0, Vec::len);
+        let target_generation = intent
+            .get("target_generation")
+            .and_then(serde_json::Value::as_u64);
+        let apply_result = control.apply_relation_target_intent(&intent).await?;
+        Some(json!({
+            "mode": "management_api_with_accepted_scope_followup",
+            "relation_target_apply": "scope_only_followup",
+            "tx_busy_retries": 0,
+            "reason": "online_root_reconfiguration_without_restart",
+            "target_generation": target_generation,
+            "app_scope_count": app_scope_count,
+            "result": apply_result,
+        }))
+    } else {
+        None
+    };
     match runtime_apply {
         Some(runtime_apply) => Ok(json!({
             "status": "ok",
@@ -601,16 +629,19 @@ fn build_auth_config(auth: &ProductAuthConfig, base_dir: &Path) -> (ApiAuthConfi
     )
 }
 
-fn load_roots_payload(path: &Path) -> anyhow::Result<serde_json::Value> {
+fn load_roots_file(path: &Path) -> anyhow::Result<Vec<RootEntry>> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("read roots file {} failed", path.display()))?;
     let file = serde_yaml::from_str::<RootsFile>(&content)
         .with_context(|| format!("parse roots file {} failed", path.display()))?;
-    let roots = match file {
+    Ok(match file {
         RootsFile::Wrapped { roots } => roots,
         RootsFile::Bare(roots) => roots,
-    };
-    Ok(json!({ "roots": roots }))
+    })
+}
+
+fn roots_payload(roots: &[RootEntry]) -> serde_json::Value {
+    json!({ "roots": roots })
 }
 
 fn ensure_roots_preview_has_no_unmatched(preview: &serde_json::Value) -> anyhow::Result<()> {
@@ -941,6 +972,182 @@ fn build_deploy_intent_for_roots(
         .map_err(|err| anyhow::anyhow!("invalid fs-meta deploy intent: {err}"))
 }
 
+fn build_scope_only_app_scopes_followup_intent(
+    product: &ProductConfig,
+    roots: &[RootEntry],
+    state_dir: &Path,
+    config_dump: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let record = current_target_record(config_dump, DEFAULT_APP_ID)?;
+    let target_id = record
+        .get("target_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_APP_ID);
+    let manifest = record
+        .get("manifest")
+        .and_then(serde_json::Value::as_object)
+        .context("current fs-meta target record missing manifest object")?;
+    let app_path = manifest
+        .get("app")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("current fs-meta target manifest missing app path")?;
+    let manifest_config = manifest
+        .get("config")
+        .and_then(serde_json::Value::as_object)
+        .context("current fs-meta target manifest missing config object")?;
+    let runtime = manifest_config
+        .get("__cnx_runtime")
+        .and_then(serde_json::Value::as_object)
+        .context("current fs-meta target manifest missing __cnx_runtime object")?;
+    let policy = manifest_config
+        .get("__cnx_policy")
+        .and_then(serde_json::Value::as_object);
+    let target_generation = positive_json_u64(runtime.get("target_generation"))
+        .or_else(|| positive_json_u64(policy.and_then(|policy| policy.get("generation"))))
+        .context("current fs-meta target manifest missing positive runtime target_generation")?;
+    let worker_role = runtime
+        .get("worker_role")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("main");
+    let worker_id = runtime
+        .get("unit_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            manifest_config
+                .get("__app_instance_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or(DEFAULT_APP_ID);
+    let worker_mode = runtime
+        .get("worker_mode")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("current fs-meta target manifest missing runtime worker_mode")?;
+    let ports = manifest
+        .get("ports")
+        .and_then(serde_json::Value::as_array)
+        .filter(|ports| !ports.is_empty())
+        .context("current fs-meta target manifest missing ports for startup manifest discovery")?;
+    let startup_manifest_path =
+        state_dir.join(format!("fs-meta-startup-scope-followup-{}.yaml", now_us()));
+    let startup_manifest = json!({ "ports": ports });
+    let startup_manifest_yaml = serde_yaml::to_string(&startup_manifest)
+        .context("encode scope-only startup manifest failed")?;
+    fs::write(&startup_manifest_path, startup_manifest_yaml).with_context(|| {
+        format!(
+            "write scope-only startup manifest {} failed",
+            startup_manifest_path.display()
+        )
+    })?;
+
+    let config = strip_capanix_runtime_config_fields(manifest_config);
+    let mut runtime = runtime.clone();
+    for key in [
+        "target_id",
+        "unit_id",
+        "target_generation",
+        "worker_role",
+        "worker_mode",
+    ] {
+        runtime.remove(key);
+    }
+    runtime.insert(
+        "app_scopes".to_string(),
+        serde_json::Value::Array(build_app_scopes_json_for_roots(
+            &product.api.facade_resource_id,
+            roots,
+        )),
+    );
+    let mut policy = policy.cloned().unwrap_or_default();
+    policy.remove("generation");
+
+    let mut startup = serde_json::Map::new();
+    startup.insert("path".to_string(), json!(app_path));
+    startup.insert(
+        "manifest".to_string(),
+        json!(startup_manifest_path.display().to_string()),
+    );
+    let mut worker = serde_json::Map::new();
+    worker.insert("worker_role".to_string(), json!(worker_role));
+    worker.insert("worker_id".to_string(), json!(worker_id));
+    worker.insert("mode".to_string(), json!(worker_mode));
+    worker.insert("startup".to_string(), serde_json::Value::Object(startup));
+    worker.insert("config".to_string(), serde_json::Value::Object(config));
+    worker.insert("runtime".to_string(), serde_json::Value::Object(runtime));
+    worker.insert("policy".to_string(), serde_json::Value::Object(policy));
+    worker.insert(
+        "restart_policy".to_string(),
+        manifest
+            .get("restart_policy")
+            .cloned()
+            .unwrap_or_else(|| json!("Always")),
+    );
+    worker.insert(
+        "version".to_string(),
+        manifest
+            .get("version")
+            .cloned()
+            .unwrap_or_else(|| json!("dev")),
+    );
+
+    let intent = json!({
+        "schema_version": "scope-worker-declaration-v1",
+        "target_id": target_id,
+        "target_generation": target_generation,
+        "route_plans": target_route_plans(config_dump, target_id),
+        "workers": [serde_json::Value::Object(worker)],
+    });
+    compile_scope_worker_relation_target_intent(intent)
+        .map_err(|err| anyhow::anyhow!("invalid scope-only fs-meta roots followup: {err}"))
+}
+
+fn current_target_record<'a>(
+    config_dump: &'a serde_json::Value,
+    target_id: &str,
+) -> anyhow::Result<&'a serde_json::Value> {
+    let records = config_dump
+        .get("runtime_target_state")
+        .and_then(|state| state.get("records"))
+        .and_then(serde_json::Value::as_array)
+        .context("cnxctl config dump missing runtime_target_state.records")?;
+    records
+        .iter()
+        .find(|record| {
+            record.get("target_id").and_then(serde_json::Value::as_str) == Some(target_id)
+        })
+        .context("cnxctl config dump missing current fs-meta runtime target record")
+}
+
+fn target_route_plans(config_dump: &serde_json::Value, target_id: &str) -> serde_json::Value {
+    config_dump
+        .get("runtime_target_state")
+        .and_then(|state| state.get("target_route_plans"))
+        .and_then(|plans| plans.get(target_id))
+        .cloned()
+        .unwrap_or_else(|| json!([]))
+}
+
+fn strip_capanix_runtime_config_fields(
+    config: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    config
+        .iter()
+        .filter(|(key, _)| !key.starts_with("__"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn positive_json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    value
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+}
+
 fn apply_worker_runtime_dirs(
     release_doc: &mut serde_json::Value,
     state_dir: &Path,
@@ -1180,8 +1387,14 @@ impl ControlClient {
             .map_err(anyhow::Error::from)
     }
 
+    async fn config_dump(&self) -> anyhow::Result<serde_json::Value> {
+        self.run_cnxctl(&["config", "dump"])
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
     async fn discover_route_plan_node_ids(&self) -> anyhow::Result<Vec<String>> {
-        let config_dump = self.run_cnxctl(&["config", "dump"]).await?;
+        let config_dump = self.config_dump().await?;
         let node_ids = derive_route_plan_node_ids_from_config_dump(&config_dump);
         if node_ids.is_empty() {
             bail!(
@@ -1830,11 +2043,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn roots_apply_config_does_not_submit_relation_target_intent_for_online_reconfiguration()
+    async fn roots_apply_config_submits_scope_only_runtime_followup_without_static_roots_mutation()
     {
         let _guard = ENV_LOCK.lock().expect("test env lock");
         let dir = std::env::temp_dir().join(format!(
-            "fsmeta-roots-online-no-relation-target-{}",
+            "fsmeta-roots-online-scope-followup-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -1875,13 +2088,96 @@ mod tests {
         )
         .expect("write roots file");
 
-        let cnxctl_marker = dir.join("cnxctl-app-apply-called");
+        let config_dump_path = dir.join("config-dump.json");
+        let intent_capture_path = dir.join("captured-scope-followup.yaml");
+        fs::write(
+            &config_dump_path,
+            serde_json::to_string(&json!({
+                "result": {
+                    "runtime_target_state": {
+                        "target_route_plans": {
+                            "fs-meta": [{
+                                "route_key": "fs-meta.source-status:panda144:v1.req",
+                                "mode": "fan_in",
+                                "peers": [{"node_id": "panda144", "addr": ""}]
+                            }]
+                        },
+                        "records": [{
+                            "target_id": "fs-meta",
+                            "unit_id": "fs-meta",
+                            "manifest": {
+                                "app": "/opt/fsmeta/libfs_meta_runtime.so",
+                                "config": {
+                                    "roots": [],
+                                    "api": {
+                                        "enabled": true,
+                                        "facade_resource_id": "fs-meta-tcp-listener",
+                                        "auth": {
+                                            "passwd_path": "/run/fsmeta/passwd",
+                                            "shadow_path": "/run/fsmeta/shadow",
+                                            "query_keys_path": "/run/fsmeta/query-keys.json",
+                                            "session_ttl_secs": 3600,
+                                            "management_group": "fsmeta_management"
+                                        }
+                                    },
+                                    "__app_instance_id": "fs-meta",
+                                    "__cnx_compiled_v5": true,
+                                    "__cnx_runtime": {
+                                        "target_id": "fs-meta",
+                                        "unit_id": "fs-meta",
+                                        "target_generation": 77,
+                                        "worker_role": "main",
+                                        "worker_mode": "embedded",
+                                        "app_scopes": [
+                                            {"scope_id": "__fsmeta_empty_roots_bootstrap", "resource_ids": ["__fsmeta_empty_roots_bootstrap"], "unit_scopes": []},
+                                            {"scope_id": "fs-meta-tcp-listener", "resource_ids": ["fs-meta-tcp-listener"], "unit_scopes": []}
+                                        ],
+                                        "route_units": {},
+                                        "units": {
+                                            "runtime.exec.source": {"enabled": true},
+                                            "runtime.exec.sink": {"enabled": true}
+                                        },
+                                        "state_carrier": {"enabled": true},
+                                        "workers": {
+                                            "source": {
+                                                "role_id": "source",
+                                                "mode": "external",
+                                                "launcher_kind": "worker_host",
+                                                "module_path": "/opt/fsmeta/libfs_meta_runtime.so",
+                                                "socket_dir": "/run/fsmeta/worker-runtime/source"
+                                            }
+                                        }
+                                    },
+                                    "__cnx_policy": {
+                                        "generation": 77,
+                                        "replicas": 1
+                                    }
+                                },
+                                "ports": [{
+                                    "route_token": "facade-control",
+                                    "use_port": "facade-control",
+                                    "pattern": "request_reply",
+                                    "roles": ["serve"],
+                                    "visibility": "internal",
+                                    "route_key": "fs-meta.facade-control:v1"
+                                }],
+                                "restart_policy": "Always",
+                                "version": "test-version"
+                            }
+                        }]
+                    }
+                }
+            }))
+            .expect("encode config dump"),
+        )
+        .expect("write config dump");
         let cnxctl = dir.join("cnxctl");
         fs::write(
             &cnxctl,
             format!(
-                "#!/bin/sh\ncase \" $* \" in\n  *\" config dump \"*) printf '%s\\n' '{{\"result\":{{\"announced_resources\":[{{\"node_id\":\"panda144\"}}],\"management_peers\":[]}}}}' ;;\n  *\" app apply \"*) printf 'called\\n' >> '{}' ; printf '%s\\n' '{{\"result\":{{\"ok\":true}}}}' ;;\n  *) printf '%s\\n' '{{\"result\":{{\"ok\":true}}}}' ;;\nesac\n",
-                cnxctl_marker.display()
+                "#!/bin/sh\ncase \" $* \" in\n  *\" config dump \"*) cat '{}' ;;\n  *\" app apply \"*) last=\"\"; for arg in \"$@\"; do last=\"$arg\"; done; cp \"$last\" '{}' ; printf '%s\\n' '{{\"result\":{{\"ok\":true}}}}' ;;\n  *) printf '%s\\n' '{{\"result\":{{\"ok\":true}}}}' ;;\nesac\n",
+                config_dump_path.display(),
+                intent_capture_path.display()
             ),
         )
         .expect("write fake cnxctl");
@@ -1980,12 +2276,66 @@ mod tests {
         assert_eq!(result["roots_count"], json!(1));
         assert_eq!(
             result["runtime_apply"]["mode"],
-            json!("management_api_only"),
-            "online roots apply should report management-API-only reconfiguration"
+            json!("management_api_with_accepted_scope_followup"),
+            "online roots apply should report the accepted-scope convergence followup"
+        );
+        assert_eq!(
+            result["runtime_apply"]["relation_target_apply"],
+            json!("scope_only_followup")
         );
         assert!(
-            !cnxctl_marker.exists(),
-            "roots apply --config must not submit a relation-target intent that can change the fs-meta manifest config fingerprint"
+            intent_capture_path.exists(),
+            "roots apply --config must submit a narrow runtime app_scopes followup"
+        );
+        let captured = fs::read_to_string(&intent_capture_path).expect("read captured intent");
+        let intent: serde_json::Value =
+            serde_yaml::from_str(&captured).expect("captured intent yaml");
+        assert_eq!(intent["target_id"], json!("fs-meta"));
+        assert_eq!(intent["target_generation"], json!(77));
+        assert_eq!(
+            intent["route_plans"],
+            json!([{
+                "route_key": "fs-meta.source-status:panda144:v1.req",
+                "mode": "fan_in",
+                "peers": [{"node_id": "panda144", "addr": ""}]
+            }]),
+            "scope-only followup must preserve current target route plans"
+        );
+        let worker = &intent["workers"][0];
+        assert_eq!(
+            worker["startup"]["path"],
+            json!("/opt/fsmeta/libfs_meta_runtime.so")
+        );
+        assert!(
+            PathBuf::from(
+                worker["startup"]["manifest"]
+                    .as_str()
+                    .expect("startup manifest path")
+            )
+            .exists(),
+            "scope-only followup must materialize a stable startup manifest for port discovery"
+        );
+        assert_eq!(
+            worker["config"]["roots"],
+            json!([]),
+            "scope-only followup must preserve the current static manifest config instead of writing the newly accepted roots into config.roots"
+        );
+        let scope_ids = worker["runtime"]["app_scopes"]
+            .as_array()
+            .expect("runtime app_scopes")
+            .iter()
+            .filter_map(|scope| scope.get("scope_id").and_then(serde_json::Value::as_str))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(scope_ids.contains("nfs-144"));
+        assert!(scope_ids.contains("fs-meta-tcp-listener"));
+        assert!(
+            !scope_ids.contains("__fsmeta_empty_roots_bootstrap"),
+            "roots-bearing accepted scope followup must replace bootstrap-only scope evidence"
+        );
+        assert_eq!(
+            worker["runtime"]["workers"]["source"]["socket_dir"],
+            json!("/run/fsmeta/worker-runtime/source"),
+            "scope-only followup must preserve compiled worker runtime bindings"
         );
 
         let _ = fs::remove_dir_all(&dir);

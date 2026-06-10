@@ -17,6 +17,7 @@ use crate::query::models::QueryNode;
 use crate::query::path::root_file_name_bytes;
 use crate::query::request::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
 use crate::runtime::orchestration::{SinkControlSignal, sink_control_signals_from_envelopes};
+use crate::runtime::routes::ROUTE_KEY_SINK_STATUS_INTERNAL;
 #[cfg(test)]
 use crate::sink::SinkStatusSnapshotIssue;
 use crate::sink::VisibilityLagSample;
@@ -1642,6 +1643,37 @@ fn retained_sink_schedule_evidence(
     (!evidence.is_empty()).then_some(evidence)
 }
 
+fn retained_sink_schedule_evidence_for_route(
+    retained: &RetainedSinkWorkerControlState,
+    fallback_node_id: &NodeId,
+    route_key: &str,
+) -> Option<CachedSinkScheduleEvidence> {
+    let evidence = cached_sink_schedule_evidence_from_bound_scopes(
+        retained
+            .active_by_route
+            .values()
+            .filter_map(|signal| match signal {
+                SinkControlSignal::Activate {
+                    route_key: signal_route_key,
+                    bound_scopes,
+                    ..
+                } if signal_route_key == route_key => Some(bound_scopes.as_slice()),
+                _ => None,
+            })
+            .flat_map(|bound_scopes| bound_scopes.iter()),
+        fallback_node_id,
+    );
+    (!evidence.is_empty()).then_some(evidence)
+}
+
+fn generic_sink_status_request_route_key() -> String {
+    format!("{ROUTE_KEY_SINK_STATUS_INTERNAL}.req")
+}
+
+fn is_generic_sink_status_request_route_key(route_key: &str) -> bool {
+    route_key == generic_sink_status_request_route_key()
+}
+
 fn control_signal_summary_scope_ids(signal: &str) -> std::collections::BTreeSet<String> {
     let Some((_, scopes)) = signal.split_once(" scopes=[") else {
         return std::collections::BTreeSet::new();
@@ -3000,6 +3032,31 @@ impl SinkWorkerClientHandle {
             .map_err(SinkFailure::from)
     }
 
+    fn cached_status_snapshot_for_status_route_key(
+        &self,
+        route_key: &str,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        if is_generic_sink_status_request_route_key(route_key) {
+            return self.cached_status_snapshot_with_republished_scheduled_groups();
+        }
+        let evidence = self.retained_schedule_evidence_for_status_route_key(route_key);
+        let Some(evidence) = evidence else {
+            return Ok(SinkStatusSnapshot::default());
+        };
+        let mut snapshot = self.cached_status_snapshot_with_failure()?;
+        Self::retain_status_snapshot_for_groups(&mut snapshot, &evidence.scheduled_groups);
+        Self::republish_cached_schedule_evidence_into_status_summary(&mut snapshot, &evidence);
+        Ok(snapshot)
+    }
+
+    fn retained_schedule_evidence_for_status_route_key(
+        &self,
+        route_key: &str,
+    ) -> Option<CachedSinkScheduleEvidence> {
+        let retained = self.retained_control_state.try_lock().ok()?;
+        retained_sink_schedule_evidence_for_route(&retained, &self.node_id, route_key)
+    }
+
     fn retain_status_snapshot_for_groups(
         snapshot: &mut SinkStatusSnapshot,
         surviving_groups: &std::collections::BTreeSet<String>,
@@ -3556,6 +3613,55 @@ impl SinkWorkerClientHandle {
         snapshot: SinkStatusSnapshot,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
         self.prepare_status_snapshot_for_evaluation(snapshot)
+            .map_err(SinkFailure::from)
+    }
+
+    fn prepare_status_snapshot_for_route_evaluation(
+        &self,
+        route_key: &str,
+        mut snapshot: SinkStatusSnapshot,
+    ) -> Result<SinkStatusSnapshot> {
+        let current_groups = self.current_logical_root_group_ids()?;
+        let mut route_evidence = self.retained_schedule_evidence_for_status_route_key(route_key);
+        if let Some(evidence) = route_evidence.as_mut()
+            && !current_groups.is_empty()
+        {
+            evidence.retain_groups(&current_groups);
+            if evidence.is_empty() {
+                route_evidence = None;
+            }
+        }
+        if let Some(evidence) = route_evidence.as_ref() {
+            Self::retain_status_snapshot_for_groups(&mut snapshot, &evidence.scheduled_groups);
+        } else if !current_groups.is_empty() {
+            Self::retain_status_snapshot_for_groups(&mut snapshot, &current_groups);
+        }
+        if let Some(evidence) = route_evidence.as_ref() {
+            Self::republish_cached_schedule_evidence_into_status_summary(&mut snapshot, evidence);
+        }
+        let grants = self
+            .config
+            .lock()
+            .map_err(|_| CnxError::Internal("sink worker config lock poisoned".into()))?
+            .host_object_grants
+            .clone();
+        normalize_sink_status_snapshot_node_keys(&mut snapshot, &self.node_id, &grants);
+        if debug_control_scope_capture_enabled() {
+            eprintln!(
+                "fs_meta_sink_worker_client: status_snapshot route reply node={} {}",
+                self.node_id.0,
+                summarize_sink_status_snapshot(&snapshot)
+            );
+        }
+        Ok(snapshot)
+    }
+
+    fn prepare_status_snapshot_for_route_evaluation_with_failure(
+        &self,
+        route_key: &str,
+        snapshot: SinkStatusSnapshot,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        self.prepare_status_snapshot_for_route_evaluation(route_key, snapshot)
             .map_err(SinkFailure::from)
     }
 
@@ -4419,6 +4525,113 @@ impl SinkWorkerClientHandle {
             }
             (snapshot, true)
         })
+    }
+
+    pub(crate) async fn status_snapshot_nonblocking_for_status_route_key(
+        &self,
+        route_key: &str,
+    ) -> (SinkStatusSnapshot, bool) {
+        if is_generic_sink_status_request_route_key(route_key) {
+            return self.status_snapshot_nonblocking_for_status_route().await;
+        }
+        let replay_required = self.control_state_replay_required.load(Ordering::Acquire) > 0;
+        let control_inflight = self.control_op_inflight();
+        if replay_required || control_inflight {
+            let snapshot = self
+                .cached_status_snapshot_for_status_route_key(route_key)
+                .unwrap_or_else(|_| SinkStatusSnapshot::default());
+            if debug_control_scope_capture_enabled() {
+                let reason = if replay_required {
+                    "status_route_key_retained_replay_pending"
+                } else {
+                    "status_route_key_control_inflight"
+                };
+                eprintln!(
+                    "fs_meta_sink_worker_client: status_snapshot route_cache_fallback node={} route={} reason={} {}",
+                    self.node_id.0,
+                    route_key,
+                    reason,
+                    summarize_sink_status_snapshot(&snapshot)
+                );
+            }
+            return (snapshot, true);
+        }
+
+        let timeout = status_snapshot_nonblocking_live_probe_budget();
+        #[cfg(test)]
+        record_sink_worker_status_timeout_probe(timeout);
+        let response = match self.existing_client_with_failure().await {
+            Ok(Some(client)) => {
+                Self::call_worker_with_failure(
+                    &client,
+                    SinkWorkerRequest::StatusSnapshotForRoute {
+                        route_key: route_key.to_string(),
+                    },
+                    timeout,
+                )
+                .await
+            }
+            Ok(None) => Err(SinkFailure::from_cause(CnxError::NotReady(
+                "sink worker status not started".into(),
+            ))),
+            Err(err) => Err(err),
+        };
+        match response {
+            Ok(SinkWorkerResponse::StatusSnapshot(snapshot)) => {
+                match self
+                    .prepare_status_snapshot_for_route_evaluation_with_failure(route_key, snapshot)
+                {
+                    Ok(snapshot) => (snapshot, false),
+                    Err(err) => {
+                        let fallback = self
+                            .cached_status_snapshot_for_status_route_key(route_key)
+                            .unwrap_or_else(|_| SinkStatusSnapshot::default());
+                        if debug_control_scope_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_sink_worker_client: status_snapshot route_cache_fallback node={} route={} reason=route_prepare_failed err={} {}",
+                                self.node_id.0,
+                                route_key,
+                                err.as_error(),
+                                summarize_sink_status_snapshot(&fallback)
+                            );
+                        }
+                        (fallback, true)
+                    }
+                }
+            }
+            Ok(other) => {
+                let err =
+                    unexpected_sink_worker_response_failure("for route status snapshot", other);
+                let fallback = self
+                    .cached_status_snapshot_for_status_route_key(route_key)
+                    .unwrap_or_else(|_| SinkStatusSnapshot::default());
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_sink_worker_client: status_snapshot route_cache_fallback node={} route={} reason=unexpected_worker_response err={} {}",
+                        self.node_id.0,
+                        route_key,
+                        err.as_error(),
+                        summarize_sink_status_snapshot(&fallback)
+                    );
+                }
+                (fallback, true)
+            }
+            Err(err) => {
+                let fallback = self
+                    .cached_status_snapshot_for_status_route_key(route_key)
+                    .unwrap_or_else(|_| SinkStatusSnapshot::default());
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_sink_worker_client: status_snapshot route_cache_fallback node={} route={} reason=route_probe_failed err={} {}",
+                        self.node_id.0,
+                        route_key,
+                        err.as_error(),
+                        summarize_sink_status_snapshot(&fallback)
+                    );
+                }
+                (fallback, true)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -5285,6 +5498,14 @@ impl SinkFileMeta {
         self.status_snapshot().map_err(SinkFailure::from)
     }
 
+    pub(crate) fn status_snapshot_for_route_with_failure(
+        &self,
+        route_key: &str,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        self.status_snapshot_for_route(route_key)
+            .map_err(SinkFailure::from)
+    }
+
     pub(crate) fn cached_status_snapshot_with_failure(
         &self,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
@@ -5519,6 +5740,24 @@ impl SinkFacade {
                 .map(|snapshot| (snapshot, false))
                 .map_err(SinkFailure::into_error),
             Self::Worker(client) => Ok(client.status_snapshot_nonblocking_for_status_route().await),
+        }
+    }
+
+    pub(crate) async fn status_snapshot_nonblocking_for_status_route_key(
+        &self,
+        route_key: &str,
+    ) -> Result<(SinkStatusSnapshot, bool)> {
+        if is_generic_sink_status_request_route_key(route_key) {
+            return self.status_snapshot_nonblocking_for_status_route().await;
+        }
+        match self {
+            Self::Local(sink) => sink
+                .status_snapshot_for_route_with_failure(route_key)
+                .map(|snapshot| (snapshot, false))
+                .map_err(SinkFailure::into_error),
+            Self::Worker(client) => Ok(client
+                .status_snapshot_nonblocking_for_status_route_key(route_key)
+                .await),
         }
     }
 

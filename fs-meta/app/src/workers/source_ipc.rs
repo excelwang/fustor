@@ -13,6 +13,7 @@ use crate::workers::source::SourceObservabilitySnapshot;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum SourceWorkerRequest {
     UpdateLogicalRoots { roots: Vec<RootSpec> },
+    UpdateLogicalRootsDeferScanAudit { roots: Vec<RootSpec> },
     LogicalRootsSnapshot,
     LogicalRootsGenerationSnapshot,
     HostObjectGrantsSnapshot,
@@ -34,6 +35,7 @@ pub enum SourceWorkerRequest {
     SubmitRescanRequestEpoch,
     SubmitTargetedRescanRequestEpoch,
     TriggerRescanWhenReadyEpoch,
+    OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch,
     TriggerTargetedRescanWhenReadyEpoch,
     CheckTargetedRescanDeliveryAcceptance,
     AcceptTargetedRescanDelivery,

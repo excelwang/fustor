@@ -948,6 +948,7 @@ pub(crate) fn merge_sink_status_snapshots(
     let mut groups = BTreeMap::<String, crate::sink::SinkGroupStatusSnapshot>::new();
     let mut scheduled_groups_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut primary_host_ref_by_group = BTreeMap::<String, String>::new();
+    let mut scheduled_primary_host_ref_groups = BTreeSet::<String>::new();
     let mut last_control_frame_signals_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut received_batches_by_node = BTreeMap::<String, u64>::new();
     let mut received_events_by_node = BTreeMap::<String, u64>::new();
@@ -974,7 +975,21 @@ pub(crate) fn merge_sink_status_snapshots(
     let mut stream_path_capture_target = None::<String>;
     for snapshot in snapshots {
         let snapshot_primary_host_ref_by_group = snapshot.primary_host_ref_by_group;
-        for (node_id, groups_for_node) in snapshot.scheduled_groups_by_node {
+        let snapshot_scheduled_groups_by_node = snapshot.scheduled_groups_by_node;
+        for (group_id, host_ref) in &snapshot_primary_host_ref_by_group {
+            let host_ref = host_ref.trim();
+            if host_ref.is_empty() {
+                continue;
+            }
+            if snapshot_scheduled_groups_by_node
+                .get(host_ref)
+                .is_some_and(|groups| groups.iter().any(|scheduled| scheduled == group_id))
+            {
+                primary_host_ref_by_group.insert(group_id.clone(), host_ref.to_string());
+                scheduled_primary_host_ref_groups.insert(group_id.clone());
+            }
+        }
+        for (node_id, groups_for_node) in snapshot_scheduled_groups_by_node {
             let entry = scheduled_groups_by_node.entry(node_id).or_default();
             entry.extend(groups_for_node);
             entry.sort();
@@ -1036,16 +1051,19 @@ pub(crate) fn merge_sink_status_snapshots(
                 .unwrap_or(true);
             if should_replace {
                 groups.insert(group_id.clone(), group);
-                if let Some(host_ref) = snapshot_primary_host_ref_by_group
-                    .get(&group_id)
-                    .map(|host_ref| host_ref.trim())
-                    .filter(|host_ref| !host_ref.is_empty())
-                {
-                    primary_host_ref_by_group.insert(group_id, host_ref.to_string());
-                } else {
-                    primary_host_ref_by_group.remove(&group_id);
+                if !scheduled_primary_host_ref_groups.contains(&group_id) {
+                    if let Some(host_ref) = snapshot_primary_host_ref_by_group
+                        .get(&group_id)
+                        .map(|host_ref| host_ref.trim())
+                        .filter(|host_ref| !host_ref.is_empty())
+                    {
+                        primary_host_ref_by_group.insert(group_id, host_ref.to_string());
+                    } else {
+                        primary_host_ref_by_group.remove(&group_id);
+                    }
                 }
-            } else if !primary_host_ref_by_group.contains_key(&group_id)
+            } else if !scheduled_primary_host_ref_groups.contains(&group_id)
+                && !primary_host_ref_by_group.contains_key(&group_id)
                 && let Some(host_ref) = snapshot_primary_host_ref_by_group
                     .get(&group_id)
                     .map(|host_ref| host_ref.trim())
@@ -1167,6 +1185,18 @@ pub(crate) fn current_owner_health_source_status_request_payload_with_live_probe
     .unwrap_or_else(|_| internal_status_request_payload_with_live_probe_timeout(collect_timeout))
 }
 
+pub(crate) fn release_scan_audit_source_status_request_payload_with_live_probe_timeout(
+    collect_timeout: Duration,
+) -> Bytes {
+    let live_probe_timeout = source_status_live_probe_timeout_for_collect(collect_timeout);
+    rmp_serde::to_vec_named(&InternalSourceStatusRequest {
+        purpose: Some("release-scan-audit-after-sink-scope-ready".to_string()),
+        live_probe_timeout_ms: Some(duration_ms_u64(live_probe_timeout)),
+    })
+    .map(Bytes::from)
+    .unwrap_or_else(|_| internal_status_request_payload_with_live_probe_timeout(collect_timeout))
+}
+
 pub(crate) fn source_status_request_live_probe_timeout(payload: &[u8]) -> Option<Duration> {
     rmp_serde::from_slice::<InternalSourceStatusRequest>(payload)
         .ok()
@@ -1188,6 +1218,13 @@ pub(crate) fn source_status_request_requires_current_owner_health_evidence(paylo
         .ok()
         .and_then(|request| request.purpose)
         .is_some_and(|purpose| purpose == "current-owner-health")
+}
+
+pub(crate) fn source_status_request_requires_scan_audit_admission_release(payload: &[u8]) -> bool {
+    rmp_serde::from_slice::<InternalSourceStatusRequest>(payload)
+        .ok()
+        .and_then(|request| request.purpose)
+        .is_some_and(|purpose| purpose == "release-scan-audit-after-sink-scope-ready")
 }
 
 pub(crate) fn merge_source_status_snapshots(
@@ -9887,6 +9924,51 @@ fn merge_sink_status_snapshots_does_not_keep_stale_primary_host_when_winner_lack
         sink_primary_owner_node_for_group(Some(&merged), "nfs1"),
         None,
         "merged sink status must not keep a stale primary_host_ref when the winning group row has no explicit host evidence: {merged:?}"
+    );
+}
+
+#[test]
+fn merge_sink_status_snapshots_preserves_scheduled_only_owner_primary_host_ref() {
+    let owner_scoped_schedule = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs-144".to_string()],
+        )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs-144".to_string(), "node-a".to_string())]),
+        ..SinkStatusSnapshot::default()
+    };
+    let materialized_without_owner_ref = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs-144".to_string(),
+            primary_object_ref: "node-a::nfs-144".to_string(),
+            total_nodes: 3,
+            live_nodes: 3,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 2,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 2,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+
+    let merged =
+        merge_sink_status_snapshots(vec![owner_scoped_schedule, materialized_without_owner_ref]);
+
+    assert_eq!(
+        merged.scheduled_groups_by_node.get("node-a"),
+        Some(&vec!["nfs-144".to_string()]),
+        "scheduled-only owner-scoped sink-status evidence must survive merge: {merged:?}"
+    );
+    assert_eq!(
+        sink_primary_owner_node_for_group(Some(&merged), "nfs-144"),
+        Some(NodeId("node-a".to_string())),
+        "accepted owner-scoped sink-status primary evidence must not be dropped just because another snapshot contributed the materialized group row: {merged:?}"
     );
 }
 

@@ -3657,7 +3657,7 @@ fn source_status_publication_marker(status: &SourceStatusSnapshot) -> (u64, u64)
     let last_published_at_us = status
         .concrete_roots
         .iter()
-        .filter_map(|entry| entry.last_forwarded_at_us.or(entry.last_emitted_at_us))
+        .filter_map(|entry| entry.last_forwarded_at_us)
         .max()
         .unwrap_or_default();
     (published_batches, last_published_at_us)
@@ -7209,12 +7209,30 @@ impl SourceWorkerClientHandle {
         &self,
         roots: Vec<RootSpec>,
     ) -> std::result::Result<(), SourceFailure> {
+        self.update_logical_roots_with_scan_audit_policy(roots, false)
+            .await
+    }
+
+    pub(crate) async fn update_logical_roots_defer_scan_audit_with_failure(
+        &self,
+        roots: Vec<RootSpec>,
+    ) -> std::result::Result<(), SourceFailure> {
+        self.update_logical_roots_with_scan_audit_policy(roots, true)
+            .await
+    }
+
+    async fn update_logical_roots_with_scan_audit_policy(
+        &self,
+        roots: Vec<RootSpec>,
+        defer_scan_audit: bool,
+    ) -> std::result::Result<(), SourceFailure> {
         let _inflight = self.begin_control_op();
         let _serial = self.control_ops_serial.lock().await;
         eprintln!(
-            "fs_meta_source_worker_client: update_logical_roots begin node={} roots={}",
+            "fs_meta_source_worker_client: update_logical_roots begin node={} roots={} defer_scan_audit={}",
             self.node_id.0,
-            roots.len()
+            roots.len(),
+            defer_scan_audit,
         );
         let deadline = clip_retry_deadline(
             std::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT,
@@ -7229,7 +7247,11 @@ impl SourceWorkerClientHandle {
                         SourceOperationLoopStep::Event(
                             SourceUpdateLogicalRootsEvent::AttemptCompleted {
                                 rpc_result: self
-                                    .execute_update_logical_roots_attempt(&roots, timeout)
+                                    .execute_update_logical_roots_attempt(
+                                        &roots,
+                                        timeout,
+                                        defer_scan_audit,
+                                    )
                                     .await,
                                 after: self.current_source_progress_state(),
                             },
@@ -7987,6 +8009,7 @@ impl SourceWorkerClientHandle {
         &self,
         roots: &[RootSpec],
         timeout: Duration,
+        defer_scan_audit: bool,
     ) -> std::result::Result<SourceWorkerResponse, CnxError> {
         self.with_started_retry_with_failure(|client| {
             let roots = roots.to_vec();
@@ -7997,12 +8020,12 @@ impl SourceWorkerClientHandle {
                 if let Some(err) = take_update_logical_roots_error_hook() {
                     return Err(SourceFailure::from(err));
                 }
-                Self::call_worker_with_failure(
-                    &client,
-                    SourceWorkerRequest::UpdateLogicalRoots { roots },
-                    timeout,
-                )
-                .await
+                let request = if defer_scan_audit {
+                    SourceWorkerRequest::UpdateLogicalRootsDeferScanAudit { roots }
+                } else {
+                    SourceWorkerRequest::UpdateLogicalRoots { roots }
+                };
+                Self::call_worker_with_failure(&client, request, timeout).await
             }
         })
         .await
@@ -8275,6 +8298,51 @@ impl SourceWorkerClientHandle {
                 ));
             }
         };
+        self.with_cache_mut(|cache| {
+            let last_audit_completed_at_us = cache
+                .status
+                .as_ref()
+                .map(source_status_rescan_completion_marker)
+                .unwrap_or_default();
+            let (published_batches, last_published_at_us) = cached_source_publication_marker(cache);
+            cache.rescan_request_published_batches = published_batches;
+            cache.rescan_request_last_published_at_us = last_published_at_us;
+            cache.rescan_request_last_audit_completed_at_us = last_audit_completed_at_us;
+            cache.rescan_request_epoch = cache.rescan_request_epoch.max(epoch);
+        });
+        self.wait_for_rescan_observed_epoch_with_failure(
+            epoch,
+            SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
+        )
+        .await?;
+        Ok(epoch)
+    }
+
+    async fn open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
+        let response = self
+            .with_started_retry_with_failure(|client| async move {
+                Self::call_worker_with_failure(
+                    &client,
+                    SourceWorkerRequest::OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch,
+                    SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
+                )
+                .await
+            })
+            .await?;
+        let epoch = match response {
+            SourceWorkerResponse::RescanRequestEpoch(epoch) => epoch,
+            other => {
+                return Err(unexpected_source_worker_response_failure(
+                    "for open_scan_audit_admission_and_trigger_rescan_when_ready_epoch",
+                    other,
+                ));
+            }
+        };
+        if epoch == 0 {
+            return Ok(0);
+        }
         self.with_cache_mut(|cache| {
             let last_audit_completed_at_us = cache
                 .status
@@ -9865,7 +9933,7 @@ fn recovered_published_observability_from_active_status(
 ) -> SourceObservabilityPublicationView {
     let mut published_batch_count = 0u64;
     let mut published_event_count = 0u64;
-    let mut published_control_event_count = 0u64;
+    let published_control_event_count = 0u64;
     let mut published_data_event_count = 0u64;
     let mut last_published_at_us = None::<u64>;
     let mut last_published_origins = std::collections::BTreeSet::<String>::new();
@@ -9880,17 +9948,10 @@ fn recovered_published_observability_from_active_status(
     {
         published_batch_count = published_batch_count.saturating_add(entry.forwarded_batch_count);
         published_event_count = published_event_count.saturating_add(entry.forwarded_event_count);
-        published_control_event_count =
-            published_control_event_count.saturating_add(entry.emitted_control_event_count);
         published_data_event_count =
-            published_data_event_count.saturating_add(entry.emitted_data_event_count);
-        last_published_at_us =
-            last_published_at_us.max(entry.last_forwarded_at_us.or(entry.last_emitted_at_us));
-        for origin in entry
-            .last_forwarded_origins
-            .iter()
-            .chain(entry.last_emitted_origins.iter())
-        {
+            published_data_event_count.saturating_add(entry.forwarded_event_count);
+        last_published_at_us = last_published_at_us.max(entry.last_forwarded_at_us);
+        for origin in entry.last_forwarded_origins.iter() {
             last_published_origins.insert(origin.clone());
         }
         if entry.forwarded_event_count > 0 {
@@ -10932,6 +10993,15 @@ impl FSMetaSource {
             .map_err(SourceFailure::from)
     }
 
+    pub(crate) async fn update_logical_roots_defer_scan_audit_with_failure(
+        &self,
+        roots: Vec<RootSpec>,
+    ) -> std::result::Result<(), SourceFailure> {
+        self.apply_logical_roots_update_defer_scan_audit(roots)
+            .await
+            .map_err(SourceFailure::from)
+    }
+
     pub(crate) fn logical_roots_snapshot_with_failure(
         &self,
     ) -> std::result::Result<Vec<RootSpec>, SourceFailure> {
@@ -11258,6 +11328,24 @@ impl SourceFacade {
         }
     }
 
+    pub(crate) async fn update_logical_roots_defer_scan_audit_with_failure(
+        &self,
+        roots: Vec<RootSpec>,
+    ) -> std::result::Result<(), SourceFailure> {
+        match self {
+            Self::Local(source) => {
+                source
+                    .update_logical_roots_defer_scan_audit_with_failure(roots)
+                    .await
+            }
+            Self::Worker(client) => {
+                client
+                    .update_logical_roots_defer_scan_audit_with_failure(roots)
+                    .await
+            }
+        }
+    }
+
     pub(crate) fn cached_logical_roots_snapshot_with_failure(
         &self,
     ) -> std::result::Result<Vec<RootSpec>, SourceFailure> {
@@ -11557,6 +11645,27 @@ impl SourceFacade {
         }
     }
 
+    pub(crate) async fn open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
+        #[cfg(test)]
+        record_source_worker_trigger_rescan_when_ready_attempt();
+        match self {
+            Self::Local(source) => {
+                if source.open_scan_audit_admission_if_closed() {
+                    source.trigger_rescan_when_ready_epoch_with_failure().await
+                } else {
+                    Ok(0)
+                }
+            }
+            Self::Worker(client) => {
+                client
+                    .open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure()
+                    .await
+            }
+        }
+    }
+
     pub(crate) async fn submit_rescan_when_ready_epoch_with_failure(
         &self,
     ) -> std::result::Result<u64, SourceFailure> {
@@ -11785,6 +11894,7 @@ async fn run_local_source_pump(
                 .first()
                 .map(|event| event.metadata().origin_id.0.clone())
                 .unwrap_or_else(|| "__empty__".to_string());
+            let accepted_batch = batch.clone();
             if let Err(err) = boundary
                 .channel_send(
                     BoundaryContext::for_unit(execution_units::SOURCE_RUNTIME_UNIT_ID),
@@ -11806,6 +11916,7 @@ async fn run_local_source_pump(
                 source.mark_publication_output_closed(err.to_string());
                 break;
             }
+            source.record_batch_downstream_accepted(&accepted_batch);
         }
     } else {
         tokio::pin!(stream);
@@ -11815,6 +11926,8 @@ async fn run_local_source_pump(
                     "fs-meta app pump failed to apply batch: {:?}",
                     err.as_error()
                 );
+            } else {
+                source.record_batch_downstream_accepted(&batch);
             }
         }
     }

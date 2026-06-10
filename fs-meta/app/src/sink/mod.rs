@@ -1141,10 +1141,26 @@ struct StreamDeliveryStats {
     last_applied_at_us: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
+struct DirectDeliveryStats {
+    received_batches: u64,
+    received_events: u64,
+    received_control_events: u64,
+    received_data_events: u64,
+    last_received_at_us: u64,
+    last_received_origins: Vec<String>,
+    received_origin_counts: BTreeMap<String, u64>,
+    received_group_counts: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AppliedEventCounts {
+    accepted_events: u64,
     control_events: u64,
     data_events: u64,
+    last_received_at_us: u64,
+    received_origin_counts: BTreeMap<String, u64>,
+    received_group_counts: BTreeMap<String, u64>,
 }
 
 enum DecodedSinkEventPayload {
@@ -1856,7 +1872,7 @@ impl SinkStateCell {
         Ok(())
     }
 
-    fn persist_snapshot_after_apply(&self, counts: AppliedEventCounts) -> Result<()> {
+    fn persist_snapshot_after_apply(&self, counts: &AppliedEventCounts) -> Result<()> {
         if counts.control_events > 0 {
             return self.persist_snapshot();
         }
@@ -1905,6 +1921,7 @@ pub struct SinkFileMeta {
     logical_roots_cell: LogicalRootsCell,
     host_object_grants: Arc<RwLock<Vec<GrantedMountRoot>>>,
     visibility_lag: Arc<Mutex<VisibilityLagTelemetry>>,
+    direct_delivery_stats: Arc<Mutex<DirectDeliveryStats>>,
     stream_delivery_stats: Arc<Mutex<StreamDeliveryStats>>,
     pending_stream_events: Arc<Mutex<VecDeque<Event>>>,
     stream_receive_enabled: Arc<AtomicBool>,
@@ -2090,6 +2107,7 @@ impl SinkFileMeta {
         let root_specs = Arc::new(RwLock::new(source_cfg.roots.clone()));
         let host_object_grants = Arc::new(RwLock::new(source_cfg.host_object_grants.clone()));
         let visibility_lag = Arc::new(Mutex::new(VisibilityLagTelemetry::default()));
+        let direct_delivery_stats = Arc::new(Mutex::new(DirectDeliveryStats::default()));
         let stream_delivery_stats = Arc::new(Mutex::new(StreamDeliveryStats::default()));
         let pending_stream_events = Arc::new(Mutex::new(VecDeque::new()));
         let stream_receive_enabled = Arc::new(AtomicBool::new(false));
@@ -2107,6 +2125,7 @@ impl SinkFileMeta {
             logical_roots_cell: logical_roots_cell.clone(),
             host_object_grants: host_object_grants.clone(),
             visibility_lag: visibility_lag.clone(),
+            direct_delivery_stats: direct_delivery_stats.clone(),
             stream_delivery_stats: stream_delivery_stats.clone(),
             pending_stream_events: pending_stream_events.clone(),
             stream_receive_enabled: stream_receive_enabled.clone(),
@@ -2134,6 +2153,7 @@ impl SinkFileMeta {
             let query_logical_roots_cell = logical_roots_cell.clone();
             let query_host_object_grants = host_object_grants.clone();
             let query_visibility_lag = visibility_lag.clone();
+            let query_direct_delivery_stats = direct_delivery_stats.clone();
             let query_stream_delivery_stats = stream_delivery_stats.clone();
             let query_pending_stream_events = pending_stream_events.clone();
             let query_stream_receive_enabled = stream_receive_enabled.clone();
@@ -2160,6 +2180,7 @@ impl SinkFileMeta {
                             let query_logical_roots_cell = query_logical_roots_cell.clone();
                             let query_host_object_grants = query_host_object_grants.clone();
                             let query_visibility_lag = query_visibility_lag.clone();
+                            let query_direct_delivery_stats = query_direct_delivery_stats.clone();
                             let query_stream_delivery_stats = query_stream_delivery_stats.clone();
                             let query_pending_stream_events = query_pending_stream_events.clone();
                             let query_stream_receive_enabled = query_stream_receive_enabled.clone();
@@ -2185,6 +2206,8 @@ impl SinkFileMeta {
                                             logical_roots_cell: query_logical_roots_cell.clone(),
                                             host_object_grants: query_host_object_grants.clone(),
                                             visibility_lag: query_visibility_lag.clone(),
+                                            direct_delivery_stats: query_direct_delivery_stats
+                                                .clone(),
                                             stream_delivery_stats: query_stream_delivery_stats
                                                 .clone(),
                                             pending_stream_events: query_pending_stream_events
@@ -2253,6 +2276,7 @@ impl SinkFileMeta {
             let internal_query_logical_roots_cell = logical_roots_cell.clone();
             let internal_query_host_object_grants = host_object_grants.clone();
             let internal_query_visibility_lag = visibility_lag.clone();
+            let internal_query_direct_delivery_stats = direct_delivery_stats.clone();
             let internal_query_stream_delivery_stats = stream_delivery_stats.clone();
             let internal_query_pending_stream_events = pending_stream_events.clone();
             let internal_query_stream_receive_enabled = stream_receive_enabled.clone();
@@ -2283,6 +2307,8 @@ impl SinkFileMeta {
                 let internal_query_host_object_grants_for_route =
                     internal_query_host_object_grants.clone();
                 let internal_query_visibility_lag_for_route = internal_query_visibility_lag.clone();
+                let internal_query_direct_delivery_stats_for_route =
+                    internal_query_direct_delivery_stats.clone();
                 let internal_query_stream_delivery_stats_for_route =
                     internal_query_stream_delivery_stats.clone();
                 let internal_query_pending_stream_events_for_route =
@@ -2317,6 +2343,8 @@ impl SinkFileMeta {
                                 internal_query_host_object_grants_for_route.clone();
                             let internal_query_visibility_lag =
                                 internal_query_visibility_lag_for_route.clone();
+                            let internal_query_direct_delivery_stats =
+                                internal_query_direct_delivery_stats_for_route.clone();
                             let internal_query_stream_delivery_stats =
                                 internal_query_stream_delivery_stats_for_route.clone();
                             let internal_query_pending_stream_events =
@@ -2358,6 +2386,8 @@ impl SinkFileMeta {
                                             host_object_grants: internal_query_host_object_grants
                                                 .clone(),
                                             visibility_lag: internal_query_visibility_lag.clone(),
+                                            direct_delivery_stats:
+                                                internal_query_direct_delivery_stats.clone(),
                                             stream_delivery_stats:
                                                 internal_query_stream_delivery_stats.clone(),
                                             pending_stream_events:
@@ -2543,6 +2573,7 @@ impl SinkFileMeta {
             let stream_logical_roots_cell = logical_roots_cell.clone();
             let stream_host_object_grants = host_object_grants.clone();
             let stream_visibility_lag = visibility_lag.clone();
+            let stream_direct_delivery_stats = direct_delivery_stats.clone();
             let stream_delivery_stats = stream_delivery_stats.clone();
             let stream_unit_control = unit_control.clone();
             let route = events_stream_route_for_scope(&node_id.0);
@@ -2553,6 +2584,7 @@ impl SinkFileMeta {
                 logical_roots_cell: stream_logical_roots_cell.clone(),
                 host_object_grants: stream_host_object_grants,
                 visibility_lag: stream_visibility_lag,
+                direct_delivery_stats: stream_direct_delivery_stats,
                 stream_delivery_stats,
                 pending_stream_events: pending_stream_events.clone(),
                 stream_receive_enabled: stream_receive_enabled.clone(),
@@ -2763,6 +2795,7 @@ impl SinkFileMeta {
         let query_logical_roots_cell = self.logical_roots_cell.clone();
         let query_host_object_grants = self.host_object_grants.clone();
         let query_visibility_lag = self.visibility_lag.clone();
+        let query_direct_delivery_stats = self.direct_delivery_stats.clone();
         let query_stream_delivery_stats = self.stream_delivery_stats.clone();
         let query_pending_stream_events = self.pending_stream_events.clone();
         let query_stream_receive_enabled = self.stream_receive_enabled.clone();
@@ -2800,6 +2833,7 @@ impl SinkFileMeta {
                             let query_logical_roots_cell = query_logical_roots_cell.clone();
                             let query_host_object_grants = query_host_object_grants.clone();
                             let query_visibility_lag = query_visibility_lag.clone();
+                            let query_direct_delivery_stats = query_direct_delivery_stats.clone();
                             let query_stream_delivery_stats = query_stream_delivery_stats.clone();
                             let query_pending_stream_events = query_pending_stream_events.clone();
                             let query_stream_receive_enabled = query_stream_receive_enabled.clone();
@@ -2819,6 +2853,8 @@ impl SinkFileMeta {
                                             logical_roots_cell: query_logical_roots_cell.clone(),
                                             host_object_grants: query_host_object_grants.clone(),
                                             visibility_lag: query_visibility_lag.clone(),
+                                            direct_delivery_stats: query_direct_delivery_stats
+                                                .clone(),
                                             stream_delivery_stats: query_stream_delivery_stats
                                                 .clone(),
                                             pending_stream_events: query_pending_stream_events
@@ -2886,6 +2922,7 @@ impl SinkFileMeta {
         let internal_query_logical_roots_cell = self.logical_roots_cell.clone();
         let internal_query_host_object_grants = self.host_object_grants.clone();
         let internal_query_visibility_lag = self.visibility_lag.clone();
+        let internal_query_direct_delivery_stats = self.direct_delivery_stats.clone();
         let internal_query_stream_delivery_stats = self.stream_delivery_stats.clone();
         let internal_query_pending_stream_events = self.pending_stream_events.clone();
         let internal_query_stream_receive_enabled = self.stream_receive_enabled.clone();
@@ -2917,6 +2954,8 @@ impl SinkFileMeta {
             let internal_query_host_object_grants_for_route =
                 internal_query_host_object_grants.clone();
             let internal_query_visibility_lag_for_route = internal_query_visibility_lag.clone();
+            let internal_query_direct_delivery_stats_for_route =
+                internal_query_direct_delivery_stats.clone();
             let internal_query_stream_delivery_stats_for_route =
                 internal_query_stream_delivery_stats.clone();
             let internal_query_pending_stream_events_for_route =
@@ -2956,6 +2995,8 @@ impl SinkFileMeta {
                             internal_query_host_object_grants_for_route.clone();
                         let internal_query_visibility_lag =
                             internal_query_visibility_lag_for_route.clone();
+                        let internal_query_direct_delivery_stats =
+                            internal_query_direct_delivery_stats_for_route.clone();
                         let internal_query_stream_delivery_stats =
                             internal_query_stream_delivery_stats_for_route.clone();
                         let internal_query_pending_stream_events =
@@ -2991,6 +3032,8 @@ impl SinkFileMeta {
                                         host_object_grants: internal_query_host_object_grants
                                             .clone(),
                                         visibility_lag: internal_query_visibility_lag.clone(),
+                                        direct_delivery_stats: internal_query_direct_delivery_stats
+                                            .clone(),
                                         stream_delivery_stats: internal_query_stream_delivery_stats
                                             .clone(),
                                         pending_stream_events: internal_query_pending_stream_events
@@ -3072,6 +3115,7 @@ impl SinkFileMeta {
         let status_logical_roots_cell = self.logical_roots_cell.clone();
         let status_host_object_grants = self.host_object_grants.clone();
         let status_visibility_lag = self.visibility_lag.clone();
+        let status_direct_delivery_stats = self.direct_delivery_stats.clone();
         let status_stream_delivery_stats = self.stream_delivery_stats.clone();
         let status_pending_stream_events = self.pending_stream_events.clone();
         let status_stream_receive_enabled = self.stream_receive_enabled.clone();
@@ -3097,6 +3141,7 @@ impl SinkFileMeta {
             let status_logical_roots_cell_for_route = status_logical_roots_cell.clone();
             let status_host_object_grants_for_route = status_host_object_grants.clone();
             let status_visibility_lag_for_route = status_visibility_lag.clone();
+            let status_direct_delivery_stats_for_route = status_direct_delivery_stats.clone();
             let status_stream_delivery_stats_for_route = status_stream_delivery_stats.clone();
             let status_pending_stream_events_for_route = status_pending_stream_events.clone();
             let status_stream_receive_enabled_for_route = status_stream_receive_enabled.clone();
@@ -3126,6 +3171,8 @@ impl SinkFileMeta {
                         let status_logical_roots_cell = status_logical_roots_cell_for_route.clone();
                         let status_host_object_grants = status_host_object_grants_for_route.clone();
                         let status_visibility_lag = status_visibility_lag_for_route.clone();
+                        let status_direct_delivery_stats =
+                            status_direct_delivery_stats_for_route.clone();
                         let status_stream_delivery_stats =
                             status_stream_delivery_stats_for_route.clone();
                         let status_pending_stream_events =
@@ -3145,6 +3192,7 @@ impl SinkFileMeta {
                                     logical_roots_cell: status_logical_roots_cell.clone(),
                                     host_object_grants: status_host_object_grants.clone(),
                                     visibility_lag: status_visibility_lag.clone(),
+                                    direct_delivery_stats: status_direct_delivery_stats.clone(),
                                     stream_delivery_stats: status_stream_delivery_stats.clone(),
                                     pending_stream_events: status_pending_stream_events.clone(),
                                     stream_receive_enabled: status_stream_receive_enabled.clone(),
@@ -3319,6 +3367,7 @@ impl SinkFileMeta {
         let stream_logical_roots_cell = self.logical_roots_cell.clone();
         let stream_host_object_grants = self.host_object_grants.clone();
         let stream_visibility_lag = self.visibility_lag.clone();
+        let stream_direct_delivery_stats = self.direct_delivery_stats.clone();
         let stream_delivery_stats = self.stream_delivery_stats.clone();
         let stream_receive_enabled = self.stream_receive_enabled.clone();
         let stream_unit_control = self.unit_control.clone();
@@ -3342,6 +3391,7 @@ impl SinkFileMeta {
                 logical_roots_cell: stream_logical_roots_cell.clone(),
                 host_object_grants: stream_host_object_grants,
                 visibility_lag: stream_visibility_lag,
+                direct_delivery_stats: stream_direct_delivery_stats,
                 stream_delivery_stats,
                 pending_stream_events: self.pending_stream_events.clone(),
                 stream_receive_enabled: stream_receive_enabled,
@@ -3404,12 +3454,13 @@ impl SinkFileMeta {
                 logical_roots_cell: self.logical_roots_cell.clone(),
                 host_object_grants: self.host_object_grants.clone(),
                 visibility_lag: self.visibility_lag.clone(),
+                direct_delivery_stats: self.direct_delivery_stats.clone(),
                 stream_delivery_stats: self.stream_delivery_stats.clone(),
                 pending_stream_events: self.pending_stream_events.clone(),
                 stream_receive_enabled: roots_control_stream_receive_enabled,
                 unit_control: self.unit_control.clone(),
                 stream_recv_observer: None,
-                stream_recv_ready_notify: None,
+                stream_recv_ready_notify: self.stream_recv_ready_notify.clone(),
                 shutdown: self.shutdown.clone(),
                 endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
             });
@@ -3572,6 +3623,7 @@ impl SinkFileMeta {
         let stream_logical_roots_cell = self.logical_roots_cell.clone();
         let stream_host_object_grants = self.host_object_grants.clone();
         let stream_visibility_lag = self.visibility_lag.clone();
+        let stream_direct_delivery_stats = self.direct_delivery_stats.clone();
         let stream_delivery_stats = self.stream_delivery_stats.clone();
         let stream_unit_control = self.unit_control.clone();
         eprintln!(
@@ -3591,6 +3643,7 @@ impl SinkFileMeta {
             logical_roots_cell: stream_logical_roots_cell.clone(),
             host_object_grants: stream_host_object_grants,
             visibility_lag: stream_visibility_lag,
+            direct_delivery_stats: stream_direct_delivery_stats,
             stream_delivery_stats,
             pending_stream_events: self.pending_stream_events.clone(),
             stream_receive_enabled: self.stream_receive_enabled.clone(),
@@ -4493,6 +4546,45 @@ impl SinkFileMeta {
         snapshot.groups = groups;
         snapshot.stream_path_capture_target = debug_stream_path_capture_target()
             .map(|target| String::from_utf8_lossy(&target).into_owned());
+        if let Ok(stats) = self.direct_delivery_stats.lock() {
+            if stats.received_batches > 0 {
+                snapshot
+                    .received_batches_by_node
+                    .insert(self.node_id.0.clone(), stats.received_batches);
+            }
+            if stats.received_events > 0 {
+                snapshot
+                    .received_events_by_node
+                    .insert(self.node_id.0.clone(), stats.received_events);
+            }
+            if stats.received_control_events > 0 {
+                snapshot
+                    .received_control_events_by_node
+                    .insert(self.node_id.0.clone(), stats.received_control_events);
+            }
+            if stats.received_data_events > 0 {
+                snapshot
+                    .received_data_events_by_node
+                    .insert(self.node_id.0.clone(), stats.received_data_events);
+            }
+            if stats.last_received_at_us > 0 {
+                snapshot
+                    .last_received_at_us_by_node
+                    .insert(self.node_id.0.clone(), stats.last_received_at_us);
+            }
+            if !stats.last_received_origins.is_empty() {
+                snapshot
+                    .last_received_origins_by_node
+                    .insert(self.node_id.0.clone(), stats.last_received_origins.clone());
+            }
+            let mut received_origin_counts = format_origin_counts(&stats.received_origin_counts);
+            received_origin_counts.extend(format_origin_counts(&stats.received_group_counts));
+            if !received_origin_counts.is_empty() {
+                snapshot
+                    .received_origin_counts_by_node
+                    .insert(self.node_id.0.clone(), received_origin_counts);
+            }
+        }
         if let Ok(stats) = self.stream_delivery_stats.lock() {
             if stats.received_batches > 0 {
                 snapshot
@@ -4656,17 +4748,26 @@ impl SinkFileMeta {
     }
 
     fn should_receive_stream_events(&self) -> bool {
-        let route_key = events_stream_route_for_scope(&self.node_id.0).0;
+        let owner_route_key = events_stream_route_for_scope(&self.node_id.0).0;
+        let generic_route_key = format!("{}.stream", ROUTE_KEY_EVENTS);
         let enabled = self.stream_receive_enabled.load(Ordering::Acquire);
         let has_targets = self.has_scheduled_stream_targets();
-        let gate = self.should_receive_control_stream_route(&route_key);
+        let owner_gate = self.should_receive_control_stream_route(&owner_route_key);
+        let generic_gate = if generic_route_key == owner_route_key {
+            false
+        } else {
+            self.should_receive_control_stream_route(&generic_route_key)
+        };
+        let gate = owner_gate || generic_gate;
         if debug_events_gate_enabled() {
             eprintln!(
-                "fs_meta_sink: events_gate node={} enabled={} has_targets={} gate={} scheduled_groups={:?} scheduled_stream_targets={:?}",
+                "fs_meta_sink: events_gate node={} enabled={} has_targets={} gate={} owner_gate={} generic_gate={} scheduled_groups={:?} scheduled_stream_targets={:?}",
                 self.node_id.0,
                 enabled,
                 has_targets,
                 gate,
+                owner_gate,
+                generic_gate,
                 self.scheduled_group_ids().ok(),
                 self.scheduled_stream_object_refs().ok(),
             );
@@ -4913,8 +5014,38 @@ impl SinkFileMeta {
         Ok(())
     }
 
+    fn record_direct_delivery_stats(&self, counts: &AppliedEventCounts) {
+        if counts.accepted_events == 0 {
+            return;
+        }
+        let mut stats = lock_or_recover(
+            &self.direct_delivery_stats,
+            "sink.apply_events.direct_delivery_stats",
+        );
+        stats.received_batches = stats.received_batches.saturating_add(1);
+        stats.received_events = stats.received_events.saturating_add(counts.accepted_events);
+        stats.received_control_events = stats
+            .received_control_events
+            .saturating_add(counts.control_events);
+        stats.received_data_events = stats
+            .received_data_events
+            .saturating_add(counts.data_events);
+        stats.last_received_at_us = stats.last_received_at_us.max(counts.last_received_at_us);
+        stats.last_received_origins = format_origin_counts(&counts.received_origin_counts);
+        accumulate_origin_counts(
+            &mut stats.received_origin_counts,
+            &counts.received_origin_counts,
+        );
+        accumulate_origin_counts(
+            &mut stats.received_group_counts,
+            &counts.received_group_counts,
+        );
+    }
+
     pub(crate) fn apply_events(&self, events: &[Event]) -> Result<()> {
-        self.apply_events_counted(events).map(|_| ())
+        let counts = self.apply_events_counted(events)?;
+        self.record_direct_delivery_stats(&counts);
+        Ok(())
     }
 
     fn apply_events_counted(&self, events: &[Event]) -> Result<AppliedEventCounts> {
@@ -4964,6 +5095,18 @@ impl SinkFileMeta {
             let object_ref = event.metadata().origin_id.0.clone();
             let (group_id, is_group_primary, group_state) =
                 state.ensure_group_state_mut(&object_ref)?;
+            counts.accepted_events = counts.accepted_events.saturating_add(1);
+            counts.last_received_at_us = counts
+                .last_received_at_us
+                .max(event.metadata().timestamp_us);
+            *counts
+                .received_origin_counts
+                .entry(object_ref.clone())
+                .or_default() += 1;
+            *counts
+                .received_group_counts
+                .entry(group_id.clone())
+                .or_default() += 1;
             group_state.clock.advance(event.metadata().timestamp_us);
 
             let payload = event.payload_bytes();
@@ -5085,7 +5228,7 @@ impl SinkFileMeta {
                 counts.data_events
             ),
         );
-        self.state.persist_snapshot_after_apply(counts)?;
+        self.state.persist_snapshot_after_apply(&counts)?;
 
         if !pending_lag_samples.is_empty() {
             lock_or_recover(

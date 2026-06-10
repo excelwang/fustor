@@ -34,6 +34,8 @@ use crate::{ControlEvent, FileMetaRecord, LogicalClock};
 #[cfg(test)]
 use crate::{EventKind, SyncTrack};
 
+pub(crate) type WatchBackpressureReporter = Arc<dyn Fn(&'static str) + Send + Sync + 'static>;
+
 fn lock_or_recover<'a, T>(m: &'a Mutex<T>, context: &str) -> MutexGuard<'a, T> {
     match m.lock() {
         Ok(g) => g,
@@ -745,6 +747,7 @@ pub(crate) fn start_watch_loop(
     host_fs: Arc<dyn HostFs>,
     throttle_interval: Duration,
     rescan_tx: Option<tokio::sync::broadcast::Sender<super::RescanReason>>,
+    backpressure_reporter: Option<WatchBackpressureReporter>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let mut buf = vec![0u8; 8192];
@@ -784,7 +787,21 @@ pub(crate) fn start_watch_loop(
                     };
 
                     if !batch.is_empty() {
-                        let _ = tx.blocking_send(batch);
+                        match tx.try_send(batch) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                log::warn!(
+                                    "watch realtime output queue is full; marking watch overflow/backpressure evidence"
+                                );
+                                if let Some(tx) = rescan_tx.as_ref() {
+                                    let _ = tx.send(super::RescanReason::Overflow);
+                                }
+                                if let Some(report) = backpressure_reporter.as_ref() {
+                                    report("realtime watch output queue full");
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -806,6 +823,7 @@ use std::time::UNIX_EPOCH;
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet, VecDeque};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
     struct MockHostFs {
@@ -896,6 +914,7 @@ mod tests {
 
     struct MockWatchBackend {
         add_results: VecDeque<io::Result<HostFsWatchDescriptor>>,
+        read_results: VecDeque<io::Result<Vec<HostFsWatchEvent>>>,
         next_id: u64,
     }
 
@@ -903,6 +922,15 @@ mod tests {
         fn with_add_results(add_results: Vec<io::Result<HostFsWatchDescriptor>>) -> Self {
             Self {
                 add_results: add_results.into(),
+                read_results: VecDeque::new(),
+                next_id: 1,
+            }
+        }
+
+        fn with_read_results(read_results: Vec<io::Result<Vec<HostFsWatchEvent>>>) -> Self {
+            Self {
+                add_results: VecDeque::new(),
+                read_results: read_results.into(),
                 next_id: 1,
             }
         }
@@ -927,7 +955,12 @@ mod tests {
         }
 
         fn read_events(&mut self, _buffer: &mut [u8]) -> io::Result<Vec<HostFsWatchEvent>> {
-            Ok(Vec::new())
+            self.read_results.pop_front().unwrap_or_else(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "mock watch has no events",
+                ))
+            })
         }
     }
 
@@ -937,6 +970,76 @@ mod tests {
             min_monitoring_window: Duration::from_millis(0),
             ..SourceConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn watch_loop_full_output_reports_backpressure_without_blocking() {
+        let config = watch_test_config(4);
+        let watch = Box::new(MockWatchBackend::with_read_results(vec![Ok(vec![
+            watch_event(
+                HostFsWatchDescriptor(1),
+                HostFsWatchMask::ATTRIB,
+                Some("file.txt"),
+            ),
+        ])]));
+        let mut manager =
+            WatchManager::new(&config, PathBuf::from("/root"), PathBuf::from("/"), watch)
+                .expect("construct watch manager");
+        manager
+            .schedule(Path::new("/root"))
+            .expect("schedule root watch");
+        let watcher = Arc::new(Mutex::new(manager));
+        let host_fs =
+            Arc::new(MockHostFs::default().with_metadata("/root/file.txt", mock_file_metadata()));
+        let (tx, _rx) = mpsc::channel::<Vec<Event>>(1);
+        tx.try_send(vec![Event::new(
+            EventMetadata {
+                origin_id: NodeId("pre-filled".to_string()),
+                timestamp_us: 0,
+                logical_ts: None,
+                correlation_id: None,
+                ingress_auth: None,
+                trace: None,
+            },
+            Bytes::new(),
+        )])
+        .expect("pre-fill watch output channel");
+        let (rescan_tx, mut rescan_rx) = tokio::sync::broadcast::channel(8);
+        let shutdown = CancellationToken::new();
+        let reporter_shutdown = shutdown.clone();
+        let reported = Arc::new(AtomicUsize::new(0));
+        let reported_for_callback = reported.clone();
+        let reporter = Arc::new(move |op: &'static str| {
+            assert_eq!(op, "realtime watch output queue full");
+            reported_for_callback.fetch_add(1, Ordering::SeqCst);
+            reporter_shutdown.cancel();
+        }) as WatchBackpressureReporter;
+
+        let handle = start_watch_loop(
+            watcher,
+            Arc::new(Mutex::new(DriftEstimator::new(8, 10, 1_000_000))),
+            tx,
+            shutdown,
+            NodeId("node-a::nfs1".to_string()),
+            Arc::new(LogicalClock::new()),
+            host_fs,
+            Duration::from_millis(0),
+            Some(rescan_tx),
+            Some(reporter),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("watch loop should exit after reporter cancellation")
+            .expect("watch loop task should not panic");
+        assert_eq!(reported.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(
+                rescan_rx.try_recv(),
+                Ok(super::super::RescanReason::Overflow)
+            ),
+            "full realtime output should emit overflow repair signal"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Implements work-stealing parallel directory walk with mtime-diff pruning,
 //! symlink loop prevention, and re-batching.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io;
 #[cfg(target_family = "unix")]
@@ -255,6 +255,44 @@ mod tests {
     }
 
     #[test]
+    fn audit_scan_backpressure_stops_directory_read_ahead_before_child_expansion() {
+        let host_fs = WideTreeHostFs::new(128);
+        let scanner = ParallelScanner::new(
+            PathBuf::from("/root"),
+            PathBuf::new(),
+            4,
+            1,
+            1024,
+            NodeId("node-a::nfs1".to_string()),
+            Arc::new(host_fs.clone()),
+        );
+
+        let result = scanner.scan_audit_streaming(
+            8,
+            &mut HashMap::new(),
+            &drift_estimator(),
+            &Arc::new(LogicalClock::new()),
+            None,
+            |batch| {
+                let is_control = batch.iter().all(|event| {
+                    rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok()
+                });
+                is_control
+            },
+        );
+
+        assert!(
+            !result.completed,
+            "scan/audit must stop when downstream refuses the first data batch"
+        );
+        assert_eq!(
+            host_fs.read_dir_calls(),
+            vec![PathBuf::from("/root")],
+            "scan/audit backpressure must stop child-directory read-ahead instead of draining an internal unbounded result queue"
+        );
+    }
+
+    #[test]
     fn directory_fingerprint_is_order_independent_for_wide_directories() {
         let mut entries = (0..4096)
             .map(|idx| HostFsDirEntry {
@@ -362,6 +400,8 @@ const AUDIT_DEEP_INTERVAL_ROUNDS_ENV: &str = "FS_META_SOURCE_AUDIT_DEEP_INTERVAL
 const AUDIT_DEEP_INTERVAL_ROUNDS_DEFAULT: u64 = 24;
 const AUDIT_DEEP_INTERVAL_ROUNDS_MIN: u64 = 1;
 const AUDIT_DEEP_INTERVAL_ROUNDS_MAX: u64 = 1024;
+const SCAN_WORK_QUEUE_PER_WORKER: usize = 4;
+const SCAN_RESULT_QUEUE_PER_WORKER: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct DirAuditState {
@@ -485,6 +525,23 @@ fn metadata_batch_size() -> usize {
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .unwrap_or(HOST_FS_METADATA_BATCH_DEFAULT)
         .clamp(1, HOST_FS_METADATA_BATCH_MAX)
+}
+
+fn scan_work_queue_capacity(scan_workers: usize) -> usize {
+    scan_workers
+        .saturating_mul(SCAN_WORK_QUEUE_PER_WORKER)
+        .max(1)
+}
+
+fn scan_result_queue_capacity(scan_workers: usize) -> usize {
+    scan_workers
+        .saturating_mul(SCAN_RESULT_QUEUE_PER_WORKER)
+        .max(1)
+}
+
+struct ScanRecordBatch {
+    records: Vec<FileMetaRecord>,
+    accepted_tx: cb::Sender<bool>,
 }
 
 fn host_fs_timeout_error(op: &str, path: &Path) -> io::Error {
@@ -706,14 +763,34 @@ fn read_dir_with_retry(
 }
 
 fn flush_scan_records(
-    result_tx: &cb::Sender<Vec<FileMetaRecord>>,
+    result_tx: &cb::Sender<ScanRecordBatch>,
     records: &mut Vec<FileMetaRecord>,
     flush_at: usize,
 ) -> bool {
     if records.len() < flush_at {
         return true;
     }
-    result_tx.send(std::mem::take(records)).is_ok()
+    send_scan_records(result_tx, std::mem::take(records))
+}
+
+fn send_scan_records(
+    result_tx: &cb::Sender<ScanRecordBatch>,
+    records: Vec<FileMetaRecord>,
+) -> bool {
+    if records.is_empty() {
+        return true;
+    }
+    let (accepted_tx, accepted_rx) = cb::bounded(1);
+    if result_tx
+        .send(ScanRecordBatch {
+            records,
+            accepted_tx,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    accepted_rx.recv().unwrap_or(false)
 }
 
 /// Parallel directory scanner with work-stealing.
@@ -982,8 +1059,10 @@ impl ParallelScanner {
             );
         }
 
-        let (work_tx, work_rx) = cb::unbounded::<PathBuf>();
-        let (result_tx, result_rx) = cb::unbounded::<Vec<FileMetaRecord>>();
+        let (work_tx, work_rx) =
+            cb::bounded::<PathBuf>(scan_work_queue_capacity(self.scan_workers));
+        let (result_tx, result_rx) =
+            cb::bounded::<ScanRecordBatch>(scan_result_queue_capacity(self.scan_workers));
         let pending_dirs = Arc::new(AtomicUsize::new(1));
         let stop_requested = Arc::new(AtomicBool::new(false));
 
@@ -1024,11 +1103,16 @@ impl ParallelScanner {
                 let metadata_batch = metadata_batch;
                 let flush_record_count = flush_record_count;
                 std::thread::spawn(move || {
+                    let mut local_work = VecDeque::<PathBuf>::new();
                     loop {
                         // Use recv_timeout instead of blocking recv to avoid deadlock.
                         // Workers hold work_tx clones, so recv() never returns Err.
                         // Instead, check pending_dirs to detect completion.
-                        match work_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                        let next_dir = match local_work.pop_front() {
+                            Some(dir_path) => Ok(dir_path),
+                            None => work_rx.recv_timeout(std::time::Duration::from_millis(10)),
+                        };
+                        match next_dir {
                             Ok(dir_path) => {
                                 if stop_requested.load(Ordering::SeqCst) {
                                     pending.fetch_sub(1, Ordering::SeqCst);
@@ -1185,6 +1269,7 @@ impl ParallelScanner {
                                     let parent_relative =
                                         watcher::make_relative(&dir_path, &root);
                                     let parent_mtime_us = (current_mtime * 1_000_000.0) as u64;
+                                    let mut child_dirs = Vec::new();
                                     let mut file_paths = Vec::new();
 
                                     for entry in entries {
@@ -1192,9 +1277,7 @@ impl ParallelScanner {
                                             break;
                                         }
                                         if entry.is_dir {
-                                            // ALWAYS_RECURSE: still descend into subdirectories.
-                                            pending.fetch_add(1, Ordering::SeqCst);
-                                            let _ = work_tx.send(entry.path);
+                                            child_dirs.push(entry.path);
                                             continue;
                                         }
 
@@ -1259,10 +1342,27 @@ impl ParallelScanner {
                                             }
                                         }
                                     }
-                                }
 
-                                if !records.is_empty() {
-                                    let _ = result_tx.send(records);
+                                    if !send_scan_records(&result_tx, records) {
+                                        stop_requested.store(true, Ordering::SeqCst);
+                                    }
+
+                                    if !stop_requested.load(Ordering::SeqCst) {
+                                        for child_dir in child_dirs {
+                                            pending.fetch_add(1, Ordering::SeqCst);
+                                            match work_tx.try_send(child_dir) {
+                                                Ok(()) => {}
+                                                Err(cb::TrySendError::Full(child_dir)) => {
+                                                    local_work.push_back(child_dir);
+                                                }
+                                                Err(cb::TrySendError::Disconnected(_)) => {
+                                                    pending.fetch_sub(1, Ordering::SeqCst);
+                                                    stop_requested.store(true, Ordering::SeqCst);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 pending.fetch_sub(1, Ordering::SeqCst);
                             }
@@ -1291,25 +1391,29 @@ impl ParallelScanner {
         let mut record_count = 0;
         let mut current_batch = Vec::new();
         let mut completed = true;
-        for records in result_rx {
-            if completed {
-                let (records_seen, still_open) = self.emit_record_events(
-                    records,
-                    drift_estimator,
-                    logical_clock,
-                    &mut current_batch,
-                    emit_batch,
-                );
-                record_count += records_seen;
-                if !still_open {
-                    completed = false;
-                    stop_requested.store(true, Ordering::SeqCst);
-                }
-            } else {
-                record_count += records.len();
+        for batch in &result_rx {
+            let (records_seen, mut still_open) = self.emit_record_events(
+                batch.records,
+                drift_estimator,
+                logical_clock,
+                &mut current_batch,
+                emit_batch,
+            );
+            if still_open
+                && !current_batch.is_empty()
+                && !emit_batch(std::mem::take(&mut current_batch))
+            {
+                still_open = false;
+            }
+            let _ = batch.accepted_tx.send(still_open);
+            record_count += records_seen;
+            if !still_open {
+                completed = false;
+                stop_requested.store(true, Ordering::SeqCst);
+                break;
             }
         }
-
+        drop(result_rx);
         if completed && !current_batch.is_empty() && !emit_batch(std::mem::take(&mut current_batch))
         {
             completed = false;

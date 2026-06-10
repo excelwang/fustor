@@ -198,6 +198,101 @@ impl ChannelIoSubset for RootsControlSequenceBoundary {
     }
 }
 
+struct RootsControlThenEventsBoundary {
+    roots_control_route: String,
+    events_route: String,
+    roots_payload: Bytes,
+    events: Vec<Event>,
+    roots_delivered: AtomicBool,
+    events_delivered: AtomicBool,
+    recv_counts: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
+    recv_notify: tokio::sync::Notify,
+}
+
+impl RootsControlThenEventsBoundary {
+    fn new(
+        roots_control_route: String,
+        events_route: String,
+        roots_payload: Vec<u8>,
+        events: Vec<Event>,
+    ) -> Self {
+        Self {
+            roots_control_route,
+            events_route,
+            roots_payload: Bytes::from(roots_payload),
+            events,
+            roots_delivered: AtomicBool::new(false),
+            events_delivered: AtomicBool::new(false),
+            recv_counts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            recv_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn roots_delivered(&self) -> bool {
+        self.roots_delivered.load(Ordering::Acquire)
+    }
+
+    fn events_delivered(&self) -> bool {
+        self.events_delivered.load(Ordering::Acquire)
+    }
+
+    fn recv_counts_snapshot(&self) -> std::collections::BTreeMap<String, usize> {
+        self.recv_counts
+            .lock()
+            .expect("roots/events recv counts lock")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelIoSubset for RootsControlThenEventsBoundary {
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+    ) -> Result<Vec<Event>> {
+        let route_key = request.channel_key.0;
+        *self
+            .recv_counts
+            .lock()
+            .expect("roots/events recv counts lock")
+            .entry(route_key.clone())
+            .or_default() += 1;
+        self.recv_notify.notify_waiters();
+
+        if route_key == self.roots_control_route
+            && self
+                .roots_delivered
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Ok(vec![Event::new(
+                EventMetadata {
+                    origin_id: NodeId("node-a".to_string()),
+                    timestamp_us: 1,
+                    logical_ts: None,
+                    correlation_id: None,
+                    ingress_auth: None,
+                    trace: None,
+                },
+                self.roots_payload.clone(),
+            )]);
+        }
+
+        if route_key == self.events_route
+            && self.roots_delivered()
+            && self
+                .events_delivered
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Ok(self.events.clone());
+        }
+
+        Err(CnxError::Timeout)
+    }
+}
+
 fn default_materialized_request() -> InternalQueryRequest {
     InternalQueryRequest::default()
 }
@@ -984,6 +1079,130 @@ async fn owner_scoped_roots_control_replay_bootstraps_route_activation_from_payl
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn owner_scoped_roots_control_replay_arms_events_stream_and_ingests_owner_events() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::nfs1",
+        "node-a",
+        "10.0.0.1",
+        "/mnt/nfs1",
+        true,
+    )];
+    let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg.clone())
+        .expect("build sink");
+    let roots_control_route =
+        crate::runtime::routes::sink_roots_control_stream_route_for("node-a").0;
+    let events_route = crate::runtime::routes::events_stream_route_for_scope("node-a").0;
+    let sink_replay = vec![
+        encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+            version: 3,
+            grants: cfg
+                .host_object_grants
+                .iter()
+                .map(|grant| RuntimeHostGrant {
+                    object_ref: grant.object_ref.clone(),
+                    object_type: RuntimeHostObjectType::MountRoot,
+                    interfaces: grant.interfaces.clone(),
+                    host: RuntimeHostDescriptor {
+                        host_ref: grant.host_ref.clone(),
+                        host_ip: grant.host_ip.clone(),
+                        host_name: grant.host_name.clone(),
+                        site: grant.site.clone(),
+                        zone: grant.zone.clone(),
+                        host_labels: grant.host_labels.clone(),
+                    },
+                    object: RuntimeObjectDescriptor {
+                        mount_point: grant.mount_point.display().to_string(),
+                        fs_source: grant.fs_source.clone(),
+                        fs_type: grant.fs_type.clone(),
+                        mount_options: grant.mount_options.clone(),
+                    },
+                    grant_state: RuntimeHostGrantState::Active,
+                })
+                .collect(),
+        })
+        .expect("encode grant replay"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: events_route.clone(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 60_000,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+        }))
+        .expect("encode sink events replay activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: roots_control_route.clone(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 60_000,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+        }))
+        .expect("encode sink roots-control replay activate"),
+    ];
+    let payload = encode_logical_roots_control_payload_with_generation_and_sink_replay(
+        &cfg.roots,
+        3,
+        sink_replay,
+    )
+    .expect("encode roots control payload with sink replay");
+    let boundary = Arc::new(RootsControlThenEventsBoundary::new(
+        roots_control_route.clone(),
+        events_route.clone(),
+        payload,
+        vec![mk_source_event(
+            "node-a::nfs1",
+            mk_record(b"/ready.txt", "ready.txt", 7, EventKind::Update),
+        )],
+    ));
+
+    sink.start_runtime_endpoints(boundary.clone(), NodeId("node-a".to_string()))
+        .expect("start runtime endpoints");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = sink
+            .status_snapshot()
+            .expect("status while waiting for owner event ingest");
+        if snapshot
+            .stream_received_events_by_node
+            .get("node-a")
+            .copied()
+            .unwrap_or(0)
+            >= 1
+        {
+            assert!(
+                boundary.events_delivered(),
+                "test boundary must have delivered the owner-scoped events batch"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "owner-scoped roots-control replay must arm the events stream and ingest owner events; roots_delivered={} events_delivered={} recv_counts={:?} snapshot={snapshot:?}",
+            boundary.roots_delivered(),
+            boundary.events_delivered(),
+            boundary.recv_counts_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let query_events = sink
+        .materialized_query(&default_materialized_request())
+        .expect("query materialized state after stream ingest");
+    assert_eq!(query_events.len(), 1, "scheduled group should reply");
+    let response = decode_tree_payload(&query_events[0]);
+    assert!(
+        payload_contains_path(&response, b"/ready.txt"),
+        "owner event delivered through the events stream must be materialized"
+    );
 
     sink.close().await.expect("close sink");
 }

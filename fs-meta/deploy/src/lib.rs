@@ -170,6 +170,13 @@ pub fn compile_release_doc_to_relation_target_intent(
         .map_err(|err| CnxError::InvalidInput(format!("invalid fs-meta deploy intent: {err}")))
 }
 
+pub fn compile_scope_worker_relation_target_intent(
+    intent_value: serde_json::Value,
+) -> Result<serde_json::Value> {
+    compile_relation_target_intent_value(intent_value)
+        .map_err(|err| CnxError::InvalidInput(format!("invalid fs-meta deploy intent: {err}")))
+}
+
 pub fn build_startup_manifest_value(
     base_manifest_path: &Path,
     spec: &FsMetaReleaseSpec,
@@ -887,17 +894,23 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     serde_json::Value::Object(route_units)
 }
 
-fn build_app_scopes_json(spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
-    let mut scopes = spec
-        .roots
+pub fn build_app_scopes_json_for_roots(
+    api_facade_resource_id: &str,
+    roots: &[RootSpec],
+) -> Vec<serde_json::Value> {
+    let mut scopes = roots
         .iter()
         .map(root_spec_app_scope_json)
         .collect::<Vec<_>>();
-    if spec.roots.is_empty() {
+    if roots.is_empty() {
         scopes.push(empty_roots_bootstrap_app_scope_json());
     }
-    scopes.push(facade_app_scope_json(spec));
+    scopes.push(facade_app_scope_json_for_resource(api_facade_resource_id));
     scopes
+}
+
+fn build_app_scopes_json(spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
+    build_app_scopes_json_for_roots(&spec.api_facade_resource_id, &spec.roots)
 }
 
 fn empty_roots_bootstrap_app_scope_json() -> serde_json::Value {
@@ -934,10 +947,10 @@ fn empty_roots_bootstrap_app_scope_json() -> serde_json::Value {
     })
 }
 
-fn facade_app_scope_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
+fn facade_app_scope_json_for_resource(api_facade_resource_id: &str) -> serde_json::Value {
     serde_json::json!({
-        "scope_id": spec.api_facade_resource_id,
-        "resource_ids": [spec.api_facade_resource_id],
+        "scope_id": api_facade_resource_id,
+        "resource_ids": [api_facade_resource_id],
         "unit_scopes": [
             {
                 "unit_id": "runtime.exec.facade",

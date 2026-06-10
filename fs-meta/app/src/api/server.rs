@@ -431,11 +431,9 @@ fn api_request_route_policy(method: &Method, path: &str) -> ApiRequestRoutePolic
     } else {
         None
     };
-    let management_write = management_readiness_gate.is_some();
-
     ApiRequestRoutePolicy {
         management_readiness_gate,
-        counts_toward_control_drain: management_write,
+        counts_toward_control_drain: roots_put,
         counts_toward_facade_request_drain: matches!(
             (method, path),
             (&Method::POST, "/api/fs-meta/v1/session/login")
@@ -443,7 +441,6 @@ fn api_request_route_policy(method: &Method, path: &str) -> ApiRequestRoutePolic
                 | (&Method::GET, "/api/fs-meta/v1/monitoring/roots")
                 | (&Method::PUT, "/api/fs-meta/v1/monitoring/roots")
                 | (&Method::POST, "/api/fs-meta/v1/monitoring/roots/preview")
-                | (&Method::POST, "/api/fs-meta/v1/index/rescan")
                 | (&Method::GET, "/api/fs-meta/v1/query-api-keys")
                 | (&Method::POST, "/api/fs-meta/v1/query-api-keys")
                 | (&Method::GET, "/api/fs-meta/v1/tree")
@@ -481,8 +478,7 @@ async fn request_control_readiness_guard(
         return next.run(request).await;
     };
     let facade_request_guard = policy
-        .management_readiness_gate
-        .is_some()
+        .counts_toward_facade_request_drain
         .then(|| control_gate.begin_facade_request());
     if readiness_gate.is_ready(&control_gate) {
         return response_with_owned_guards(next.run(request).await, None, facade_request_guard);
@@ -730,17 +726,14 @@ mod tests {
     }
     #[test]
     fn request_control_drain_counts_only_management_writes() {
-        for (method, path) in [
-            (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
-            (Method::POST, "/api/fs-meta/v1/index/rescan"),
-        ] {
-            assert!(
-                api_request_route_policy(&method, path).counts_toward_control_drain,
-                "{method} {path} should count toward global control drain"
-            );
-        }
+        assert!(
+            api_request_route_policy(&Method::PUT, "/api/fs-meta/v1/monitoring/roots")
+                .counts_toward_control_drain,
+            "roots_put should count toward global control drain"
+        );
 
         for (method, path) in [
+            (Method::POST, "/api/fs-meta/v1/index/rescan"),
             (Method::POST, "/api/fs-meta/v1/session/login"),
             (Method::GET, "/api/fs-meta/v1/status"),
             (Method::GET, "/api/fs-meta/v1/runtime/grants"),
@@ -806,7 +799,6 @@ mod tests {
             (Method::GET, "/api/fs-meta/v1/monitoring/roots"),
             (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
             (Method::POST, "/api/fs-meta/v1/monitoring/roots/preview"),
-            (Method::POST, "/api/fs-meta/v1/index/rescan"),
             (Method::GET, "/api/fs-meta/v1/query-api-keys"),
             (Method::POST, "/api/fs-meta/v1/query-api-keys"),
             (Method::DELETE, "/api/fs-meta/v1/query-api-keys/key-1"),
@@ -857,15 +849,112 @@ mod tests {
     }
 
     #[test]
+    fn source_repair_rescan_does_not_join_admission_drains() {
+        assert_eq!(
+            api_request_route_policy(&Method::POST, "/api/fs-meta/v1/index/rescan"),
+            ApiRequestRoutePolicy {
+                management_readiness_gate: Some(ApiManagementReadinessGate::SourceRepair),
+                counts_toward_control_drain: false,
+                counts_toward_facade_request_drain: false,
+            },
+            "manual rescan stays source-repair gated but must not block fixed-bind facade admission drains"
+        );
+    }
+
+    #[test]
     fn api_request_route_policy_assigns_rescan_to_source_repair_gate() {
         assert_eq!(
             api_request_route_policy(&Method::POST, "/api/fs-meta/v1/index/rescan"),
             ApiRequestRoutePolicy {
                 management_readiness_gate: Some(ApiManagementReadinessGate::SourceRepair),
-                counts_toward_control_drain: true,
-                counts_toward_facade_request_drain: true,
+                counts_toward_control_drain: false,
+                counts_toward_facade_request_drain: false,
             }
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rescan_request_waiting_on_source_repair_does_not_hold_facade_admission_drains() {
+        let request_tracker = Arc::new(ApiRequestTracker::default());
+        let state = test_api_state(request_tracker.clone());
+        let control_gate = state.control_gate.clone();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/index/rescan",
+                post({
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    move || {
+                        let entered = entered.clone();
+                        let release = release.clone();
+                        async move {
+                            entered.notify_waiters();
+                            release.notified().await;
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .route("/api/fs-meta/v1/session/login", post(|| async { "login" }))
+            .with_state(state.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                request_control_readiness_guard,
+            ))
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                projection_request_facade_guard,
+            ))
+            .layer(middleware::from_fn_with_state(state, request_logging));
+
+        let rescan_app = app.clone();
+        let rescan_task = tokio::spawn(async move {
+            rescan_app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/fs-meta/v1/index/rescan")
+                        .body(Body::empty())
+                        .expect("build rescan request"),
+                )
+                .await
+                .expect("route rescan request")
+        });
+
+        entered.notified().await;
+        tokio::time::timeout(Duration::from_millis(200), request_tracker.wait_for_drain())
+            .await
+            .expect("waiting manual rescan must not hold the global control drain");
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            control_gate.wait_for_facade_request_drain(),
+        )
+        .await
+        .expect("waiting manual rescan must not hold facade request admission drain");
+
+        let login = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/fs-meta/v1/session/login")
+                    .body(Body::empty())
+                    .expect("build login request"),
+            ),
+        )
+        .await
+        .expect("login should remain admissible while rescan is waiting")
+        .expect("route login request");
+        assert_eq!(login.status(), axum::http::StatusCode::OK);
+
+        release.notify_waiters();
+        let rescan = tokio::time::timeout(Duration::from_secs(1), rescan_task)
+            .await
+            .expect("rescan response should settle after release")
+            .expect("join rescan response");
+        assert_eq!(rescan.status(), axum::http::StatusCode::OK);
     }
 
     #[test]
