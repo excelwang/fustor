@@ -4220,6 +4220,11 @@ impl FSMetaSource {
                             req.payload_bytes(),
                         )
                     });
+                    let scan_audit_admission_release = requests.iter().any(|req| {
+                        crate::query::api::source_status_request_requires_scan_audit_admission_release(
+                            req.payload_bytes(),
+                        )
+                    });
                     let generic_source_status_route =
                         format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
                     let generic_non_target_status = match status_source
@@ -4276,6 +4281,25 @@ impl FSMetaSource {
                         if used_cached_fallback {
                             eprintln!(
                                 "fs_meta_source: source-status generic non-target using cached/degraded snapshot node={}",
+                                status_node_id.0
+                            );
+                        }
+                        snapshot
+                    } else if scan_audit_admission_release {
+                        let epoch = if status_source.open_scan_audit_admission_if_closed() {
+                            status_source.submit_rescan_request_epoch()
+                        } else {
+                            0
+                        };
+                        eprintln!(
+                            "fs_meta_source: release_source_scan_audit_after_sink_scope_ready_if_needed source-status ok node={} route={} epoch={}",
+                            status_node_id.0, status_route_key, epoch
+                        );
+                        let (snapshot, used_cached_fallback) =
+                            status_source.observability_snapshot_nonblocking_for_status_route();
+                        if used_cached_fallback {
+                            eprintln!(
+                                "fs_meta_source: source-status release-scan-audit using cached/degraded snapshot node={}",
                                 status_node_id.0
                             );
                         }

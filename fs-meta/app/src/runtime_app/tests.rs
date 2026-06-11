@@ -1461,6 +1461,262 @@ async fn worker_backed_source_roots_control_stream_feeds_manual_rescan_status_pr
     app.close().await.expect("close app");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_source_status_release_opens_scan_audit_admission_while_source_state_pending() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+
+    struct SourceWorkerTriggerHookReset;
+
+    impl Drop for SourceWorkerTriggerHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_trigger_rescan_when_ready_call_count_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let root_a = tmp.path().join("nfs-144");
+    fs::create_dir_all(&root_a).expect("create nfs root");
+    fs::write(root_a.join("ready.txt"), "ready").expect("write nfs source file");
+    let fs_source_a = root_a.display().to_string();
+    let roots = vec![worker_fs_watch_scan_root("nfs-144", &fs_source_a)];
+    let grants = vec![worker_export_with_fs_source(
+        "node-a::nfs-144",
+        "node-a",
+        "127.0.0.1",
+        &fs_source_a,
+        root_a.clone(),
+    )];
+
+    let source_roots_control_route =
+        crate::runtime::routes::source_roots_control_stream_route_for("node-a").0;
+    let source_status_route = crate::runtime::routes::source_status_request_route_for("node-a").0;
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = FSMetaApp::with_boundaries_and_state(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: Vec::new(),
+                host_object_grants: grants.clone(),
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        external_runtime_worker_binding("source", &source_socket_dir),
+        external_runtime_worker_binding("sink", &sink_socket_dir),
+        NodeId("node-a".into()),
+        Some(boundary.clone()),
+        Some(boundary.clone()),
+        state_boundary,
+    )
+    .expect("init external-worker app");
+
+    match tokio::time::timeout(Duration::from_secs(10), app.start()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => panic!(
+            "start external-worker app: {err}\nsource stderr:\n{}\nsink stderr:\n{}",
+            worker_stderr_excerpt(&source_socket_dir),
+            worker_stderr_excerpt(&sink_socket_dir),
+        ),
+        Err(_) => panic!(
+            "start external-worker app timed out\nsource stderr:\n{}\nsink stderr:\n{}",
+            worker_stderr_excerpt(&source_socket_dir),
+            worker_stderr_excerpt(&sink_socket_dir),
+        ),
+    }
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_roots_control_route.clone(),
+            &[("nfs-144", &["node-a::nfs-144"])],
+            3,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_status_route.clone(),
+            &[("nfs-144", &["node-a::nfs-144"])],
+            3,
+        ),
+    ])
+    .await
+    .expect("activate worker-backed source status routes");
+
+    let payload =
+        crate::runtime::orchestration::encode_logical_roots_control_payload_with_generation_and_defer_scan_audit(
+            &roots,
+            3,
+            true,
+        )
+        .expect("encode deferred source roots-control payload");
+    boundary
+        .channel_send(
+            BoundaryContext::default(),
+            ChannelSendRequest {
+                channel_key: ChannelKey(source_roots_control_route.clone()),
+                events: vec![Event::new(
+                    EventMetadata {
+                        origin_id: NodeId("node-b".into()),
+                        timestamp_us: now_us(),
+                        logical_ts: None,
+                        correlation_id: None,
+                        ingress_auth: None,
+                        trace: None,
+                    },
+                    Bytes::from(payload),
+                )],
+                timeout_ms: Some(1_000),
+            },
+        )
+        .await
+        .expect("send owner-scoped deferred source roots-control payload");
+
+    let roots_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let logical_roots = app
+            .source
+            .cached_logical_roots_snapshot_with_failure()
+            .expect("read cached source logical roots after roots-control replay");
+        if logical_roots.iter().any(|root| root.id == "nfs-144") {
+            break;
+        }
+        if tokio::time::Instant::now() >= roots_deadline {
+            app.close()
+                .await
+                .expect("close app after source roots replay timeout");
+            panic!(
+                "worker-backed source roots-control replay did not update cached source roots; roots={logical_roots:?}\nsource stderr:\n{}\nsink stderr:\n{}",
+                worker_stderr_excerpt(&source_socket_dir),
+                worker_stderr_excerpt(&sink_socket_dir),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let defer_log_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stderr = worker_stderr_excerpt(&source_socket_dir);
+        if stderr.contains("defer_scan_audit=true") {
+            break;
+        }
+        if tokio::time::Instant::now() >= defer_log_deadline {
+            app.close()
+                .await
+                .expect("close app after deferred source roots replay log timeout");
+            panic!(
+                "worker-backed source roots-control must pass defer_scan_audit=true through worker RPC; source stderr:\n{stderr}\nsink stderr:\n{}",
+                worker_stderr_excerpt(&sink_socket_dir),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let status_endpoint_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let endpoint_tasks = app.runtime_endpoint_tasks.lock().await;
+        let source_status_receive_armed = endpoint_tasks.iter().any(|task| {
+            task.route_key() == source_status_route
+                && task.is_receive_armed()
+                && !task.is_shutdown_requested()
+                && !task.is_finished()
+        });
+        let task_summary = endpoint_tasks
+            .iter()
+            .map(|task| {
+                format!(
+                    "{}:armed={} polling={} shutdown={} finished={} reason={:?}",
+                    task.route_key(),
+                    task.is_receive_armed(),
+                    task.is_receive_polling(),
+                    task.is_shutdown_requested(),
+                    task.is_finished(),
+                    task.finish_reason()
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(endpoint_tasks);
+        if source_status_receive_armed {
+            break;
+        }
+        if tokio::time::Instant::now() >= status_endpoint_deadline {
+            app.close()
+                .await
+                .expect("close app after source-status endpoint wait timeout");
+            panic!(
+                "worker-backed source-status endpoint did not become receive-armed before release probe; route={source_status_route} tasks={task_summary:?}\nsource stderr:\n{}\nsink stderr:\n{}",
+                worker_stderr_excerpt(&source_socket_dir),
+                worker_stderr_excerpt(&sink_socket_dir),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    set_control_initialized_for_tests(&app, true);
+    set_source_replay_required_for_tests(&app, true);
+
+    let _hook_reset = SourceWorkerTriggerHookReset;
+    let trigger_count = Arc::new(AtomicUsize::new(0));
+    crate::workers::source::install_source_worker_trigger_rescan_when_ready_call_count_hook(
+        crate::workers::source::SourceWorkerTriggerRescanWhenReadyCallCountHook {
+            count: trigger_count.clone(),
+        },
+    );
+
+    let status_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("node-b".to_string()),
+        source_status_route_bindings_for("node-a"),
+    );
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        crate::query::api::release_scan_audit_source_status_request_payload_with_live_probe_timeout(
+            Duration::from_millis(500),
+        ),
+        Duration::from_secs(2),
+        Duration::ZERO,
+    )
+    .await
+    .expect("release source-status probe should return bounded source evidence");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.metadata().origin_id == NodeId("node-a".to_string())),
+        "release source-status request must return pending/cache evidence from the target owner; events={events:?}"
+    );
+    let app_proxy_trigger_count = trigger_count.load(AtomicOrdering::SeqCst);
+    let worker_release_log = "fs_meta_source: release_source_scan_audit_after_sink_scope_ready_if_needed source-status ok";
+    let mut worker_endpoint_release_seen =
+        worker_stderr_excerpt(&source_socket_dir).contains(worker_release_log);
+    if app_proxy_trigger_count == 0 && !worker_endpoint_release_seen {
+        let release_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < release_deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            worker_endpoint_release_seen =
+                worker_stderr_excerpt(&source_socket_dir).contains(worker_release_log);
+            if worker_endpoint_release_seen {
+                break;
+            }
+        }
+    }
+    assert!(
+        app_proxy_trigger_count == 1 || worker_endpoint_release_seen,
+        "owner-scoped release source-status must open deferred scan/audit admission and submit rescan intent even while source state observability is pending; app_proxy_trigger_count={app_proxy_trigger_count} worker_endpoint_release_seen={worker_endpoint_release_seen}\nsource stderr:\n{}\nsink stderr:\n{}",
+        worker_stderr_excerpt(&source_socket_dir),
+        worker_stderr_excerpt(&sink_socket_dir),
+    );
+
+    app.close().await.expect("close app");
+}
+
 fn worker_export(
     object_ref: &str,
     host_ref: &str,
@@ -2107,6 +2363,124 @@ async fn manual_rescan_source_status_live_probe_returns_runtime_scope_cache_with
         "manual-rescan source-status request must be handled by the query-peer app proxy: {recv_unit_ids:?}"
     );
 
+    app.close().await.expect("close app");
+}
+
+#[tokio::test]
+async fn manual_rescan_source_status_apply_inflight_returns_pending_runtime_scope_cache() {
+    let tmp = tempdir().expect("create temp dir");
+    let root = tmp.path().join("root-a");
+    fs::create_dir_all(&root).expect("create root");
+    let boundary = Arc::new(SourceStatusUnitAwareBoundary::new(
+        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+    ));
+    let app = FSMetaApp::with_boundaries_and_state(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("test-root", &root)],
+                host_object_grants: vec![granted_mount_root("single-app-node::root-1", &root)],
+                ..local_source_config()
+            },
+            ..FSMetaConfig::default()
+        },
+        local_runtime_worker_binding("source"),
+        local_runtime_worker_binding("sink"),
+        NodeId("single-app-node".into()),
+        Some(boundary.clone()),
+        None,
+        in_memory_state_boundary(),
+    )
+    .expect("init app");
+
+    let source_roots_control_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let source_rescan_control_route = format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL);
+    let source_rescan_route = format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL);
+    let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_roots_control_route,
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_rescan_control_route,
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_rescan_route.clone(),
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            source_rescan_route,
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            source_status_route.clone(),
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("activate query-peer source-status route");
+
+    set_control_initialized_for_tests(&app, true);
+    set_source_replay_required_for_tests(&app, false);
+    let source_apply_inflight = app.begin_source_control_apply();
+    app.api_control_gate
+        .set_ready_state_with_source_repair(false, false, false);
+
+    let adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("single-app-node".into()),
+        crate::runtime::routes::default_route_bindings(),
+    );
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        crate::query::api::manual_rescan_source_status_request_payload_with_live_probe_timeout(
+            Duration::from_millis(500),
+        ),
+        Duration::from_millis(500),
+        Duration::from_millis(25),
+    )
+    .await
+    .expect(
+        "manual-rescan source-status must return pending source evidence while apply is inflight",
+    );
+
+    assert!(
+        !events.is_empty(),
+        "apply-inflight source-status must not black-hole the request"
+    );
+    let snapshot: crate::workers::source::SourceObservabilitySnapshot =
+        rmp_serde::from_slice(events[0].payload_bytes())
+            .expect("decode manual-rescan source-status snapshot");
+    assert!(
+        snapshot
+            .scheduled_source_groups_by_node
+            .values()
+            .any(|groups| groups.iter().any(|group| group == "test-root")),
+        "apply-inflight source-status must preserve runtime-scope source ownership cache: {snapshot:?}"
+    );
+    assert!(
+        snapshot
+            .status
+            .degraded_roots
+            .iter()
+            .any(|(_, reason)| { reason == SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON }),
+        "apply-inflight source-status must label pending source state without claiming delivery proof: {snapshot:?}"
+    );
+
+    drop(source_apply_inflight);
     app.close().await.expect("close app");
 }
 
@@ -38701,11 +39075,34 @@ async fn sink_observation_repair_does_not_replay_source_scoped_sink_control_ever
             "status-triggered sink observation repair must not wait for materialization republish",
         )
         .expect("sink observation repair should replay source-scoped sink routes");
+    let replay_payload_generations = || {
+        boundary
+            .sent_payloads_snapshot()
+            .into_iter()
+            .flat_map(|(_, payloads)| payloads.into_iter())
+            .filter_map(|payload| {
+                crate::runtime::orchestration::decode_logical_roots_control_payload(&payload).ok()
+            })
+            .filter(|payload| !payload.sink_replay_envelopes.is_empty())
+            .map(|payload| payload.generation)
+            .collect::<Vec<_>>()
+    };
+    let first_replay_payload_generations = replay_payload_generations();
+    assert!(
+        !first_replay_payload_generations.is_empty(),
+        "first status-triggered sink observation repair must publish owner-scoped roots-control replay"
+    );
+    set_sink_replay_required_for_tests(&app, true);
     let recovery = app.sink_observation_repair_recovery_for_tests();
     tokio::time::timeout(Duration::from_millis(500), recovery())
         .await
         .expect("repeated status-triggered sink observation repair must remain bounded")
         .expect("repeated sink observation repair should be an observational no-op once schedule is accepted");
+    assert_eq!(
+        replay_payload_generations().len(),
+        first_replay_payload_generations.len(),
+        "same-signature status-triggered sink observation repair must not republish roots-control replay while sink replay remains pending"
+    );
 
     assert_eq!(
         sink_apply_entries.load(AtomicOrdering::Acquire),

@@ -5483,11 +5483,6 @@ impl ManagementWriteRecoveryContext {
         &self,
         signature: &SourceScopedSinkObservationRepairSignature,
     ) -> bool {
-        if self.runtime_control_state().sink_state_replay_required()
-            || self.sink.retained_replay_required()
-        {
-            return false;
-        }
         let previously_applied = self
             .source_scoped_sink_observation_repair_signature
             .lock()
@@ -14276,12 +14271,13 @@ impl FSMetaApp {
                                     let runtime_state = RuntimeControlState::from_state_cell(
                                         &runtime_gate_state_for_source_status,
                                     );
-                                    if runtime_state.source_control_apply_inflight() {
+                                    let source_control_apply_inflight =
+                                        runtime_state.source_control_apply_inflight();
+                                    if source_control_apply_inflight {
                                         eprintln!(
-                                            "fs_meta_runtime_app: source status endpoint unavailable reason=runtime_source_apply_pending route={}",
+                                            "fs_meta_runtime_app: source status endpoint pending reason=runtime_source_apply_pending route={}",
                                             route_key
                                         );
-                                        continue;
                                     }
                                     let source_state_pending_observation = !runtime_state
                                         .source_state_current()
@@ -14321,60 +14317,60 @@ impl FSMetaApp {
                                             && control_failure_uninitialized
                                                 .load(Ordering::Acquire);
                                     let (snapshot, used_cached_fallback) =
-                                        if source_state_pending_observation
+                                        if source_control_apply_inflight
+                                            || source_state_pending_observation
                                             || retained_source_replay_from_control_failure
                                         {
                                             source
                                             .source_state_pending_observability_snapshot_for_status_route()
                                             .await
                                         } else if scan_audit_admission_release {
+                                            let release_budget = source_status_live_probe_timeout
+                                                .unwrap_or(Duration::from_millis(500))
+                                                .min(Duration::from_secs(2));
+                                            match tokio::time::timeout(
+                                                release_budget,
+                                                source
+                                                    .open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(epoch)) => {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: release_source_scan_audit_after_sink_scope_ready_if_needed source-status ok node={} route={} epoch={} correlation={:?} trace_id={}",
+                                                        node_id.0,
+                                                        route_key,
+                                                        epoch,
+                                                        req.metadata().correlation_id,
+                                                        trace_id
+                                                    );
+                                                }
+                                                Ok(Err(err)) => {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: release_source_scan_audit_after_sink_scope_ready_if_needed source-status failed node={} route={} err={} correlation={:?} trace_id={}",
+                                                        node_id.0,
+                                                        route_key,
+                                                        err.as_error(),
+                                                        req.metadata().correlation_id,
+                                                        trace_id
+                                                    );
+                                                }
+                                                Err(_) => {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: release_source_scan_audit_after_sink_scope_ready_if_needed source-status timed out node={} route={} budget_ms={} correlation={:?} trace_id={}",
+                                                        node_id.0,
+                                                        route_key,
+                                                        release_budget.as_millis(),
+                                                        req.metadata().correlation_id,
+                                                        trace_id
+                                                    );
+                                                }
+                                            }
                                             if !runtime_state.source_state_current() {
                                                 source
                                                     .source_state_pending_observability_snapshot_for_status_route()
                                                     .await
                                             } else {
-                                                let release_budget =
-                                                    source_status_live_probe_timeout
-                                                        .unwrap_or(Duration::from_millis(500))
-                                                        .min(Duration::from_secs(2));
-                                                match tokio::time::timeout(
-                                                    release_budget,
-                                                    source
-                                                        .open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure(),
-                                                )
-                                                .await
-                                                {
-                                                    Ok(Ok(epoch)) => {
-                                                        eprintln!(
-                                                            "fs_meta_runtime_app: release_source_scan_audit_after_sink_scope_ready_if_needed source-status ok node={} route={} epoch={} correlation={:?} trace_id={}",
-                                                            node_id.0,
-                                                            route_key,
-                                                            epoch,
-                                                            req.metadata().correlation_id,
-                                                            trace_id
-                                                        );
-                                                    }
-                                                    Ok(Err(err)) => {
-                                                        eprintln!(
-                                                            "fs_meta_runtime_app: release_source_scan_audit_after_sink_scope_ready_if_needed source-status failed node={} route={} err={} correlation={:?} trace_id={}",
-                                                            node_id.0,
-                                                            route_key,
-                                                            err.as_error(),
-                                                            req.metadata().correlation_id,
-                                                            trace_id
-                                                        );
-                                                    }
-                                                    Err(_) => {
-                                                        eprintln!(
-                                                            "fs_meta_runtime_app: release_source_scan_audit_after_sink_scope_ready_if_needed source-status timed out node={} route={} budget_ms={} correlation={:?} trace_id={}",
-                                                            node_id.0,
-                                                            route_key,
-                                                            release_budget.as_millis(),
-                                                            req.metadata().correlation_id,
-                                                            trace_id
-                                                        );
-                                                    }
-                                                }
                                                 source
                                                     .observability_snapshot_nonblocking_for_status_route_with_timeout(
                                                         source_status_live_probe_timeout,

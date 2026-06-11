@@ -3412,6 +3412,12 @@ fn status_should_run_sink_observation_repair(
     if expected_groups.is_empty() || trusted_observation_readiness_for_status(source, sink_status) {
         return false;
     }
+    let any_published = expected_groups
+        .iter()
+        .any(|group| source_snapshot_has_publication_evidence_for_group(source, group));
+    if !any_published {
+        return false;
+    }
     if !status_sink_schedule_gaps_for_groups(sink_status, &expected_groups).is_empty() {
         return true;
     }
@@ -3419,12 +3425,6 @@ fn status_should_run_sink_observation_repair(
         !expected_groups.is_subset(&sink_snapshot_advertised_groups(sink_status));
     if missing_expected_sink_group {
         return true;
-    }
-    let any_published = expected_groups
-        .iter()
-        .any(|group| source_snapshot_has_publication_evidence_for_group(source, group));
-    if !any_published {
-        return false;
     }
     if sink_status_snapshot_lacks_ingress_for_published_group(source, sink_status, &expected_groups)
     {

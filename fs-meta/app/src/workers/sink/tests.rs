@@ -5382,6 +5382,70 @@ fn sink_status_scenario_outcome_returns_live_after_retry_reset_stale_empty_when_
 }
 
 #[test]
+fn finalize_cached_sink_status_snapshot_fails_closed_for_live_control_inflight_access_path() {
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-live-path-cache-test".to_string()),
+        SourceConfig::default(),
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    let err = sink
+        .finalize_nonblocking_cached_status_snapshot(
+            SinkStatusSnapshot::default(),
+            SinkStatusAccessPath::ControlInflight,
+            None,
+        )
+        .expect_err("cached sink-status evaluation must fail closed instead of panicking");
+
+    assert!(
+        matches!(err.as_error(), CnxError::Timeout),
+        "live access path in cached sink-status evaluation must return typed fail-closed evidence: {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_route_control_inflight_cached_entry_uses_cached_access_path() {
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-control-inflight-cache-test".to_string()),
+        SourceConfig::default(),
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    let _inflight = sink.begin_control_op();
+    let action = sink
+        .status_route_nonblocking_entry_action()
+        .await
+        .expect("status-route cached entry action");
+    let SinkStatusNonblockingEntryAction::ReturnCached {
+        snapshot,
+        access_path,
+    } = action
+    else {
+        panic!("control-inflight status-route entry must use cached fallback");
+    };
+
+    assert_eq!(access_path, SinkStatusAccessPath::ControlInflightCached);
+    let err = sink
+        .finalize_nonblocking_cached_status_snapshot(snapshot, access_path, None)
+        .expect_err("empty control-inflight cached status should fail closed");
+    assert!(matches!(err.as_error(), CnxError::Timeout));
+}
+
+#[test]
 fn sink_status_scenario_outcome_returns_cached_for_worker_unavailable_replay_pending_cache() {
     let outcome = reduce_sink_status_scenario_outcome(
         SinkStatusScenario::Cached(SinkStatusCachedScenario::WorkerUnavailable),

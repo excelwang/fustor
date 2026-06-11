@@ -34,7 +34,7 @@ User-visible and operator-visible state names consumed by these workflows are ow
 3. 扫描遍历使用 `scan_workers` 并行执行；事件输出按 `batch_size` 重新分批，避免超大批次突发。
 4. 审计阶段对目录启用 mtime 差分：命中静默目录时跳过文件级 stat，并发出 `audit_skipped=true` 心跳；仍递归子目录。
 5. source 在每轮 baseline/audit 扫描前后都发出 in-band 审计边界控制事件：`EpochStart(Audit, epoch_id)` 与 `EpochEnd(Audit, epoch_id)`。
-6. source 为 scan/realtime/control 事件统一写入 `EventMetadata.timestamp_us = shadow_now_us(drift)`，该时间轴与 payload `modified_time_us` 解耦。
+6. source 为 scan/realtime/control 事件统一写入 `EventMetadata.timestamp_us = shadow_now_us(drift)`，该时间轴与 payload `modified_time_us` 解耦；scan/audit 文件元数据事件的 timestamp 必须在元数据观测或 scan batch 封口、进入任何可背压 publication/result 队列之前确定，不得在旧记录稍后被 drain 时重新生成。
 7. 若 drift 样本采集不可用（权限受限/metadata 不可得/瞬时 I/O 失败），source 仍必须继续启动并发流；drift 基线保持 `0`，并记录降级告警。
 8. scan/watch 过程中的单条目错误（如 `ENOENT`、metadata/read_dir 失败）仅影响该条目，执行 `log+skip`，不得中断整条管线。
 9. watcher 必须订阅并处理 `IN_ATTRIB`；该类事件按 `Update + is_atomic_write=false` 发出，不得误标为原子写。
@@ -126,20 +126,22 @@ User-visible and operator-visible state names consumed by these workflows are ow
 
 1. sink 收到 `FileMetaRecord` 后先按 `group_id` 路由到组内单树。
 2. 对于 `Scan` 事件，先执行祖先 tombstone 拦截与 `parent_mtime_us` 过期检查。
-3. 若同一路径发生类型变更（`dir<->file`），先清理该路径下已缓存的后代节点，再应用当前事件。
+3. 对于 `Scan` 事件，若同一路径已有 accepted realtime event shadow-time，且当前事件自己的 `EventMetadata.timestamp_us` 小于或等于该 realtime shadow-time，则拒绝当前事件的 metadata/delete/tombstone/type-change 副作用；仅允许更新 `last_seen_epoch` 等 audit/MID 可观测性。
 4. 执行 LWW 仲裁：默认拒绝 `mtime` 回退或相等更新。
-5. 仅当“`incoming=Realtime atomic` 且 `existing=Scan`”时，允许在相同/更旧 `mtime` 情况下覆盖。
-6. `audit_skipped=true` 的 Scan 心跳可绕过普通 mtime 拒绝，用于保持 epoch 可观测性与 MID 保护上下文。
+5. 仅当“`incoming=Realtime atomic` 且 `existing=Scan`”时，允许在相同/更旧 `mtime` 情况下覆盖；该例外不允许越过较新的 realtime tombstone event-time。
+6. `audit_skipped=true` 的 Scan 心跳仅用于保持 epoch 可观测性与 MID 保护上下文；不得绕过 metadata LWW、event-time fence、tombstone fence，或产生 metadata rollback。
+7. 若同一路径发生类型变更（`dir<->file`），必须在当前事件通过 parent-staleness、event-time、tombstone 与 LWW 接受之后，才清理该路径下已缓存的后代节点并应用当前事件；被拒绝的旧 Scan 类型变更不得 purge 后代。
 
 ## [workflow] TombstoneReincarnationWorkflow
 
 **Steps**
 
 1. Realtime delete 将节点标记为 tombstone，并写入 TTL 到期时间。
-2. Tombstone 生效窗口内，`Scan` 与 `Realtime non-atomic` 事件需通过 mtime tolerance 判定；落在 tolerance 内视为 zombie，拒绝回生。
-3. 若 mtime 差异超过 tolerance，视为真实重建，清除 tombstone 并接受更新。
-4. tombstone 期满后允许回生；过期 tombstone 在 MID 周期清理。
-5. tombstone 策略参数由配置提供：`sink_tombstone_ttl_ms` 与 `sink_tombstone_tolerance_us`，默认 `90000ms` / `1000000us`。
+2. Realtime delete 同时记录 tombstone event shadow-time；任何 `EventMetadata.timestamp_us` 小于或等于该 tombstone shadow-time 的后续 update 都不得清除或回生该 tombstone，包括 delayed Scan/audit compensation 与 delayed realtime atomic update。
+3. Tombstone 生效窗口内，`Scan` 与 `Realtime non-atomic` 事件还需通过 mtime tolerance 判定；落在 tolerance 内视为 zombie，拒绝回生。
+4. 若事件时间新于 tombstone 且 mtime 差异超过 tolerance，视为真实重建，清除 tombstone 并接受更新。`Realtime atomic` 可跳过 mtime tolerance，但仍必须新于 tombstone event shadow-time。
+5. tombstone 期满后仅允许 mtime 新于 tombstone 记录的事件回生；过期 tombstone 在 MID 周期清理。
+6. tombstone 策略参数由配置提供：`sink_tombstone_ttl_ms` 与 `sink_tombstone_tolerance_us`，默认 `90000ms` / `1000000us`。
 
 ## [workflow] IntegrityFlagsWorkflow
 
@@ -160,7 +162,7 @@ User-visible and operator-visible state names consumed by these workflows are ow
 2. MID 跳过 tombstone 节点、`audit_skipped` 节点与其后代、以及审计窗口内被 Realtime 再确认的节点。
 3. 对仍判定缺失的节点执行 `hard-remove`（不打 tombstone）。
 4. MID 同轮执行 tombstone 过期清理。
-5. 已知权衡：`hard-remove` 在极端竞态下可能出现短暂假阳性（迟到 Scan 回生），由后续 realtime/audit 收敛。
+5. 已知权衡：`hard-remove` 在没有 retained realtime/tombstone event-time fence 的极端竞态下可能出现短暂假阳性（迟到 Scan 回生），由后续 realtime/audit 收敛；若 fence 仍存在，旧 Scan 不得回生。
 
 ## [workflow] LogicalClockAndShadowClockWorkflow
 

@@ -537,11 +537,25 @@ pub fn build_event(
     drift_us: i64,
     logical_clock: &LogicalClock,
 ) -> Option<Event> {
+    build_event_at(
+        record,
+        node_id,
+        drift::shadow_now_us(drift_us),
+        logical_clock,
+    )
+}
+
+pub fn build_event_at(
+    record: &FileMetaRecord,
+    node_id: &NodeId,
+    timestamp_us: u64,
+    logical_clock: &LogicalClock,
+) -> Option<Event> {
     let payload = rmp_serde::to_vec_named(record).ok()?;
     Some(Event::new(
         EventMetadata {
             origin_id: node_id.clone(),
-            timestamp_us: drift::shadow_now_us(drift_us),
+            timestamp_us,
             logical_ts: Some(logical_clock.tick()),
             correlation_id: None,
             ingress_auth: None,

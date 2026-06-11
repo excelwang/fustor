@@ -39,9 +39,13 @@ pub struct FileMetaNode {
     pub blind_spot: bool,
     /// True if this node is tombstoned (deleted).
     pub is_tombstoned: bool,
-    /// Physical time when tombstone expires. After this, reincarnation from Scan is allowed.
+    /// Physical time when tombstone expires.
     /// None = no tombstone or no expiry.
     pub tombstone_expires_at: Option<Instant>,
+    /// Sink shadow-time high-water mark when the tombstone was created.
+    pub tombstoned_at_shadow_us: Option<u64>,
+    /// Event shadow-time of the latest accepted realtime update/delete for this path.
+    pub last_realtime_event_shadow_us: Option<u64>,
     /// Epoch in which this node was last seen by an audit scan.
     pub last_seen_epoch: u64,
     /// Monotonic instant when any descendant-or-self last changed in a write-significant way.
@@ -707,6 +711,8 @@ mod tests {
             blind_spot: false,
             is_tombstoned: false,
             tombstone_expires_at: None,
+            tombstoned_at_shadow_us: None,
+            last_realtime_event_shadow_us: None,
             last_seen_epoch: 0,
             subtree_last_write_significant_change_at: None,
         }

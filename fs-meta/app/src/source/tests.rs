@@ -1547,6 +1547,111 @@ async fn source_status_manual_rescan_probe_serves_node_scoped_status_route() {
 }
 
 #[tokio::test]
+async fn source_owned_source_status_release_opens_scan_audit_admission_and_records_rescan_intent() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 root");
+    std::fs::write(nfs1.join("ready.txt"), b"ready").expect("seed nfs1 source file");
+
+    let mut cfg = SourceConfig::default();
+    cfg.roots = Vec::new();
+    cfg.host_object_grants = vec![test_export(
+        "node-a::nfs1",
+        "node-a",
+        "10.0.0.11",
+        nfs1.clone(),
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries_and_state(
+        cfg,
+        NodeId("node-a".to_string()),
+        None,
+        in_memory_state_boundary(),
+    )
+    .expect("build source");
+
+    source
+        .apply_logical_roots_update_defer_scan_audit(vec![RootSpec::new("nfs1", nfs1)])
+        .await
+        .expect("apply deferred logical roots");
+    assert!(
+        !source
+            .state_cell
+            .scan_audit_admission_open
+            .load(Ordering::Acquire),
+        "deferred roots apply must close scan/audit admission before release"
+    );
+    assert_eq!(
+        source.materialized_read_cache_epoch(),
+        0,
+        "fixture starts without a pending rescan intent"
+    );
+
+    let source_status_route = crate::runtime::routes::source_status_request_route_for("node-a").0;
+    source
+        .on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
+                route_key: source_status_route,
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 3,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            },
+        ))
+        .expect("encode scoped source-status activate")])
+        .await
+        .expect("activate scoped source-status route");
+
+    let boundary = Arc::new(SourceLoopbackBoundary::default());
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("start source-owned source-status endpoint");
+
+    let status_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary,
+        NodeId("node-d".to_string()),
+        source_status_route_bindings_for("node-a"),
+    );
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        crate::query::api::release_scan_audit_source_status_request_payload_with_live_probe_timeout(
+            Duration::from_millis(750),
+        ),
+        Duration::from_millis(750),
+        Duration::ZERO,
+    )
+    .await
+    .expect("source-status release probe should return bounded source evidence");
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.metadata().origin_id == NodeId("node-a".to_string())),
+        "source-status release probe must reply from the source owner: {events:?}"
+    );
+    assert!(
+        source
+            .state_cell
+            .scan_audit_admission_open
+            .load(Ordering::Acquire),
+        "source-owned release source-status endpoint must open deferred scan/audit admission"
+    );
+    assert!(
+        source.materialized_read_cache_epoch() > 0,
+        "source-owned release source-status endpoint must record a rescan intent epoch"
+    );
+
+    source.close().await.expect("close source");
+}
+
+#[tokio::test]
 async fn source_status_manual_rescan_probe_returns_receivable_ready_evidence() {
     let source = build_source(vec![test_export(
         "node-a",

@@ -223,6 +223,7 @@ version: 3.0.0
    > Verification: scan/audit traversal uses configurable parallel workers (`scan_workers`) and bounded re-batch emission (`batch_size`).
    > Verification: sink/channel backpressure on scan/audit publication MUST propagate into source scan/audit read-ahead and concurrency/admission state; source MUST NOT hide that pressure in unbounded publication buffers or advance scan/audit progress as if downstream acceptance had already happened.
    > Verification: scan/audit backpressure MUST NOT be applied to realtime watch/listen ingestion. Realtime watch events use a separate bounded nonblocking lane; when that lane is full or unavailable, source emits explicit overflow/backpressure evidence and relies on audit/repair convergence instead of blocking the host watch loop or silently preserving trusted readiness.
+   > Verification: scan/audit `EventMetadata.timestamp_us` MUST represent the metadata observation or scan-batch sealing time before any backpressured publication/result queue wait. It MUST NOT be minted only when an old scan record is later drained, because sink arbitration depends on this timestamp to reject delayed compensation metadata that predates accepted realtime evidence.
    > Verification: non-primary members keep realtime watch/listen hot set and metadata emission enabled, but do not execute epoch0 baseline/audit scan loops.
    > Verification: initial baseline includes root directory metadata; audit mtime-pruning uses cached directory mtime and emits `audit_skipped=true` heartbeat for silent directories.
    > Verification: scan traversal tracks visited directory identity `(dev, ino)` and MUST skip symlink loops with warning instead of recursive dead-loop.
@@ -250,15 +251,18 @@ version: 3.0.0
    > Responsibility: avoid zombie resurrection while keeping missing-item sweep deterministic.
    > Verification: realtime delete paths preserve tombstone protection window; MID only removes missing stale nodes directly.
    > Verification: tombstone reincarnation uses mtime tolerance window to reject stale-cache zombie events and accept genuine recreate events.
+   > Verification: tombstone reincarnation also uses the incoming event's own `EventMetadata.timestamp_us`; an event at or before the retained realtime tombstone shadow-time MUST NOT clear or reincarnate that tombstone, including delayed Scan/audit compensation and delayed realtime atomic updates.
    > Verification: tombstone policy boundary is configurable (`sink_tombstone_ttl_ms`, `sink_tombstone_tolerance_us`), baseline defaults remain `90000ms` / `1000000us`.
-   > Verification: `MID hard-remove` path may allow short-lived false-positive reappearance from delayed Scan in extreme races; this is an explicit accepted tradeoff and MUST converge by subsequent realtime/audit progression.
+   > Verification: `MID hard-remove` path may allow short-lived false-positive reappearance from delayed Scan only when no retained realtime/tombstone event-time fence exists for that path; this is an explicit accepted tradeoff and MUST converge by subsequent realtime/audit progression.
 5. **GROUP_PARTITIONED_SINK_STATE**: **fs-meta System** MUST maintain sink materialization state partitioned by logical group.
    > Responsibility: prevent cross-group contamination and enable per-group lifecycle loops.
    > Verification: sink state organizes tree/clock/epoch by group only (single tree per group, no member sub-tree); same relative path from different members arbitrates into that group's single tree.
    > Verification: worker hosting identity is only a hosting boundary; query fanout, sink ownership, and materialized response assembly are defined per logical group rather than by "all groups currently hosted behind one worker host".
    > Verification: sink arbitration authority hierarchy is `Realtime atomic > Scan > Realtime non-atomic` for mtime dominance; equal/older compensation events do not rollback newer state.
    > Verification: sink applies compensation parent-staleness check (`parent_mtime_us`) before accepting first-seen Scan file insertions.
-   > Verification: when a path changes type (`dir<->file`), sink purges cached descendants of that path before applying the new type to keep single-tree structure valid.
+   > Verification: delayed Scan/audit compensation whose own `EventMetadata.timestamp_us` is equal to or older than accepted realtime evidence for the path MUST NOT mutate metadata, delete state, clear tombstones, or purge descendants; it may update audit/MID observability such as `last_seen_epoch`.
+   > Verification: `audit_skipped=true` is audit/MID observability evidence only. It MUST NOT bypass metadata LWW or event-time arbitration to rollback newer realtime metadata.
+   > Verification: when a path changes type (`dir<->file`), sink purges cached descendants of that path only after the incoming event has passed parent-staleness, event-time, tombstone, and LWW acceptance; stale rejected type-change events MUST NOT purge descendants.
    > Verification: sink suspect-age evaluation uses shadow clock domain (`shadow_time_high_us` vs payload `modified_time_us`) and MUST NOT use local host wall-clock as arbitration freshness source.
    > Verification: Scan with unchanged `mtime` preserves existing `monitoring_attested`; only mtime-changed Scan may downgrade attestation.
    > Verification: cold start (`shadow_time_high_us=0`) with empty materialized tree keeps query response reliability permissive (`reliable=true` unless independent overflow marker is pending).

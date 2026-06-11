@@ -39,7 +39,57 @@ pub enum ProcessOutcome {
     DeleteApplied,
 }
 
+fn mtime_abs_diff(left: u64, right: u64) -> u64 {
+    left.abs_diff(right)
+}
+
+fn tombstone_reincarnation_allowed(
+    existing: &FileMetaNode,
+    record: &FileMetaRecord,
+    tombstone_policy: TombstonePolicy,
+    event_shadow_time_us: u64,
+) -> bool {
+    if existing
+        .tombstoned_at_shadow_us
+        .is_some_and(|tombstoned_at| {
+            tombstoned_at > 0 && event_shadow_time_us > 0 && event_shadow_time_us <= tombstoned_at
+        })
+    {
+        return false;
+    }
+
+    let tombstone_expired = existing
+        .tombstone_expires_at
+        .is_some_and(|expiry| Instant::now() >= expiry);
+    let incoming_is_newer = record.unix_stat.mtime_us > existing.modified_time_us;
+
+    if tombstone_expired {
+        return incoming_is_newer;
+    }
+
+    incoming_is_newer
+        && mtime_abs_diff(record.unix_stat.mtime_us, existing.modified_time_us)
+            >= tombstone_policy.tolerance_us
+}
+
+fn event_not_newer_than_realtime(existing: &FileMetaNode, event_shadow_time_us: u64) -> bool {
+    existing
+        .last_realtime_event_shadow_us
+        .is_some_and(|last_realtime| {
+            last_realtime > 0 && event_shadow_time_us > 0 && event_shadow_time_us <= last_realtime
+        })
+}
+
+fn event_not_newer_than_tombstone(existing: &FileMetaNode, event_shadow_time_us: u64) -> bool {
+    existing
+        .tombstoned_at_shadow_us
+        .is_some_and(|tombstoned_at| {
+            tombstoned_at > 0 && event_shadow_time_us > 0 && event_shadow_time_us <= tombstoned_at
+        })
+}
+
 /// Process an incoming file metadata record against the materialized tree.
+#[cfg(test)]
 pub fn process_event(
     record: &FileMetaRecord,
     tree: &mut MaterializedTree,
@@ -47,9 +97,37 @@ pub fn process_event(
     tombstone_policy: TombstonePolicy,
     current_epoch: u64,
 ) -> ProcessOutcome {
+    process_event_at(
+        record,
+        tree,
+        clock,
+        tombstone_policy,
+        current_epoch,
+        clock.now_us(),
+    )
+}
+
+/// Process an incoming file metadata record with the record's own event shadow-time.
+pub fn process_event_at(
+    record: &FileMetaRecord,
+    tree: &mut MaterializedTree,
+    clock: &SinkClock,
+    tombstone_policy: TombstonePolicy,
+    current_epoch: u64,
+    event_shadow_time_us: u64,
+) -> ProcessOutcome {
     match record.event_kind {
-        EventKind::Update => process_upsert(record, tree, clock, tombstone_policy, current_epoch),
-        EventKind::Delete => process_delete(record, tree, clock, tombstone_policy),
+        EventKind::Update => process_upsert(
+            record,
+            tree,
+            clock,
+            tombstone_policy,
+            current_epoch,
+            event_shadow_time_us,
+        ),
+        EventKind::Delete => {
+            process_delete(record, tree, clock, tombstone_policy, event_shadow_time_us)
+        }
     }
 }
 
@@ -60,6 +138,7 @@ fn process_upsert(
     clock: &SinkClock,
     tombstone_policy: TombstonePolicy,
     current_epoch: u64,
+    event_shadow_time_us: u64,
 ) -> ProcessOutcome {
     let path = &record.path;
     let had_existing = tree.get(path).is_some();
@@ -90,76 +169,43 @@ fn process_upsert(
         if existing.is_tombstoned {
             match record.source {
                 SyncTrack::Realtime if record.is_atomic_write => {
-                    // Atomic Realtime reincarnation — proceed unconditionally.
-                    // CLOSE_WRITE has flush-before-notify guarantee, so if
-                    // mtime differs from tombstone, it's a genuine new file.
+                    if event_not_newer_than_tombstone(existing, event_shadow_time_us) {
+                        return ProcessOutcome::Ignored;
+                    }
+                    // Atomic Realtime reincarnation may bypass mtime tolerance,
+                    // but not a newer realtime tombstone event.
                 }
                 SyncTrack::Realtime => {
                     // Non-atomic Realtime (IN_MODIFY, IN_ATTRIB): mtime is
                     // unreliable (stale NFS cache). Apply same zombie check
                     // as Scan to avoid false reincarnation.
-                    let tombstone_expired = existing
-                        .tombstone_expires_at
-                        .map_or(false, |expiry| Instant::now() >= expiry);
-
-                    if tombstone_expired {
-                        // TTL expired — allow reincarnation
-                    } else {
-                        let mtime_diff = if record.unix_stat.mtime_us >= existing.modified_time_us {
-                            record.unix_stat.mtime_us - existing.modified_time_us
-                        } else {
-                            existing.modified_time_us - record.unix_stat.mtime_us
-                        };
-                        if mtime_diff < tombstone_policy.tolerance_us {
-                            tree.with_node_mut(path, |node| {
-                                node.last_seen_epoch = current_epoch;
-                            });
-                            return ProcessOutcome::Ignored; // NFS cache zombie — reject
-                        }
+                    if !tombstone_reincarnation_allowed(
+                        existing,
+                        record,
+                        tombstone_policy,
+                        event_shadow_time_us,
+                    ) {
+                        tree.with_node_mut(path, |node| {
+                            node.last_seen_epoch = current_epoch;
+                        });
+                        return ProcessOutcome::Ignored; // NFS cache zombie — reject
                     }
                 }
                 SyncTrack::Scan => {
-                    let tombstone_expired = existing
-                        .tombstone_expires_at
-                        .map_or(false, |expiry| Instant::now() >= expiry);
-
-                    if tombstone_expired {
-                        // TTL expired — allow reincarnation from Scan
-                    } else {
-                        // Tolerance-based zombie rejection: mtime within window → reject
-                        let mtime_diff = if record.unix_stat.mtime_us >= existing.modified_time_us {
-                            record.unix_stat.mtime_us - existing.modified_time_us
-                        } else {
-                            existing.modified_time_us - record.unix_stat.mtime_us
-                        };
-                        if mtime_diff < tombstone_policy.tolerance_us {
-                            // NFS cache zombie — same mtime (within tolerance), reject
-                            tree.with_node_mut(path, |node| {
-                                node.last_seen_epoch = current_epoch;
-                            });
-                            return ProcessOutcome::Ignored;
-                        }
-                        // mtime differs beyond tolerance → genuine reincarnation
+                    if !tombstone_reincarnation_allowed(
+                        existing,
+                        record,
+                        tombstone_policy,
+                        event_shadow_time_us,
+                    ) {
+                        // NFS cache zombie — same/older than tombstone fence, reject
+                        tree.with_node_mut(path, |node| {
+                            node.last_seen_epoch = current_epoch;
+                        });
+                        return ProcessOutcome::Ignored;
                     }
                 }
             }
-        }
-    }
-
-    // Clear tombstone now (only reached for valid reincarnations)
-    tree.with_node_mut(path, |existing| {
-        if existing.is_tombstoned {
-            existing.is_tombstoned = false;
-            existing.tombstone_expires_at = None;
-        }
-    });
-
-    // ── Step 0.75: Type mutation subtree purge ──
-    // If an existing path changes type (dir<->file), any cached descendants
-    // become invalid under the new type and must be purged first.
-    if let Some(existing) = tree.get(path) {
-        if existing.is_dir != record.unix_stat.is_dir && !existing.is_tombstoned {
-            tree.purge_descendants(path);
         }
     }
 
@@ -175,9 +221,14 @@ fn process_upsert(
             });
         }
 
+        if record.source == SyncTrack::Scan
+            && event_not_newer_than_realtime(&existing_before, event_shadow_time_us)
+        {
+            return ProcessOutcome::Ignored;
+        }
+
         // ── Step 2: LWW check ──
-        // audit_skipped bypasses the mtime comparison
-        if !record.audit_skipped && existing_before.modified_time_us >= record.unix_stat.mtime_us {
+        if existing_before.modified_time_us >= record.unix_stat.mtime_us {
             // Existing is newer or same mtime — reject.
             // Exception: only atomic Realtime (CLOSE_WRITE, DIR_CREATE) can
             // override Scan's mtime. Non-atomic Realtime (IN_MODIFY, IN_ATTRIB)
@@ -192,9 +243,19 @@ fn process_upsert(
         }
 
         let mtime_changed = existing_before.modified_time_us != record.unix_stat.mtime_us;
+        let type_changed = existing_before.is_dir != record.unix_stat.is_dir;
+
+        if type_changed && !existing_before.is_tombstoned {
+            tree.purge_descendants(path);
+        }
 
         // ── Step 3: Apply metadata ──
         tree.with_node_mut(path, |existing| {
+            if existing.is_tombstoned {
+                existing.is_tombstoned = false;
+                existing.tombstone_expires_at = None;
+                existing.tombstoned_at_shadow_us = None;
+            }
             existing.size = record.unix_stat.size;
             existing.modified_time_us = record.unix_stat.mtime_us;
             existing.created_time_us = record.unix_stat.ctime_us;
@@ -207,6 +268,7 @@ fn process_upsert(
                 SyncTrack::Realtime => {
                     existing.monitoring_attested = true;
                     existing.last_confirmed_at = Some(now);
+                    existing.last_realtime_event_shadow_us = Some(event_shadow_time_us);
                     existing.blind_spot = false;
 
                     if record.is_atomic_write {
@@ -286,6 +348,12 @@ fn process_upsert(
                 blind_spot,
                 is_tombstoned: false,
                 tombstone_expires_at: None,
+                tombstoned_at_shadow_us: None,
+                last_realtime_event_shadow_us: if record.source == SyncTrack::Realtime {
+                    Some(event_shadow_time_us)
+                } else {
+                    None
+                },
                 last_seen_epoch: current_epoch,
                 subtree_last_write_significant_change_at: None,
             },
@@ -307,22 +375,49 @@ fn process_delete(
     tree: &mut MaterializedTree,
     _clock: &SinkClock,
     tombstone_policy: TombstonePolicy,
+    event_shadow_time_us: u64,
 ) -> ProcessOutcome {
     let path = &record.path;
     let is_realtime = matches!(record.source, SyncTrack::Realtime);
 
     if is_realtime {
-        // Authoritative delete — create inline tombstone
-        tree.with_node_mut(path, |existing| {
-            existing.is_tombstoned = true;
-            // Preserve original mtime for tolerance comparison — do NOT overwrite.
-            existing.tombstone_expires_at = Some(Instant::now() + tombstone_policy.ttl);
-            existing.suspect_until = None;
-        });
+        let expires_at = Instant::now() + tombstone_policy.ttl;
+        if tree.get(path).is_some() {
+            // Authoritative delete — create inline tombstone
+            tree.with_node_mut(path, |existing| {
+                existing.is_tombstoned = true;
+                // Preserve original mtime for tolerance comparison — do NOT overwrite.
+                existing.tombstone_expires_at = Some(expires_at);
+                existing.tombstoned_at_shadow_us = Some(event_shadow_time_us);
+                existing.last_realtime_event_shadow_us = Some(event_shadow_time_us);
+                existing.suspect_until = None;
+            });
 
-        // Purge all descendants if it was a directory
-        if record.unix_stat.is_dir {
-            tree.purge_descendants(path);
+            // Purge all descendants if it was a directory
+            if record.unix_stat.is_dir {
+                tree.purge_descendants(path);
+            }
+        } else {
+            tree.insert(
+                path.clone(),
+                FileMetaNode {
+                    size: 0,
+                    modified_time_us: record.unix_stat.mtime_us,
+                    created_time_us: record.unix_stat.ctime_us,
+                    is_dir: record.unix_stat.is_dir,
+                    source: SyncTrack::Realtime,
+                    monitoring_attested: false,
+                    last_confirmed_at: None,
+                    suspect_until: None,
+                    blind_spot: false,
+                    is_tombstoned: true,
+                    tombstone_expires_at: Some(expires_at),
+                    tombstoned_at_shadow_us: Some(event_shadow_time_us),
+                    last_realtime_event_shadow_us: Some(event_shadow_time_us),
+                    last_seen_epoch: 0,
+                    subtree_last_write_significant_change_at: None,
+                },
+            );
         }
         ProcessOutcome::DeleteApplied
     } else {
@@ -331,7 +426,13 @@ fn process_delete(
             if existing.is_tombstoned {
                 return ProcessOutcome::Ignored; // Already explicitly deleted by Realtime
             }
-            if existing.modified_time_us > record.unix_stat.mtime_us {
+            if event_not_newer_than_realtime(existing, event_shadow_time_us) {
+                return ProcessOutcome::Ignored;
+            }
+            if existing.modified_time_us > record.unix_stat.mtime_us
+                || (existing.modified_time_us == record.unix_stat.mtime_us
+                    && existing.source == SyncTrack::Realtime)
+            {
                 return ProcessOutcome::Ignored; // Memory is newer — LWW reject
             }
         }
@@ -396,6 +497,320 @@ mod tests {
         process_event(&r1, &mut tree, &clock, TombstonePolicy::default(), 0);
         process_event(&r2, &mut tree, &clock, TombstonePolicy::default(), 0);
         assert_eq!(tree.get(b"/a.txt").unwrap().modified_time_us, 2000);
+    }
+
+    #[test]
+    fn test_stale_scan_type_mutation_does_not_purge_realtime_descendants() {
+        let mut tree = MaterializedTree::new();
+        let clock = SinkClock::new();
+
+        let mut dir = make_record(b"/swap", 2_000, EventKind::Update, SyncTrack::Realtime);
+        dir.unix_stat.is_dir = true;
+        process_event(&dir, &mut tree, &clock, TombstonePolicy::default(), 0);
+        process_event(
+            &make_record(
+                b"/swap/child.txt",
+                2_100,
+                EventKind::Update,
+                SyncTrack::Realtime,
+            ),
+            &mut tree,
+            &clock,
+            TombstonePolicy::default(),
+            0,
+        );
+
+        let stale_scan_file = make_record(b"/swap", 1_000, EventKind::Update, SyncTrack::Scan);
+        let outcome = process_event(
+            &stale_scan_file,
+            &mut tree,
+            &clock,
+            TombstonePolicy::default(),
+            1,
+        );
+
+        assert_eq!(outcome, ProcessOutcome::Ignored);
+        assert!(tree.get(b"/swap").is_some_and(|node| node.is_dir));
+        assert!(tree.get(b"/swap/child.txt").is_some());
+    }
+
+    #[test]
+    fn test_stale_audit_skipped_scan_does_not_rollback_realtime_metadata() {
+        let mut tree = MaterializedTree::new();
+        let clock = SinkClock::new();
+
+        let mut realtime_dir =
+            make_record(b"/stable", 2_000, EventKind::Update, SyncTrack::Realtime);
+        realtime_dir.unix_stat.is_dir = true;
+        realtime_dir.unix_stat.size = 64;
+        process_event(
+            &realtime_dir,
+            &mut tree,
+            &clock,
+            TombstonePolicy::default(),
+            0,
+        );
+        let confirmed_at = tree
+            .get(b"/stable")
+            .expect("realtime dir")
+            .last_confirmed_at;
+
+        let mut skipped = make_record(b"/stable", 1_000, EventKind::Update, SyncTrack::Scan);
+        skipped.unix_stat.is_dir = true;
+        skipped.unix_stat.size = 1;
+        skipped.audit_skipped = true;
+        let outcome = process_event(&skipped, &mut tree, &clock, TombstonePolicy::default(), 7);
+
+        assert_eq!(outcome, ProcessOutcome::Ignored);
+        let node = tree.get(b"/stable").expect("stable dir");
+        assert_eq!(node.modified_time_us, 2_000);
+        assert_eq!(node.size, 64);
+        assert_eq!(node.source, SyncTrack::Realtime);
+        assert_eq!(node.last_seen_epoch, 7);
+        assert_eq!(node.last_confirmed_at, confirmed_at);
+        assert!(node.monitoring_attested);
+        assert!(!node.blind_spot);
+    }
+
+    #[test]
+    fn test_late_scan_event_older_than_realtime_event_cannot_apply_newer_mtime() {
+        let mut tree = MaterializedTree::new();
+        let clock = SinkClock::new();
+
+        let realtime = make_record(b"/race.txt", 2_000, EventKind::Update, SyncTrack::Realtime);
+        process_event_at(
+            &realtime,
+            &mut tree,
+            &clock,
+            TombstonePolicy::default(),
+            0,
+            20_000,
+        );
+
+        let mut stale_scan = make_record(b"/race.txt", 3_000, EventKind::Update, SyncTrack::Scan);
+        stale_scan.unix_stat.size = 9_999;
+        let outcome = process_event_at(
+            &stale_scan,
+            &mut tree,
+            &clock,
+            TombstonePolicy::default(),
+            7,
+            10_000,
+        );
+
+        assert_eq!(outcome, ProcessOutcome::Ignored);
+        let node = tree.get(b"/race.txt").expect("race node");
+        assert_eq!(node.modified_time_us, 2_000);
+        assert_eq!(node.size, 1024);
+        assert_eq!(node.source, SyncTrack::Realtime);
+        assert_eq!(node.last_seen_epoch, 7);
+        assert!(node.monitoring_attested);
+    }
+
+    #[test]
+    fn test_late_scan_delete_event_older_than_realtime_event_cannot_remove_state() {
+        let mut tree = MaterializedTree::new();
+        let clock = SinkClock::new();
+
+        let realtime = make_record(b"/race.txt", 2_000, EventKind::Update, SyncTrack::Realtime);
+        process_event_at(
+            &realtime,
+            &mut tree,
+            &clock,
+            TombstonePolicy::default(),
+            0,
+            20_000,
+        );
+
+        let scan_delete = make_record(b"/race.txt", 3_000, EventKind::Delete, SyncTrack::Scan);
+        let outcome = process_event_at(
+            &scan_delete,
+            &mut tree,
+            &clock,
+            TombstonePolicy::default(),
+            7,
+            10_000,
+        );
+
+        assert_eq!(outcome, ProcessOutcome::Ignored);
+        let node = tree.get(b"/race.txt").expect("race node retained");
+        assert_eq!(node.modified_time_us, 2_000);
+        assert_eq!(node.source, SyncTrack::Realtime);
+        assert!(!node.is_tombstoned);
+    }
+
+    #[test]
+    fn test_equal_mtime_scan_delete_does_not_remove_realtime_state() {
+        let mut tree = MaterializedTree::new();
+        let clock = SinkClock::new();
+
+        let create = make_record(b"/a.txt", 1_000, EventKind::Update, SyncTrack::Realtime);
+        process_event(&create, &mut tree, &clock, TombstonePolicy::default(), 0);
+
+        let delete = make_record(b"/a.txt", 1_000, EventKind::Delete, SyncTrack::Scan);
+        let outcome = process_event(&delete, &mut tree, &clock, TombstonePolicy::default(), 1);
+
+        assert_eq!(outcome, ProcessOutcome::Ignored);
+        assert!(tree.get(b"/a.txt").is_some());
+        assert_eq!(tree.get(b"/a.txt").unwrap().source, SyncTrack::Realtime);
+    }
+
+    #[test]
+    fn test_stale_scan_cannot_reincarnate_realtime_tombstone() {
+        let mut tree = MaterializedTree::new();
+        let clock = SinkClock::new();
+        let policy = TombstonePolicy {
+            ttl: Duration::from_secs(90),
+            tolerance_us: 100,
+        };
+
+        let create = make_record(
+            b"/deleted.txt",
+            2_000,
+            EventKind::Update,
+            SyncTrack::Realtime,
+        );
+        let delete = make_record(
+            b"/deleted.txt",
+            2_000,
+            EventKind::Delete,
+            SyncTrack::Realtime,
+        );
+        process_event(&create, &mut tree, &clock, policy, 0);
+        process_event(&delete, &mut tree, &clock, policy, 0);
+        assert!(
+            tree.get(b"/deleted.txt")
+                .is_some_and(|node| node.is_tombstoned)
+        );
+
+        let stale_scan = make_record(b"/deleted.txt", 1_000, EventKind::Update, SyncTrack::Scan);
+        let outcome = process_event(&stale_scan, &mut tree, &clock, policy, 1);
+
+        assert_eq!(outcome, ProcessOutcome::Ignored);
+        let node = tree.get(b"/deleted.txt").expect("tombstone retained");
+        assert!(node.is_tombstoned);
+        assert_eq!(node.modified_time_us, 2_000);
+        assert_eq!(node.last_seen_epoch, 1);
+    }
+
+    #[test]
+    fn test_scan_older_than_delete_shadow_time_cannot_reincarnate_tombstone() {
+        let mut tree = MaterializedTree::new();
+        let mut clock = SinkClock::new();
+        let policy = TombstonePolicy {
+            ttl: Duration::from_secs(90),
+            tolerance_us: 100,
+        };
+
+        let create = make_record(
+            b"/deleted.txt",
+            1_000,
+            EventKind::Update,
+            SyncTrack::Realtime,
+        );
+        process_event(&create, &mut tree, &clock, policy, 0);
+        clock.advance(10_000);
+        let delete = make_record(
+            b"/deleted.txt",
+            1_000,
+            EventKind::Delete,
+            SyncTrack::Realtime,
+        );
+        process_event(&delete, &mut tree, &clock, policy, 0);
+
+        let stale_scan = make_record(b"/deleted.txt", 2_000, EventKind::Update, SyncTrack::Scan);
+        let outcome = process_event(&stale_scan, &mut tree, &clock, policy, 1);
+
+        assert_eq!(outcome, ProcessOutcome::Ignored);
+        let node = tree.get(b"/deleted.txt").expect("tombstone retained");
+        assert!(node.is_tombstoned);
+        assert_eq!(node.modified_time_us, 1_000);
+        assert_eq!(node.tombstoned_at_shadow_us, Some(10_000));
+        assert_eq!(node.last_seen_epoch, 1);
+    }
+
+    #[test]
+    fn test_unknown_realtime_delete_tombstone_blocks_late_scan_insert() {
+        let mut tree = MaterializedTree::new();
+        let mut clock = SinkClock::new();
+        let policy = TombstonePolicy {
+            ttl: Duration::from_secs(90),
+            tolerance_us: 100,
+        };
+
+        clock.advance(10_000);
+        let delete = make_record(
+            b"/unseen-deleted.txt",
+            0,
+            EventKind::Delete,
+            SyncTrack::Realtime,
+        );
+        let delete_outcome = process_event(&delete, &mut tree, &clock, policy, 0);
+        assert_eq!(delete_outcome, ProcessOutcome::DeleteApplied);
+        assert!(
+            tree.get(b"/unseen-deleted.txt")
+                .is_some_and(|node| node.is_tombstoned)
+        );
+
+        let stale_scan = make_record(
+            b"/unseen-deleted.txt",
+            5_000,
+            EventKind::Update,
+            SyncTrack::Scan,
+        );
+        let outcome = process_event(&stale_scan, &mut tree, &clock, policy, 1);
+
+        assert_eq!(outcome, ProcessOutcome::Ignored);
+        let node = tree
+            .get(b"/unseen-deleted.txt")
+            .expect("unknown delete tombstone retained");
+        assert!(node.is_tombstoned);
+        assert_eq!(node.modified_time_us, 0);
+        assert_eq!(node.tombstoned_at_shadow_us, Some(10_000));
+        assert_eq!(node.last_seen_epoch, 1);
+    }
+
+    #[test]
+    fn test_stale_realtime_atomic_cannot_reincarnate_newer_realtime_tombstone() {
+        let mut tree = MaterializedTree::new();
+        let clock = SinkClock::new();
+        let policy = TombstonePolicy {
+            ttl: Duration::from_secs(90),
+            tolerance_us: 100,
+        };
+
+        let create = make_record(
+            b"/atomic-race.txt",
+            1_000,
+            EventKind::Update,
+            SyncTrack::Realtime,
+        );
+        process_event_at(&create, &mut tree, &clock, policy, 0, 10_000);
+
+        let delete = make_record(
+            b"/atomic-race.txt",
+            1_000,
+            EventKind::Delete,
+            SyncTrack::Realtime,
+        );
+        process_event_at(&delete, &mut tree, &clock, policy, 0, 20_000);
+
+        let stale_atomic = make_record(
+            b"/atomic-race.txt",
+            9_000,
+            EventKind::Update,
+            SyncTrack::Realtime,
+        );
+        let outcome = process_event_at(&stale_atomic, &mut tree, &clock, policy, 0, 15_000);
+
+        assert_eq!(outcome, ProcessOutcome::Ignored);
+        let node = tree
+            .get(b"/atomic-race.txt")
+            .expect("newer realtime tombstone retained");
+        assert!(node.is_tombstoned);
+        assert_eq!(node.modified_time_us, 1_000);
+        assert_eq!(node.tombstoned_at_shadow_us, Some(20_000));
+        assert_eq!(node.last_realtime_event_shadow_us, Some(20_000));
     }
 
     #[test]

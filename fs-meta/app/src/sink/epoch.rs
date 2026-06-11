@@ -235,6 +235,8 @@ mod tests {
             blind_spot: false,
             is_tombstoned: false,
             tombstone_expires_at: None,
+            tombstoned_at_shadow_us: None,
+            last_realtime_event_shadow_us: None,
             last_seen_epoch,
             subtree_last_write_significant_change_at: None,
         }

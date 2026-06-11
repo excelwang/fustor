@@ -522,6 +522,7 @@ enum SinkStatusAccessPath {
     ControlInflight,
     Steady,
     SteadyAfterRetryReset,
+    ControlInflightCached,
     WorkerUnavailable,
     ControlInflightNoClient,
     NotStarted,
@@ -582,6 +583,7 @@ enum SinkStatusLiveScenario {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SinkStatusCachedScenario {
+    ControlInflightCached,
     WorkerUnavailable,
     ControlInflightNoClient,
     NotStarted,
@@ -624,6 +626,9 @@ impl SinkStatusAccessPath {
             Self::Steady => SinkStatusScenario::Live(SinkStatusLiveScenario::Steady),
             Self::SteadyAfterRetryReset => {
                 SinkStatusScenario::Live(SinkStatusLiveScenario::SteadyAfterRetryReset)
+            }
+            Self::ControlInflightCached => {
+                SinkStatusScenario::Cached(SinkStatusCachedScenario::ControlInflightCached)
             }
             Self::WorkerUnavailable => {
                 SinkStatusScenario::Cached(SinkStatusCachedScenario::WorkerUnavailable)
@@ -1154,9 +1159,9 @@ impl SinkStatusCachedScenario {
             | (Self::WorkerUnavailable, SinkStatusConcernLane::MixedReadiness) => {
                 SinkStatusOutcomeKind::PropagateError
             }
-            (Self::NotStarted, SinkStatusConcernLane::StaleEmpty)
+            (Self::ControlInflightCached | Self::NotStarted, SinkStatusConcernLane::StaleEmpty)
             | (
-                Self::ControlInflightNoClient | Self::NotStarted,
+                Self::ControlInflightCached | Self::ControlInflightNoClient | Self::NotStarted,
                 SinkStatusConcernLane::CoverageGap | SinkStatusConcernLane::MixedReadiness,
             ) => SinkStatusOutcomeKind::FailClosed,
         }
@@ -1264,8 +1269,17 @@ fn evaluate_cached_sink_status_snapshot(
     cached_snapshot: &SinkStatusSnapshot,
     access_path: SinkStatusAccessPath,
 ) -> SinkStatusSnapshotOutcome {
-    let SinkStatusScenario::Cached(scenario) = access_path.scenario() else {
-        unreachable!("live access path passed to cached sink status evaluation");
+    let scenario = match access_path.scenario() {
+        SinkStatusScenario::Cached(scenario) => scenario,
+        SinkStatusScenario::Live(_) => {
+            let cached_projection = project_sink_status_snapshot_concern(cached_snapshot);
+            return SinkStatusSnapshotOutcome {
+                kind: SinkStatusOutcomeKind::FailClosed,
+                concern: cached_projection.concern,
+                should_mark_replay_required: false,
+                should_republish_zero_row_summary: false,
+            };
+        }
     };
     let cached_projection = project_sink_status_snapshot_concern(cached_snapshot);
     let delivery_backed_zero_uninitialized =
@@ -3703,6 +3717,46 @@ impl SinkWorkerClientHandle {
                     unreachable!("control-inflight cached evaluation never returns live")
                 }
             },
+            SinkStatusAccessPath::ControlInflightCached => match outcome.kind {
+                SinkStatusOutcomeKind::ReturnCached => match outcome.concern {
+                    Some(SinkStatusConcern::WaitingForMaterializedRoot) => {
+                        "control_inflight_scheduled_waiting_for_materialized_root_cached_snapshot"
+                    }
+                    Some(SinkStatusConcern::ReplayPending) => {
+                        "control_inflight_pending_materialization_without_stream_receipts_cached_snapshot"
+                    }
+                    Some(SinkStatusConcern::CoverageGap) => {
+                        "control_inflight_missing_scheduled_group_rows_cached_snapshot"
+                    }
+                    Some(SinkStatusConcern::MixedReadiness) => {
+                        "control_inflight_scheduled_mixed_ready_and_unready_cached_snapshot"
+                    }
+                    Some(SinkStatusConcern::StaleEmpty) | None => "control_inflight",
+                },
+                SinkStatusOutcomeKind::FailClosed => match outcome.concern {
+                    Some(SinkStatusConcern::WaitingForMaterializedRoot) => {
+                        "control_inflight_scheduled_waiting_for_materialized_root_cached_snapshot"
+                    }
+                    Some(SinkStatusConcern::CoverageGap) => {
+                        "control_inflight_missing_scheduled_group_rows_cached_snapshot"
+                    }
+                    Some(SinkStatusConcern::MixedReadiness) => {
+                        "control_inflight_scheduled_mixed_ready_and_unready_cached_snapshot"
+                    }
+                    Some(SinkStatusConcern::ReplayPending) => {
+                        "control_inflight_pending_materialization_without_stream_receipts_cached_snapshot"
+                    }
+                    Some(SinkStatusConcern::StaleEmpty) | None => {
+                        "control_inflight_fail_closed_cached_snapshot"
+                    }
+                },
+                SinkStatusOutcomeKind::PropagateError => {
+                    unreachable!("control-inflight cached evaluation never propagates error")
+                }
+                SinkStatusOutcomeKind::ReturnLive => {
+                    unreachable!("control-inflight cached evaluation never returns live")
+                }
+            },
             SinkStatusAccessPath::WorkerUnavailable => match outcome.concern {
                 Some(SinkStatusConcern::CoverageGap) => {
                     "worker_unavailable_missing_scheduled_group_rows_after_stream_evidence"
@@ -3750,9 +3804,30 @@ impl SinkWorkerClientHandle {
             SinkStatusAccessPath::Blocking
             | SinkStatusAccessPath::ControlInflight
             | SinkStatusAccessPath::Steady
-            | SinkStatusAccessPath::SteadyAfterRetryReset => {
-                unreachable!("live access path passed to cached reason formatter")
-            }
+            | SinkStatusAccessPath::SteadyAfterRetryReset => match outcome.kind {
+                SinkStatusOutcomeKind::FailClosed => match outcome.concern {
+                    Some(SinkStatusConcern::WaitingForMaterializedRoot) => {
+                        "live_access_path_scheduled_waiting_for_materialized_root_cached_snapshot"
+                    }
+                    Some(SinkStatusConcern::CoverageGap) => {
+                        "live_access_path_missing_scheduled_group_rows_cached_snapshot"
+                    }
+                    Some(SinkStatusConcern::MixedReadiness) => {
+                        "live_access_path_scheduled_mixed_ready_and_unready_cached_snapshot"
+                    }
+                    Some(SinkStatusConcern::ReplayPending) => {
+                        "live_access_path_pending_materialization_without_stream_receipts_cached_snapshot"
+                    }
+                    Some(SinkStatusConcern::StaleEmpty) | None => {
+                        "live_access_path_fail_closed_cached_snapshot"
+                    }
+                },
+                SinkStatusOutcomeKind::ReturnCached => "live_access_path_cached_snapshot",
+                SinkStatusOutcomeKind::PropagateError => "live_access_path_error_cached_snapshot",
+                SinkStatusOutcomeKind::ReturnLive => {
+                    unreachable!("cached reason formatter never returns live")
+                }
+            },
         }
     }
 
@@ -3826,7 +3901,7 @@ impl SinkWorkerClientHandle {
             }
             return Ok(SinkStatusNonblockingEntryAction::ReturnCached {
                 snapshot,
-                access_path: SinkStatusAccessPath::ControlInflightNoClient,
+                access_path: SinkStatusAccessPath::ControlInflightCached,
             });
         }
 
@@ -3860,7 +3935,7 @@ impl SinkWorkerClientHandle {
             snapshot = self.cached_status_snapshot_with_republished_scheduled_groups()?;
             return Ok(SinkStatusNonblockingEntryAction::ReturnCached {
                 snapshot,
-                access_path: SinkStatusAccessPath::ControlInflight,
+                access_path: SinkStatusAccessPath::ControlInflightCached,
             });
         }
         if self.existing_client_with_failure().await?.is_none() {
@@ -3877,7 +3952,7 @@ impl SinkWorkerClientHandle {
         if self.control_op_inflight() {
             return Ok(SinkStatusNonblockingEntryAction::ReturnCached {
                 snapshot,
-                access_path: SinkStatusAccessPath::ControlInflight,
+                access_path: SinkStatusAccessPath::ControlInflightCached,
             });
         }
         Ok(SinkStatusNonblockingEntryAction::ProbeLive(

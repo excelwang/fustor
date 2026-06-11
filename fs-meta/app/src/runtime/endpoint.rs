@@ -1738,7 +1738,10 @@ async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
                 stale_recv_gap_count = 0;
                 continue;
             }
-            Err(err) if is_retryable_worker_bridge_peer_error(&err) => {
+            Err(err)
+                if matches!(err, CnxError::TxBusy)
+                    || is_retryable_worker_bridge_peer_error(&err) =>
+            {
                 stale_recv_gap_count = 0;
                 if should_emit_endpoint_retry_log(&format!(
                     "retryable_gap:{}:{}",
@@ -2056,6 +2059,7 @@ mod tests {
         RevokedGrantAttachmentToken,
         RetryableBridgePeerError,
         RetryableBridgeInternalError,
+        TxBusy,
         AuthoritativeIpcTransportClosed,
         SidecarTransportClosed,
     }
@@ -2226,6 +2230,7 @@ mod tests {
                         "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
                             .into(),
                     )),
+                    FirstFailure::TxBusy => Err(CnxError::TxBusy),
                     FirstFailure::AuthoritativeIpcTransportClosed => Err(
                         CnxError::TransportClosed("IPC control transport closed".into()),
                     ),
@@ -3273,6 +3278,37 @@ mod tests {
                 "source-status:v1.req".to_string()
             ],
             "endpoint recv should retry retryable worker-bridge Internal values instead of exiting and relying on route respawn"
+        );
+    }
+
+    #[test]
+    fn stream_loop_retries_tx_busy_recv_gap() {
+        let boundary = Arc::new(RecordingBoundary {
+            recv_keys: Mutex::new(Vec::new()),
+            recv_unit_ids: Mutex::new(Vec::new()),
+            close_keys: Mutex::new(Vec::new()),
+            first_failure: Mutex::new(Some(FirstFailure::TxBusy)),
+        });
+        crate::runtime_app::shared_tokio_runtime().block_on(run_stream_loop(
+            boundary.clone(),
+            RouteKey("source-logical-roots-control:v1.stream".into()),
+            "test-stream".into(),
+            "runtime.exec.source".into(),
+            CancellationToken::new(),
+            Arc::new(|| true),
+            Arc::new(|| {}),
+            Arc::new(|_events: Vec<Event>| std::future::ready(())),
+            test_terminal_reason(),
+        ));
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(
+            recv_keys,
+            vec![
+                "source-logical-roots-control:v1.stream".to_string(),
+                "source-logical-roots-control:v1.stream".to_string()
+            ],
+            "stream recv should retry Capanix tx_busy contention instead of terminating the endpoint task"
         );
     }
 

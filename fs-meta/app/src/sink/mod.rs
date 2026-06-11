@@ -63,7 +63,7 @@ use crate::runtime::routes::{
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::unit_gate::RuntimeUnitGate;
-use crate::sink::arbitrator::{ProcessOutcome, TombstonePolicy, process_event};
+use crate::sink::arbitrator::{ProcessOutcome, TombstonePolicy, process_event_at};
 use crate::sink::clock::SinkClock;
 use crate::sink::epoch::EpochManager;
 use crate::sink::query::query_node_from_node;
@@ -1315,6 +1315,10 @@ struct PersistedFileMetaNode {
     blind_spot: bool,
     is_tombstoned: bool,
     tombstone_remaining_ms: Option<u64>,
+    #[serde(default)]
+    tombstoned_at_shadow_us: Option<u64>,
+    #[serde(default)]
+    last_realtime_event_shadow_us: Option<u64>,
     last_seen_epoch: u64,
     subtree_last_write_significant_change_age_ms: Option<u64>,
 }
@@ -1334,6 +1338,8 @@ impl PersistedFileMetaNode {
             blind_spot: node.blind_spot,
             is_tombstoned: node.is_tombstoned,
             tombstone_remaining_ms: encode_instant_remaining_ms(node.tombstone_expires_at, now),
+            tombstoned_at_shadow_us: node.tombstoned_at_shadow_us,
+            last_realtime_event_shadow_us: node.last_realtime_event_shadow_us,
             last_seen_epoch: node.last_seen_epoch,
             subtree_last_write_significant_change_age_ms: encode_instant_age_ms(
                 node.subtree_last_write_significant_change_at,
@@ -1355,6 +1361,8 @@ impl PersistedFileMetaNode {
             blind_spot: self.blind_spot,
             is_tombstoned: self.is_tombstoned,
             tombstone_expires_at: decode_instant_remaining_ms(self.tombstone_remaining_ms),
+            tombstoned_at_shadow_us: self.tombstoned_at_shadow_us,
+            last_realtime_event_shadow_us: self.last_realtime_event_shadow_us,
             last_seen_epoch: self.last_seen_epoch,
             subtree_last_write_significant_change_at: decode_instant_age_ms(
                 self.subtree_last_write_significant_change_age_ms,
@@ -5169,12 +5177,13 @@ impl SinkFileMeta {
                 shadow_time_high_us: group_state.clock.now_us(),
             };
             let previous_node = group_state.tree.get(&record.path).cloned();
-            let outcome = process_event(
+            let outcome = process_event_at(
                 &record,
                 &mut group_state.tree,
                 &clock_snapshot,
                 group_state.tombstone_policy,
                 current_epoch,
+                event.metadata().timestamp_us,
             );
             group_state.refresh_materialization_readiness();
             let write_significant = match outcome {

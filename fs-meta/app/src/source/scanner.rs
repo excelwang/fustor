@@ -293,6 +293,60 @@ mod tests {
     }
 
     #[test]
+    fn audit_emit_preserves_observed_scan_timestamp() {
+        let scanner = ParallelScanner::new(
+            PathBuf::from("/root"),
+            PathBuf::new(),
+            1,
+            1,
+            1024,
+            NodeId("node-a::nfs1".to_string()),
+            Arc::new(WideTreeHostFs::new(0)),
+        );
+        let record = FileMetaRecord::scan_update(
+            b"/old.txt".to_vec(),
+            b"old.txt".to_vec(),
+            UnixStat {
+                is_dir: false,
+                size: 1,
+                mtime_us: 1_000,
+                ctime_us: 1_000,
+                dev: None,
+                ino: None,
+            },
+            Vec::new(),
+            0,
+            false,
+        );
+        let observed = ObservedScanRecord {
+            record,
+            observed_shadow_time_us: 12_345,
+        };
+        let mut current_batch = Vec::new();
+        let mut emitted = Vec::new();
+        let logical_clock = Arc::new(LogicalClock::new());
+
+        let (records_seen, still_open) = scanner.emit_record_events(
+            vec![observed],
+            &logical_clock,
+            &mut current_batch,
+            &mut |batch| {
+                emitted.extend(batch);
+                true
+            },
+        );
+
+        assert_eq!(records_seen, 1);
+        assert!(still_open);
+        assert!(current_batch.is_empty());
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].metadata().timestamp_us, 12_345);
+        let decoded: FileMetaRecord =
+            rmp_serde::from_slice(emitted[0].payload_bytes()).expect("decode scan record");
+        assert_eq!(decoded.path, b"/old.txt".to_vec());
+    }
+
+    #[test]
     fn directory_fingerprint_is_order_independent_for_wide_directories() {
         let mut entries = (0..4096)
             .map(|idx| HostFsDirEntry {
@@ -540,8 +594,25 @@ fn scan_result_queue_capacity(scan_workers: usize) -> usize {
 }
 
 struct ScanRecordBatch {
-    records: Vec<FileMetaRecord>,
+    records: Vec<ObservedScanRecord>,
     accepted_tx: cb::Sender<bool>,
+}
+
+struct ObservedScanRecord {
+    record: FileMetaRecord,
+    observed_shadow_time_us: u64,
+}
+
+fn observed_scan_record(
+    record: FileMetaRecord,
+    drift_estimator: &Arc<Mutex<DriftEstimator>>,
+    context: &str,
+) -> ObservedScanRecord {
+    let drift_us = lock_or_recover(drift_estimator, context).drift_us();
+    ObservedScanRecord {
+        record,
+        observed_shadow_time_us: drift::shadow_now_us(drift_us),
+    }
 }
 
 fn host_fs_timeout_error(op: &str, path: &Path) -> io::Error {
@@ -764,7 +835,7 @@ fn read_dir_with_retry(
 
 fn flush_scan_records(
     result_tx: &cb::Sender<ScanRecordBatch>,
-    records: &mut Vec<FileMetaRecord>,
+    records: &mut Vec<ObservedScanRecord>,
     flush_at: usize,
 ) -> bool {
     if records.len() < flush_at {
@@ -775,7 +846,7 @@ fn flush_scan_records(
 
 fn send_scan_records(
     result_tx: &cb::Sender<ScanRecordBatch>,
-    records: Vec<FileMetaRecord>,
+    records: Vec<ObservedScanRecord>,
 ) -> bool {
     if records.is_empty() {
         return true;
@@ -1013,8 +1084,7 @@ impl ParallelScanner {
 
     fn emit_record_events<F>(
         &self,
-        records: Vec<FileMetaRecord>,
-        drift_estimator: &Arc<Mutex<DriftEstimator>>,
+        records: Vec<ObservedScanRecord>,
         logical_clock: &Arc<LogicalClock>,
         current_batch: &mut Vec<Event>,
         emit_batch: &mut F,
@@ -1023,10 +1093,13 @@ impl ParallelScanner {
         F: FnMut(Vec<Event>) -> bool,
     {
         let record_count = records.len();
-        let drift_us = lock_or_recover(drift_estimator, "scanner.audit_stream.drift").drift_us();
-        for record in records {
-            if let Some(ev) = watcher::build_event(&record, &self.node_id, drift_us, logical_clock)
-            {
+        for observed in records {
+            if let Some(ev) = watcher::build_event_at(
+                &observed.record,
+                &self.node_id,
+                observed.observed_shadow_time_us,
+                logical_clock,
+            ) {
                 current_batch.push(ev);
                 if current_batch.len() >= self.batch_size
                     && !emit_batch(std::mem::take(current_batch))
@@ -1264,7 +1337,11 @@ impl ParallelScanner {
                                     };
 
                                     // Emit directory record (includes root on initial scan).
-                                    records.push(dir_record(!should_deep_scan));
+                                    records.push(observed_scan_record(
+                                        dir_record(!should_deep_scan),
+                                        &drift_est,
+                                        "scanner.parallel_walk.dir_record_timestamp",
+                                    ));
 
                                     let parent_relative =
                                         watcher::make_relative(&dir_path, &root);
@@ -1307,23 +1384,27 @@ impl ParallelScanner {
                                                 Ok(meta) => {
                                                     let mtime_us = to_epoch_us(meta.modified);
                                                     let ctime_us = to_epoch_us(meta.created);
-                                                    records.push(FileMetaRecord::scan_update(
-                                                        relative,
-                                                        entry_path
-                                                            .file_name()
-                                                            .map(|n| n.as_bytes().to_vec())
-                                                            .unwrap_or_default(),
-                                                        UnixStat {
-                                                            is_dir: false,
-                                                            size: meta.len,
-                                                            mtime_us,
-                                                            ctime_us,
-                                                            dev: meta.dev,
-                                                            ino: meta.ino,
-                                                        },
-                                                        parent_relative.clone(),
-                                                        parent_mtime_us,
-                                                        false,
+                                                    records.push(observed_scan_record(
+                                                        FileMetaRecord::scan_update(
+                                                            relative,
+                                                            entry_path
+                                                                .file_name()
+                                                                .map(|n| n.as_bytes().to_vec())
+                                                                .unwrap_or_default(),
+                                                            UnixStat {
+                                                                is_dir: false,
+                                                                size: meta.len,
+                                                                mtime_us,
+                                                                ctime_us,
+                                                                dev: meta.dev,
+                                                                ino: meta.ino,
+                                                            },
+                                                            parent_relative.clone(),
+                                                            parent_mtime_us,
+                                                            false,
+                                                        ),
+                                                        &drift_est,
+                                                        "scanner.parallel_walk.file_record_timestamp",
                                                     ));
                                                 }
                                                 Err(e) => log::warn!(
@@ -1394,7 +1475,6 @@ impl ParallelScanner {
         for batch in &result_rx {
             let (records_seen, mut still_open) = self.emit_record_events(
                 batch.records,
-                drift_estimator,
                 logical_clock,
                 &mut current_batch,
                 emit_batch,
@@ -1581,7 +1661,11 @@ impl ParallelScanner {
                     should
                 };
 
-                records.push(dir_record(!should_deep_scan));
+                records.push(observed_scan_record(
+                    dir_record(!should_deep_scan),
+                    drift_estimator,
+                    "scanner.parallel_walk_inline.dir_record_timestamp",
+                ));
 
                 let parent_relative = watcher::make_relative(&dir_path, &root);
                 let parent_mtime_us = (current_mtime * 1_000_000.0) as u64;
@@ -1606,23 +1690,27 @@ impl ParallelScanner {
                         Ok(meta) => {
                             let mtime_us = to_epoch_us(meta.modified);
                             let ctime_us = to_epoch_us(meta.created);
-                            records.push(FileMetaRecord::scan_update(
-                                relative,
-                                entry_path
-                                    .file_name()
-                                    .map(|n| n.as_bytes().to_vec())
-                                    .unwrap_or_default(),
-                                UnixStat {
-                                    is_dir: false,
-                                    size: meta.len,
-                                    mtime_us,
-                                    ctime_us,
-                                    dev: meta.dev,
-                                    ino: meta.ino,
-                                },
-                                parent_relative.clone(),
-                                parent_mtime_us,
-                                false,
+                            records.push(observed_scan_record(
+                                FileMetaRecord::scan_update(
+                                    relative,
+                                    entry_path
+                                        .file_name()
+                                        .map(|n| n.as_bytes().to_vec())
+                                        .unwrap_or_default(),
+                                    UnixStat {
+                                        is_dir: false,
+                                        size: meta.len,
+                                        mtime_us,
+                                        ctime_us,
+                                        dev: meta.dev,
+                                        ino: meta.ino,
+                                    },
+                                    parent_relative.clone(),
+                                    parent_mtime_us,
+                                    false,
+                                ),
+                                drift_estimator,
+                                "scanner.parallel_walk_inline.file_record_timestamp",
                             ));
                         }
                         Err(e) => {
@@ -1632,13 +1720,8 @@ impl ParallelScanner {
                 }
             }
 
-            let (records_seen, still_open) = self.emit_record_events(
-                records,
-                drift_estimator,
-                logical_clock,
-                &mut current_batch,
-                emit_batch,
-            );
+            let (records_seen, still_open) =
+                self.emit_record_events(records, logical_clock, &mut current_batch, emit_batch);
             record_count += records_seen;
             if !still_open {
                 *mtime_cache_ref = mtime_cache;

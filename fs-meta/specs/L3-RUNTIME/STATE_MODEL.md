@@ -178,6 +178,8 @@ QueryObservationState =
 6. source MUST NOT advance scan/audit progress or release source-side scan/audit concurrency as if a batch were downstream-accepted while that batch is only waiting in an unbounded or fairness-only publication buffer.
 7. realtime watch ingestion is a separate evidence lane. Backpressure from the scan/audit publication lane MUST NOT block host watch event ingestion or force realtime events to wait behind scan/audit backlog.
 8. if realtime watch publication itself is full or unavailable, fs-meta MUST surface explicit overflow/backpressure evidence and keep trusted materialized readiness closed until audit/repair recovery evidence arrives; silent loss with trusted readiness is not an allowed state transition, and the host watch loop MUST NOT be blocked on sink progress as the recovery mechanism.
+9. scan/audit event timestamps are part of the observation state, not queue-drain state. They MUST be captured before a scan/audit record can wait behind a backpressured publication/result queue, so sink event-time arbitration can reject delayed compensation metadata that predates accepted realtime state.
+10. separation of realtime ingestion from scan/audit backpressure depends on sink arbitration preserving accepted realtime event shadow-time per path; delayed Scan/audit events at or before that shadow-time MUST NOT overwrite metadata, delete state, clear tombstones, or trigger destructive type-change purges.
 
 ## [state-machine] FacadeServiceState
 
