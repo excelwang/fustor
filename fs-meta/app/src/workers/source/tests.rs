@@ -39,7 +39,7 @@ use crate::runtime::execution_units::{
 use crate::runtime::routes::{
     METHOD_SOURCE_RESCAN, ROUTE_KEY_QUERY, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
     ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_TOKEN_FS_META_INTERNAL,
-    source_rescan_request_route_for, source_rescan_route_bindings_for,
+    is_events_stream_route_key, source_rescan_request_route_for, source_rescan_route_bindings_for,
 };
 use crate::sink::SinkFileMeta;
 use crate::source::SourceLogicalRootHealthSnapshot;
@@ -3352,6 +3352,41 @@ impl ChannelIoSubset for LoopbackWorkerBoundary {
     }
 }
 
+impl LoopbackWorkerBoundary {
+    async fn recv_any_events_stream(&self, timeout_ms: u64) -> Result<Vec<Event>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            {
+                let mut channels = self.channels.lock().await;
+                if let Some(route) = channels
+                    .keys()
+                    .find(|route| is_events_stream_route_key(route))
+                    .cloned()
+                    && let Some(events) = channels.remove(&route)
+                    && !events.is_empty()
+                {
+                    return Ok(events);
+                }
+            }
+            {
+                let closed = self.closed.lock().expect("loopback closed lock");
+                if closed.iter().any(|route| is_events_stream_route_key(route)) {
+                    return Err(CnxError::ChannelClosed);
+                }
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(CnxError::Timeout);
+            }
+            let notified = self.changed.notified();
+            match tokio::time::timeout_at(deadline, notified).await {
+                Ok(()) => {}
+                Err(_) => return Err(CnxError::Timeout),
+            }
+        }
+    }
+}
+
 impl ChannelBoundary for LoopbackWorkerBoundary {
     fn log(&self, _ctx: BoundaryContext, _level: LogLevel, _msg: &str) {}
 }
@@ -4211,15 +4246,7 @@ async fn recv_loopback_events(
     boundary: &LoopbackWorkerBoundary,
     timeout_ms: u64,
 ) -> Result<Vec<Event>> {
-    boundary
-        .channel_recv(
-            BoundaryContext::default(),
-            ChannelRecvRequest {
-                channel_key: ChannelKey("fs-meta.events:v1.stream".to_string()),
-                timeout_ms: Some(timeout_ms),
-            },
-        )
-        .await
+    boundary.recv_any_events_stream(timeout_ms).await
 }
 
 fn record_control_and_data_counts(

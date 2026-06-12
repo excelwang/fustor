@@ -4058,6 +4058,79 @@ async fn status_route_cache_fallback_preserves_owner_scoped_sink_schedule_and_pr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_status_route_uses_matching_roots_control_scope_instead_of_facade_fallback() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs144 = tmp.path().join("nfs-144");
+    std::fs::create_dir_all(&nfs144).expect("create nfs-144 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs-144", &nfs144)],
+        host_object_grants: vec![
+            sink_worker_export("node-a::nfs-144", "node-a", "10.0.82.144", nfs144.clone()),
+            sink_worker_export("node-b::nfs-144", "node-b", "10.0.82.145", nfs144.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-b".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    let owner_status_route = sink_status_request_route_for("node-a").0;
+    let roots_control_route = sink_roots_control_stream_route_for("node-a").0;
+    let envelope =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: roots_control_route,
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 7,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources(
+                "nfs-144",
+                &["node-a::nfs-144", "node-b::nfs-144"],
+            )],
+        }))
+        .expect("encode retained owner-scoped sink roots-control activate");
+    let signals =
+        sink_control_signals_from_envelopes(&[envelope]).expect("decode retained activate");
+    sink.retain_control_signals(&signals)
+        .await
+        .expect("retain owner-scoped sink roots-control route evidence");
+    sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
+        .expect("seed empty cached sink status");
+
+    let _inflight = sink.begin_control_op();
+    let (snapshot, from_cache) = sink
+        .status_snapshot_nonblocking_for_status_route_key(&owner_status_route)
+        .await;
+
+    assert!(
+        from_cache,
+        "precondition: route-specific owner evidence must be read from cached fallback"
+    );
+    assert_eq!(
+        snapshot.scheduled_groups_by_node,
+        std::collections::BTreeMap::from([("node-a".to_string(), vec!["nfs-144".to_string()])]),
+        "owner-scoped sink-status must use the matching roots-control route owner and must not collapse accepted schedule evidence to the facade/local fallback node: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.primary_host_ref_by_group,
+        std::collections::BTreeMap::from([("nfs-144".to_string(), "node-a".to_string())]),
+        "owner-scoped sink-status must preserve the roots-control route owner as primary schedule evidence: {snapshot:?}"
+    );
+
+    drop(_inflight);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_sink_worker_status_route_snapshot_uses_owner_route_scope_not_generic_aggregate() {
     let tmp = tempdir().expect("create temp dir");
     let nfs144 = tmp.path().join("nfs-144");

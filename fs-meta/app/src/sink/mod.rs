@@ -3997,6 +3997,11 @@ impl SinkFileMeta {
         self.scheduled_group_ids()
     }
 
+    #[cfg(test)]
+    pub(crate) fn node_id_for_tests(&self) -> &NodeId {
+        &self.node_id
+    }
+
     pub fn scheduled_group_ids_snapshot(&self) -> Result<Option<BTreeSet<String>>> {
         self.snapshot_scheduled_group_ids()
     }

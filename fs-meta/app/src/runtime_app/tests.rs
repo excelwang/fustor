@@ -11182,6 +11182,14 @@ impl Drop for SinkControlRecoveryErrorQueueHookReset {
     }
 }
 
+struct SinkFacadeScheduledGroupsErrorHookReset;
+
+impl Drop for SinkFacadeScheduledGroupsErrorHookReset {
+    fn drop(&mut self) {
+        crate::workers::sink::clear_sink_facade_scheduled_groups_error_hook();
+    }
+}
+
 struct SinkApplyEntryCountHookReset {
     instance_id: u64,
 }
@@ -39168,6 +39176,292 @@ async fn sink_observation_repair_does_not_replay_source_scoped_sink_control_ever
             .iter()
             .map(|payload| payload.generation)
             .collect::<Vec<_>>()
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sink_observation_repair_suppresses_same_signature_when_sink_schedule_probe_is_pending() {
+    let tmp = tempdir().expect("create temp dir");
+    let root = tmp.path().join("nfs-145");
+    fs::create_dir_all(&root).expect("create root");
+    let fs_source = root.display().to_string();
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+
+    let app = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![worker_fs_watch_scan_root("nfs-145", &fs_source)],
+                host_object_grants: vec![worker_export_with_fs_source(
+                    "node-pending::nfs-145",
+                    "node-pending",
+                    "127.0.0.2",
+                    &fs_source,
+                    root.clone(),
+                )],
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        NodeId("node-pending".into()),
+        Some(boundary.clone()),
+    )
+    .expect("init app");
+
+    app.start().await.expect("start app");
+    app.on_control_frame(&selected_group_source_control_wave(
+        2,
+        &[("nfs-145", &["node-pending::nfs-145"])],
+    ))
+    .await
+    .expect("source-only runtime scope should apply");
+    set_control_initialized_for_tests(&app, true);
+    set_source_replay_required_for_tests(&app, false);
+    set_sink_replay_required_for_tests(&app, false);
+    app.control_failure_uninitialized
+        .store(false, AtomicOrdering::Release);
+    app.api_control_gate.set_ready_state(true, true);
+
+    let sink_apply_entries = Arc::new(AtomicUsize::new(0));
+    let _sink_entry_reset = SinkApplyEntryCountHookReset::install(&app, sink_apply_entries.clone());
+    let replay_payload_generations = || {
+        boundary
+            .sent_payloads_snapshot()
+            .into_iter()
+            .flat_map(|(_, payloads)| payloads.into_iter())
+            .filter_map(|payload| {
+                crate::runtime::orchestration::decode_logical_roots_control_payload(&payload).ok()
+            })
+            .filter(|payload| !payload.sink_replay_envelopes.is_empty())
+            .map(|payload| payload.generation)
+            .collect::<Vec<_>>()
+    };
+
+    let recovery = app.sink_observation_repair_recovery_for_tests();
+    tokio::time::timeout(Duration::from_secs(10), recovery())
+        .await
+        .expect("first sink observation repair must stay bounded")
+        .expect("first sink observation repair should replay source-scoped sink routes");
+    let first_replay_payload_generations = replay_payload_generations();
+    assert!(
+        !first_replay_payload_generations.is_empty(),
+        "first repair must publish owner-scoped roots-control replay"
+    );
+    assert_eq!(
+        sink_apply_entries.load(AtomicOrdering::Acquire),
+        1,
+        "first repair should apply the accepted source-scoped sink replay once"
+    );
+
+    set_sink_replay_required_for_tests(&app, true);
+    {
+        let _scheduled_groups_error_reset = SinkFacadeScheduledGroupsErrorHookReset;
+        crate::workers::sink::install_sink_facade_scheduled_groups_error_hook(
+            "node-pending".to_string(),
+            CnxError::Internal("runtime_replay_or_sink_apply_pending".to_string()),
+        );
+        let recovery = app.sink_observation_repair_recovery_for_tests();
+        tokio::time::timeout(Duration::from_secs(10), recovery())
+            .await
+            .expect("same-signature repair with pending sink schedule probe must stay bounded")
+            .expect(
+                "same-signature repair with pending sink schedule probe should be observational",
+            );
+    }
+
+    assert_eq!(
+        sink_apply_entries.load(AtomicOrdering::Acquire),
+        1,
+        "same accepted sink-control/logical-roots signature must not replay while sink schedule observation still reports pending"
+    );
+    assert_eq!(
+        replay_payload_generations().len(),
+        first_replay_payload_generations.len(),
+        "same accepted sink-control/logical-roots signature must not republish owner-scoped roots-control replay while pending markers remain"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sink_observation_repair_suppresses_same_logical_roots_after_control_generation_refresh() {
+    let tmp = tempdir().expect("create temp dir");
+    let root_a = tmp.path().join("nfs-144");
+    let root_b = tmp.path().join("nfs-145");
+    let root_c = tmp.path().join("nfs-146");
+    fs::create_dir_all(&root_a).expect("create nfs-144 root");
+    fs::create_dir_all(&root_b).expect("create nfs-145 root");
+    fs::create_dir_all(&root_c).expect("create nfs-146 root");
+    let fs_source_a = root_a.display().to_string();
+    let fs_source_b = root_b.display().to_string();
+    let fs_source_c = root_c.display().to_string();
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+
+    let app = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![
+                    worker_fs_watch_scan_root("nfs-144", &fs_source_a),
+                    worker_fs_watch_scan_root("nfs-145", &fs_source_b),
+                    worker_fs_watch_scan_root("nfs-146", &fs_source_c),
+                ],
+                host_object_grants: vec![
+                    worker_export_with_fs_source(
+                        "node-va::nfs-144",
+                        "node-va",
+                        "127.0.0.1",
+                        &fs_source_a,
+                        root_a.clone(),
+                    ),
+                    worker_export_with_fs_source(
+                        "node-vb::nfs-145",
+                        "node-vb",
+                        "127.0.0.2",
+                        &fs_source_b,
+                        root_b.clone(),
+                    ),
+                    worker_export_with_fs_source(
+                        "node-vc::nfs-146",
+                        "node-vc",
+                        "127.0.0.3",
+                        &fs_source_c,
+                        root_c.clone(),
+                    ),
+                ],
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        NodeId("node-vb".into()),
+        Some(boundary.clone()),
+    )
+    .expect("init app");
+
+    app.start().await.expect("start app");
+    let source_scopes = [
+        ("nfs-144", &["node-va::nfs-144"][..]),
+        ("nfs-145", &["node-vb::nfs-145"][..]),
+        ("nfs-146", &["node-vc::nfs-146"][..]),
+    ];
+    app.on_control_frame(&selected_group_source_control_wave(2, &source_scopes))
+        .await
+        .expect("source-only runtime scope should apply");
+    set_control_initialized_for_tests(&app, true);
+    set_source_replay_required_for_tests(&app, false);
+    set_sink_replay_required_for_tests(&app, false);
+    app.control_failure_uninitialized
+        .store(false, AtomicOrdering::Release);
+    app.api_control_gate.set_ready_state(true, true);
+
+    let sink_apply_entries = Arc::new(AtomicUsize::new(0));
+    let _sink_entry_reset = SinkApplyEntryCountHookReset::install(&app, sink_apply_entries.clone());
+    let replay_payloads = || {
+        boundary
+            .sent_payloads_snapshot()
+            .into_iter()
+            .flat_map(|(route, payloads)| {
+                payloads.into_iter().filter_map(move |payload| {
+                    crate::runtime::orchestration::decode_logical_roots_control_payload(&payload)
+                        .ok()
+                        .filter(|payload| !payload.sink_replay_envelopes.is_empty())
+                        .map(|payload| {
+                            let root_ids = payload
+                                .roots
+                                .iter()
+                                .map(|root| root.id.clone())
+                                .collect::<std::collections::BTreeSet<_>>();
+                            (route.clone(), payload.generation, root_ids)
+                        })
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let roots_generation_before = app
+        .source
+        .logical_roots_generation_with_failure()
+        .await
+        .expect("logical roots generation before repair")
+        .max(1);
+    let recovery = app.sink_observation_repair_recovery_for_tests();
+    tokio::time::timeout(Duration::from_secs(10), recovery())
+        .await
+        .expect("first sink observation repair must stay bounded")
+        .expect("first sink observation repair should replay source-scoped sink routes");
+    let first_replay_payloads = replay_payloads();
+    assert!(
+        !first_replay_payloads.is_empty(),
+        "first repair must publish owner-scoped roots-control replay"
+    );
+    let first_replay_routes = first_replay_payloads
+        .iter()
+        .map(|(route, _, _)| route.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        first_replay_routes,
+        std::collections::BTreeSet::from([
+            crate::runtime::routes::sink_roots_control_stream_route_for("node-va").0,
+            crate::runtime::routes::sink_roots_control_stream_route_for("node-vb").0,
+            crate::runtime::routes::sink_roots_control_stream_route_for("node-vc").0,
+        ]),
+        "first repair must publish only the current owner-scoped sink roots-control routes"
+    );
+    assert!(
+        first_replay_payloads
+            .iter()
+            .all(
+                |(_, generation, root_ids)| *generation == roots_generation_before
+                    && *root_ids
+                        == std::collections::BTreeSet::from([
+                            "nfs-144".to_string(),
+                            "nfs-145".to_string(),
+                            "nfs-146".to_string(),
+                        ])
+            ),
+        "first replay must carry the app-authoritative logical roots declaration"
+    );
+    assert_eq!(
+        sink_apply_entries.load(AtomicOrdering::Acquire),
+        1,
+        "first repair should apply the accepted source-scoped sink replay once"
+    );
+
+    app.on_control_frame(&selected_group_source_control_wave(3, &source_scopes))
+        .await
+        .expect("same source owner scopes may refresh control generation");
+    let roots_generation_after = app
+        .source
+        .logical_roots_generation_with_failure()
+        .await
+        .expect("logical roots generation after source control refresh")
+        .max(1);
+    assert_eq!(
+        roots_generation_after, roots_generation_before,
+        "test must refresh only volatile control generation, not logical-roots generation"
+    );
+    set_control_initialized_for_tests(&app, true);
+    set_source_replay_required_for_tests(&app, false);
+    set_sink_replay_required_for_tests(&app, false);
+    app.control_failure_uninitialized
+        .store(false, AtomicOrdering::Release);
+    app.api_control_gate.set_ready_state(true, true);
+
+    let recovery = app.sink_observation_repair_recovery_for_tests();
+    tokio::time::timeout(Duration::from_secs(10), recovery())
+        .await
+        .expect("same logical-roots repair after control refresh must stay bounded")
+        .expect("same logical-roots repair after control refresh should be observational");
+
+    assert_eq!(
+        sink_apply_entries.load(AtomicOrdering::Acquire),
+        1,
+        "same app-authoritative logical-roots content/generation and owner routes must not replay after only volatile control generation changes"
+    );
+    assert_eq!(
+        replay_payloads().len(),
+        first_replay_payloads.len(),
+        "same app-authoritative logical-roots content/generation and owner routes must not republish roots-control replay after only volatile control generation changes"
     );
 
     app.close().await.expect("close app");

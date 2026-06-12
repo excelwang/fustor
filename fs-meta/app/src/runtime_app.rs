@@ -5413,19 +5413,29 @@ impl ManagementWriteRecoveryContext {
                         .iter()
                         .map(|grant| {
                             format!(
-                                "{}:{}:{}",
+                                "object_ref={};object_type={:?};interfaces={:?};host_ref={};host_ip={:?};host_name={:?};site={:?};zone={:?};host_labels={:?};mount_point={};fs_source={:?};fs_type={:?};mount_options={:?};active={}",
                                 grant.object_ref,
+                                grant.object_type,
+                                grant.interfaces,
                                 grant.host.host_ref,
+                                grant.host.host_ip,
+                                grant.host.host_name,
+                                grant.host.site,
+                                grant.host.zone,
+                                grant.host.host_labels,
+                                grant.object.mount_point,
+                                grant.object.fs_source,
+                                grant.object.fs_type,
+                                grant.object.mount_options,
                                 matches!(grant.grant_state, RuntimeHostGrantState::Active)
                             )
                         })
                         .collect::<Vec<_>>();
                     grants.sort();
-                    signal_parts.push(format!("grants:{}:{}", changed.version, grants.join(",")));
+                    signal_parts.push(format!("grants:{}", grants.join(",")));
                 }
                 SinkControlSignal::Activate {
                     route_key,
-                    generation,
                     bound_scopes,
                     ..
                 } => {
@@ -5444,30 +5454,11 @@ impl ManagementWriteRecoveryContext {
                         scopes.push(format!("{}={}", scope.scope_id, resource_ids.join("|")));
                     }
                     scopes.sort();
-                    signal_parts.push(format!(
-                        "activate:{}:{}:{}",
-                        route_key,
-                        generation,
-                        scopes.join(",")
-                    ));
+                    signal_parts.push(format!("activate:{}:{}", route_key, scopes.join(",")));
                 }
-                SinkControlSignal::Deactivate {
-                    route_key,
-                    generation,
-                    ..
-                } => {
-                    signal_parts.push(format!("deactivate:{route_key}:{generation}"));
-                }
-                SinkControlSignal::Tick {
-                    route_key,
-                    generation,
-                    ..
-                } => {
-                    signal_parts.push(format!("tick:{route_key}:{generation}"));
-                }
-                SinkControlSignal::Passthrough(envelope) => {
-                    signal_parts.push(format!("passthrough:{envelope:?}"));
-                }
+                SinkControlSignal::Deactivate { .. }
+                | SinkControlSignal::Tick { .. }
+                | SinkControlSignal::Passthrough(_) => {}
             }
         }
         signal_parts.sort();
@@ -5483,23 +5474,10 @@ impl ManagementWriteRecoveryContext {
         &self,
         signature: &SourceScopedSinkObservationRepairSignature,
     ) -> bool {
-        let previously_applied = self
-            .source_scoped_sink_observation_repair_signature
+        self.source_scoped_sink_observation_repair_signature
             .lock()
             .map(|guard| guard.as_ref() == Some(signature))
-            .unwrap_or(false);
-        if !previously_applied {
-            return false;
-        }
-        if signature.local_groups.is_empty() {
-            return true;
-        }
-        self.sink
-            .scheduled_group_ids_with_failure()
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|groups| signature.local_groups.is_subset(&groups))
+            .unwrap_or(false)
     }
 
     fn record_source_scoped_sink_observation_repair_signature(

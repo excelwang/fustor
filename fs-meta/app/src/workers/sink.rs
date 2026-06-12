@@ -17,7 +17,7 @@ use crate::query::models::QueryNode;
 use crate::query::path::root_file_name_bytes;
 use crate::query::request::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
 use crate::runtime::orchestration::{SinkControlSignal, sink_control_signals_from_envelopes};
-use crate::runtime::routes::ROUTE_KEY_SINK_STATUS_INTERNAL;
+use crate::runtime::routes::{ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SINK_STATUS_INTERNAL};
 #[cfg(test)]
 use crate::sink::SinkStatusSnapshotIssue;
 use crate::sink::VisibilityLagSample;
@@ -1583,6 +1583,7 @@ fn cached_sink_schedule_host_ref(resource_id: &str) -> Option<String> {
 fn cached_sink_schedule_evidence_from_bound_scopes<'a>(
     bound_scopes: impl Iterator<Item = &'a capanix_runtime_entry_sdk::control::RuntimeBoundScope>,
     fallback_node_id: &NodeId,
+    preferred_route_scope: Option<&str>,
 ) -> CachedSinkScheduleEvidence {
     let mut evidence = CachedSinkScheduleEvidence::default();
     for scope in bound_scopes {
@@ -1600,13 +1601,30 @@ fn cached_sink_schedule_evidence_from_bound_scopes<'a>(
         if host_refs.is_empty() {
             host_refs.insert(fallback_node_id.0.clone());
         }
-        if let Some(host_ref) = host_refs.iter().next().cloned() {
-            evidence
-                .primary_host_ref_by_group
-                .entry(group_id.clone())
-                .or_insert(host_ref);
-        }
-        for host_ref in host_refs {
+        let route_scoped_host_ref = preferred_route_scope.and_then(|route_scope| {
+            host_refs
+                .iter()
+                .find(|host_ref| normalized_route_scope_suffix(host_ref) == route_scope)
+                .cloned()
+                .or_else(|| {
+                    (normalized_route_scope_suffix(&fallback_node_id.0) == route_scope)
+                        .then(|| fallback_node_id.0.clone())
+                })
+                .or_else(|| Some(route_scope.to_string()))
+        });
+        let schedule_host_refs = if let Some(host_ref) = route_scoped_host_ref.clone() {
+            std::collections::BTreeSet::from([host_ref])
+        } else {
+            host_refs
+        };
+        let primary_host_ref = route_scoped_host_ref
+            .or_else(|| schedule_host_refs.iter().next().cloned())
+            .unwrap_or_else(|| fallback_node_id.0.clone());
+        evidence
+            .primary_host_ref_by_group
+            .entry(group_id.clone())
+            .or_insert(primary_host_ref.clone());
+        for host_ref in schedule_host_refs {
             evidence
                 .scheduled_groups_by_node
                 .entry(host_ref)
@@ -1653,8 +1671,45 @@ fn retained_sink_schedule_evidence(
             })
             .flat_map(|bound_scopes| bound_scopes.iter()),
         fallback_node_id,
+        None,
     );
     (!evidence.is_empty()).then_some(evidence)
+}
+
+fn normalized_route_scope_suffix(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn scoped_route_suffix(route_key: &str, base: &str, suffix: &str) -> Option<String> {
+    let route = route_key.strip_suffix(suffix)?;
+    if route == base {
+        return None;
+    }
+    let route_scope = if let Some((stem, version)) = base.rsplit_once(':') {
+        let route_stem = route.strip_suffix(&format!(":{version}"))?;
+        route_stem.strip_prefix(&format!("{stem}."))?
+    } else {
+        route.strip_prefix(&format!("{base}."))?
+    };
+    (!route_scope.is_empty()).then(|| route_scope.to_string())
+}
+
+fn scoped_route_key_from_normalized_suffix(base: &str, route_scope: &str, suffix: &str) -> String {
+    let route = if let Some((stem, version)) = base.rsplit_once(':') {
+        format!("{stem}.{route_scope}:{version}")
+    } else {
+        format!("{base}.{route_scope}")
+    };
+    format!("{route}{suffix}")
 }
 
 fn retained_sink_schedule_evidence_for_route(
@@ -1662,6 +1717,14 @@ fn retained_sink_schedule_evidence_for_route(
     fallback_node_id: &NodeId,
     route_key: &str,
 ) -> Option<CachedSinkScheduleEvidence> {
+    let status_route_scope = scoped_route_suffix(route_key, ROUTE_KEY_SINK_STATUS_INTERNAL, ".req");
+    let matching_roots_control_route = status_route_scope.as_ref().map(|route_scope| {
+        scoped_route_key_from_normalized_suffix(
+            ROUTE_KEY_SINK_ROOTS_CONTROL,
+            route_scope,
+            ".stream",
+        )
+    });
     let evidence = cached_sink_schedule_evidence_from_bound_scopes(
         retained
             .active_by_route
@@ -1671,11 +1734,18 @@ fn retained_sink_schedule_evidence_for_route(
                     route_key: signal_route_key,
                     bound_scopes,
                     ..
-                } if signal_route_key == route_key => Some(bound_scopes.as_slice()),
+                } if signal_route_key == route_key
+                    || matching_roots_control_route
+                        .as_ref()
+                        .is_some_and(|roots_route| signal_route_key == roots_route) =>
+                {
+                    Some(bound_scopes.as_slice())
+                }
                 _ => None,
             })
             .flat_map(|bound_scopes| bound_scopes.iter()),
         fallback_node_id,
+        status_route_scope.as_deref(),
     );
     (!evidence.is_empty()).then_some(evidence)
 }
@@ -2108,6 +2178,13 @@ fn sink_worker_scheduled_groups_error_hook_cell()
 }
 
 #[cfg(test)]
+fn sink_facade_scheduled_groups_error_hook_cell() -> &'static Mutex<Option<(String, CnxError)>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<(String, CnxError)>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
 fn sink_worker_status_nonblocking_cache_fallback_hook_cell()
 -> &'static Mutex<Option<SinkWorkerStatusNonblockingCacheFallbackHookSlot>> {
     static CELL: std::sync::OnceLock<
@@ -2284,6 +2361,18 @@ pub(crate) fn install_sink_worker_scheduled_groups_error_hook(
 }
 
 #[cfg(test)]
+pub(crate) fn install_sink_facade_scheduled_groups_error_hook(
+    target_node_id: String,
+    err: CnxError,
+) {
+    let mut guard = match sink_facade_scheduled_groups_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some((target_node_id, err));
+}
+
+#[cfg(test)]
 pub(crate) fn install_sink_worker_status_nonblocking_cache_fallback_hook(
     hook: SinkWorkerStatusNonblockingCacheFallbackHook,
 ) {
@@ -2355,6 +2444,15 @@ pub(crate) fn clear_sink_worker_control_frame_error_hook() {
 #[cfg(test)]
 pub(crate) fn clear_sink_worker_scheduled_groups_error_hook() {
     let mut guard = match sink_worker_scheduled_groups_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_sink_facade_scheduled_groups_error_hook() {
+    let mut guard = match sink_facade_scheduled_groups_error_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -2504,6 +2602,22 @@ fn take_sink_worker_scheduled_groups_error_hook() -> Option<CnxError> {
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.take().map(|hook| hook.err)
+}
+
+#[cfg(test)]
+fn take_sink_facade_scheduled_groups_error_hook(node_id: &NodeId) -> Option<CnxError> {
+    let mut guard = match sink_facade_scheduled_groups_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard
+        .as_ref()
+        .is_some_and(|(target_node_id, _)| target_node_id == &node_id.0)
+    {
+        guard.take().map(|(_, err)| err)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -5876,8 +5990,22 @@ impl SinkFacade {
         &self,
     ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SinkFailure> {
         match self {
-            Self::Local(sink) => sink.scheduled_group_ids_snapshot_with_failure(),
-            Self::Worker(client) => client.scheduled_group_ids_with_failure().await,
+            Self::Local(sink) => {
+                #[cfg(test)]
+                if let Some(err) =
+                    take_sink_facade_scheduled_groups_error_hook(sink.node_id_for_tests())
+                {
+                    return Err(SinkFailure::from(err));
+                }
+                sink.scheduled_group_ids_snapshot_with_failure()
+            }
+            Self::Worker(client) => {
+                #[cfg(test)]
+                if let Some(err) = take_sink_facade_scheduled_groups_error_hook(&client.node_id) {
+                    return Err(SinkFailure::from(err));
+                }
+                client.scheduled_group_ids_with_failure().await
+            }
         }
     }
 

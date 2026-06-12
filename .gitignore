@@ -15,3 +15,4 @@ fs-meta/docs/examples/*monitoring-roots*.local.json
 fs-meta.query-keys.json
 .tmp/
 .tmp-target-status-owner/
+.codex/
