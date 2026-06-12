@@ -251,7 +251,11 @@ fn fs_meta_get_json(bind_addr: &str, path: &str, bearer: &str) -> Result<Value, 
         .send()
         .map_err(|e| format_reqwest_error(&format!("GET {path} failed"), e))?;
     if !response.status().is_success() {
-        return Err(format!("GET {path} returned HTTP {}", response.status()));
+        let status = response.status();
+        let body = response
+            .text()
+            .unwrap_or_else(|err| format!("<failed to read body: {err}>"));
+        return Err(format!("GET {path} returned HTTP {status} body={body}"));
     }
     response
         .json()

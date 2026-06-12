@@ -186,6 +186,16 @@ fn is_stale_grant_attachment_recv_gap(err: &CnxError) -> bool {
     )
 }
 
+fn is_retryable_recv_capacity_gap(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::ResourceExhausted(message)
+            if message.contains("max channels")
+                || message.contains("source worker unavailable")
+                || message.contains("sink worker unavailable")
+    )
+}
+
 fn is_retryable_worker_bridge_transport_error_message(message: &str) -> bool {
     message.contains("transport closed")
         && (message.contains("Connection reset by peer")
@@ -412,12 +422,15 @@ fn maybe_pause_before_endpoint_ready_wait(name: &str) {
 #[derive(Default)]
 struct EndpointReceiveState {
     inflight_recv_count: AtomicUsize,
+    recv_poll_observation_count: AtomicU64,
     receivable_observation_count: AtomicU64,
 }
 
 impl EndpointReceiveState {
     fn enter_recv(self: &Arc<Self>) -> EndpointReceiveGuard {
         self.inflight_recv_count.fetch_add(1, Ordering::AcqRel);
+        self.recv_poll_observation_count
+            .fetch_add(1, Ordering::AcqRel);
         EndpointReceiveGuard {
             state: self.clone(),
         }
@@ -435,6 +448,10 @@ impl EndpointReceiveState {
 
     fn is_receive_polling(&self) -> bool {
         self.inflight_recv_count.load(Ordering::Acquire) > 0
+    }
+
+    fn has_receive_poll_observed(&self) -> bool {
+        self.recv_poll_observation_count.load(Ordering::Acquire) > 0
     }
 }
 
@@ -1168,6 +1185,10 @@ impl ManagedEndpointTask {
         self.receive_state.is_receive_polling()
     }
 
+    pub(crate) fn has_receive_poll_observed(&self) -> bool {
+        self.receive_state.has_receive_poll_observed()
+    }
+
     pub(crate) fn is_shutdown_requested(&self) -> bool {
         self.shutdown.is_cancelled()
     }
@@ -1408,6 +1429,27 @@ async fn run_endpoint_loop_with_contexts_and_ready_signal<F, Fut>(
                         }
                         log::debug!(
                             "endpoint task {} recv retry for {} after retryable worker-bridge error: {:?}",
+                            join_name,
+                            route.0,
+                            err
+                        );
+                        saw_retryable_gap = true;
+                        continue;
+                    }
+                    Err(err) if is_retryable_recv_capacity_gap(&err) => {
+                        stale_recv_gap_count = 0;
+                        retryable_recv_gap_count = retryable_recv_gap_count.saturating_add(1);
+                        if should_emit_endpoint_retry_log(&format!(
+                            "capacity_gap:{}:{}",
+                            request_channel.0, join_name
+                        )) {
+                            eprintln!(
+                                "fs_meta_runtime_endpoint: capacity recv gap task={} route={} err={:?}",
+                                join_name, request_channel.0, err
+                            );
+                        }
+                        log::debug!(
+                            "endpoint task {} recv retry for {} after capacity gap: {:?}",
                             join_name,
                             route.0,
                             err
@@ -1740,7 +1782,8 @@ async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
             }
             Err(err)
                 if matches!(err, CnxError::TxBusy)
-                    || is_retryable_worker_bridge_peer_error(&err) =>
+                    || is_retryable_worker_bridge_peer_error(&err)
+                    || is_retryable_recv_capacity_gap(&err) =>
             {
                 stale_recv_gap_count = 0;
                 if should_emit_endpoint_retry_log(&format!(
@@ -2060,6 +2103,7 @@ mod tests {
         RetryableBridgePeerError,
         RetryableBridgeInternalError,
         TxBusy,
+        ResourceExhaustedMaxChannels,
         AuthoritativeIpcTransportClosed,
         SidecarTransportClosed,
     }
@@ -2231,6 +2275,9 @@ mod tests {
                             .into(),
                     )),
                     FirstFailure::TxBusy => Err(CnxError::TxBusy),
+                    FirstFailure::ResourceExhaustedMaxChannels => Err(CnxError::ResourceExhausted(
+                        "max channels (16) reached".into(),
+                    )),
                     FirstFailure::AuthoritativeIpcTransportClosed => Err(
                         CnxError::TransportClosed("IPC control transport closed".into()),
                     ),
@@ -3148,6 +3195,44 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_loop_retries_recv_capacity_gap_without_terminal_respawn() {
+        let boundary = Arc::new(RecordingBoundary {
+            recv_keys: Mutex::new(Vec::new()),
+            recv_unit_ids: Mutex::new(Vec::new()),
+            close_keys: Mutex::new(Vec::new()),
+            first_failure: Mutex::new(Some(FirstFailure::ResourceExhaustedMaxChannels)),
+        });
+        let terminal_reason = test_terminal_reason();
+        crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
+            boundary.clone(),
+            RouteKey("sink-status:v1.req".into()),
+            "test-endpoint".into(),
+            BoundaryContext::for_unit("runtime.exec.sink"),
+            CancellationToken::new(),
+            Arc::new(|_events: Vec<Event>| std::future::ready(Vec::new())),
+            terminal_reason.clone(),
+        ));
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(
+            recv_keys,
+            vec![
+                "sink-status:v1.req".to_string(),
+                "sink-status:v1.req".to_string()
+            ],
+            "resource-exhausted channel capacity gaps must retry inside the same endpoint loop instead of exiting for immediate respawn"
+        );
+        assert_eq!(
+            terminal_reason
+                .lock()
+                .expect("terminal_reason lock")
+                .as_deref(),
+            Some("recv_failed:internal error: stop after first recv"),
+            "the later test stop should be the terminal reason; max-channel capacity should not terminate the endpoint"
+        );
+    }
+
+    #[test]
     fn endpoint_receivable_ready_returns_after_closing_stale_grant_gap() {
         let boundary = Arc::new(RecordingBoundary {
             recv_keys: Mutex::new(Vec::new()),
@@ -3615,6 +3700,46 @@ mod tests {
         );
         let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
         assert_eq!(close_keys, vec!["fs-meta.events:v1.stream".to_string()]);
+    }
+
+    #[test]
+    fn stream_loop_retries_recv_capacity_gap_without_terminal_respawn() {
+        let boundary = Arc::new(RecordingBoundary {
+            recv_keys: Mutex::new(Vec::new()),
+            recv_unit_ids: Mutex::new(Vec::new()),
+            close_keys: Mutex::new(Vec::new()),
+            first_failure: Mutex::new(Some(FirstFailure::ResourceExhaustedMaxChannels)),
+        });
+        let terminal_reason = test_terminal_reason();
+        crate::runtime_app::shared_tokio_runtime().block_on(run_stream_loop(
+            boundary.clone(),
+            RouteKey("fs-meta.events:v1.stream".into()),
+            "test-stream".into(),
+            "runtime.exec.sink".to_string(),
+            CancellationToken::new(),
+            Arc::new(|| true),
+            Arc::new(|| {}),
+            Arc::new(|_events: Vec<Event>| std::future::ready(())),
+            terminal_reason.clone(),
+        ));
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(
+            recv_keys,
+            vec![
+                "fs-meta.events:v1.stream".to_string(),
+                "fs-meta.events:v1.stream".to_string()
+            ],
+            "resource-exhausted channel capacity gaps must retry inside the same stream loop instead of exiting for immediate respawn"
+        );
+        assert_eq!(
+            terminal_reason
+                .lock()
+                .expect("terminal_reason lock")
+                .as_deref(),
+            Some("recv_failed:internal error: stop after first recv"),
+            "the later test stop should be the terminal reason; max-channel capacity should not terminate the stream endpoint"
+        );
     }
 
     #[test]

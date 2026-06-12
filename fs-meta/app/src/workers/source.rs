@@ -9484,6 +9484,30 @@ pub(crate) fn annotate_manual_rescan_route_receivable_evidence_for_current_group
     );
 }
 
+pub(crate) fn annotate_manual_rescan_route_active_evidence_for_route_groups(
+    snapshot: &mut SourceObservabilitySnapshot,
+    node_id: &NodeId,
+    route: &str,
+    generation: u64,
+    scheduled_scan_groups: &std::collections::BTreeSet<String>,
+) {
+    if generation == 0 {
+        return;
+    }
+    let Some(scopes) = manual_rescan_ready_scopes_from_groups(scheduled_scan_groups) else {
+        return;
+    };
+    let signal =
+        format!("activate unit=runtime.exec.source route={route} generation={generation}{scopes}");
+    let signals = snapshot
+        .last_control_frame_signals_by_node
+        .entry(node_id.0.clone())
+        .or_default();
+    if !signals.iter().any(|existing| existing == &signal) {
+        signals.push(signal);
+    }
+}
+
 pub(crate) fn annotate_manual_rescan_route_receivable_evidence_for_route_groups(
     snapshot: &mut SourceObservabilitySnapshot,
     node_id: &NodeId,
@@ -11825,6 +11849,18 @@ impl SourceFacade {
                     .source_state_pending_observability_snapshot_for_status_route()
                     .await
             }
+        }
+    }
+
+    pub(crate) async fn source_state_pending_observability_snapshot_for_status_route_with_timeout(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Option<(SourceObservabilitySnapshot, bool)> {
+        let observation = self.source_state_pending_observability_snapshot_for_status_route();
+        match timeout {
+            Some(timeout) if timeout.is_zero() => None,
+            Some(timeout) => tokio::time::timeout(timeout, observation).await.ok(),
+            None => Some(observation.await),
         }
     }
 

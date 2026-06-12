@@ -1903,6 +1903,12 @@ fn sink_control_signals_are_fresh_initial_bootstrap_apply(
     has_activation
 }
 
+fn sink_control_signals_include_route_activation(signals: &[SinkControlSignal]) -> bool {
+    signals
+        .iter()
+        .any(|signal| matches!(signal, SinkControlSignal::Activate { .. }))
+}
+
 struct InflightControlOpGuard {
     counter: Arc<AtomicUsize>,
     state: tokio::sync::watch::Sender<usize>,
@@ -2906,6 +2912,30 @@ impl SinkWorkerClientHandle {
                 .is_some()
     }
 
+    async fn retained_control_replay_needed_before_tick(
+        &self,
+        signals: Option<&[SinkControlSignal]>,
+    ) -> std::result::Result<bool, SinkFailure> {
+        let Some(signals) = signals else {
+            return Ok(false);
+        };
+        if signals.is_empty()
+            || !signals
+                .iter()
+                .all(|signal| matches!(signal, SinkControlSignal::Tick { .. }))
+        {
+            return Ok(false);
+        }
+        if self.control_state_replay_required.load(Ordering::Acquire) > 0 {
+            return Ok(true);
+        }
+        if self.existing_client_with_failure().await?.is_some() {
+            return Ok(false);
+        }
+        let retained = self.retained_control_state.lock().await;
+        Ok(retained.latest_host_grant_change.is_some() || !retained.active_by_route.is_empty())
+    }
+
     async fn apply_control_frame_total_timeout(
         &self,
         signals: &[SinkControlSignal],
@@ -2917,7 +2947,8 @@ impl SinkWorkerClientHandle {
             &retained,
             replay_required,
             signals,
-        ) {
+        ) || sink_control_signals_include_route_activation(signals)
+        {
             total_timeout
         } else {
             std::cmp::min(
@@ -5434,6 +5465,25 @@ impl SinkWorkerClientHandle {
             }
         }
         let deadline = std::time::Instant::now() + total_timeout;
+        if !retained_replay_fail_closed
+            && self
+                .retained_control_replay_needed_before_tick(decoded_signals.as_deref())
+                .await?
+        {
+            self.control_state_replay_required
+                .store(1, Ordering::Release);
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(SinkFailure::retry_budget_exhausted(
+                    SinkRetryBudgetExhaustionKind::ControlFrameAttempt,
+                ));
+            }
+            Box::pin(self.replay_retained_control_state_if_needed_with_timeouts(
+                remaining,
+                std::cmp::min(rpc_timeout, remaining),
+            ))
+            .await?;
+        }
         let mut machine = if retained_replay_fail_closed {
             SinkControlFrameMachine::new_retained_replay(deadline, &envelopes)
         } else {
@@ -6141,7 +6191,8 @@ impl SinkFacade {
                     &RetainedSinkWorkerControlState::default(),
                     false,
                     signals,
-                ) {
+                ) || sink_control_signals_include_route_activation(signals)
+                {
                     total_timeout
                 } else {
                     std::cmp::min(
@@ -6203,10 +6254,9 @@ impl SinkFacade {
                 SinkRetryBudgetExhaustionKind::ControlFrameAttempt,
             ),
             Self::Worker(client) => {
-                let control_frame_total_timeout = std::cmp::min(
-                    total_timeout,
-                    SINK_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
-                );
+                let control_frame_total_timeout = total_timeout;
+                let rpc_timeout =
+                    std::cmp::min(SINK_WORKER_CONTROL_RPC_TIMEOUT, control_frame_total_timeout);
                 let envelopes = signals
                     .iter()
                     .map(SinkControlSignal::envelope)
@@ -6215,7 +6265,7 @@ impl SinkFacade {
                     .on_control_frame_retained_replay_with_timeouts_with_failure(
                         envelopes,
                         control_frame_total_timeout,
-                        control_frame_total_timeout,
+                        rpc_timeout,
                     )
                     .await
             }

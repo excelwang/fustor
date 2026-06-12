@@ -812,7 +812,7 @@ fn sink_worker_client_retry_helper_uses_typed_runtime_adapter_mapping() {
 }
 
 #[test]
-fn sink_retained_replay_control_rpc_uses_short_typed_retry_attempt() {
+fn sink_retained_replay_control_rpc_uses_typed_retry_attempt() {
     let sink_impl = include_str!("../sink.rs");
     let start = sink_impl
         .find("async fn on_control_frame_with_timeouts_with_policy_with_failure(")
@@ -827,12 +827,12 @@ fn sink_retained_replay_control_rpc_uses_short_typed_retry_attempt() {
         executor.contains("if retained_replay_fail_closed {")
             && executor.contains("self.with_started_retry_with_failure(|client|")
             && executor.contains("self.with_started_once_with_failure(|client|"),
-        "sink retained control replay must use typed worker retry inside the short retained budget, while ordinary control frames must use one-shot dispatch so the outer state machine owns reset/replay decisions",
+        "sink retained control replay must use typed worker retry inside the retained policy, while ordinary control frames must use one-shot dispatch so the outer state machine owns reset/replay decisions",
     );
 }
 
 #[test]
-fn sink_facade_retained_orchestration_replay_uses_retained_control_policy() {
+fn sink_facade_retained_orchestration_replay_keeps_recovery_budget() {
     let sink_impl = include_str!("../sink.rs");
     let start = sink_impl
         .find("pub(crate) async fn apply_retained_orchestration_signals_with_total_timeout_with_failure(")
@@ -845,12 +845,14 @@ fn sink_facade_retained_orchestration_replay_uses_retained_control_policy() {
 
     assert!(
         helper.contains(".on_control_frame_retained_replay_with_timeouts_with_failure(")
-            && helper.contains("SINK_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT"),
-        "app-retained sink replay must use the retained worker control-frame policy and the short existing-client budget"
+            && helper.contains("let control_frame_total_timeout = total_timeout;")
+            && helper.contains("SINK_WORKER_CONTROL_RPC_TIMEOUT"),
+        "app-retained sink replay must use the retained worker control-frame policy with the recovery budget and standard worker RPC cap"
     );
     assert!(
-        !helper.contains(".apply_control_frame_total_timeout("),
-        "app-retained sink replay must not be reclassified as a fresh bootstrap apply by the ordinary worker timeout selector"
+        !helper.contains(".apply_control_frame_total_timeout(")
+            && !helper.contains("SINK_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT"),
+        "app-retained sink replay must not be reclassified as a fresh bootstrap apply or capped by the stale-client short budget"
     );
 }
 

@@ -978,6 +978,54 @@ async fn source_scheduled_groups_refresh_total_deadline_bounds_delayed_fetch_lan
     client.close().await.expect("close source worker");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_state_pending_status_observation_honors_timeout_when_control_state_is_blocked() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![worker_source_root("nfs1", &nfs1)],
+        host_object_grants: vec![worker_source_export(
+            "node-a::nfs1",
+            "node-a",
+            "10.0.0.11",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = Arc::new(
+        SourceWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client"),
+    );
+    let facade = SourceFacade::worker(client.clone());
+    let _control_state_guard = client.control_state.lock().await;
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(200),
+        facade.source_state_pending_observability_snapshot_for_status_route_with_timeout(Some(
+            Duration::from_millis(25),
+        )),
+    )
+    .await
+    .expect("budgeted source-state-pending observation must return before the caller timeout");
+
+    assert!(
+        result.is_none(),
+        "blocked source-state-pending worker observation must consume only its local budget"
+    );
+}
+
 #[test]
 fn source_operations_hard_cut_removed_generic_operation_machine_family() {
     let source_impl = include_str!("../source.rs");

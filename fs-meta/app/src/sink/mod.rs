@@ -309,6 +309,39 @@ fn debug_stream_path_capture_target() -> Option<Vec<u8>> {
         .clone()
 }
 
+type LogicalRootsDeclarationSignature = Vec<(
+    String,
+    Option<std::path::PathBuf>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    std::path::PathBuf,
+    bool,
+    bool,
+    Option<u64>,
+)>;
+
+fn logical_roots_declaration_signature(roots: &[RootSpec]) -> LogicalRootsDeclarationSignature {
+    roots
+        .iter()
+        .map(|root| {
+            (
+                root.id.clone(),
+                root.selector.mount_point.clone(),
+                root.selector.fs_source.clone(),
+                root.selector.fs_type.clone(),
+                root.selector.host_ip.clone(),
+                root.selector.host_ref.clone(),
+                root.subpath_scope.clone(),
+                root.watch,
+                root.scan,
+                root.audit_interval_ms,
+            )
+        })
+        .collect()
+}
+
 fn summarize_bound_scopes(bound_scopes: &[RuntimeBoundScope]) -> Vec<String> {
     bound_scopes
         .iter()
@@ -753,6 +786,8 @@ pub struct SinkStatusSnapshot {
     pub received_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub stream_received_batches_by_node: BTreeMap<String, u64>,
     pub stream_received_events_by_node: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub stream_receive_armed_by_node: BTreeMap<String, u64>,
     pub stream_received_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub stream_path_capture_target: Option<String>,
     pub stream_received_path_origin_counts_by_node: BTreeMap<String, Vec<String>>,
@@ -1124,6 +1159,7 @@ fn sink_status_snapshot_has_delivery_evidence(snapshot: &SinkStatusSnapshot) -> 
 
 #[derive(Debug, Clone, Default)]
 struct StreamDeliveryStats {
+    receive_armed_count: u64,
     received_batches: u64,
     received_events: u64,
     received_origin_counts: BTreeMap<String, u64>,
@@ -1956,10 +1992,25 @@ impl SinkFileMeta {
     fn logical_roots_control_generation_can_replay_same_declaration(
         &self,
         generation: u64,
+        roots: &[RootSpec],
     ) -> bool {
-        generation != 0
-            && generation == self.state.last_logical_roots_control_generation()
-            && generation >= self.current_logical_roots_generation()
+        if generation == 0 || generation != self.state.last_logical_roots_control_generation() {
+            return false;
+        }
+        match self.logical_roots_cell.refresh_from_boundary_blocking() {
+            Ok(current_roots) => {
+                generation >= self.logical_roots_cell.current_seq()
+                    || logical_roots_declaration_signature(&current_roots)
+                        == logical_roots_declaration_signature(roots)
+            }
+            Err(err) => {
+                log::warn!(
+                    "sink logical-roots control current declaration refresh failed before same-generation replay: {:?}",
+                    err
+                );
+                generation >= self.logical_roots_cell.current_seq()
+            }
+        }
     }
 
     fn mark_logical_roots_control_generation(&self, generation: u64) {
@@ -1982,6 +2033,9 @@ impl SinkFileMeta {
     }
 
     fn mark_before_stream_recv(&self) {
+        if let Ok(mut stats) = self.stream_delivery_stats.lock() {
+            stats.receive_armed_count = stats.receive_armed_count.saturating_add(1);
+        }
         if let Some(observer) = self.stream_recv_observer.as_ref() {
             observer.mark_before_recv();
         }
@@ -3455,6 +3509,7 @@ impl SinkFileMeta {
             );
             let roots_control_stream_receive_enabled = self.stream_receive_enabled.clone();
             let roots_control_route_key = route.0.clone();
+            let roots_control_route_for_handler = route.0.clone();
             let sink = Arc::new(SinkFileMeta {
                 node_id: self.node_id.clone(),
                 state: self.state.clone(),
@@ -3485,6 +3540,7 @@ impl SinkFileMeta {
                 },
                 move |events| {
                     let sink = sink.clone();
+                    let roots_control_route_for_handler = roots_control_route_for_handler.clone();
                     async move {
                         for event in events {
                             let payload =
@@ -3499,13 +3555,40 @@ impl SinkFileMeta {
                                     }
                                 };
                             let replay_envelopes = payload.sink_replay_envelopes;
-                            if sink.logical_roots_control_generation_is_stale(payload.generation) {
-                                if sink
-                                    .logical_roots_control_generation_can_replay_same_declaration(
-                                        payload.generation,
-                                    )
-                                    && !replay_envelopes.is_empty()
-                                {
+                            let generation_is_stale =
+                                sink.logical_roots_control_generation_is_stale(payload.generation);
+                            let can_replay_same_declaration = sink
+                                .logical_roots_control_generation_can_replay_same_declaration(
+                                    payload.generation,
+                                    &payload.roots,
+                                );
+                            if debug_stream_delivery_enabled()
+                                || std::env::var_os("FSMETA_DEBUG_ROOTS_CONTROL_GATE").is_some()
+                            {
+                                let replay_signals =
+                                    match sink_control_signals_from_envelopes(&replay_envelopes) {
+                                        Ok(signals) => signals.len().to_string(),
+                                        Err(err) => format!("decode_error:{err:?}"),
+                                    };
+                                eprintln!(
+                                    "fs_meta_sink: roots_control payload node={} route={} generation={} current_logical_roots_generation={} last_control_generation={} roots={} replay_envelopes={} replay_signals={} stale={} can_replay_same_declaration={} will_apply_declaration={} will_apply_replay={}",
+                                    sink.node_id.0,
+                                    roots_control_route_for_handler,
+                                    payload.generation,
+                                    sink.current_logical_roots_generation(),
+                                    sink.state.last_logical_roots_control_generation(),
+                                    payload.roots.len(),
+                                    replay_envelopes.len(),
+                                    replay_signals,
+                                    generation_is_stale,
+                                    can_replay_same_declaration,
+                                    !generation_is_stale,
+                                    !replay_envelopes.is_empty()
+                                        && (!generation_is_stale || can_replay_same_declaration),
+                                );
+                            }
+                            if generation_is_stale {
+                                if can_replay_same_declaration && !replay_envelopes.is_empty() {
                                     sink.apply_logical_roots_control_sink_replay(&replay_envelopes)
                                         .await;
                                 } else {
@@ -4599,6 +4682,11 @@ impl SinkFileMeta {
             }
         }
         if let Ok(stats) = self.stream_delivery_stats.lock() {
+            if stats.receive_armed_count > 0 {
+                snapshot
+                    .stream_receive_armed_by_node
+                    .insert(self.node_id.0.clone(), stats.receive_armed_count);
+            }
             if stats.received_batches > 0 {
                 snapshot
                     .stream_received_batches_by_node

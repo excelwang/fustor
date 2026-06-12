@@ -52,6 +52,7 @@ use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::workers::sink::{SinkFacade, SinkFailure, SinkWorkerClientHandle};
 use crate::workers::source::{
     SourceFacade, SourceFailure, SourcePumpHandle, SourceWorkerClientHandle,
+    annotate_manual_rescan_route_active_evidence_for_route_groups,
     annotate_manual_rescan_route_receivable_evidence,
     annotate_manual_rescan_route_receivable_evidence_for_current_groups_and_generation,
     annotate_manual_rescan_route_receivable_evidence_for_route_groups,
@@ -97,6 +98,7 @@ use crate::source::config::SourceConfig;
 const ACTIVE_FACADE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+const STATUS_SINK_OBSERVATION_REPAIR_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
 const SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_ATTEMPTS: usize = 3;
 const SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SOURCE_CONTROL_RECOVERY_MAX_RETRYABLE_RESETS: usize = 64;
@@ -106,6 +108,7 @@ const DEFERRED_SINK_REPAIR_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 const INTERNAL_SINK_STATUS_UNINITIALIZED_READY_BUDGET: Duration = Duration::from_millis(1500);
 const CONTROL_FRAME_LEASE_ACQUIRE_BUDGET: Duration = Duration::from_secs(1);
 const CONTROL_FRAME_LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const INTERNAL_SINK_STATUS_NONBLOCKING_ROUTE_BUDGET: Duration = Duration::from_millis(500);
 const INTERNAL_SINK_STATUS_BLOCKING_FALLBACK_BUDGET: Duration = Duration::from_millis(250);
 const HOST_GRANT_CONTROL_FAST_LANE_TIMEOUT: Duration = Duration::from_secs(5);
 const MANUAL_RESCAN_SOURCE_STATUS_DEFAULT_PROBE_BUDGET: Duration = Duration::from_secs(15);
@@ -4677,26 +4680,6 @@ impl ManagementWriteRecoveryContext {
             })
     }
 
-    async fn try_begin_until(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Option<ManagementWriteRecoveryInflightGuard> {
-        loop {
-            if let Some(guard) = self.try_begin() {
-                return Some(guard);
-            }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            tokio::select! {
-                _ = self.runtime_state_changed.notified() => {}
-                _ = tokio::time::sleep(DEFERRED_SINK_REPAIR_RETRY_INTERVAL.min(remaining)) => {}
-            }
-        }
-    }
-
     fn runtime_control_state(&self) -> RuntimeControlState {
         RuntimeControlState::from_state_cell(&self.runtime_gate_state)
     }
@@ -5295,7 +5278,21 @@ impl ManagementWriteRecoveryContext {
             .map(source_signal_generation)
             .max()
             .unwrap_or_default();
-        let generation = status_generation.max(retained_generation).max(1);
+        let retained_sink_generation = self
+            .retained_sink_control_state
+            .lock()
+            .await
+            .active_by_route
+            .values()
+            .map(sink_signal_generation)
+            .max()
+            .unwrap_or_default();
+        let runtime_generation_floor = now_us() / 1000;
+        let generation = status_generation
+            .max(retained_generation)
+            .max(retained_sink_generation)
+            .max(runtime_generation_floor)
+            .max(1);
 
         let mut signals = Vec::new();
         if !grants.is_empty() {
@@ -5326,6 +5323,8 @@ impl ManagementWriteRecoveryContext {
 
     async fn replay_source_scoped_sink_state_if_present(
         &self,
+        total_timeout: Duration,
+        publish_deadline: Option<tokio::time::Instant>,
     ) -> std::result::Result<bool, CnxError> {
         let signals = self.source_scoped_sink_replay_signals().await?;
         if signals.is_empty() {
@@ -5365,12 +5364,17 @@ impl ManagementWriteRecoveryContext {
         self.sink
             .apply_retained_orchestration_signals_with_total_timeout_with_failure(
                 &signals,
-                SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
+                total_timeout,
             )
             .await
             .map_err(SinkFailure::into_error)?;
-        self.publish_source_scoped_sink_roots_control_replay(&signals, &roots, generation)
-            .await?;
+        self.publish_source_scoped_sink_roots_control_replay(
+            &signals,
+            &roots,
+            generation,
+            publish_deadline,
+        )
+        .await?;
         self.record_source_scoped_sink_observation_repair_signature(signature);
         Ok(true)
     }
@@ -5494,6 +5498,7 @@ impl ManagementWriteRecoveryContext {
         signals: &[SinkControlSignal],
         roots: &[source::config::RootSpec],
         generation: u64,
+        deadline: Option<tokio::time::Instant>,
     ) -> std::result::Result<bool, CnxError> {
         let Some(boundary) = self.runtime_boundary.clone() else {
             return Ok(false);
@@ -5505,9 +5510,27 @@ impl ManagementWriteRecoveryContext {
         }
         for attempt in 1..=SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_ATTEMPTS {
             if attempt > 1 {
-                tokio::time::sleep(SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_RETRY_INTERVAL).await;
+                let sleep_for = if let Some(deadline) = deadline {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(CnxError::Timeout);
+                    }
+                    SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_RETRY_INTERVAL.min(remaining)
+                } else {
+                    SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_RETRY_INTERVAL
+                };
+                tokio::time::sleep(sleep_for).await;
             }
             for (route_key, replay_envelopes) in &replay_by_route {
+                let send_timeout = if let Some(deadline) = deadline {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(CnxError::Timeout);
+                    }
+                    Duration::from_secs(5).min(remaining)
+                } else {
+                    Duration::from_secs(5)
+                };
                 let payload = encode_logical_roots_control_payload_with_generation_and_sink_replay(
                     &roots,
                     generation,
@@ -5521,26 +5544,31 @@ impl ManagementWriteRecoveryContext {
                     attempt,
                     SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_ATTEMPTS
                 );
-                boundary
-                    .channel_send(
-                        BoundaryContext::default(),
-                        ChannelSendRequest {
-                            channel_key: ChannelKey(route_key.clone()),
-                            events: vec![Event::new(
-                                EventMetadata {
-                                    origin_id: self.node_id.clone(),
-                                    timestamp_us: now_us(),
-                                    logical_ts: None,
-                                    correlation_id: None,
-                                    ingress_auth: None,
-                                    trace: None,
-                                },
-                                bytes::Bytes::from(payload),
-                            )],
-                            timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
-                        },
-                    )
-                    .await?;
+                let send = boundary.channel_send(
+                    BoundaryContext::default(),
+                    ChannelSendRequest {
+                        channel_key: ChannelKey(route_key.clone()),
+                        events: vec![Event::new(
+                            EventMetadata {
+                                origin_id: self.node_id.clone(),
+                                timestamp_us: now_us(),
+                                logical_ts: None,
+                                correlation_id: None,
+                                ingress_auth: None,
+                                trace: None,
+                            },
+                            bytes::Bytes::from(payload),
+                        )],
+                        timeout_ms: Some(send_timeout.as_millis().max(1) as u64),
+                    },
+                );
+                if deadline.is_some() {
+                    tokio::time::timeout(send_timeout, send)
+                        .await
+                        .map_err(|_| CnxError::Timeout)??;
+                } else {
+                    send.await?;
+                }
                 eprintln!(
                     "fs_meta_runtime_app: source-scoped sink roots-control replay send ok route={} roots={} generation={} attempt={}/{}",
                     route_key,
@@ -5876,13 +5904,22 @@ impl ManagementWriteRecoveryContext {
                         .should_replay_source_scoped_sink_state_after_app_retained_replay()
                         .await?
                     {
-                        self.replay_source_scoped_sink_state_if_present().await?;
+                        self.replay_source_scoped_sink_state_if_present(
+                            SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
+                            None,
+                        )
+                        .await?;
                     }
                     self.wait_for_sink_replay_readiness_after_repair().await?;
                     self.clear_sink_replay_after_repair();
                 }
             } else if !self.sink.retained_replay_required()
-                && self.replay_source_scoped_sink_state_if_present().await?
+                && self
+                    .replay_source_scoped_sink_state_if_present(
+                        SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
+                        None,
+                    )
+                    .await?
             {
                 self.wait_for_sink_replay_readiness_after_repair().await?;
                 self.clear_sink_replay_after_repair();
@@ -5975,11 +6012,20 @@ impl ManagementWriteRecoveryContext {
                         .should_replay_source_scoped_sink_state_after_app_retained_replay()
                         .await?
                 {
-                    self.replay_source_scoped_sink_state_if_present().await?;
+                    self.replay_source_scoped_sink_state_if_present(
+                        SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
+                        None,
+                    )
+                    .await?;
                 }
                 !self.sink.retained_replay_required()
             } else if !self.sink.retained_replay_required()
-                && self.replay_source_scoped_sink_state_if_present().await?
+                && self
+                    .replay_source_scoped_sink_state_if_present(
+                        SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
+                        None,
+                    )
+                    .await?
             {
                 true
             } else if !self.sink.retained_replay_required() {
@@ -6011,26 +6057,49 @@ impl ManagementWriteRecoveryContext {
         Ok(())
     }
 
-    async fn run_source_scoped_sink_observation_repair(&self) -> std::result::Result<(), CnxError> {
-        let source_replay_required_at_entry =
-            self.runtime_control_state().source_state_replay_required();
+    async fn run_source_scoped_sink_observation_repair_for_status(
+        &self,
+    ) -> std::result::Result<(), CnxError> {
+        let deadline = tokio::time::Instant::now() + STATUS_SINK_OBSERVATION_REPAIR_TOTAL_TIMEOUT;
+        if self
+            .sink_generation_cutover_replay_deferred
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let state_at_entry = self.runtime_control_state();
+        let source_replay_required_at_entry = state_at_entry.source_state_replay_required();
         let source_scoped_sink_route_evidence_at_entry = source_replay_required_at_entry
             && !self.api_control_gate.is_source_repair_ready()
             && self.source_scoped_sink_replay_has_route_evidence().await;
-        let source_repair_ready_at_entry = !source_replay_required_at_entry
+        let source_repair_ready_at_entry = if !source_replay_required_at_entry
             || self.api_control_gate.is_source_repair_ready()
             || source_scoped_sink_route_evidence_at_entry
-            || self.source_repair_ready_from_runtime_or_observation().await;
+        {
+            true
+        } else {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                false
+            } else {
+                tokio::time::timeout(
+                    remaining,
+                    self.source_repair_ready_from_runtime_or_observation(),
+                )
+                .await
+                .unwrap_or(false)
+            }
+        };
         if !source_repair_ready_at_entry {
             return Ok(());
         }
-        let sink_repair_deadline =
-            tokio::time::Instant::now() + SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT;
-        let Some(_inflight) = self.try_begin_until(sink_repair_deadline).await else {
+        let Some(_inflight) = self.try_begin() else {
             return Ok(());
         };
         let replayed_sink_state = {
-            let _serial = self.control_frame_serial.lock().await;
+            let Ok(_serial) = self.control_frame_serial.try_lock() else {
+                return Ok(());
+            };
             if self.runtime_control_state().source_state_replay_required()
                 && !self.api_control_gate.is_source_repair_ready()
                 && !source_repair_ready_at_entry
@@ -6038,14 +6107,18 @@ impl ManagementWriteRecoveryContext {
             {
                 return Ok(());
             }
-            self.replay_source_scoped_sink_state_if_present().await?
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            self.replay_source_scoped_sink_state_if_present(remaining, Some(deadline))
+                .await?
         };
 
         if replayed_sink_state {
-            self.wait_for_sink_replay_readiness_after_repair().await?;
+            self.restore_control_after_retained_replay_recovery();
+            self.publish_recovered_facade_state().await;
         }
-        self.restore_control_after_retained_replay_recovery();
-        self.publish_recovered_facade_state().await;
         Ok(())
     }
 }
@@ -7294,6 +7367,51 @@ fn source_rescan_route_groups_for_current_generation(
     }
 }
 
+fn source_rescan_route_groups_for_current_generation_or_local_proxy(
+    facade_gate: &RuntimeUnitGate,
+    route_key: &str,
+    node_id: &NodeId,
+) -> Option<(u64, BTreeSet<String>)> {
+    if let Some(route_groups) =
+        source_rescan_route_groups_for_current_generation(facade_gate, route_key)
+    {
+        return Some(route_groups);
+    }
+    if route_key != source_rescan_request_route_for(&node_id.0).0 {
+        return None;
+    }
+    let generic_route_key = format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL);
+    let (generation, bound_scopes) = facade_gate
+        .active_route_state(execution_units::SOURCE_RUNTIME_UNIT_ID, &generic_route_key)
+        .ok()
+        .flatten()?;
+    if generation == 0 {
+        return None;
+    }
+    let groups = bound_scopes
+        .iter()
+        .filter(|scope| {
+            let has_resource_id = scope
+                .resource_ids
+                .iter()
+                .any(|resource_id| !resource_id.trim().is_empty());
+            !scope.scope_id.trim().is_empty()
+                && !scope.scope_id.starts_with("__fsmeta_empty_roots_bootstrap")
+                && (!has_resource_id
+                    || scope
+                        .resource_ids
+                        .iter()
+                        .any(|resource_id| runtime_resource_id_targets_node(resource_id, node_id)))
+        })
+        .map(|scope| scope.scope_id.clone())
+        .collect::<BTreeSet<_>>();
+    if groups.is_empty() {
+        None
+    } else {
+        Some((generation, groups))
+    }
+}
+
 fn runtime_node_identity_matches(left: &str, right: &str) -> bool {
     if left == right {
         return true;
@@ -7350,6 +7468,62 @@ fn source_rescan_route_semantic_generation(facade_gate: &RuntimeUnitGate, route_
         .unwrap_or(0)
 }
 
+async fn annotate_pending_source_status_snapshot_with_existing_rescan_route_evidence(
+    snapshot: &mut crate::workers::source::SourceObservabilitySnapshot,
+    node_id: &NodeId,
+    facade_gate: &RuntimeUnitGate,
+    route_key: &str,
+    ready_generation: &Arc<AtomicU64>,
+    runtime_endpoint_tasks: &Mutex<Vec<ManagedEndpointTask>>,
+) {
+    if !source_rescan_route_targets_node(facade_gate, route_key, node_id) {
+        return;
+    }
+    let route_groups = source_rescan_route_groups_for_current_generation_or_local_proxy(
+        facade_gate,
+        route_key,
+        node_id,
+    );
+    if let Some((generation, groups)) = route_groups.as_ref() {
+        annotate_manual_rescan_route_active_evidence_for_route_groups(
+            snapshot,
+            node_id,
+            route_key,
+            *generation,
+            groups,
+        );
+    }
+    if !worker_source_rescan_proxy_task_ready_for_current_generation(
+        facade_gate,
+        route_key,
+        ready_generation.as_ref(),
+        runtime_endpoint_tasks,
+        true,
+    )
+    .await
+    {
+        return;
+    }
+    if let Some((generation, groups)) = route_groups.as_ref() {
+        annotate_manual_rescan_route_receivable_evidence_for_route_groups(
+            snapshot,
+            node_id,
+            route_key,
+            Some(*generation),
+            groups,
+        );
+    } else {
+        let generation = source_rescan_route_semantic_generation(facade_gate, route_key);
+        if generation == 0 {
+            annotate_manual_rescan_route_receivable_evidence(snapshot, node_id);
+        } else {
+            annotate_manual_rescan_route_receivable_evidence_for_current_groups_and_generation(
+                snapshot, node_id, route_key, generation,
+            );
+        }
+    }
+}
+
 async fn worker_source_rescan_proxy_task_ready_for_current_generation(
     facade_gate: &RuntimeUnitGate,
     route_key: &str,
@@ -7378,7 +7552,7 @@ async fn worker_source_rescan_proxy_task_ready_for_current_generation(
             && task.finish_reason().is_none()
             && !task.is_shutdown_requested()
             && route_usable
-            && task.is_receive_polling()
+            && task.has_receive_poll_observed()
     });
     drop(tasks);
     if task_ready {
@@ -9857,7 +10031,11 @@ impl FSMetaApp {
         let context = self.management_write_recovery_context();
         Arc::new(move || {
             let context = context.clone();
-            Box::pin(async move { context.run_source_scoped_sink_observation_repair().await })
+            Box::pin(async move {
+                context
+                    .run_source_scoped_sink_observation_repair_for_status()
+                    .await
+            })
         })
     }
 
@@ -13144,7 +13322,7 @@ impl FSMetaApp {
                     &self.facade_gate,
                     task.route_key(),
                     &self.source_rescan_proxy_ready_generation,
-                    task.is_receive_polling(),
+                    task.has_receive_poll_observed(),
                 );
             }
         }
@@ -13287,7 +13465,7 @@ impl FSMetaApp {
                         &self.facade_gate,
                         task.route_key(),
                         &self.source_rescan_proxy_ready_generation,
-                        task.is_receive_polling(),
+                        task.has_receive_poll_observed(),
                     );
                 }
                 spawned_routes.insert(task.route_key().to_string());
@@ -13434,6 +13612,7 @@ impl FSMetaApp {
                     route_key
                 );
                 let route_for_gate = route_key.clone();
+                let route_for_handler = route_key.clone();
                 let scoped_route_for_gate = scoped_sink_roots_control_route_key.clone();
                 let facade_gate = self.facade_gate.clone();
                 let sink = self.sink.clone();
@@ -13467,6 +13646,7 @@ impl FSMetaApp {
                         let config_host_object_grants = config_host_object_grants.clone();
                         let retained_sink_control_state = retained_sink_control_state.clone();
                         let generation_cell = generation_cell.clone();
+                        let route_for_handler = route_for_handler.clone();
                         async move {
                             for event in events {
                                 let payload = match decode_logical_roots_control_payload(
@@ -13494,17 +13674,31 @@ impl FSMetaApp {
                                         continue;
                                     }
                                 };
-                                if ManagementWriteRecoveryContext::sink_roots_control_generation_is_stale(
-                                    &generation_cell,
-                                    payload.generation,
-                                ) {
-                                    if ManagementWriteRecoveryContext::sink_roots_control_generation_can_replay_same_declaration(
-                                        &generation_cell,
+                                let generation_is_stale =
+	                                    ManagementWriteRecoveryContext::sink_roots_control_generation_is_stale(
+	                                    &generation_cell,
+	                                    payload.generation,
+	                                );
+                                let can_replay_same_declaration =
+	                                    ManagementWriteRecoveryContext::sink_roots_control_generation_can_replay_same_declaration(
+	                                        &generation_cell,
+	                                        payload.generation,
+	                                    );
+                                if std::env::var_os("FSMETA_DEBUG_STREAM_DELIVERY").is_some() {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: worker-backed sink roots-control payload route={} generation={} replay_envelopes={} replay_signals={} stale={} can_replay_same_declaration={}",
+                                        route_for_handler,
                                         payload.generation,
-                                    ) && !replay_signals.is_empty()
-                                    {
+                                        replay_envelopes.len(),
+                                        replay_signals.len(),
+                                        generation_is_stale,
+                                        can_replay_same_declaration,
+                                    );
+                                }
+                                if generation_is_stale {
+                                    if can_replay_same_declaration && !replay_signals.is_empty() {
                                         if let Err(err) = sink
-                                            .apply_retained_orchestration_signals_with_total_timeout_with_failure(
+	                                            .apply_retained_orchestration_signals_with_total_timeout_with_failure(
                                                 &replay_signals,
                                                 SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
                                             )
@@ -13900,12 +14094,18 @@ impl FSMetaApp {
                                         );
                                         continue;
                                     }
-                                    match sink
-                                        .status_snapshot_nonblocking_for_status_route_key(
+                                    let sink_status_result = match tokio::time::timeout(
+                                        INTERNAL_SINK_STATUS_NONBLOCKING_ROUTE_BUDGET,
+                                        sink.status_snapshot_nonblocking_for_status_route_key(
                                             &route_key,
-                                        )
-                                        .await
+                                        ),
+                                    )
+                                    .await
                                     {
+                                        Ok(result) => result,
+                                        Err(_) => Err(CnxError::Timeout),
+                                    };
+                                    match sink_status_result {
                                         Ok((snapshot, _used_cached_fallback)) => {
                                             if debug_status_endpoint_response_enabled() {
                                                 eprintln!(
@@ -14125,7 +14325,6 @@ impl FSMetaApp {
                 let runtime_endpoint_tasks_for_source_status = self.runtime_endpoint_tasks.clone();
                 let source_rescan_proxy_ready_generation =
                     self.source_rescan_proxy_ready_generation.clone();
-                let control_failure_uninitialized = self.control_failure_uninitialized.clone();
                 let source_rescan_proxy_route_key =
                     source_rescan_request_route_for(&self.node_id.0).0;
                 let route_key = route.0.clone();
@@ -14165,8 +14364,6 @@ impl FSMetaApp {
                                 runtime_endpoint_tasks_for_source_status.clone();
                             let source_rescan_proxy_ready_generation =
                                 source_rescan_proxy_ready_generation.clone();
-                            let control_failure_uninitialized =
-                                control_failure_uninitialized.clone();
                             let source_rescan_proxy_route_key =
                                 source_rescan_proxy_route_key.clone();
                             let route_key = route_key.clone();
@@ -14289,15 +14486,9 @@ impl FSMetaApp {
                                                 .checked_add(budget)
                                                 .unwrap_or_else(tokio::time::Instant::now)
                                         });
-                                    let retained_source_replay_from_control_failure =
-                                        manual_rescan_delivery_evidence
-                                            && runtime_state.source_state_replay_required()
-                                            && control_failure_uninitialized
-                                                .load(Ordering::Acquire);
                                     let (snapshot, used_cached_fallback) =
                                         if source_control_apply_inflight
                                             || source_state_pending_observation
-                                            || retained_source_replay_from_control_failure
                                         {
                                             source
                                             .source_state_pending_observability_snapshot_for_status_route()
@@ -14362,12 +14553,22 @@ impl FSMetaApp {
                                             )
                                             .await
                                         } else if manual_rescan_delivery_evidence {
-                                            if !runtime_state.source_state_current()
-                                                && !source.is_worker()
-                                            {
-                                                source
-                                                .source_state_pending_observability_snapshot_for_status_route()
-                                                .await
+                                            if !runtime_state.source_state_current() {
+                                                let (mut snapshot, used_cached_fallback) = source
+                                                    .source_state_pending_observability_snapshot_for_status_route()
+                                                    .await;
+                                                if source.is_worker() {
+                                                    annotate_pending_source_status_snapshot_with_existing_rescan_route_evidence(
+                                                        &mut snapshot,
+                                                        &node_id,
+                                                        &facade_gate_for_source_status,
+                                                        &source_rescan_proxy_route_key,
+                                                        &source_rescan_proxy_ready_generation,
+                                                        &runtime_endpoint_tasks_for_source_status,
+                                                    )
+                                                    .await;
+                                                }
+                                                (snapshot, used_cached_fallback)
                                             } else {
                                                 let probe_budget = manual_rescan_delivery_probe_budget
                                                 .unwrap_or(
@@ -14420,16 +14621,17 @@ impl FSMetaApp {
                                                     }
                                                     if source_rescan_proxy_ready {
                                                         source_rescan_proxy_route_groups =
-                                                        source_rescan_route_groups_for_current_generation(
+                                                        source_rescan_route_groups_for_current_generation_or_local_proxy(
                                                             &facade_gate_for_source_status,
                                                             &source_rescan_proxy_route_key,
+                                                            &node_id,
                                                         );
                                                     }
                                                     let route_group_ids =
                                                         source_rescan_proxy_route_groups
                                                             .as_ref()
                                                             .map(|(_, groups)| groups);
-                                                    let app_route_snapshot =
+                                                    let mut app_route_snapshot =
                                                         if source_rescan_proxy_ready {
                                                             source
                                                         .manual_rescan_app_route_observability_snapshot_for_status_route(
@@ -14439,6 +14641,57 @@ impl FSMetaApp {
                                                         } else {
                                                             None
                                                         };
+                                                    if source_rescan_proxy_ready
+                                                        && app_route_snapshot.is_none()
+                                                    {
+                                                        let repair_budget = probe_deadline
+                                                            .saturating_duration_since(
+                                                                tokio::time::Instant::now(),
+                                                            );
+                                                        if repair_budget.is_zero() {
+                                                            eprintln!(
+                                                                "fs_meta_runtime_app: source status endpoint manual-rescan retained source repair skipped node={} correlation={:?} trace_id={} budget_ms={} err=operation timed out",
+                                                                node_id.0,
+                                                                req.metadata().correlation_id,
+                                                                trace_id,
+                                                                probe_budget.as_millis()
+                                                            );
+                                                        } else {
+                                                            match tokio::time::timeout(
+                                                                repair_budget,
+                                                                (source_repair_recovery_without_proxy_ready)(),
+                                                            )
+                                                            .await
+                                                            {
+                                                                Ok(Ok(())) => {
+                                                                    app_route_snapshot = source
+                                                                        .manual_rescan_app_route_observability_snapshot_for_status_route(
+                                                                            route_group_ids,
+                                                                        )
+                                                                        .await;
+                                                                }
+                                                                Ok(Err(err)) => {
+                                                                    eprintln!(
+                                                                        "fs_meta_runtime_app: source status endpoint manual-rescan retained source repair failed node={} correlation={:?} trace_id={} budget_ms={} err={}",
+                                                                        node_id.0,
+                                                                        req.metadata().correlation_id,
+                                                                        trace_id,
+                                                                        probe_budget.as_millis(),
+                                                                        err
+                                                                    );
+                                                                }
+                                                                Err(_) => {
+                                                                    eprintln!(
+                                                                        "fs_meta_runtime_app: source status endpoint manual-rescan retained source repair timed out node={} correlation={:?} trace_id={} budget_ms={}",
+                                                                        node_id.0,
+                                                                        req.metadata().correlation_id,
+                                                                        trace_id,
+                                                                        probe_budget.as_millis()
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                     let app_route_snapshot_ready =
                                                         app_route_snapshot.is_some();
                                                     let (mut snapshot, used_cached_fallback) =
@@ -14449,6 +14702,20 @@ impl FSMetaApp {
                                                             .source_state_pending_observability_snapshot_for_status_route()
                                                             .await
                                                         };
+                                                    if source_rescan_proxy_ready {
+                                                        if let Some((generation, groups)) =
+                                                            source_rescan_proxy_route_groups
+                                                                .as_ref()
+                                                        {
+                                                            annotate_manual_rescan_route_active_evidence_for_route_groups(
+                                                            &mut snapshot,
+                                                            &node_id,
+                                                            &source_rescan_proxy_route_key,
+                                                            *generation,
+                                                            groups,
+                                                        );
+                                                        }
+                                                    }
                                                     if source_rescan_proxy_ready
                                                         && app_route_snapshot_ready
                                                     {
@@ -14667,7 +14934,10 @@ impl FSMetaApp {
                                             )
                                             .await
                                         };
-                                    if used_cached_fallback && source.is_worker() {
+                                    if used_cached_fallback
+                                        && source.is_worker()
+                                        && debug_source_status_lifecycle_enabled()
+                                    {
                                         eprintln!(
                                             "fs_meta_runtime_app: source status endpoint using cached/degraded source observability snapshot node={} correlation={:?} trace_id={}",
                                             node_id.0,

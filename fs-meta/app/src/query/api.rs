@@ -959,6 +959,7 @@ pub(crate) fn merge_sink_status_snapshots(
     let mut received_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut stream_received_batches_by_node = BTreeMap::<String, u64>::new();
     let mut stream_received_events_by_node = BTreeMap::<String, u64>::new();
+    let mut stream_receive_armed_by_node = BTreeMap::<String, u64>::new();
     let mut stream_received_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut stream_received_path_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut stream_ready_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
@@ -1005,6 +1006,7 @@ pub(crate) fn merge_sink_status_snapshots(
         received_origin_counts_by_node.extend(snapshot.received_origin_counts_by_node);
         stream_received_batches_by_node.extend(snapshot.stream_received_batches_by_node);
         stream_received_events_by_node.extend(snapshot.stream_received_events_by_node);
+        stream_receive_armed_by_node.extend(snapshot.stream_receive_armed_by_node);
         stream_received_origin_counts_by_node
             .extend(snapshot.stream_received_origin_counts_by_node);
         stream_received_path_origin_counts_by_node
@@ -1088,6 +1090,7 @@ pub(crate) fn merge_sink_status_snapshots(
     merged.received_origin_counts_by_node = received_origin_counts_by_node;
     merged.stream_received_batches_by_node = stream_received_batches_by_node;
     merged.stream_received_events_by_node = stream_received_events_by_node;
+    merged.stream_receive_armed_by_node = stream_receive_armed_by_node;
     merged.stream_received_origin_counts_by_node = stream_received_origin_counts_by_node;
     merged.stream_path_capture_target = stream_path_capture_target;
     merged.stream_received_path_origin_counts_by_node = stream_received_path_origin_counts_by_node;
@@ -1502,6 +1505,12 @@ struct StatusRouteAttemptRuntime {
     collect_idle_grace: Duration,
 }
 
+impl StatusRouteAttemptRuntime {
+    fn outer_timeout(self) -> Duration {
+        self.attempt_timeout
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StatusRouteMachinePhase {
     Attempt(StatusRouteAttemptRuntime),
@@ -1707,23 +1716,28 @@ impl StatusRouteMachine {
                         origin_id.clone(),
                         route_bindings.clone(),
                     );
-                    match adapter
-                        .call_collect(
+                    match tokio::time::timeout(
+                        attempt.outer_timeout(),
+                        adapter.call_collect(
                             ROUTE_TOKEN_FS_META_INTERNAL,
                             method,
                             request_payload(attempt.attempt_timeout),
                             attempt.attempt_timeout,
                             attempt.collect_idle_grace,
-                        )
-                        .await
+                        ),
+                    )
+                    .await
                     {
-                        Ok(events) => return Ok(events),
-                        Err(err) => {
+                        Ok(Ok(events)) => return Ok(events),
+                        Ok(Err(err)) => {
                             phase = self.followup_phase_at(
                                 tokio::time::Instant::now(),
                                 err,
                                 is_retryable_gap,
                             );
+                        }
+                        Err(_) => {
+                            phase = StatusRouteMachinePhase::Failed(RouteTerminalError::Timeout);
                         }
                     }
                 }
@@ -3097,26 +3111,6 @@ async fn load_materialized_status_snapshots_with_plan(
     };
     let mut readiness_groups =
         materialized_readiness_groups_for_loaded_source(&fallback_readiness_groups, &source_status);
-    if matches!(&state.backend, QueryBackend::Route { .. })
-        && source_status_should_refresh_current_owner_before_sink_readiness(
-            &source_status,
-            &readiness_groups,
-            &routed_source_observability_snapshots,
-        )
-    {
-        source_status = augment_routed_source_status_with_current_owner_evidence(
-            state,
-            source_status,
-            &readiness_groups,
-            status_load_plan.source_route,
-            &routed_source_observability_snapshots,
-        )
-        .await?;
-        readiness_groups = materialized_readiness_groups_for_loaded_source(
-            &fallback_readiness_groups,
-            &source_status,
-        );
-    }
     let mut explicit_empty_all_active_recollect_attempted = false;
     if let QueryBackend::Route {
         boundary,
@@ -3139,6 +3133,34 @@ async fn load_materialized_status_snapshots_with_plan(
         {
             sink_status = retry_snapshot;
         }
+    }
+    let sink_still_reports_explicit_empty_for_all_active_readiness_groups =
+        explicit_empty_all_active_recollect_attempted
+            && sink_status_snapshot_reports_explicit_empty_for_all_active_readiness_groups(
+                &source_status,
+                &sink_status,
+                &readiness_groups,
+            );
+    if matches!(&state.backend, QueryBackend::Route { .. })
+        && !sink_still_reports_explicit_empty_for_all_active_readiness_groups
+        && source_status_should_refresh_current_owner_before_sink_readiness(
+            &source_status,
+            &readiness_groups,
+            &routed_source_observability_snapshots,
+        )
+    {
+        source_status = augment_routed_source_status_with_current_owner_evidence(
+            state,
+            source_status,
+            &readiness_groups,
+            status_load_plan.source_route,
+            &routed_source_observability_snapshots,
+        )
+        .await?;
+        readiness_groups = materialized_readiness_groups_for_loaded_source(
+            &fallback_readiness_groups,
+            &source_status,
+        );
     }
     let sink_owner_evidence_plan = if explicit_empty_all_active_recollect_attempted
         && sink_status_snapshot_reports_explicit_empty_for_all_active_readiness_groups(

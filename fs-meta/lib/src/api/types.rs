@@ -220,6 +220,7 @@ pub struct StatusSinkDebug {
     pub last_control_frame_signals_by_node: BTreeMap<String, Vec<String>>,
     pub received_batches_by_node: BTreeMap<String, u64>,
     pub received_events_by_node: BTreeMap<String, u64>,
+    pub stream_receive_armed_by_node: BTreeMap<String, u64>,
     pub received_control_events_by_node: BTreeMap<String, u64>,
     pub received_data_events_by_node: BTreeMap<String, u64>,
     pub last_received_at_us_by_node: BTreeMap<String, u64>,

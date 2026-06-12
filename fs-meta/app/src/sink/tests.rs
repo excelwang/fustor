@@ -198,6 +198,83 @@ impl ChannelIoSubset for RootsControlSequenceBoundary {
     }
 }
 
+struct OrderedRootsControlRoutesBoundary {
+    steps: Vec<(String, Bytes)>,
+    cursor: std::sync::Mutex<usize>,
+    recv_counts: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
+}
+
+impl OrderedRootsControlRoutesBoundary {
+    fn new(steps: Vec<(String, Vec<u8>)>) -> Self {
+        Self {
+            steps: steps
+                .into_iter()
+                .map(|(route, payload)| (route, Bytes::from(payload)))
+                .collect(),
+            cursor: std::sync::Mutex::new(0),
+            recv_counts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    fn delivered_count(&self) -> usize {
+        *self.cursor.lock().expect("ordered roots cursor lock")
+    }
+
+    fn recv_counts_snapshot(&self) -> std::collections::BTreeMap<String, usize> {
+        self.recv_counts
+            .lock()
+            .expect("ordered roots recv counts lock")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelIoSubset for OrderedRootsControlRoutesBoundary {
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+    ) -> Result<Vec<Event>> {
+        let route_key = request.channel_key.0;
+        *self
+            .recv_counts
+            .lock()
+            .expect("ordered roots recv counts lock")
+            .entry(route_key.clone())
+            .or_default() += 1;
+
+        let (index, event) = {
+            let mut cursor = self.cursor.lock().expect("ordered roots cursor lock");
+            let Some((expected_route, payload)) = self.steps.get(*cursor) else {
+                return Err(CnxError::Timeout);
+            };
+            if expected_route != &route_key {
+                return Err(CnxError::Timeout);
+            }
+            let index = *cursor;
+            *cursor += 1;
+            (
+                index,
+                Event::new(
+                    EventMetadata {
+                        origin_id: NodeId("node-a".to_string()),
+                        timestamp_us: (index + 1) as u64,
+                        logical_ts: None,
+                        correlation_id: None,
+                        ingress_auth: None,
+                        trace: None,
+                    },
+                    payload.clone(),
+                ),
+            )
+        };
+        if index > 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(vec![event])
+    }
+}
+
 struct RootsControlThenEventsBoundary {
     roots_control_route: String,
     events_route: String,
@@ -991,6 +1068,194 @@ async fn owner_scoped_roots_control_payload_replays_sink_runtime_scope_for_local
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn owner_scoped_roots_control_replay_applies_after_generic_same_generation_declaration() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+        RootSpec::new("nfs3", "/mnt/nfs3"),
+    ];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.1", "/mnt/nfs1", true),
+        granted_mount_root("node-b::nfs2", "node-b", "10.0.0.2", "/mnt/nfs2", true),
+        granted_mount_root("node-c::nfs3", "node-c", "10.0.0.3", "/mnt/nfs3", true),
+    ];
+    let sink = SinkFileMeta::with_boundaries(NodeId("node-b".to_string()), None, cfg.clone())
+        .expect("build sink");
+    let generic_roots_control_route = format!(
+        "{}.stream",
+        crate::runtime::routes::ROUTE_KEY_SINK_ROOTS_CONTROL
+    );
+    let owner_roots_control_route =
+        crate::runtime::routes::sink_roots_control_stream_route_for("node-b").0;
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: generic_roots_control_route.clone(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 60_000,
+            bound_scopes: Vec::new(),
+        },
+    ))
+    .expect("encode generic roots-control activate")])
+        .await
+        .expect("activate generic roots-control route");
+
+    let owner_replay = vec![
+        host_object_grants_changed_envelope(2, &cfg.host_object_grants),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: owner_roots_control_route.clone(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 60_000,
+            bound_scopes: vec![bound_scope_with_resources("nfs2", &["node-b::nfs2"])],
+        }))
+        .expect("encode owner roots-control replay activate"),
+    ];
+    let generic_payload = encode_logical_roots_control_payload_with_generation(&cfg.roots, 2)
+        .expect("encode generic roots-only control payload");
+    let owner_payload = encode_logical_roots_control_payload_with_generation_and_sink_replay(
+        &cfg.roots,
+        2,
+        owner_replay,
+    )
+    .expect("encode owner roots control payload with sink replay");
+    let boundary = Arc::new(OrderedRootsControlRoutesBoundary::new(vec![
+        (generic_roots_control_route.clone(), generic_payload),
+        (owner_roots_control_route.clone(), owner_payload),
+    ]));
+
+    sink.start_runtime_endpoints(boundary.clone(), NodeId("node-b".to_string()))
+        .expect("start runtime endpoints");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let groups = sink
+            .scheduled_group_ids()
+            .expect("scheduled groups")
+            .unwrap_or_default();
+        if groups == std::collections::BTreeSet::from(["nfs2".to_string()]) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "owner-scoped same-generation replay after generic declaration must schedule only node-b's sink group; groups={groups:?} delivered={} recv_counts={:?}",
+            boundary.delivered_count(),
+            boundary.recv_counts_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn owner_scoped_roots_control_replay_applies_after_same_declaration_cell_seq_advance() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+    ];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.1", "/mnt/nfs1", true),
+        granted_mount_root("node-b::nfs2", "node-b", "10.0.0.2", "/mnt/nfs2", true),
+    ];
+    let sink = SinkFileMeta::with_boundaries(NodeId("node-b".to_string()), None, cfg.clone())
+        .expect("build sink");
+    let owner_roots_control_route =
+        crate::runtime::routes::sink_roots_control_stream_route_for("node-b").0;
+
+    sink.logical_roots_cell
+        .replace(cfg.roots.clone())
+        .await
+        .expect("accepted roots write establishes generation 2");
+    assert_eq!(sink.current_logical_roots_generation(), 2);
+    sink.apply_logical_roots_control_stream_declaration(cfg.roots.clone(), &cfg.host_object_grants)
+        .expect("generic roots-control declaration applies");
+    sink.mark_logical_roots_control_generation(2);
+
+    sink.logical_roots_cell
+        .replace(cfg.roots.clone())
+        .await
+        .expect("same declaration source-side refresh advances local cell seq");
+    assert_eq!(sink.current_logical_roots_generation(), 3);
+
+    let owner_replay = vec![
+        host_object_grants_changed_envelope(2, &cfg.host_object_grants),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: owner_roots_control_route,
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 60_000,
+            bound_scopes: vec![bound_scope_with_resources("nfs2", &["node-b::nfs2"])],
+        }))
+        .expect("encode owner roots-control replay activate"),
+    ];
+
+    assert!(
+        sink.logical_roots_control_generation_is_stale(2),
+        "same-generation replay is stale as a declaration after another path advanced the cell seq"
+    );
+    assert!(
+        sink.logical_roots_control_generation_can_replay_same_declaration(2, &cfg.roots),
+        "same declaration replay must not be blocked only because local logical-roots seq advanced"
+    );
+    sink.apply_logical_roots_control_sink_replay(&owner_replay)
+        .await;
+
+    assert_eq!(
+        sink.scheduled_group_ids()
+            .expect("scheduled groups")
+            .unwrap_or_default(),
+        std::collections::BTreeSet::from(["nfs2".to_string()])
+    );
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn owner_scoped_roots_control_replay_rejects_same_generation_after_different_declaration() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+    ];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.1", "/mnt/nfs1", true),
+        granted_mount_root("node-b::nfs2", "node-b", "10.0.0.2", "/mnt/nfs2", true),
+    ];
+    let sink = SinkFileMeta::with_boundaries(NodeId("node-b".to_string()), None, cfg.clone())
+        .expect("build sink");
+
+    sink.logical_roots_cell
+        .replace(cfg.roots.clone())
+        .await
+        .expect("accepted roots write establishes generation 2");
+    sink.apply_logical_roots_control_stream_declaration(cfg.roots.clone(), &cfg.host_object_grants)
+        .expect("generic roots-control declaration applies");
+    sink.mark_logical_roots_control_generation(2);
+
+    sink.logical_roots_cell
+        .replace(vec![RootSpec::new("nfs1", "/mnt/nfs1")])
+        .await
+        .expect("newer different declaration advances local cell seq");
+
+    assert!(
+        sink.logical_roots_control_generation_is_stale(2),
+        "old payload generation must be stale after newer declaration"
+    );
+    assert!(
+        !sink.logical_roots_control_generation_can_replay_same_declaration(2, &cfg.roots),
+        "same-generation replay must stay blocked when the current declaration content differs"
+    );
 
     sink.close().await.expect("close sink");
 }
