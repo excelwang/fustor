@@ -928,7 +928,9 @@ pub fn is_retryable_management_unavailable_error(err: &str) -> bool {
             || err.contains("manual rescan current roots runtime-scope readiness failed")
             || err.contains("manual rescan source-status target proof incomplete")
             || err.contains("manual rescan scoped source route pending")
-            || err.contains("manual rescan generic source route pending"))
+            || err.contains("manual rescan generic source route pending")
+            || err.contains("manual rescan source repair readiness pending")
+            || err.contains("manual rescan response budget exhausted"))
         || (err.contains("http 500 failed")
             && err.contains("manual rescan generic source route failed: operation timed out"))
 }

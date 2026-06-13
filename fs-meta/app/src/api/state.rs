@@ -17,6 +17,7 @@ use crate::workers::sink::SinkFacade;
 use crate::workers::source::SourceFacade;
 
 use super::auth::AuthService;
+use super::types::{StatusRepairLaneEvidence, repair_lane_now_us, repair_lane_signature};
 
 pub type ManagementWriteRecoveryFuture =
     Pin<Box<dyn Future<Output = Result<(), capanix_app_sdk::CnxError>> + Send>>;
@@ -73,6 +74,7 @@ pub struct ApiControlGate {
     changed: Notify,
     facade_request_tracker: Arc<ApiRequestTracker>,
     status_remote_collection_tracker: Arc<ApiRequestTracker>,
+    repair_lane_evidence: Mutex<BTreeMap<String, StatusRepairLaneEvidence>>,
     management_write_recovery: RwLock<Option<ManagementWriteRecovery>>,
     source_repair_recovery: RwLock<Option<ManagementWriteRecovery>>,
     sink_repair_recovery: RwLock<Option<ManagementWriteRecovery>>,
@@ -115,6 +117,7 @@ impl ApiControlGate {
             changed: Notify::new(),
             facade_request_tracker: Arc::new(ApiRequestTracker::default()),
             status_remote_collection_tracker: Arc::new(ApiRequestTracker::default()),
+            repair_lane_evidence: Mutex::new(BTreeMap::new()),
             management_write_recovery: RwLock::new(None),
             source_repair_recovery: RwLock::new(None),
             sink_repair_recovery: RwLock::new(None),
@@ -137,10 +140,11 @@ impl ApiControlGate {
         self.management_write_drain_closed.load(Ordering::Acquire)
     }
 
-    pub fn readiness_snapshot(&self) -> (bool, bool, u64) {
+    pub fn readiness_snapshot(&self) -> (bool, bool, bool, u64) {
         (
             self.is_ready(),
             self.is_management_write_ready(),
+            self.is_source_repair_ready(),
             self.epoch(),
         )
     }
@@ -265,6 +269,87 @@ impl ApiControlGate {
             .read()
             .ok()
             .and_then(|guard| guard.clone())
+    }
+
+    pub fn record_repair_lane_evidence(&self, mut evidence: StatusRepairLaneEvidence) {
+        if evidence.signature.is_empty() {
+            evidence.signature = repair_lane_signature(
+                &evidence.owner,
+                &evidence.lane,
+                &evidence.trigger,
+                evidence.route_outcome.as_deref(),
+            );
+        }
+        if evidence.updated_at_us == 0 {
+            evidence.updated_at_us = repair_lane_now_us();
+        }
+        let key = evidence.signature.clone();
+        if let Ok(mut guard) = self.repair_lane_evidence.lock() {
+            guard.insert(key, evidence);
+        }
+    }
+
+    pub fn claim_repair_lane_schedule(
+        &self,
+        mut evidence: StatusRepairLaneEvidence,
+    ) -> (bool, StatusRepairLaneEvidence) {
+        if evidence.signature.is_empty() {
+            evidence.signature = repair_lane_signature(
+                &evidence.owner,
+                &evidence.lane,
+                &evidence.trigger,
+                evidence.route_outcome.as_deref(),
+            );
+        }
+        if evidence.updated_at_us == 0 {
+            evidence.updated_at_us = repair_lane_now_us();
+        }
+        let key = evidence.signature.clone();
+        let Ok(mut guard) = self.repair_lane_evidence.lock() else {
+            return (true, evidence);
+        };
+        if let Some(existing) = guard.get(&key) {
+            if matches!(existing.state.as_str(), "scheduled" | "inflight") {
+                return (false, existing.clone());
+            }
+        }
+        guard.insert(key, evidence.clone());
+        (true, evidence)
+    }
+
+    pub fn record_repair_lane_state_with_metadata(
+        &self,
+        lane: &str,
+        owner: &str,
+        state: &str,
+        trigger: &str,
+        blocking: bool,
+        reason: Option<String>,
+        generation: Option<u64>,
+        attempt: Option<u32>,
+        deadline_at_us: Option<u64>,
+    ) {
+        self.record_repair_lane_evidence(StatusRepairLaneEvidence {
+            lane: lane.to_string(),
+            owner: owner.to_string(),
+            state: state.to_string(),
+            trigger: trigger.to_string(),
+            blocking,
+            signature: repair_lane_signature(owner, lane, trigger, None),
+            updated_at_us: repair_lane_now_us(),
+            generation,
+            attempt,
+            deadline_at_us,
+            reason,
+            route_outcome: None,
+        });
+    }
+
+    pub fn repair_lane_snapshot(&self) -> Vec<StatusRepairLaneEvidence> {
+        self.repair_lane_evidence
+            .lock()
+            .map(|guard| guard.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn begin_facade_request(self: &Arc<Self>) -> ApiRequestGuard {

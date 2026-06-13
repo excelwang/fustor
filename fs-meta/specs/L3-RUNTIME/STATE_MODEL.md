@@ -151,6 +151,68 @@ QueryObservationState =
 8. Management Write Ready MAY be open while Trusted Observation Ready is still closed; in that case full management writes can be accepted, but trusted-materialized reads remain closed until observation evidence catches up.
 9. Trusted Observation Ready MUST NOT be inferred from API Facade Liveness, Source Repair Ready, or Management Write Ready; it follows `QueryObservationState=trusted-materialized` and package-local observation eligibility.
 
+## [state-machine] RecoveryLaneState
+
+**Rationale**
+
+Operators need to know whether recovery work is pending, running,
+blocked, complete, or failed without making `/status` execute that work.
+
+**Type Signature**
+
+```text
+RecoveryLaneState =
+  | idle
+  | scheduled
+  | inflight
+  | blocked
+  | completed
+  | failed
+  | timed-out
+  | skipped
+```
+
+**State Meaning**
+
+1. `idle`: the lane has no current work for the active Authority Epoch.
+2. `scheduled`: work is queued or woken but has not started executing.
+3. `inflight`: work is actively applying control state, collecting route evidence, or processing recovery.
+4. `blocked`: work cannot proceed until named prerequisite evidence appears, such as route availability, worker client availability, source repair readiness, or sink owner evidence.
+5. `completed`: work completed for its current diagnostic signature and Authority Epoch.
+6. `failed`: work reached a terminal non-timeout error for the current diagnostic signature.
+7. `timed-out`: work exhausted its bounded deadline for the current diagnostic signature.
+8. `skipped`: the lane intentionally did not run because another owner lane owns the same recovery, the predicate was not satisfied, or the request was observation-only.
+
+**Allowed Transitions**
+
+| From | To | Trigger |
+|---|---|---|
+| `idle` | `scheduled` | retained replay, roots-control propagation, manual rescan, worker recovery, or materialization repair is requested |
+| `scheduled` | `inflight` | the lane starts its bounded execution turn |
+| `scheduled` | `blocked` | a prerequisite is absent before execution starts |
+| `inflight` | `completed` | the lane proves its bounded objective for the current signature |
+| `inflight` | `blocked` | route, worker, owner, or readiness prerequisite becomes unavailable |
+| `inflight` | `failed` | terminal non-timeout error occurs |
+| `inflight` | `timed-out` | the lane deadline expires |
+| `blocked` | `scheduled` | prerequisite evidence changes or a nonblocking wake requeues the lane |
+| `completed` | `scheduled` | a new Authority Epoch, generation, trigger, or diagnostic signature opens new work |
+| `failed` | `scheduled` | an explicit retry policy or new signature reopens work |
+| `timed-out` | `scheduled` | an explicit retry policy or new signature reopens work |
+| `scheduled` | `skipped` | another lane already owns the same recovery or the predicate is false |
+
+**Concurrency Rules**
+
+1. For a given diagnostic signature, `scheduled` and `inflight` are single-flight ownership states.
+2. A status-observation wake that encounters the same lane signature already `scheduled` or `inflight` MUST observe that lane instead of starting another execution turn.
+3. New work for the same lane requires a new Authority Epoch, generation, trigger, diagnostic signature, or an explicit retry transition from `failed`/`timed-out`/`blocked`/`completed`.
+
+**User Question This Answers**
+
+1. Is recovery work waiting, running, blocked, done, or failed?
+2. Which recovery owner owns the work?
+3. Did this `/status` request block on recovery, merely observe it, or skip it?
+4. Which generation/signature should be used to correlate repeated observations?
+
 ## [decision] MaterializedReadinessEvidenceEpochMonotonicity
 
 1. Materialized readiness evidence is evaluated per Authority Epoch.

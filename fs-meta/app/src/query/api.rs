@@ -218,7 +218,8 @@ fn summarize_event_counts_by_origin(events: &[Event]) -> Vec<String> {
         .collect()
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiParams {
     pub path: Option<String>,
     pub path_b64: Option<String>,
@@ -982,10 +983,11 @@ pub(crate) fn merge_sink_status_snapshots(
             if host_ref.is_empty() {
                 continue;
             }
-            if snapshot_scheduled_groups_by_node
-                .get(host_ref)
-                .is_some_and(|groups| groups.iter().any(|scheduled| scheduled == group_id))
-            {
+            if sink_status_schedule_contains_group_for_equivalent_node(
+                &snapshot_scheduled_groups_by_node,
+                host_ref,
+                group_id,
+            ) {
                 primary_host_ref_by_group.insert(group_id.clone(), host_ref.to_string());
                 scheduled_primary_host_ref_groups.insert(group_id.clone());
             }
@@ -1116,6 +1118,52 @@ pub(crate) fn merge_sink_status_snapshots(
         merged.shadow_time_us = merged.shadow_time_us.max(group.shadow_time_us);
     }
     merged
+}
+
+fn sink_status_node_ref(value: &str) -> &str {
+    value
+        .split_once("::")
+        .map(|(node_id, _)| node_id)
+        .unwrap_or(value)
+        .trim()
+}
+
+fn sink_status_node_identity_matches(left: &str, right: &str) -> bool {
+    let left = sink_status_node_ref(left);
+    let right = sink_status_node_ref(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+        || left.strip_prefix("cluster-").is_some_and(|left_scoped| {
+            left_scoped == right
+                || left_scoped
+                    .strip_prefix(right)
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+        })
+        || right.strip_prefix("cluster-").is_some_and(|right_scoped| {
+            right_scoped == left
+                || right_scoped
+                    .strip_prefix(left)
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+        })
+}
+
+fn sink_status_schedule_contains_group_for_equivalent_node(
+    scheduled_groups_by_node: &BTreeMap<String, Vec<String>>,
+    host_ref: &str,
+    group_id: &str,
+) -> bool {
+    scheduled_groups_by_node.iter().any(|(node_id, groups)| {
+        sink_status_node_identity_matches(node_id, host_ref)
+            && groups.iter().any(|scheduled| scheduled == group_id)
+    })
 }
 
 pub(crate) fn internal_status_request_payload() -> Bytes {
@@ -4673,7 +4721,23 @@ fn stats_read_class(params: &NormalizedApiParams) -> ReadClass {
     params.read_class.unwrap_or(ReadClass::TrustedMaterialized)
 }
 
-fn validate_stats_query_params(params: &NormalizedApiParams) -> std::result::Result<(), CnxError> {
+fn validate_stats_query_params(params: &ApiParams) -> std::result::Result<(), CnxError> {
+    let unsupported = [
+        (params.max_depth.is_some(), "max_depth"),
+        (params.pit_id.is_some(), "pit_id"),
+        (params.group_order.is_some(), "group_order"),
+        (params.group_page_size.is_some(), "group_page_size"),
+        (params.group_after.is_some(), "group_after"),
+        (params.entry_page_size.is_some(), "entry_page_size"),
+        (params.entry_after.is_some(), "entry_after"),
+    ]
+    .into_iter()
+    .find_map(|(present, name)| present.then_some(name));
+    if let Some(name) = unsupported {
+        return Err(CnxError::InvalidInput(format!(
+            "{name} is not supported on /stats"
+        )));
+    }
     if params
         .read_class
         .is_some_and(|read_class| read_class == ReadClass::Fresh)
@@ -4691,6 +4755,7 @@ fn validate_tree_query_params(params: &NormalizedApiParams) -> std::result::Resu
             "pit_id is required when using group_after or entry_after".into(),
         ));
     }
+    validate_paged_query_params(params, CursorQueryMode::Tree)?;
     Ok(())
 }
 
@@ -4707,6 +4772,41 @@ fn validate_force_find_params(params: &NormalizedApiParams) -> std::result::Resu
         return Err(CnxError::InvalidInput(
             "pit_id is required when using group_after or entry_after".into(),
         ));
+    }
+    validate_paged_query_params(params, CursorQueryMode::ForceFind)?;
+    Ok(())
+}
+
+fn validate_paged_query_params(
+    params: &NormalizedApiParams,
+    mode: CursorQueryMode,
+) -> std::result::Result<(), CnxError> {
+    normalize_group_page_size(params)?;
+    normalize_entry_page_size(params)?;
+    if let Some(raw) = params.group_after.as_deref() {
+        let cursor = decode_group_page_cursor(raw)?;
+        match mode {
+            CursorQueryMode::Tree => validate_tree_group_cursor(params, &cursor)?,
+            CursorQueryMode::ForceFind => validate_force_find_group_cursor(params, &cursor)?,
+        }
+    }
+    let entry_bundle = params
+        .entry_after
+        .as_deref()
+        .map(decode_entry_cursor_bundle)
+        .transpose()?
+        .unwrap_or_default();
+    for (group, raw) in entry_bundle {
+        match mode {
+            CursorQueryMode::Tree => {
+                let cursor = decode_tree_entry_cursor(&raw)?;
+                validate_tree_entry_cursor(params, &group, &cursor)?;
+            }
+            CursorQueryMode::ForceFind => {
+                let cursor = decode_force_find_entry_cursor(&raw)?;
+                validate_force_find_entry_cursor(params, &group, &cursor)?;
+            }
+        }
     }
     Ok(())
 }
@@ -9991,6 +10091,54 @@ fn merge_sink_status_snapshots_preserves_scheduled_only_owner_primary_host_ref()
         sink_primary_owner_node_for_group(Some(&merged), "nfs-144"),
         Some(NodeId("node-a".to_string())),
         "accepted owner-scoped sink-status primary evidence must not be dropped just because another snapshot contributed the materialized group row: {merged:?}"
+    );
+}
+
+#[test]
+fn merge_sink_status_snapshots_preserves_primary_host_ref_when_schedule_node_identity_is_equivalent()
+ {
+    let owner_scoped_schedule = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a-29885641718114460421324801".to_string(),
+            vec!["nfs-144".to_string()],
+        )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs-144".to_string(), "node-a".to_string())]),
+        ..SinkStatusSnapshot::default()
+    };
+    let materialized_without_owner_ref = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs-144".to_string(),
+            primary_object_ref: "node-a-29885641718114460421324801::nfs-144".to_string(),
+            total_nodes: 3,
+            live_nodes: 3,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 2,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 2,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+
+    let merged =
+        merge_sink_status_snapshots(vec![owner_scoped_schedule, materialized_without_owner_ref]);
+
+    assert_eq!(
+        merged
+            .scheduled_groups_by_node
+            .get("node-a-29885641718114460421324801"),
+        Some(&vec!["nfs-144".to_string()]),
+        "owner-scoped schedule evidence must survive merge: {merged:?}"
+    );
+    assert_eq!(
+        sink_primary_owner_node_for_group(Some(&merged), "nfs-144"),
+        Some(NodeId("node-a".to_string())),
+        "primary owner evidence from an equivalent schedule node identity must not be dropped when the materialized row comes from another snapshot: {merged:?}"
     );
 }
 
@@ -16203,14 +16351,13 @@ async fn get_stats(
     Query(params): Query<ApiParams>,
 ) -> impl IntoResponse {
     let policy = snapshot_policy(&state.policy);
+    if let Err(err) = validate_stats_query_params(&params) {
+        return error_response_with_context(err, None);
+    }
     let params = match normalize_api_params(params) {
         Ok(params) => params,
         Err(err) => return error_response_with_context(err, None),
     };
-    let path_for_error = params.path.clone();
-    if let Err(err) = validate_stats_query_params(&params) {
-        return error_response_with_context(err, Some(&path_for_error));
-    }
     let read_class = stats_read_class(&params);
     let mut request_source_status = None::<SourceStatusSnapshot>;
     let mut request_sink_status = None::<SinkStatusSnapshot>;

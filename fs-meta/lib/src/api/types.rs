@@ -4,6 +4,7 @@ use crate::domain_state::{
 use crate::source::config::GrantedMountRoot;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoginRequest {
@@ -292,7 +293,50 @@ pub struct AuthorityEpochEvidence {
 pub struct ReadinessPlanesEvidence {
     pub api_facade_liveness: bool,
     pub management_write_readiness: bool,
+    pub source_repair_readiness: bool,
     pub trusted_observation_readiness: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusRepairLaneEvidence {
+    pub lane: String,
+    pub owner: String,
+    pub state: String,
+    pub trigger: String,
+    pub blocking: bool,
+    pub signature: String,
+    pub updated_at_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_at_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_outcome: Option<String>,
+}
+
+pub fn repair_lane_now_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as u64)
+        .unwrap_or_default()
+}
+
+pub fn repair_lane_signature(
+    owner: &str,
+    lane: &str,
+    trigger: &str,
+    route_outcome: Option<&str>,
+) -> String {
+    match route_outcome {
+        Some(route_outcome) if !route_outcome.is_empty() => {
+            format!("{owner}:{lane}:{trigger}:{route_outcome}")
+        }
+        _ => format!("{owner}:{lane}:{trigger}"),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -300,6 +344,7 @@ pub struct StatusResponse {
     pub runtime_artifact: RuntimeArtifactEvidence,
     pub authority_epoch: AuthorityEpochEvidence,
     pub readiness_planes: ReadinessPlanesEvidence,
+    pub repair_lanes: Vec<StatusRepairLaneEvidence>,
     pub source: StatusSource,
     pub sink: StatusSink,
     pub rollout: StatusRollout,

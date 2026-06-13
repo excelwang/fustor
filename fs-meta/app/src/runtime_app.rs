@@ -14,6 +14,7 @@ use crate::api::facade_status::{
 use crate::api::rollout_status::{
     PublishedRolloutStatusSnapshot, SharedRolloutStatusCell, shared_rollout_status_cell,
 };
+use crate::api::types::repair_lane_now_us;
 use crate::api::{ApiControlGate, ApiRequestTracker, ManagementWriteRecovery};
 use crate::domain_state::{FacadeServiceState, RolloutGenerationState};
 use crate::query::TreeGroupPayload;
@@ -116,6 +117,11 @@ const SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON: &str =
     "source worker runtime scope served from control cache";
 const SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON: &str =
     "source worker source state pending; delivery proof withheld";
+
+fn repair_lane_deadline_at_us(timeout: Duration) -> u64 {
+    let timeout_us = timeout.as_micros().min(u64::MAX as u128) as u64;
+    repair_lane_now_us().saturating_add(timeout_us)
+}
 
 struct FacadeActivation {
     route_key: String,
@@ -1369,6 +1375,7 @@ struct SinkGenerationCutoverDecisionInput<'a> {
 enum SinkGenerationCutoverInlineAction {
     DeferReplay,
     ApplyAsInitialAuditCatchup,
+    CompleteFromTrustedMaterialized,
     Apply,
 }
 
@@ -1378,6 +1385,7 @@ fn sink_generation_cutover_inline_action_from_evidence(
     source_state_replay_required: bool,
     sink_generation_cutover_replay_deferred: bool,
     initial_materialization_catchup: bool,
+    trusted_materialized_current: bool,
 ) -> SinkGenerationCutoverInlineAction {
     let can_defer_replay = matches!(
         generation_cutover_disposition,
@@ -1385,6 +1393,9 @@ fn sink_generation_cutover_inline_action_from_evidence(
     ) && has_post_initial_single_route_activate;
     if !can_defer_replay {
         return SinkGenerationCutoverInlineAction::Apply;
+    }
+    if !source_state_replay_required && trusted_materialized_current {
+        return SinkGenerationCutoverInlineAction::CompleteFromTrustedMaterialized;
     }
     if !source_state_replay_required && initial_materialization_catchup {
         return SinkGenerationCutoverInlineAction::ApplyAsInitialAuditCatchup;
@@ -3593,6 +3604,7 @@ fn initial_audit_catchup_applies_first_post_initial_sink_cutover_without_deferri
             false,
             false,
             true,
+            false,
         ),
         SinkGenerationCutoverInlineAction::ApplyAsInitialAuditCatchup,
         "online initial audit catch-up with materialized sink progress should not first schedule a sink-generation-cutover replay"
@@ -3601,6 +3613,19 @@ fn initial_audit_catchup_applies_first_post_initial_sink_cutover_without_deferri
         sink_generation_cutover_inline_action_from_evidence(
             SinkGenerationCutoverDisposition::FailClosedRetainedReplayOnRetryableReset,
             true,
+            false,
+            false,
+            false,
+            true,
+        ),
+        SinkGenerationCutoverInlineAction::CompleteFromTrustedMaterialized,
+        "trusted/materialized sink evidence must complete retained cutover observation without replaying sink control"
+    );
+    assert_eq!(
+        sink_generation_cutover_inline_action_from_evidence(
+            SinkGenerationCutoverDisposition::FailClosedRetainedReplayOnRetryableReset,
+            true,
+            false,
             false,
             false,
             false,
@@ -3615,6 +3640,7 @@ fn initial_audit_catchup_applies_first_post_initial_sink_cutover_without_deferri
             false,
             false,
             true,
+            false,
         ),
         SinkGenerationCutoverInlineAction::Apply,
         "shared generation cutover is outside the initial-audit catch-up exception"
@@ -3625,6 +3651,7 @@ fn initial_audit_catchup_applies_first_post_initial_sink_cutover_without_deferri
             true,
             true,
             false,
+            true,
             true,
         ),
         SinkGenerationCutoverInlineAction::Apply,
@@ -4623,6 +4650,7 @@ struct ManagementWriteRecoveryContext {
     facade_service_state: SharedFacadeServiceStateCell,
     api_control_gate: Arc<ApiControlGate>,
     control_failure_uninitialized: Arc<AtomicBool>,
+    internal_status_withdrawn_after_control_failure: Arc<AtomicBool>,
     runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
     runtime_state_changed: Arc<tokio::sync::Notify>,
     retained_sink_control_state: Arc<Mutex<RetainedSinkControlState>>,
@@ -4658,6 +4686,12 @@ struct SourceScopedSinkObservationRepairSignature {
     local_groups: BTreeSet<String>,
     logical_roots_generation: u64,
     logical_roots: LogicalRootsRepairSignature,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceScopedSinkReplayDuplicatePolicy {
+    SuppressStatusObservationDuplicate,
+    AllowFullRecoveryRepublish,
 }
 
 struct ManagementWriteRecoveryInflightGuard {
@@ -5326,6 +5360,33 @@ impl ManagementWriteRecoveryContext {
         total_timeout: Duration,
         publish_deadline: Option<tokio::time::Instant>,
     ) -> std::result::Result<bool, CnxError> {
+        self.replay_source_scoped_sink_state_if_present_with_policy(
+            total_timeout,
+            publish_deadline,
+            SourceScopedSinkReplayDuplicatePolicy::SuppressStatusObservationDuplicate,
+        )
+        .await
+    }
+
+    async fn replay_source_scoped_sink_state_for_full_recovery_if_present(
+        &self,
+        total_timeout: Duration,
+        publish_deadline: Option<tokio::time::Instant>,
+    ) -> std::result::Result<bool, CnxError> {
+        self.replay_source_scoped_sink_state_if_present_with_policy(
+            total_timeout,
+            publish_deadline,
+            SourceScopedSinkReplayDuplicatePolicy::AllowFullRecoveryRepublish,
+        )
+        .await
+    }
+
+    async fn replay_source_scoped_sink_state_if_present_with_policy(
+        &self,
+        total_timeout: Duration,
+        publish_deadline: Option<tokio::time::Instant>,
+        duplicate_policy: SourceScopedSinkReplayDuplicatePolicy,
+    ) -> std::result::Result<bool, CnxError> {
         let signals = self.source_scoped_sink_replay_signals().await?;
         if signals.is_empty() {
             return Ok(false);
@@ -5347,9 +5408,11 @@ impl ManagementWriteRecoveryContext {
             &roots,
             generation,
         );
-        if self
-            .source_scoped_sink_observation_repair_already_applied(&signature)
-            .await
+        if duplicate_policy
+            == SourceScopedSinkReplayDuplicatePolicy::SuppressStatusObservationDuplicate
+            && self
+                .source_scoped_sink_observation_repair_already_applied(&signature)
+                .await
         {
             if debug_sink_recovery_capture_enabled() {
                 eprintln!(
@@ -5687,6 +5750,8 @@ impl ManagementWriteRecoveryContext {
             self.update_runtime_control_state(|state| state.mark_initialized());
             self.control_failure_uninitialized
                 .store(false, Ordering::Release);
+            self.internal_status_withdrawn_after_control_failure
+                .store(false, Ordering::Release);
         }
     }
 
@@ -5904,7 +5969,7 @@ impl ManagementWriteRecoveryContext {
                         .should_replay_source_scoped_sink_state_after_app_retained_replay()
                         .await?
                     {
-                        self.replay_source_scoped_sink_state_if_present(
+                        self.replay_source_scoped_sink_state_for_full_recovery_if_present(
                             SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
                             None,
                         )
@@ -5915,7 +5980,7 @@ impl ManagementWriteRecoveryContext {
                 }
             } else if !self.sink.retained_replay_required()
                 && self
-                    .replay_source_scoped_sink_state_if_present(
+                    .replay_source_scoped_sink_state_for_full_recovery_if_present(
                         SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
                         None,
                     )
@@ -6012,7 +6077,7 @@ impl ManagementWriteRecoveryContext {
                         .should_replay_source_scoped_sink_state_after_app_retained_replay()
                         .await?
                 {
-                    self.replay_source_scoped_sink_state_if_present(
+                    self.replay_source_scoped_sink_state_for_full_recovery_if_present(
                         SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
                         None,
                     )
@@ -6021,7 +6086,7 @@ impl ManagementWriteRecoveryContext {
                 !self.sink.retained_replay_required()
             } else if !self.sink.retained_replay_required()
                 && self
-                    .replay_source_scoped_sink_state_if_present(
+                    .replay_source_scoped_sink_state_for_full_recovery_if_present(
                         SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
                         None,
                     )
@@ -9627,6 +9692,7 @@ pub struct FSMetaApp {
     pending_fixed_bind_claim_release_followup: Arc<AtomicBool>,
     pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
     control_failure_uninitialized: Arc<AtomicBool>,
+    internal_status_withdrawn_after_control_failure: Arc<AtomicBool>,
     management_write_recovery_inflight: Arc<AtomicBool>,
     source_fail_closed_reinitialize_required: Arc<AtomicBool>,
     source_generation_cutover_replay_deferred: Arc<AtomicBool>,
@@ -9959,6 +10025,97 @@ impl From<CnxError> for RuntimeWorkerControlApplyFailure {
 }
 
 impl FSMetaApp {
+    fn fixture_runtime_scope_signature(
+        generation: u64,
+        roots: &[source::config::RootSpec],
+    ) -> String {
+        let root_ids = roots
+            .iter()
+            .map(|root| root.id.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        format!("generation:{generation}:roots:{root_ids}")
+    }
+
+    async fn current_fixture_runtime_scope_convergence(
+        &self,
+    ) -> Result<(String, u64, Vec<RuntimeBoundScope>)> {
+        let roots = self
+            .source
+            .logical_roots_snapshot_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)?;
+        let generation = self
+            .source
+            .logical_roots_generation_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)?
+            .max(1);
+        let signature = Self::fixture_runtime_scope_signature(generation, &roots);
+        let worker_scopes = roots
+            .iter()
+            .map(|root| RuntimeBoundScope {
+                scope_id: root.id.clone(),
+                resource_ids: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        Ok((signature, generation, worker_scopes))
+    }
+
+    fn fixture_runtime_scope_activate_envelope(
+        unit_id: &str,
+        generation: u64,
+        bound_scopes: Vec<RuntimeBoundScope>,
+    ) -> Result<ControlEnvelope> {
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+            unit_id: unit_id.to_string(),
+            lease: None,
+            generation,
+            expires_at_ms: 60_000,
+            bound_scopes,
+        }))
+    }
+
+    #[doc(hidden)]
+    pub async fn fixture_runtime_scope_convergence_signature_for_current_roots(
+        &self,
+    ) -> Result<String> {
+        self.current_fixture_runtime_scope_convergence()
+            .await
+            .map(|(signature, _, _)| signature)
+    }
+
+    #[doc(hidden)]
+    pub async fn apply_fixture_runtime_scope_convergence_for_current_roots(
+        &self,
+    ) -> Result<String> {
+        let (signature, generation, worker_scopes) =
+            self.current_fixture_runtime_scope_convergence().await?;
+        let envelopes = [
+            Self::fixture_runtime_scope_activate_envelope(
+                "runtime.exec.source",
+                generation,
+                worker_scopes.clone(),
+            )?,
+            Self::fixture_runtime_scope_activate_envelope(
+                "runtime.exec.scan",
+                generation,
+                worker_scopes.clone(),
+            )?,
+            Self::fixture_runtime_scope_activate_envelope(
+                "runtime.exec.sink",
+                generation,
+                worker_scopes,
+            )?,
+        ];
+        self.on_control_frame(&envelopes).await?;
+        self.sink
+            .mark_fixture_stream_receive_armed_with_failure()
+            .map_err(SinkFailure::into_error)?;
+        Ok(signature)
+    }
+
     fn management_write_recovery_context(&self) -> ManagementWriteRecoveryContext {
         ManagementWriteRecoveryContext {
             instance_id: self.instance_id,
@@ -9971,6 +10128,9 @@ impl FSMetaApp {
             facade_service_state: self.facade_service_state.clone(),
             api_control_gate: self.api_control_gate.clone(),
             control_failure_uninitialized: self.control_failure_uninitialized.clone(),
+            internal_status_withdrawn_after_control_failure: self
+                .internal_status_withdrawn_after_control_failure
+                .clone(),
             runtime_gate_state: self.runtime_gate_state.clone(),
             runtime_state_changed: self.runtime_state_changed.clone(),
             retained_sink_control_state: self.retained_sink_control_state.clone(),
@@ -10049,7 +10209,41 @@ impl FSMetaApp {
         RuntimeControlState::from_state_cell(runtime_gate_state).sink_state_replay_required()
     }
 
-    fn schedule_deferred_source_repair_recovery(&self, reason: &'static str) {
+    async fn retained_source_repair_lane_generation(&self) -> Option<u64> {
+        self.source
+            .control_signals_with_replay(&[])
+            .await
+            .iter()
+            .map(source_signal_generation)
+            .filter(|generation| *generation > 0)
+            .max()
+    }
+
+    async fn retained_sink_repair_lane_generation(&self) -> Option<u64> {
+        let retained_sink_generation = self
+            .retained_sink_control_state
+            .lock()
+            .await
+            .active_by_route
+            .values()
+            .map(sink_signal_generation)
+            .filter(|generation| *generation > 0)
+            .max();
+        let retained_source_generation = self
+            .source
+            .control_signals_with_replay(&[])
+            .await
+            .iter()
+            .map(source_signal_generation)
+            .filter(|generation| *generation > 0)
+            .max();
+        retained_sink_generation
+            .into_iter()
+            .chain(retained_source_generation)
+            .max()
+    }
+
+    async fn schedule_deferred_source_repair_recovery(&self, reason: &'static str) {
         if self.closing.load(Ordering::Acquire) {
             return;
         }
@@ -10061,21 +10255,50 @@ impl FSMetaApp {
             return;
         }
 
+        let generation = self.retained_source_repair_lane_generation().await;
+        let deadline_at_us = Some(repair_lane_deadline_at_us(
+            SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT,
+        ));
+        self.api_control_gate
+            .record_repair_lane_state_with_metadata(
+                "source-repair",
+                "source",
+                "scheduled",
+                reason,
+                false,
+                Some("deferred source repair scheduled".to_string()),
+                generation,
+                None,
+                deadline_at_us,
+            );
         let recovery = self.source_repair_recovery();
         let runtime_gate_state = self.runtime_gate_state.clone();
         let runtime_state_changed = self.runtime_state_changed.clone();
         let scheduled = self.deferred_source_repair_recovery_scheduled.clone();
+        let api_control_gate = self.api_control_gate.clone();
         tokio::spawn(async move {
             eprintln!(
                 "fs_meta_runtime_app: deferred source repair scheduled reason={}",
                 reason
             );
             let deadline = tokio::time::Instant::now() + SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT;
+            let mut attempt = 0u32;
             loop {
                 if !Self::source_repair_still_required(&runtime_gate_state) {
                     eprintln!(
                         "fs_meta_runtime_app: deferred source repair done reason={}",
                         reason
+                    );
+                    api_control_gate.record_repair_lane_state_with_metadata(
+                        "source-repair",
+                        "source",
+                        "completed",
+                        reason,
+                        false,
+                        None,
+                        generation,
+                        (attempt > 0).then_some(attempt),
+                        deadline_at_us,
                     );
                     scheduled.store(false, Ordering::Release);
                     return;
@@ -10086,6 +10309,17 @@ impl FSMetaApp {
                     eprintln!(
                         "fs_meta_runtime_app: deferred source repair timed out reason={}",
                         reason
+                    );
+                    api_control_gate.record_repair_lane_state_with_metadata(
+                        "source-repair",
+                        "source",
+                        "timed-out",
+                        reason,
+                        false,
+                        Some("deferred source repair deadline elapsed".to_string()),
+                        generation,
+                        (attempt > 0).then_some(attempt),
+                        deadline_at_us,
                     );
                     scheduled.store(false, Ordering::Release);
                     return;
@@ -10098,6 +10332,18 @@ impl FSMetaApp {
                     _ = tokio::time::sleep(DEFERRED_SOURCE_REPAIR_QUIET_WINDOW.min(remaining)) => {}
                 }
 
+                attempt = attempt.saturating_add(1);
+                api_control_gate.record_repair_lane_state_with_metadata(
+                    "source-repair",
+                    "source",
+                    "inflight",
+                    reason,
+                    false,
+                    None,
+                    generation,
+                    Some(attempt),
+                    deadline_at_us,
+                );
                 match tokio::time::timeout(remaining, recovery()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
@@ -10105,11 +10351,33 @@ impl FSMetaApp {
                             "fs_meta_runtime_app: deferred source repair failed reason={} err={}",
                             reason, err
                         );
+                        api_control_gate.record_repair_lane_state_with_metadata(
+                            "source-repair",
+                            "source",
+                            "failed",
+                            reason,
+                            false,
+                            Some(err.to_string()),
+                            generation,
+                            Some(attempt),
+                            deadline_at_us,
+                        );
                     }
                     Err(_) => {
                         eprintln!(
                             "fs_meta_runtime_app: deferred source repair timed out reason={}",
                             reason
+                        );
+                        api_control_gate.record_repair_lane_state_with_metadata(
+                            "source-repair",
+                            "source",
+                            "timed-out",
+                            reason,
+                            false,
+                            Some("deferred source repair attempt timed out".to_string()),
+                            generation,
+                            Some(attempt),
+                            deadline_at_us,
                         );
                         scheduled.store(false, Ordering::Release);
                         return;
@@ -10120,6 +10388,17 @@ impl FSMetaApp {
                     eprintln!(
                         "fs_meta_runtime_app: deferred source repair done reason={}",
                         reason
+                    );
+                    api_control_gate.record_repair_lane_state_with_metadata(
+                        "source-repair",
+                        "source",
+                        "completed",
+                        reason,
+                        false,
+                        None,
+                        generation,
+                        (attempt > 0).then_some(attempt),
+                        deadline_at_us,
                     );
                     scheduled.store(false, Ordering::Release);
                     return;
@@ -10133,7 +10412,7 @@ impl FSMetaApp {
         });
     }
 
-    fn schedule_deferred_sink_repair_recovery(&self, reason: &'static str) {
+    async fn schedule_deferred_sink_repair_recovery(&self, reason: &'static str) {
         if self.closing.load(Ordering::Acquire) {
             return;
         }
@@ -10145,21 +10424,50 @@ impl FSMetaApp {
             return;
         }
 
+        let generation = self.retained_sink_repair_lane_generation().await;
+        let deadline_at_us = Some(repair_lane_deadline_at_us(
+            SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
+        ));
+        self.api_control_gate
+            .record_repair_lane_state_with_metadata(
+                "sink-repair",
+                "sink",
+                "scheduled",
+                reason,
+                false,
+                Some("deferred sink repair scheduled".to_string()),
+                generation,
+                None,
+                deadline_at_us,
+            );
         let recovery = self.sink_repair_recovery();
         let runtime_gate_state = self.runtime_gate_state.clone();
         let runtime_state_changed = self.runtime_state_changed.clone();
         let scheduled = self.deferred_sink_repair_recovery_scheduled.clone();
+        let api_control_gate = self.api_control_gate.clone();
         tokio::spawn(async move {
             eprintln!(
                 "fs_meta_runtime_app: deferred sink repair scheduled reason={}",
                 reason
             );
             let deadline = tokio::time::Instant::now() + SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT;
+            let mut attempt = 0u32;
             loop {
                 if !Self::sink_repair_still_required(&runtime_gate_state) {
                     eprintln!(
                         "fs_meta_runtime_app: deferred sink repair done reason={}",
                         reason
+                    );
+                    api_control_gate.record_repair_lane_state_with_metadata(
+                        "sink-repair",
+                        "sink",
+                        "completed",
+                        reason,
+                        false,
+                        None,
+                        generation,
+                        (attempt > 0).then_some(attempt),
+                        deadline_at_us,
                     );
                     scheduled.store(false, Ordering::Release);
                     return;
@@ -10171,10 +10479,33 @@ impl FSMetaApp {
                         "fs_meta_runtime_app: deferred sink repair timed out reason={}",
                         reason
                     );
+                    api_control_gate.record_repair_lane_state_with_metadata(
+                        "sink-repair",
+                        "sink",
+                        "timed-out",
+                        reason,
+                        false,
+                        Some("deferred sink repair deadline elapsed".to_string()),
+                        generation,
+                        (attempt > 0).then_some(attempt),
+                        deadline_at_us,
+                    );
                     scheduled.store(false, Ordering::Release);
                     return;
                 }
 
+                attempt = attempt.saturating_add(1);
+                api_control_gate.record_repair_lane_state_with_metadata(
+                    "sink-repair",
+                    "sink",
+                    "inflight",
+                    reason,
+                    false,
+                    None,
+                    generation,
+                    Some(attempt),
+                    deadline_at_us,
+                );
                 match tokio::time::timeout(remaining, recovery()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
@@ -10182,11 +10513,33 @@ impl FSMetaApp {
                             "fs_meta_runtime_app: deferred sink repair failed reason={} err={}",
                             reason, err
                         );
+                        api_control_gate.record_repair_lane_state_with_metadata(
+                            "sink-repair",
+                            "sink",
+                            "failed",
+                            reason,
+                            false,
+                            Some(err.to_string()),
+                            generation,
+                            Some(attempt),
+                            deadline_at_us,
+                        );
                     }
                     Err(_) => {
                         eprintln!(
                             "fs_meta_runtime_app: deferred sink repair timed out reason={}",
                             reason
+                        );
+                        api_control_gate.record_repair_lane_state_with_metadata(
+                            "sink-repair",
+                            "sink",
+                            "timed-out",
+                            reason,
+                            false,
+                            Some("deferred sink repair attempt timed out".to_string()),
+                            generation,
+                            Some(attempt),
+                            deadline_at_us,
                         );
                         scheduled.store(false, Ordering::Release);
                         return;
@@ -10197,6 +10550,17 @@ impl FSMetaApp {
                     eprintln!(
                         "fs_meta_runtime_app: deferred sink repair done reason={}",
                         reason
+                    );
+                    api_control_gate.record_repair_lane_state_with_metadata(
+                        "sink-repair",
+                        "sink",
+                        "completed",
+                        reason,
+                        false,
+                        None,
+                        generation,
+                        (attempt > 0).then_some(attempt),
+                        deadline_at_us,
                     );
                     scheduled.store(false, Ordering::Release);
                     return;
@@ -10477,6 +10841,8 @@ impl FSMetaApp {
             self.update_runtime_control_state(|state| state.mark_initialized());
             self.control_failure_uninitialized
                 .store(false, Ordering::Release);
+            self.internal_status_withdrawn_after_control_failure
+                .store(false, Ordering::Release);
         }
         self.publish_recovered_facade_state_after_retained_replay()
             .await;
@@ -10551,6 +10917,24 @@ impl FSMetaApp {
                         && root.last_error.is_none()
                         && root.last_audit_started_at_us.is_some()
                         && root.last_audit_completed_at_us.is_none()
+                })
+            })
+    }
+
+    fn source_status_snapshot_has_completed_initial_audit_for_expected_groups(
+        snapshot: &crate::source::SourceStatusSnapshot,
+        expected_groups: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        !expected_groups.is_empty()
+            && expected_groups.iter().all(|expected_group| {
+                snapshot.concrete_roots.iter().any(|root| {
+                    root.logical_root_id == *expected_group
+                        && root.active
+                        && root.is_group_primary
+                        && root.scan_enabled
+                        && root.last_error.is_none()
+                        && root.last_audit_started_at_us.is_some()
+                        && root.last_audit_completed_at_us.is_some()
                 })
             })
     }
@@ -11160,6 +11544,8 @@ impl FSMetaApp {
                 self.update_runtime_control_state(|state| state.mark_initialized());
                 self.control_failure_uninitialized
                     .store(false, Ordering::Release);
+                self.internal_status_withdrawn_after_control_failure
+                    .store(false, Ordering::Release);
                 fixed_bind_session = self
                     .rebuild_fixed_bind_lifecycle_session(
                         &fixed_bind_session,
@@ -11219,6 +11605,7 @@ impl FSMetaApp {
                     self.runtime_state_changed.clone(),
                     self.pending_fixed_bind_has_suppressed_dependent_routes.clone(),
                     self.control_failure_uninitialized.clone(),
+                    self.internal_status_withdrawn_after_control_failure.clone(),
                 );
             } else {
                 fixed_bind_session = self
@@ -11327,6 +11714,7 @@ impl FSMetaApp {
         runtime_state_changed: Arc<tokio::sync::Notify>,
         pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
         control_failure_uninitialized: Arc<AtomicBool>,
+        internal_status_withdrawn_after_control_failure: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
             let retained_sink_replay_present = !post_return_sink_replay_signals.is_empty();
@@ -11395,6 +11783,7 @@ impl FSMetaApp {
                 if state.replay_fully_cleared() {
                     state.mark_initialized();
                     control_failure_uninitialized.store(false, Ordering::Release);
+                    internal_status_withdrawn_after_control_failure.store(false, Ordering::Release);
                 }
             }
             runtime_state_changed.notify_waiters();
@@ -11645,6 +12034,7 @@ impl FSMetaApp {
             pending_fixed_bind_claim_release_followup: Arc::new(AtomicBool::new(false)),
             pending_fixed_bind_has_suppressed_dependent_routes: Arc::new(AtomicBool::new(false)),
             control_failure_uninitialized: Arc::new(AtomicBool::new(false)),
+            internal_status_withdrawn_after_control_failure: Arc::new(AtomicBool::new(false)),
             management_write_recovery_inflight: Arc::new(AtomicBool::new(false)),
             source_fail_closed_reinitialize_required: Arc::new(AtomicBool::new(false)),
             source_generation_cutover_replay_deferred: Arc::new(AtomicBool::new(false)),
@@ -13237,6 +13627,8 @@ impl FSMetaApp {
         self.update_runtime_control_state(|state| state.mark_initialized());
         self.control_failure_uninitialized
             .store(false, Ordering::Release);
+        self.internal_status_withdrawn_after_control_failure
+            .store(false, Ordering::Release);
         let _ = self
             .publish_facade_service_state_with_session(fixed_bind_session)
             .await;
@@ -13929,6 +14321,8 @@ impl FSMetaApp {
                 let retained_sink_control_state = self.retained_sink_control_state.clone();
                 let runtime_state_changed = self.runtime_state_changed.clone();
                 let control_failure_uninitialized = self.control_failure_uninitialized.clone();
+                let internal_status_withdrawn_after_control_failure =
+                    self.internal_status_withdrawn_after_control_failure.clone();
                 let route_key = route.0.clone();
                 eprintln!(
                     "fs_meta_runtime_app: spawning sink status endpoint route={}",
@@ -13958,6 +14352,8 @@ impl FSMetaApp {
                             let runtime_state_changed = runtime_state_changed.clone();
                             let control_failure_uninitialized =
                                 control_failure_uninitialized.clone();
+                            let internal_status_withdrawn_after_control_failure =
+                                internal_status_withdrawn_after_control_failure.clone();
                             let route_key = route_key.clone();
                             let active_unit_ids = active_unit_ids.clone();
                             async move {
@@ -14037,6 +14433,15 @@ impl FSMetaApp {
                                                 "fs_meta_runtime_app: sink status endpoint unavailable reason=runtime_uninitialized_sink_apply_inflight route={}",
                                                 route_key
                                             );
+                                            if internal_status_withdrawn_after_control_failure
+                                                .load(Ordering::Acquire)
+                                            {
+                                                // A fail-closed runtime boundary is not an empty
+                                                // sink-status snapshot. Let callers observe the
+                                                // closed route instead of treating a default
+                                                // snapshot as a successful status response.
+                                                continue;
+                                            }
                                             match explicit_empty_sink_status_reply(
                                                 &req.metadata().origin_id,
                                                 req.metadata().correlation_id,
@@ -14062,6 +14467,54 @@ impl FSMetaApp {
                                             "fs_meta_runtime_app: sink status endpoint unavailable reason=runtime_replay_or_sink_apply_pending route={}",
                                             route_key
                                         );
+                                        if is_per_peer_sink_status_request_route(&route_key) {
+                                            let cached_route_status_result =
+                                                match tokio::time::timeout(
+                                                    INTERNAL_SINK_STATUS_NONBLOCKING_ROUTE_BUDGET,
+                                                    sink.status_snapshot_nonblocking_for_status_route_key(
+                                                        &route_key,
+                                                    ),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(result) => result,
+                                                    Err(_) => Err(CnxError::Timeout),
+                                                };
+                                            match cached_route_status_result {
+                                                Ok((snapshot, _used_cached_fallback))
+                                                    if !snapshot
+                                                        .progress_snapshot()
+                                                        .empty_summary =>
+                                                {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: sink status endpoint replay/apply pending route-cache fallback {}",
+                                                        summarize_sink_status_endpoint(&snapshot)
+                                                    );
+                                                    match sink_status_reply(
+                                                        &snapshot,
+                                                        &req.metadata().origin_id,
+                                                        req.metadata().correlation_id,
+                                                    ) {
+                                                        Ok(event) => responses.push(event),
+                                                        Err(err) => eprintln!(
+                                                            "fs_meta_runtime_app: sink status endpoint replay/apply pending route-cache encode failed: {err}"
+                                                        ),
+                                                    }
+                                                    continue;
+                                                }
+                                                Ok((snapshot, _used_cached_fallback)) => {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: sink status endpoint replay/apply pending route-cache empty {}",
+                                                        summarize_sink_status_endpoint(&snapshot)
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: sink status endpoint replay/apply pending route-cache failed err={err}"
+                                                    );
+                                                }
+                                            }
+                                        }
                                         let request_origin_is_local =
                                             req.metadata().origin_id == local_node_id;
                                         if request_origin_is_local
@@ -17843,7 +18296,8 @@ impl FSMetaApp {
         )
         .await;
         if schedule_repair {
-            self.schedule_deferred_source_repair_recovery("source-generation-cutover");
+            self.schedule_deferred_source_repair_recovery("source-generation-cutover")
+                .await;
         }
     }
 
@@ -17884,7 +18338,8 @@ impl FSMetaApp {
         )
         .await;
         if schedule_repair {
-            self.schedule_deferred_sink_repair_recovery("sink-generation-cutover");
+            self.schedule_deferred_sink_repair_recovery("sink-generation-cutover")
+                .await;
         }
     }
 
@@ -17957,6 +18412,12 @@ impl FSMetaApp {
         });
         self.control_failure_uninitialized
             .store(true, Ordering::Release);
+        let withdraw_internal_status = recovery_lane_policy
+            == ControlFailureRecoveryLanePolicy::WithdrawInternalStatus
+            && replay_requirement == ControlFailureReplayRequirement::Full
+            && !preserve_core_business_read_routes;
+        self.internal_status_withdrawn_after_control_failure
+            .store(withdraw_internal_status, Ordering::Release);
         self.api_control_gate.set_ready(false);
         let fixed_bind_session = self
             .rebuild_fixed_bind_lifecycle_session(
@@ -19977,6 +20438,11 @@ impl FSMetaApp {
             && self
                 .sink_status_and_source_audit_show_initial_materialization_catchup()
                 .await;
+        let trusted_materialized_current = can_defer_replay
+            && !self.runtime_control_state().source_state_replay_required()
+            && self
+                .sink_status_and_source_audit_show_trusted_materialized_current()
+                .await;
         sink_generation_cutover_inline_action_from_evidence(
             generation_cutover_disposition,
             has_post_initial_single_route_activate,
@@ -19984,7 +20450,44 @@ impl FSMetaApp {
             self.sink_generation_cutover_replay_deferred
                 .load(Ordering::Acquire),
             initial_materialization_catchup,
+            trusted_materialized_current,
         )
+    }
+
+    async fn sink_status_and_source_audit_show_trusted_materialized_current(&self) -> bool {
+        let Ok(expected_groups) = Self::runtime_scoped_facade_group_ids(&self.source, &self.sink)
+            .await
+            .map(|groups| {
+                groups
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+        else {
+            return false;
+        };
+        if expected_groups.is_empty() {
+            return false;
+        }
+        let sink_ready = self
+            .sink
+            .cached_status_snapshot_with_failure()
+            .ok()
+            .is_some_and(|snapshot| {
+                sink_status_snapshot_ready_for_expected_groups(&snapshot, &expected_groups)
+            });
+        if !sink_ready {
+            return false;
+        }
+        self.source
+            .status_snapshot_with_failure()
+            .await
+            .ok()
+            .is_some_and(|snapshot| {
+                FSMetaApp::source_status_snapshot_has_completed_initial_audit_for_expected_groups(
+                    &snapshot,
+                    &expected_groups,
+                )
+            })
     }
 
     async fn sink_status_and_source_audit_show_initial_materialization_catchup(&self) -> bool {
@@ -20051,6 +20554,70 @@ impl FSMetaApp {
             .await;
         eprintln!(
             "fs_meta_runtime_app: sink control deferred post-initial route cutover at app boundary"
+        );
+        Ok(())
+    }
+
+    async fn complete_sink_generation_cutover_from_trusted_materialized(
+        &self,
+        fixed_bind_session: &FixedBindLifecycleSession,
+        sink_signals: &[SinkControlSignal],
+    ) -> std::result::Result<(), RuntimeWorkerControlApplyFailure> {
+        let filtered_sink_signals = self
+            .filter_sink_facade_dependent_route_activates_during_pending_fixed_bind_claim_with_session(
+                &self
+                    .filter_shared_sink_route_deactivates(
+                        &self.filter_stale_sink_ticks(sink_signals).await,
+                    )
+                    .await,
+                fixed_bind_session,
+            )
+            .await;
+        self.record_retained_sink_control_state(&filtered_sink_signals)
+            .await;
+        self.record_shared_sink_route_claims(&filtered_sink_signals)
+            .await;
+        self.apply_sink_signals_to_runtime_endpoint_gate(&filtered_sink_signals)
+            .map_err(RuntimeWorkerControlApplyFailure::from)?;
+        let state = self.update_runtime_control_state(|state| {
+            state.clear_sink_replay();
+            if state.replay_fully_cleared() {
+                state.mark_initialized();
+            }
+        });
+        self.sink_generation_cutover_replay_deferred
+            .store(false, Ordering::Release);
+        if state.control_gate_ready(false) {
+            self.control_failure_uninitialized
+                .store(false, Ordering::Release);
+            self.internal_status_withdrawn_after_control_failure
+                .store(false, Ordering::Release);
+        }
+        let generation = filtered_sink_signals
+            .iter()
+            .map(sink_signal_generation)
+            .filter(|generation| *generation > 0)
+            .max();
+        self.api_control_gate
+            .record_repair_lane_state_with_metadata(
+                "sink-repair",
+                "sink",
+                "completed",
+                "sink-generation-cutover",
+                false,
+                Some(
+                    "trusted/materialized sink evidence completed retained cutover without replay"
+                        .to_string(),
+                ),
+                generation,
+                None,
+                None,
+            );
+        self.notify_runtime_state_changed();
+        self.publish_recovered_facade_state_after_retained_replay()
+            .await;
+        eprintln!(
+            "fs_meta_runtime_app: sink control completed post-initial route cutover from trusted/materialized evidence"
         );
         Ok(())
     }
@@ -21805,6 +22372,7 @@ impl FSMetaApp {
                         );
                     } else {
                         let mut sink_apply_as_initial_audit_catchup = false;
+                        let mut sink_cutover_completed_from_trusted_materialized = false;
                         if !apply_full_sink_recovery_synchronously {
                             match self
                                 .sink_generation_cutover_inline_action(
@@ -21861,19 +22429,40 @@ impl FSMetaApp {
                                         "fs_meta_runtime_app: sink control applying post-initial route cutover as initial audit materialization catch-up"
                                     );
                                 }
+                                SinkGenerationCutoverInlineAction::CompleteFromTrustedMaterialized => {
+                                    self.complete_sink_generation_cutover_from_trusted_materialized(
+                                        &fixed_bind_session,
+                                        &sink_signals,
+                                    )
+                                    .await?;
+                                    sink_cutover_completed_from_trusted_materialized = true;
+                                }
                                 SinkGenerationCutoverInlineAction::Apply => {}
                             }
                         }
-                        #[cfg(test)]
-                        note_sink_apply_entry_for_tests(self.instance_id);
-                        #[cfg(test)]
-                        maybe_pause_before_sink_apply().await;
-                        if debug_control_frame {
-                            eprintln!(
-                                "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals begin"
-                            );
-                        }
-                        if let Err(err) = self
+                        if sink_cutover_completed_from_trusted_materialized {
+                            if wait_for_status_republish_after_apply {
+                                if let Some(expected_groups) = self
+                                    .wait_for_sink_status_republish_readiness_after_recovery(None)
+                                    .await?
+                                {
+                                    self.wait_for_local_sink_status_republish_after_recovery(
+                                        &expected_groups,
+                                    )
+                                    .await?;
+                                }
+                            }
+                        } else {
+                            #[cfg(test)]
+                            note_sink_apply_entry_for_tests(self.instance_id);
+                            #[cfg(test)]
+                            maybe_pause_before_sink_apply().await;
+                            if debug_control_frame {
+                                eprintln!(
+                                    "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals begin"
+                                );
+                            }
+                            if let Err(err) = self
                         .apply_sink_signals_with_recovery(
                             &fixed_bind_session,
                             &sink_signals,
@@ -21897,20 +22486,21 @@ impl FSMetaApp {
                         );
                         return Err(err.into());
                     }
-                        if debug_control_frame {
-                            eprintln!(
-                                "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals ok"
-                            );
-                        }
-                        if wait_for_status_republish_after_apply {
-                            if let Some(expected_groups) = self
-                                .wait_for_sink_status_republish_readiness_after_recovery(None)
-                                .await?
-                            {
-                                self.wait_for_local_sink_status_republish_after_recovery(
-                                    &expected_groups,
-                                )
-                                .await?;
+                            if debug_control_frame {
+                                eprintln!(
+                                    "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals ok"
+                                );
+                            }
+                            if wait_for_status_republish_after_apply {
+                                if let Some(expected_groups) = self
+                                    .wait_for_sink_status_republish_readiness_after_recovery(None)
+                                    .await?
+                                {
+                                    self.wait_for_local_sink_status_republish_after_recovery(
+                                        &expected_groups,
+                                    )
+                                    .await?;
+                                }
                             }
                         }
                     }
@@ -22067,6 +22657,8 @@ impl FSMetaApp {
             {
                 self.update_runtime_control_state(|state| state.mark_initialized());
                 self.control_failure_uninitialized
+                    .store(false, Ordering::Release);
+                self.internal_status_withdrawn_after_control_failure
                     .store(false, Ordering::Release);
                 self.publish_recovered_facade_state_after_retained_replay()
                     .await;

@@ -495,6 +495,9 @@ async fn request_control_readiness_guard(
             facade_request_guard,
         );
     }
+    if !readiness_gate.blocks_handler_until_ready() {
+        return response_with_owned_guards(next.run(request).await, None, facade_request_guard);
+    }
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     if let Some(recovery) = readiness_gate.recovery(&control_gate) {
         tokio::spawn(async move {
@@ -511,7 +514,7 @@ async fn request_control_readiness_guard(
             || tokio::time::timeout(remaining, readiness_gate.wait_ready(&control_gate))
                 .await
                 .is_err());
-    if wait_timed_out && readiness_gate.blocks_handler_until_ready() {
+    if wait_timed_out {
         return response_with_owned_guards(
             ApiError::service_unavailable(
             "fs-meta management request handling is unavailable until runtime control initializes the app",
@@ -1220,7 +1223,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rescan_control_readiness_guard_runs_source_repair_recovery_before_waiting_not_ready() {
+    async fn rescan_control_readiness_guard_allows_handler_without_source_repair_wait() {
         let control_gate = Arc::new(ApiControlGate::new(false));
         let recovery_calls = Arc::new(AtomicUsize::new(0));
         control_gate.set_source_repair_recovery(Some(Arc::new({
@@ -1268,19 +1271,19 @@ mod tests {
             ),
         )
         .await
-        .expect("rescan should run bounded management-write recovery before timing out")
+        .expect("rescan source-repair gate must not wait in middleware")
         .expect("route rescan request");
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         assert_eq!(
             recovery_calls.load(Ordering::SeqCst),
-            1,
-            "rescan readiness guard must drive exactly one bounded source-repair recovery before allowing the handler"
+            0,
+            "rescan source-repair recovery is owned by the /index/rescan handler, not the middleware"
         );
         assert_eq!(
             handler_calls.load(Ordering::SeqCst),
             1,
-            "rescan handler must run after source-repair recovery reopens the gate"
+            "rescan middleware must enter the handler without spending the source-repair budget"
         );
     }
 
@@ -1351,8 +1354,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rescan_control_readiness_guard_enters_handler_while_source_repair_recovery_continues()
-    {
+    async fn rescan_control_readiness_guard_enters_handler_without_owning_source_repair() {
         tokio::time::pause();
 
         let control_gate = Arc::new(ApiControlGate::new(false));
@@ -1399,7 +1401,8 @@ mod tests {
                 request_control_readiness_guard,
             ));
 
-        let response_task = tokio::spawn(
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
             app.oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -1407,46 +1410,20 @@ mod tests {
                     .body(Body::empty())
                     .expect("build rescan request"),
             ),
-        );
-        while recovery_calls.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            recovery_calls.load(Ordering::SeqCst),
-            1,
-            "source-repair recovery should start when the rescan gate is closed"
-        );
-
-        tokio::time::advance(Duration::from_secs(16)).await;
-        tokio::task::yield_now().await;
-        let response = response_task
-            .await
-            .expect("join advisory rescan request")
-            .expect("route advisory rescan request");
+        )
+        .await
+        .expect("rescan middleware must not wait on source repair")
+        .expect("route advisory rescan request");
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         assert_eq!(
             handler_calls.load(Ordering::SeqCst),
             1,
-            "source-repair-gated rescan must enter its handler while advisory source repair continues"
+            "source-repair-gated rescan must enter its handler immediately"
         );
         assert_eq!(
-            recovery_completions.load(Ordering::SeqCst),
+            recovery_calls.load(Ordering::SeqCst),
             0,
-            "precondition: source-repair recovery is still waiting when the handler runs"
-        );
-
-        release_recovery.notify_waiters();
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            recovery_completions.load(Ordering::SeqCst),
-            1,
-            "request timeout must not cancel the service-level source-repair recovery"
-        );
-        assert!(
-            control_gate.is_source_repair_ready(),
-            "background source repair should be able to reopen the rescan plane after the caller timed out"
+            "middleware must not start a separate source-repair recovery lane"
         );
     }
 
@@ -1665,19 +1642,19 @@ mod tests {
             ),
         )
         .await
-        .expect("drain-closed source repair must run bounded recovery")
+        .expect("drain-closed source repair must not block rescan middleware")
         .expect("route rescan request");
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         assert_eq!(
             recovery_calls.load(Ordering::SeqCst),
-            1,
-            "manual rescan must run source-repair recovery while full management drain is closed"
+            0,
+            "manual rescan source-repair recovery is owned by the handler while full management drain is closed"
         );
         assert_eq!(
             handler_calls.load(Ordering::SeqCst),
             1,
-            "source-repair recovery should reopen the rescan gate without reopening full management writes"
+            "source-repair middleware must allow rescan without reopening full management writes"
         );
     }
 

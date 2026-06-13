@@ -52,7 +52,14 @@ version: 3.0.0
    3. Role: expose one bounded product API on a resource-scoped one-cardinality fs-meta app package boundary while keeping capanix privileged mutation-path details out of the fs-meta user workflow.
    4. Invariant: fs-meta product UI and `fsmeta` CLI talk only to this bounded API or to fs-meta deployment helpers, not directly to capanix internals.
 
-7. **Observation Eligibility Path (App Internal)**:
+7. **Recovery Lane Registry (App Internal)**:
+   1. Inputs: retained source/sink replay ownership, roots-control replay attempts, worker-control recovery attempts, manual-rescan execution, scan/audit traversal, sink materialization catch-up, and route collection outcomes.
+   2. Outputs: bounded status-visible recovery lane snapshots with owner, state, trigger, diagnostic signature, generation/attempt/deadline evidence, route outcome, and reason.
+   3. Role: publish asynchronous recovery progress to `/status` and diagnostics without making the status endpoint own repair execution.
+   4. Invariant: the registry records and exposes lane state; it does not decide source/sink placement, fabricate materialized readiness, or convert a status poll into synchronous repair work.
+   5. Invariant: nonblocking `/status` wakes are single-flight for a lane diagnostic signature. A registry entry already in `scheduled` or `inflight` state is the active owner for that signature; another status request observes that active owner instead of spawning a duplicate replay/recovery task.
+
+8. **Observation Eligibility Path (App Internal)**:
    1. Inputs: authoritative journal revision, replayed monitoring roots/runtime grants, current projection/materialized-tree status, stale-writer fencing evidence.
    2. Outputs: `observation_eligible` evidence for HTTP facade exposure, degraded observation state, and release/failover cutover readiness.
    3. Role: decide when externally visible observation can be trusted as caught up to current authoritative truth.
@@ -97,6 +104,7 @@ version: 3.0.0
    3. API service reads or mutates source/sink state and returns structured domain response.
    4. runtime grant discovery is exposed through `/api/fs-meta/v1/runtime/grants`; product workflows generate roots from runtime-visible grants rather than from legacy exports/fanout diagnostics.
    5. query/find payload shaping is modeled on query-path parameters and path-specific response contracts (for example `/tree` and `/on-demand-force-find` use `pit_id/group_page_size/group_after/entry_page_size/entry_after`), not management request-body size fields.
+   6. `/status` reads current source/sink/facade/recovery evidence and may issue documented nonblocking wakes, but background recovery lanes own retained replay, worker lifecycle repair, scan/audit traversal, manual-rescan execution, and sink materialization catch-up.
 
 6. **Product Config And Release Path**:
    1. deployment helper consumes thin deploy config (`api/auth` bootstrap only) and generates internal desired-state/execution details.

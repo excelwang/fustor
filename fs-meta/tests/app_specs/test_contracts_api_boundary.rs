@@ -5,6 +5,17 @@ use std::time::{Duration, Instant};
 use crate::app_support::fixture_support::{http_json, FsMetaApiFixture, HttpResponse};
 use serde_json::{json, Value};
 
+const RECOVERY_LANE_STATES: &[&str] = &[
+    "idle",
+    "scheduled",
+    "inflight",
+    "blocked",
+    "completed",
+    "failed",
+    "timed-out",
+    "skipped",
+];
+
 fn expect_error_field(resp: &HttpResponse) {
     let json = resp
         .json
@@ -616,11 +627,52 @@ fn assert_status_top_level_evidence(body: &Value, status: &HttpResponse) {
     for key in [
         "api_facade_liveness",
         "management_write_readiness",
+        "source_repair_readiness",
         "trusted_observation_readiness",
     ] {
         assert!(
             readiness_planes.get(key).is_some_and(Value::is_boolean),
             "status.readiness_planes.{key} missing boolean value: {}",
+            status.body
+        );
+    }
+    let repair_lanes = body
+        .get("repair_lanes")
+        .and_then(Value::as_array)
+        .expect("status.repair_lanes must be array");
+    assert!(
+        !repair_lanes.is_empty(),
+        "status.repair_lanes must expose touched recovery lanes: {}",
+        status.body
+    );
+    for lane in repair_lanes {
+        let lane = lane
+            .as_object()
+            .expect("status.repair_lanes[] must be object");
+        for key in ["lane", "owner", "state", "trigger", "signature"] {
+            assert!(
+                lane.get(key).is_some_and(Value::is_string),
+                "status.repair_lanes[].{key} missing string value: {}",
+                status.body
+            );
+        }
+        let state = lane
+            .get("state")
+            .and_then(Value::as_str)
+            .expect("status.repair_lanes[].state string checked above");
+        assert!(
+            RECOVERY_LANE_STATES.contains(&state),
+            "status.repair_lanes[].state must use RecoveryLaneState, got {state}: {}",
+            status.body
+        );
+        assert!(
+            lane.get("blocking").is_some_and(Value::is_boolean),
+            "status.repair_lanes[].blocking missing boolean value: {}",
+            status.body
+        );
+        assert!(
+            lane.get("updated_at_us").is_some_and(Value::is_u64),
+            "status.repair_lanes[].updated_at_us missing u64 value: {}",
             status.body
         );
     }

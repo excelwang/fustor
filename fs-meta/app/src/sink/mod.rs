@@ -2041,6 +2041,11 @@ impl SinkFileMeta {
         }
     }
 
+    pub(crate) fn mark_fixture_stream_receive_armed(&self) {
+        self.mark_before_stream_recv();
+        self.notify_stream_recv_waiters();
+    }
+
     fn notify_stream_recv_waiters(&self) {
         if let Some(notify) = self.stream_recv_ready_notify.as_ref() {
             notify.notify_waiters();

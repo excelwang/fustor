@@ -6,15 +6,20 @@ use axum::{
 use capanix_app_sdk::CnxError;
 use serde::Serialize;
 
+use super::types::StatusRepairLaneEvidence;
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repair_lanes: Option<Vec<StatusRepairLaneEvidence>>,
 }
 
 #[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    pub repair_lanes: Option<Vec<StatusRepairLaneEvidence>>,
 }
 
 impl ApiError {
@@ -22,6 +27,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: msg.into(),
+            repair_lanes: None,
         }
     }
 
@@ -29,6 +35,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: msg.into(),
+            repair_lanes: None,
         }
     }
 
@@ -36,6 +43,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: msg.into(),
+            repair_lanes: None,
         }
     }
 
@@ -43,6 +51,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: msg.into(),
+            repair_lanes: None,
         }
     }
 
@@ -50,6 +59,18 @@ impl ApiError {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: msg.into(),
+            repair_lanes: None,
+        }
+    }
+
+    pub fn service_unavailable_with_repair_lanes(
+        msg: impl Into<String>,
+        repair_lanes: Vec<StatusRepairLaneEvidence>,
+    ) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: msg.into(),
+            repair_lanes: Some(repair_lanes),
         }
     }
 }
@@ -60,6 +81,7 @@ impl IntoResponse for ApiError {
             self.status,
             Json(ErrorBody {
                 error: self.message,
+                repair_lanes: self.repair_lanes,
             }),
         )
             .into_response()

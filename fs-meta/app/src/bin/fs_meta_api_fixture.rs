@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
+use std::time::Duration;
 
 use capanix_app_sdk::runtime::{ConfigValue, NodeId};
 use capanix_runtime_entry_sdk::control::{
@@ -63,6 +65,47 @@ fn default_root_subpath_scope() -> String {
 
 fn env_required(key: &str) -> Result<String, String> {
     env::var(key).map_err(|_| format!("missing required env {key}"))
+}
+
+fn spawn_fixture_runtime_scope_convergence_watch(
+    app: Arc<FSMetaApp>,
+    mut last_signature: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            let current_signature = match app
+                .fixture_runtime_scope_convergence_signature_for_current_roots()
+                .await
+            {
+                Ok(signature) => signature,
+                Err(err) => {
+                    eprintln!(
+                        "fs_meta_api_fixture: runtime scope convergence signature failed: {err}"
+                    );
+                    continue;
+                }
+            };
+            if current_signature == last_signature {
+                continue;
+            }
+            match app
+                .apply_fixture_runtime_scope_convergence_for_current_roots()
+                .await
+            {
+                Ok(applied_signature) => {
+                    eprintln!(
+                        "fs_meta_api_fixture: runtime scope convergence applied {applied_signature}"
+                    );
+                    last_signature = applied_signature;
+                }
+                Err(err) => {
+                    eprintln!("fs_meta_api_fixture: runtime scope convergence failed: {err}");
+                }
+            }
+        }
+    })
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -282,7 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     );
     let config = FSMetaConfig::from_runtime_manifest_config(&cfg)?;
-    let app = FSMetaApp::new(config, NodeId(node_id.clone()))?;
+    let app = Arc::new(FSMetaApp::new(config, NodeId(node_id.clone()))?);
     app.start().await?;
     let worker_scopes = roots_env
         .iter()
@@ -341,10 +384,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         facade_activate,
     ])
     .await?;
+    let fixture_scope_signature = app
+        .fixture_runtime_scope_convergence_signature_for_current_roots()
+        .await?;
+    let fixture_scope_watch =
+        spawn_fixture_runtime_scope_convergence_watch(app.clone(), fixture_scope_signature);
     wait_for_fixture_query_ready(&app).await?;
     println!("FS_META_API_FIXTURE_READY {bind_addr}");
 
     wait_for_shutdown().await;
+    fixture_scope_watch.abort();
     app.close().await?;
     Ok(())
 }

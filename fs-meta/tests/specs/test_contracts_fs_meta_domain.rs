@@ -1017,6 +1017,31 @@ fn test_query_limit_param_owns_payload_bound_contract() {
     );
 }
 
+// @verify_spec("CONTRACTS.API_BOUNDARY.GIANT_ROOT_PUBLIC_API_PARAMETER_GOVERNANCE", mode="system")
+#[test]
+fn test_giant_root_public_api_parameter_governance_contract() {
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let l3_api = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/API_HTTP.md");
+    let todo = std::fs::read_to_string(crate::path_support::workspace_root().join("TODO.md"))
+        .expect("read workspace TODO");
+
+    assert!(l1.contains("GIANT_ROOT_PUBLIC_API_PARAMETER_GOVERNANCE"));
+    assert!(l1.contains("more than 1 billion files"));
+    assert!(l1.contains("HTTP `400 Bad Request`"));
+    assert!(l1.contains("same-generation/same-scope submissions"));
+    assert!(l1.contains("MUST NOT execute file-count-dependent repair or query work"));
+
+    assert!(l3_api.contains("GiantRootPublicApiParameterGovernance"));
+    assert!(l3_api.contains("HTTP `400 Bad Request`"));
+    assert!(l3_api.contains("path=/&recursive=true` is a paged observation session"));
+    assert!(l3_api.contains("same-generation/same-scope retries"));
+    assert!(l3_api.contains("MUST NOT execute file-count-dependent query"));
+
+    assert!(todo.contains("giant-root public API parameter governance"));
+    assert!(todo.contains("more than 1 billion files"));
+    assert!(todo.contains("fail fast with HTTP `400 Bad Request`"));
+}
+
 // @verify_spec("CONTRACTS.API_BOUNDARY.FS_META_HTTP_API_BOUNDARY", mode="system")
 #[test]
 fn test_fs_meta_http_api_boundary_contract() {

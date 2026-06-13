@@ -5881,6 +5881,18 @@ impl SinkFacade {
         }
     }
 
+    pub(crate) fn mark_fixture_stream_receive_armed_with_failure(
+        &self,
+    ) -> std::result::Result<(), SinkFailure> {
+        match self {
+            Self::Local(sink) => {
+                sink.mark_fixture_stream_receive_armed();
+                Ok(())
+            }
+            Self::Worker(_) => Ok(()),
+        }
+    }
+
     pub(crate) async fn update_logical_roots_with_failure(
         &self,
         roots: Vec<crate::source::config::RootSpec>,

@@ -181,6 +181,40 @@ async fn force_find_defaults_when_query_params_omitted_local() {
     );
 }
 
+// @verify_spec("CONTRACTS.API_BOUNDARY.GIANT_ROOT_PUBLIC_API_PARAMETER_GOVERNANCE", mode="system")
+#[tokio::test]
+async fn public_query_endpoints_reject_unknown_query_params_local() {
+    let fixture = ForceFindFixture::new(ForceFindFixtureScenario::Standard);
+
+    for uri in [
+        "/tree?path=/&limit=1",
+        "/stats?path=/&limit=1",
+        "/on-demand-force-find?path=/&limit=1",
+    ] {
+        let req = Request::builder()
+            .uri(uri)
+            .method("GET")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = fixture
+            .app
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("serve request");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "uri={uri}");
+        let body = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("response body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("limit") || body.contains("unknown field"),
+            "unknown parameter response should name the rejected parameter; uri={uri} body={body}"
+        );
+    }
+}
+
 // @verify_spec("CONTRACTS.QUERY_OUTCOME.QUERY_BOUND_ROUTE_METRICS_DIAGNOSTICS_BOUNDARY", mode="system")
 #[tokio::test]
 async fn projection_rpc_metrics_endpoint_shape_local() {

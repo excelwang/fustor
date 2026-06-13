@@ -1205,20 +1205,10 @@ fn normalize_api_params_uses_defaults() {
 fn validate_stats_query_rejects_fresh_read_class() {
     let params = ApiParams {
         path: Some("/mnt".into()),
-        path_b64: None,
-        group: None,
-        recursive: None,
-        max_depth: None,
-        pit_id: None,
-        group_order: None,
-        group_page_size: None,
-        group_after: None,
-        entry_page_size: None,
-        entry_after: None,
         read_class: Some(ReadClass::Fresh),
+        ..ApiParams::default()
     };
-    let normalized = normalize_api_params(params).expect("normalize stats params");
-    let err = validate_stats_query_params(&normalized).expect_err("reject stats fresh read_class");
+    let err = validate_stats_query_params(&params).expect_err("reject stats fresh read_class");
     assert!(err.to_string().contains("not supported on /stats"));
 }
 
@@ -1227,20 +1217,73 @@ fn validate_stats_query_accepts_materialized_read_classes() {
     for read_class in [ReadClass::Materialized, ReadClass::TrustedMaterialized] {
         let params = ApiParams {
             path: Some("/mnt".into()),
-            path_b64: None,
-            group: None,
-            recursive: None,
-            max_depth: None,
-            pit_id: None,
-            group_order: None,
-            group_page_size: None,
-            group_after: None,
-            entry_page_size: None,
-            entry_after: None,
             read_class: Some(read_class),
+            ..ApiParams::default()
         };
-        let normalized = normalize_api_params(params).expect("normalize stats params");
-        validate_stats_query_params(&normalized).expect("accept stats materialized read_class");
+        validate_stats_query_params(&params).expect("accept stats materialized read_class");
+    }
+}
+
+#[test]
+fn validate_stats_query_rejects_tree_paging_and_depth_axes() {
+    let cases = [
+        (
+            "max_depth",
+            ApiParams {
+                max_depth: Some(2),
+                ..ApiParams::default()
+            },
+        ),
+        (
+            "pit_id",
+            ApiParams {
+                pit_id: Some("pit-1".into()),
+                ..ApiParams::default()
+            },
+        ),
+        (
+            "group_order",
+            ApiParams {
+                group_order: Some(GroupOrder::FileAge),
+                ..ApiParams::default()
+            },
+        ),
+        (
+            "group_page_size",
+            ApiParams {
+                group_page_size: Some(10),
+                ..ApiParams::default()
+            },
+        ),
+        (
+            "group_after",
+            ApiParams {
+                group_after: Some("cursor".into()),
+                ..ApiParams::default()
+            },
+        ),
+        (
+            "entry_page_size",
+            ApiParams {
+                entry_page_size: Some(10),
+                ..ApiParams::default()
+            },
+        ),
+        (
+            "entry_after",
+            ApiParams {
+                entry_after: Some("cursor".into()),
+                ..ApiParams::default()
+            },
+        ),
+    ];
+
+    for (name, params) in cases {
+        let err = validate_stats_query_params(&params).expect_err("reject unsupported stats param");
+        assert!(
+            err.to_string().contains(name),
+            "expected {name} in stats rejection, got {err}"
+        );
     }
 }
 
@@ -1315,6 +1358,49 @@ fn normalize_api_params_rejects_path_and_path_b64_together() {
     };
     let err = normalize_api_params(params).expect_err("reject mixed path inputs");
     assert!(err.to_string().contains("mutually exclusive"));
+}
+
+#[test]
+fn validate_tree_query_rejects_bad_page_size_and_malformed_cursor_before_execution() {
+    let oversized = normalize_api_params(ApiParams {
+        group_page_size: Some(GROUP_PAGE_SIZE_MAX + 1),
+        ..ApiParams::default()
+    })
+    .expect("normalize oversized page size shape");
+    let err =
+        validate_tree_query_params(&oversized).expect_err("reject oversized group_page_size");
+    assert!(err.to_string().contains("group_page_size"));
+
+    let malformed_cursor = normalize_api_params(ApiParams {
+        pit_id: Some("pit-1".into()),
+        group_after: Some("not-base64".into()),
+        ..ApiParams::default()
+    })
+    .expect("normalize malformed cursor shape");
+    let err =
+        validate_tree_query_params(&malformed_cursor).expect_err("reject malformed group cursor");
+    assert!(err.to_string().contains("invalid group_after cursor"));
+}
+
+#[test]
+fn validate_force_find_query_rejects_bad_page_size_and_malformed_cursor_before_execution() {
+    let oversized = normalize_api_params(ApiParams {
+        entry_page_size: Some(ENTRY_PAGE_SIZE_MAX + 1),
+        ..ApiParams::default()
+    })
+    .expect("normalize oversized page size shape");
+    let err = validate_force_find_params(&oversized).expect_err("reject oversized entry_page_size");
+    assert!(err.to_string().contains("entry_page_size"));
+
+    let malformed_cursor = normalize_api_params(ApiParams {
+        pit_id: Some("pit-1".into()),
+        group_after: Some("not-base64".into()),
+        ..ApiParams::default()
+    })
+    .expect("normalize malformed cursor shape");
+    let err =
+        validate_force_find_params(&malformed_cursor).expect_err("reject malformed group cursor");
+    assert!(err.to_string().contains("invalid group_after cursor"));
 }
 
 #[test]

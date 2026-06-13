@@ -1174,6 +1174,7 @@ fn validate_status_top_level_evidence(status: &Value) -> Result<(), String> {
     for key in [
         "api_facade_liveness",
         "management_write_readiness",
+        "source_repair_readiness",
         "trusted_observation_readiness",
     ] {
         if !readiness_planes.get(key).is_some_and(Value::is_boolean) {
@@ -1191,6 +1192,10 @@ fn validate_status_top_level_evidence(status: &Value) -> Result<(), String> {
             .and_then(Value::as_bool)
             != Some(true)
         || readiness_planes
+            .get("source_repair_readiness")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || readiness_planes
             .get("trusted_observation_readiness")
             .and_then(Value::as_bool)
             != Some(true)
@@ -1198,6 +1203,29 @@ fn validate_status_top_level_evidence(status: &Value) -> Result<(), String> {
         return Err(format!(
             "mini smoke requires all readiness planes ready: {status}"
         ));
+    }
+    if let Some(repair_lanes) = status.get("repair_lanes").and_then(Value::as_array) {
+        for lane in repair_lanes {
+            let state = lane
+                .get("state")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("status.repair_lanes[].state missing string: {status}"))?;
+            if !matches!(
+                state,
+                "idle"
+                    | "scheduled"
+                    | "inflight"
+                    | "blocked"
+                    | "completed"
+                    | "failed"
+                    | "timed-out"
+                    | "skipped"
+            ) {
+                return Err(format!(
+                    "status.repair_lanes[].state must use RecoveryLaneState, got {state}: {status}"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1851,7 +1879,9 @@ fn is_retryable_source_repair_not_ready(err: &str) -> bool {
     err.contains("http 503 failed")
         && (err.contains("manual rescan current roots runtime-scope readiness failed")
             || err.contains("manual rescan scoped source route pending")
-            || err.contains("manual rescan source-status target proof incomplete"))
+            || err.contains("manual rescan source-status target proof incomplete")
+            || err.contains("manual rescan source repair readiness pending")
+            || err.contains("manual rescan response budget exhausted"))
 }
 
 #[test]
