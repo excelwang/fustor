@@ -6248,17 +6248,6 @@ fn cached_logical_roots_snapshot_is_used_for_stale_drained_pid_errors() {
 }
 
 #[test]
-fn manual_rescan_logical_roots_snapshot_uses_cache_for_stale_worker_handoff() {
-    let err = CnxError::TransportClosed(
-        "stale shared source worker client detached during logical_roots_snapshot".to_string(),
-    );
-    assert!(
-        can_use_cached_manual_rescan_logical_roots_snapshot(&err),
-        "manual rescan target selection should use the cached current-roots view when a live roots snapshot loses an in-flight stale worker client handoff"
-    );
-}
-
-#[test]
 fn source_snapshot_reads_use_cache_during_worker_resource_exhaustion() {
     let err = CnxError::ResourceExhausted(
         "source worker unavailable: max channels (1024) reached".to_string(),
@@ -6266,10 +6255,6 @@ fn source_snapshot_reads_use_cache_during_worker_resource_exhaustion() {
     assert!(
         can_use_cached_grant_derived_snapshot(&err),
         "source snapshot reads should use cached roots/grants while worker control channels are temporarily exhausted"
-    );
-    assert!(
-        can_use_cached_manual_rescan_logical_roots_snapshot(&err),
-        "manual rescan target selection should not fail hard when worker max-channel pressure blocks a live roots snapshot"
     );
 }
 

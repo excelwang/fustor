@@ -7,8 +7,8 @@ Use this runbook when changing binaries on an existing fs-meta Capanix cluster.
 Default production-like fs-meta cluster:
 
 - SSH user: `wanghuajin`
-- Nodes: `10.0.82.144`, `10.0.82.145`, `10.0.82.146`, `10.0.82.147`, `10.0.82.148`
-- Active fs-meta runtime nodes for the current gate: `10.0.82.144`, `10.0.82.145`, `10.0.82.146`; keep `10.0.82.147` and `10.0.82.148` stopped/excluded unless the task explicitly changes this boundary.
+- Nodes: `10.0.82.144`, `10.0.82.145`, `10.0.82.146`
+- Active fs-meta runtime nodes for the current gate: `10.0.82.144`, `10.0.82.145`, `10.0.82.146`.
 - Run root: `/home/wanghuajin/fsmeta-stable/run`
 - Control socket example: `nodes/panda145/home/core.sock`
 - Remote ABI: CentOS 7 / glibc 2.17
@@ -27,6 +27,40 @@ Hard gates:
 - Use `bash -s` or `bash -lc` for remote commands because node login shells may differ.
 - Do not rely on running `stop-all.sh` or `start-all.sh` once from `panda145` for cross-node state. Run the local stop/start path through SSH on every node, then verify no stale `capanixd` or `capanix_worker_host` remains for the run root.
 - If the branch says not to modify `fs-meta app`, do not build or deploy `libfs_meta_runtime.so`; only restore existing fs-meta declarations after daemon health is proven.
+
+## Long Wait Discipline
+
+- Treat a long wait as an observation boundary, not as a process to monitor.
+- Separate the shell wait from the execution tool's yield behavior. The local shell command must contain the full wait before the remote sample; a yielded tool session is only a handle for the already-running foreground command.
+- Use this lifecycle:
+  - Plan the reason, duration, absolute deadline, and one post-wait evidence sample.
+  - Launch one foreground local command whose script performs the whole local wait and then the bounded sample.
+  - Stay quiet until the deadline: no process checks, SSH probes, log tails, status samples, or execution-tool session reads.
+  - Collect once at or after the deadline and classify that planned evidence.
+- Before launching a wait that may outlive the current turn, write down the active wait record: reason, duration, absolute deadline with timezone, local command shape, planned post-wait sample, and any yielded session id. Status answers during the wait must come from that record, not from probes.
+- The assistant/tool layer must not emulate waiting by periodically reading session output. Set the tool yield window as high as practical, accept a session id when the tool yields, and read it only once after the planned deadline.
+- Put cluster-convergence waits on the local side, before the remote command: `sleep 900; ssh wanghuajin@10.0.82.145 'bash -s' ...`.
+- Do not put long `sleep` calls inside SSH scripts or heredocs. Remote scripts should collect bounded evidence and return. Short remote sleeps used as process-signal grace periods, such as a local `sleep 2` between `pkill -TERM` and `pkill -KILL`, are not convergence waits.
+- Use this shape for convergence waits; run it as one local foreground tool command with a timeout covering the sleep plus the sample:
+
+```bash
+set -euo pipefail
+sleep 900
+ssh -o BatchMode=yes -o ConnectTimeout=10 wanghuajin@10.0.82.145 'bash -s' <<'REMOTE'
+set -euo pipefail
+# Collect exactly one bounded authenticated /status sample or one bounded diagnostic.
+REMOTE
+```
+
+- Do not use these shapes for convergence waits: `ssh host 'sleep 900; ...'`, a remote heredoc that starts with a long `sleep`, `while sleep 30; do ssh ...; done`, repeated log tails, or repeated execution-tool session reads before the planned deadline.
+- Do not background the wait just to inspect it later.
+- If the execution tool returns a session id before the planned deadline, treat that as a yielded foreground command, not as a reason to probe. Read the session once at or after the deadline to collect the planned result.
+- Do not poll the local `sleep` or long-running command just to prove it is still running. Avoid repeated `ps`, `pgrep`, SSH samples, tool-output/session-output checks, build-log tails, or "still running" heartbeats. A check whose only question is "is the sleep/build/deploy still running?" is invalid polling.
+- Before the deadline, there are no valid wait-supervision tool calls. Do not run `date` loops, empty session reads, local process checks, remote status calls, or log tails just to rebuild confidence. If the deadline is unclear, wait conservatively until after it.
+- If the first post-deadline session read still has no planned sample, classify that as a new tooling/runtime boundary and choose a fresh explicit wait window or cancel the command. Do not switch to short-interval peeking.
+- If asked for status during the wait, report the already-known wait window and deadline without running a probe. Probe only after the wait completes or after the user explicitly changes the task.
+- For builds/tests/deploys, start one command that writes logs, wait for its result with a long timeout, and report only meaningful output: success, failure, artifact hashes, GLIBC evidence, or the first raw failing boundary.
+- For cluster convergence, take one bounded sample after the local wait completes. If more waiting is needed, start a new explicit local wait window with a reason derived from the previous sample.
 
 ## Clean Redeploy Order
 
@@ -76,7 +110,7 @@ Required shape:
 - Build or select an explicit `capanix_worker_host` from the matching source snapshot and set `CAPANIX_WORKER_HOST_BINARY`; do not rely on PATH or an installed worker host.
 - Set app/runtime binary environment variables to the freshly built snapshot artifact and verify the exact paths and hashes before tests.
 - Exercise external-worker IPC in tests. A test that bypasses the worker host is not sufficient for deployment approval.
-- Reproduce the target active-three topology as closely as possible before remote build: active nodes/resources/apps/roots equivalent to `panda144-146`, excluded-node assumptions equivalent to `panda147/148`, one owner per source/scan/sink logical root, and the same source app declaration, `fsmeta deploy`, `roots apply`, `/status`, materialization, and process/log inspection order used on the real cluster.
+- Reproduce the target active-three topology as closely as possible before remote build: active nodes/resources/apps/roots equivalent to `panda144-146`, one owner per source/scan/sink logical root, and the same source app declaration, `fsmeta deploy`, `roots apply`, `/status`, materialization, and process/log inspection order used on the real cluster.
 - Run the production-equivalent replay under a clean validation window on aibox: clear old daemon/app/worker logs, start from no stale processes or stale app roots, apply resources, apply app declarations, deploy fs-meta, apply roots through the facade-origin `--api-base`, then inspect fresh worker stdout/stderr, daemon logs, process list, duplicate runtime/worker rows, and `/status` completeness.
 - Run focused tests for the changed seam plus the production-equivalent smoke for the affected config/API/resource path. For fs-meta management paths, use the same API-base semantics as the real cluster: CLI `--api-base` gets only the facade origin, while manual HTTP uses the full `/api/fs-meta/v1/...` path.
 - Treat `operation timed out`, missing worker stdout/stderr, worker sidecar bind failures, statecell read/write timeouts, duplicate or zombie workers, unexpected partial/degraded status, stale binary hashes, source snapshot drift, or config differences from the target deployment as blockers. Do not upload to `panda145` until they are explained or fixed.
@@ -237,7 +271,7 @@ Run from the compatible builder or from a host that can reach all nodes. Replace
 ```bash
 set -euo pipefail
 RUN_ROOT=/home/wanghuajin/fsmeta-stable/run
-NODES=(10.0.82.144 10.0.82.145 10.0.82.146 10.0.82.147 10.0.82.148)
+NODES=(10.0.82.144 10.0.82.145 10.0.82.146)
 artifact=target/release/capanixd
 name=capanixd
 sha=$(sha256sum "$artifact" | awk '{print $1}')
@@ -271,7 +305,7 @@ Stop through each node's local control path. Do not run `stop-all.sh` once on `p
 ```bash
 set -euo pipefail
 RUN_ROOT=/home/wanghuajin/fsmeta-stable/run
-NODES=(10.0.82.144 10.0.82.145 10.0.82.146 10.0.82.147 10.0.82.148)
+NODES=(10.0.82.144 10.0.82.145 10.0.82.146)
 
 for host in "${NODES[@]}"; do
   ssh "wanghuajin@$host" 'bash -s' -- "$RUN_ROOT" <<'REMOTE'
@@ -309,7 +343,7 @@ Clear logs on every redeploy after stopping affected processes and before starti
 ```bash
 set -euo pipefail
 RUN_ROOT=/home/wanghuajin/fsmeta-stable/run
-NODES=(10.0.82.144 10.0.82.145 10.0.82.146 10.0.82.147 10.0.82.148)
+NODES=(10.0.82.144 10.0.82.145 10.0.82.146)
 ts=$(date +%Y%m%d%H%M%S)
 
 for host in "${NODES[@]}"; do
@@ -351,7 +385,7 @@ Use the "Stop Affected Processes" and "Clear Live Logs" steps before replacement
 ```bash
 set -euo pipefail
 RUN_ROOT=/home/wanghuajin/fsmeta-stable/run
-NODES=(10.0.82.144 10.0.82.145 10.0.82.146 10.0.82.147 10.0.82.148)
+NODES=(10.0.82.144 10.0.82.145 10.0.82.146)
 sha=<expected-sha256>
 
 for host in "${NODES[@]}"; do
@@ -374,7 +408,7 @@ Start the local node on every host only after replacement and log clearing are c
 ```bash
 set -euo pipefail
 RUN_ROOT=/home/wanghuajin/fsmeta-stable/run
-NODES=(10.0.82.144 10.0.82.145 10.0.82.146 10.0.82.147 10.0.82.148)
+NODES=(10.0.82.144 10.0.82.145 10.0.82.146)
 
 for host in "${NODES[@]}"; do
   ssh "wanghuajin@$host" 'bash -s' -- "$RUN_ROOT" <<'REMOTE'
@@ -406,7 +440,7 @@ Before replacing files that may already be loaded by a worker process, run "Stop
 ```bash
 set -euo pipefail
 RUN_ROOT=/home/wanghuajin/fsmeta-stable/run
-NODES=(10.0.82.144 10.0.82.145 10.0.82.146 10.0.82.147 10.0.82.148)
+NODES=(10.0.82.144 10.0.82.145 10.0.82.146)
 name=libes_source_runtime.so
 sha=<expected-sha256>
 
@@ -532,7 +566,7 @@ REMOTE
 
 Required interpretation:
 
-- `peer_count` must match the intended node count, normally `5`.
+- `peer_count` must match the intended node count; for the current active-three gate it must be `3`.
 - Cluster status must not show duplicate self peers.
 - `process list` must show the expected apps, including fs-meta and any source or union-graph apps that should be deployed.
 - CPU is diagnostic only; final acceptance is stable complete/non-partial index growth beyond the target entry count, not low CPU overhead.

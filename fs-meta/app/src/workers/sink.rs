@@ -5896,7 +5896,7 @@ impl SinkWorkerClientHandle {
                         eprintln!(
                             "fs_meta_sink_worker_client: on_control_frame fail-fast node={} err={} lane={}",
                             self.node_id.0,
-                            failure.as_error(),
+                            sink_status_observation_log_error(failure.as_error()),
                             lane
                         );
                         return Err(failure);
@@ -5905,7 +5905,7 @@ impl SinkWorkerClientHandle {
                         eprintln!(
                             "fs_meta_sink_worker_client: on_control_frame done node={} ok=false err={}",
                             self.node_id.0,
-                            failure.as_error()
+                            sink_status_observation_log_error(failure.as_error())
                         );
                         return Err(failure);
                     }

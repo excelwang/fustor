@@ -1555,16 +1555,6 @@ fn can_use_cached_grant_derived_snapshot(err: &CnxError) -> bool {
         .is_some_and(|kind| kind.supports_cached_grant_derived_snapshot())
 }
 
-pub(crate) fn can_use_cached_manual_rescan_logical_roots_snapshot(err: &CnxError) -> bool {
-    match classify_source_worker_control_reset(err) {
-        Some(SourceWorkerControlResetKind::ResourceExhausted) => true,
-        Some(SourceWorkerControlResetKind::TransportClosed) => err
-            .to_string()
-            .contains("stale shared source worker client detached during logical_roots_snapshot"),
-        _ => false,
-    }
-}
-
 fn can_retry_update_logical_roots(err: &CnxError) -> bool {
     classify_source_worker_control_reset(err).is_some()
 }
@@ -7499,18 +7489,6 @@ impl SourceWorkerClientHandle {
         }
     }
 
-    async fn manual_rescan_logical_roots_snapshot_with_failure(
-        &self,
-    ) -> std::result::Result<Vec<RootSpec>, SourceFailure> {
-        match self.logical_roots_snapshot_with_failure().await {
-            Ok(roots) => Ok(roots),
-            Err(err) if can_use_cached_manual_rescan_logical_roots_snapshot(err.as_error()) => {
-                self.cached_logical_roots_snapshot_with_failure()
-            }
-            Err(err) => Err(err),
-        }
-    }
-
     fn cached_host_object_grants_snapshot_with_failure(
         &self,
     ) -> std::result::Result<Vec<GrantedMountRoot>, SourceFailure> {
@@ -11532,19 +11510,6 @@ impl SourceFacade {
         match self {
             Self::Local(source) => Ok(source.current_logical_roots_generation()),
             Self::Worker(client) => client.logical_roots_generation_with_failure().await,
-        }
-    }
-
-    pub(crate) async fn manual_rescan_logical_roots_snapshot_with_failure(
-        &self,
-    ) -> std::result::Result<Vec<RootSpec>, SourceFailure> {
-        match self {
-            Self::Local(source) => source.logical_roots_snapshot_with_failure(),
-            Self::Worker(client) => {
-                client
-                    .manual_rescan_logical_roots_snapshot_with_failure()
-                    .await
-            }
         }
     }
 

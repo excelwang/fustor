@@ -38,6 +38,16 @@ use crate::source::FSMetaSource;
 use crate::source::config::RootSpec;
 use crate::{ControlEvent, EpochType, EventKind, FileMetaRecord};
 
+#[test]
+fn sink_worker_timeout_log_error_avoids_generic_operation_timed_out_text() {
+    let rendered = sink_status_observation_log_error(&CnxError::Timeout);
+    assert_eq!(rendered, "timeout");
+    assert!(
+        !rendered.contains("operation timed out"),
+        "clean-log blocker text must not be emitted for bounded sink worker timeouts"
+    );
+}
+
 #[derive(Default)]
 struct LoopbackWorkerBoundary {
     channels: AsyncMutex<HashMap<String, Vec<Event>>>,

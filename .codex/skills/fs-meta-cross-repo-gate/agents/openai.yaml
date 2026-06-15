@@ -1,4 +1,4 @@
 interface:
   display_name: "Fs-meta Cross-Repo Gate"
-  short_description: "Shared blocker-state, direct iteration, clean-log deploy gates"
-  default_prompt: "Use $fs-meta-cross-repo-gate to run the current fustor-capanix blocker workflow through one shared blocker-state document, direct bounded iterations, a production-parity aibox predeploy gate, and the safe clean-log binary build/deploy gate when changing cluster daemons or app runtimes."
+  short_description: "Shared blocker-state, direct iteration, no-poll deploy gates"
+  default_prompt: "Use $fs-meta-cross-repo-gate to run the current fustor-capanix blocker workflow through one shared blocker-state document, direct bounded iterations, no-poll long waits, a production-parity aibox predeploy gate, and the safe clean-log binary build/deploy gate when changing cluster daemons or app runtimes."

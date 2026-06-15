@@ -1,6 +1,6 @@
 ---
 name: fs-meta-cross-repo-gate
-description: Coordinate fs-meta cross-repo blocker work between fustor and capanix with the single fustor goal trace, direct bounded iterations, production-parity aibox predeploy validation, and safe clean-log binary build/deploy gates for fs-meta clusters. Use when the user says "fs-meta gate", "fustor cross-repo gate", "fustor blocker gate", asks how to build or deploy capanix binaries for fs-meta, wants logs cleared before redeploy validation, wants the current blocker handled through the canonical goal trace instead of ad hoc coordination, or needs the official fs-meta deploy gate workflow.
+description: Coordinate fs-meta cross-repo blocker work between fustor and capanix with the single fustor goal trace, direct bounded iterations, production-parity aibox predeploy validation, correct long blocking waits without polling, and safe clean-log binary build/deploy gates for fs-meta clusters. Use when the user says "fs-meta gate", "fustor cross-repo gate", "fustor blocker gate", asks how to build or deploy capanix binaries for fs-meta, wants logs cleared before redeploy validation, wants the current blocker handled through the canonical goal trace instead of ad hoc coordination, asks how to wait for fs-meta validation/deploy convergence, or needs the official fs-meta deploy gate workflow.
 ---
 
 # Fs-meta Cross-Repo Gate
@@ -38,7 +38,41 @@ One-click activation phrases:
 - Treat the inactive side as dormant.
 - Re-read `/root/repo/fustor/TODO.md` before every new bounded iteration.
 - Run one bounded iteration directly in the current session for the active owner.
-- Use long blocking waits instead of polling when waiting for external validation or cluster state.
+- Use long blocking waits instead of polling when waiting for external validation or cluster state. A long wait is an observation boundary, not a process that needs supervision.
+- Separate the three clocks before launching a long wait:
+  - Shell clock: the local command itself performs the real wait, for example `sleep 900` before `ssh`.
+  - Deadline clock: record the absolute deadline and do not collect evidence before that wall-clock time.
+  - Tool-yield clock: an execution tool may yield early with a session id because of UI/output limits; that is not progress evidence and not permission to inspect the session.
+- Use this long-wait lifecycle:
+  - Plan: choose the exact reason, duration, absolute deadline, and single post-wait evidence sample before launching the command.
+  - Launch: start one foreground local command whose shell script blocks locally for the full wait and then performs the bounded sample.
+  - Quiesce: after launch, do not inspect the wait, the process, the remote host, logs, or execution-tool session output before the planned deadline.
+  - Collect: at or after the deadline, read the command result once and classify that planned evidence sample.
+- Before launch, make the active wait record explicit in the response or goal trace when the wait may outlive the turn: reason, duration, absolute deadline with timezone, local command shape, planned post-wait sample, and the yielded session id if one appears. During the wait, that record is the only source for status answers.
+- The wait contract lives in the shell command, not in repeated assistant/tool checks. Set the tool wait/yield as high as practical, but never simulate a long wait by repeatedly reading a yielded session every 30 seconds.
+- For convergence waits, put the wait on the local side before the remote sample: `sleep 900; ssh ...one bounded sample...`. The `sleep` must appear before `ssh`; do not put long `sleep` inside an SSH heredoc or remote script.
+- Preferred convergence-wait command shape:
+
+```bash
+set -euo pipefail
+sleep 900
+ssh -o BatchMode=yes -o ConnectTimeout=10 wanghuajin@10.0.82.145 'bash -s' <<'REMOTE'
+set -euo pipefail
+# Collect exactly one bounded evidence sample here, then exit.
+REMOTE
+```
+
+- Forbidden convergence-wait shapes: `ssh host 'sleep 900; ...'`, `ssh host 'bash -s' <<'REMOTE'` with a long remote `sleep`, `while sleep 30; do ssh ...; done`, or repeated session-output peeks while a local `sleep` is still before its planned deadline.
+- Do not background the wait just to check it later.
+- If the execution tool returns a session id before the planned deadline, treat that as a yielded foreground command, not as a failure or liveness question. Record the deadline and leave the session alone until then. At or after the deadline, read the result once; that read is the planned post-wait collection, not a liveness probe.
+- Do not poll the local wait itself. Do not repeatedly run `ps`, `pgrep`, SSH status probes, tool-output checks, session-output peeks, build-log tails, or "is it still sleeping/running" checks. Checking whether `sleep` is still active is the same invalid polling as checking cluster status early.
+- While the deadline has not arrived, the allowed tool calls for that wait are none. Do not spend tool calls proving that it is not time yet; if uncertain, wait conservatively past the deadline before collecting.
+- If the post-deadline read shows the foreground command still has not produced its planned sample, classify that as a tooling/runtime boundary and choose a new explicit wait or cancellation. Do not fall into short-interval session peeks.
+- If the user asks for status while a local long wait is active, answer from the known wait window and deadline; do not run a diagnostic probe unless the wait has completed or the user explicitly changes the task.
+- Do not send heartbeat updates that only say the wait is still running. Report only material output: pass, fail, artifact hashes, GLIBC result, an authenticated post-wait `/status` sample, or a new raw boundary.
+- For long build/test/deploy commands, start one command that writes its own logs, wait for the command result with a long timeout, and classify the result once.
+- If context resumes during a planned wait, use only the recorded absolute deadline and current wall clock to decide whether collection is allowed. Do not read the session, SSH to the host, or inspect logs merely to reconstruct progress.
+- If the user supersedes the task while a local wait is active, cancel that specific wait once and then proceed with the new request.
 - Process fresh evidence before updating the goal trace or summarizing status.
 
 ## Quick Start
@@ -52,7 +86,7 @@ One-click activation phrases:
 
 ## Cluster Access
 
-- For the `wanghuajin@10.0.82.144~148` fs-meta cluster, the management shadow secret is on `10.0.82.145` at `/home/wanghuajin/fsmeta-stable/run/.fsmeta-state/fs-meta.shadow`.
+- For the `wanghuajin@10.0.82.144-146` fs-meta cluster, the management shadow secret is on `10.0.82.145` at `/home/wanghuajin/fsmeta-stable/run/.fsmeta-state/fs-meta.shadow`.
 - Read that file over SSH only when API authentication is required for diagnostics or deployment validation.
 - Never write the secret value into repository files, logs, artifacts, shell history, or user-facing responses; report only safe authentication success/failure evidence.
 
@@ -89,7 +123,7 @@ When `fustor` owns the blocker:
 
 Use this gate before changing `capanixd` on an existing `fs-meta` cluster.
 
-- Treat remote cluster ABI as the deployment target. The `wanghuajin@10.0.82.144~148` cluster is CentOS 7 / glibc 2.17; do not deploy an aibox-built `capanixd` unless its GLIBC requirements are proven compatible.
+- Treat remote cluster ABI as the deployment target. The `wanghuajin@10.0.82.144-146` cluster is CentOS 7 / glibc 2.17; do not deploy an aibox-built `capanixd` unless its GLIBC requirements are proven compatible.
 - Before any `panda14x` build/deploy attempt, run the full aibox predeploy gate from `references/binary-deploy.md` as a hard blocker. It must use complete source snapshots unpacked into a fresh builder-like long path, preserve sibling repo layout, delete stale target artifacts, build release/runtime artifacts, point tests at an explicit external `capanix_worker_host`, exercise external-worker IPC, and replay the closest practical production-equivalent active-three config/API/resource/app/root flow under clean logs. Match the target topology and operational sequence enough to expose statecell, sidecar bind, worker lifecycle, route apply, status fan-in, timeout, and stale-binary failures before touching `panda14x`.
 - Do not treat a narrow unit test, direct checkout build, or simplified smoke as permission to build/deploy on `panda14x`. If aibox cannot exactly reproduce a target detail, record the gap and compensate with the nearest stricter local check; unexplained parity gaps block remote build/deploy.
 - A passing aibox gate only permits the next `panda145` compatible-builder stage. It does not prove CentOS 7 ABI compatibility and does not allow deploying an aibox-built ELF unless GLIBC compatibility is separately proven.

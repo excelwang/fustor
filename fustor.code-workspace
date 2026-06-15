@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../capanix"
+		},
+		{
+			"path": "../fustor-dashboard"
+		}
+	],
+	"settings": {}
+}
