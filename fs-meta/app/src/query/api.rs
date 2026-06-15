@@ -949,6 +949,8 @@ pub(crate) fn merge_sink_status_snapshots(
     let mut groups = BTreeMap::<String, crate::sink::SinkGroupStatusSnapshot>::new();
     let mut scheduled_groups_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut primary_host_ref_by_group = BTreeMap::<String, String>::new();
+    let mut owner_scoped_scheduled_groups_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut owner_scoped_primary_host_ref_by_group = BTreeMap::<String, String>::new();
     let mut scheduled_primary_host_ref_groups = BTreeSet::<String>::new();
     let mut last_control_frame_signals_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut received_batches_by_node = BTreeMap::<String, u64>::new();
@@ -976,6 +978,32 @@ pub(crate) fn merge_sink_status_snapshots(
     let mut stream_last_applied_at_us_by_node = BTreeMap::<String, u64>::new();
     let mut stream_path_capture_target = None::<String>;
     for snapshot in snapshots {
+        let snapshot_owner_scoped_primary_host_ref_by_group =
+            snapshot.owner_scoped_primary_host_ref_by_group;
+        let snapshot_owner_scoped_scheduled_groups_by_node =
+            snapshot.owner_scoped_scheduled_groups_by_node;
+        for (group_id, host_ref) in &snapshot_owner_scoped_primary_host_ref_by_group {
+            let host_ref = host_ref.trim();
+            if host_ref.is_empty() {
+                continue;
+            }
+            if sink_status_schedule_contains_group_for_equivalent_node(
+                &snapshot_owner_scoped_scheduled_groups_by_node,
+                host_ref,
+                group_id,
+            ) {
+                owner_scoped_primary_host_ref_by_group
+                    .insert(group_id.clone(), host_ref.to_string());
+            }
+        }
+        for (node_id, groups_for_node) in snapshot_owner_scoped_scheduled_groups_by_node {
+            let entry = owner_scoped_scheduled_groups_by_node
+                .entry(node_id)
+                .or_default();
+            entry.extend(groups_for_node);
+            entry.sort();
+            entry.dedup();
+        }
         let snapshot_primary_host_ref_by_group = snapshot.primary_host_ref_by_group;
         let snapshot_scheduled_groups_by_node = snapshot.scheduled_groups_by_node;
         for (group_id, host_ref) in &snapshot_primary_host_ref_by_group {
@@ -1082,6 +1110,8 @@ pub(crate) fn merge_sink_status_snapshots(
     merged.groups = groups.into_values().collect();
     merged.scheduled_groups_by_node = scheduled_groups_by_node;
     merged.primary_host_ref_by_group = primary_host_ref_by_group;
+    merged.owner_scoped_scheduled_groups_by_node = owner_scoped_scheduled_groups_by_node;
+    merged.owner_scoped_primary_host_ref_by_group = owner_scoped_primary_host_ref_by_group;
     merged.last_control_frame_signals_by_node = last_control_frame_signals_by_node;
     merged.received_batches_by_node = received_batches_by_node;
     merged.received_events_by_node = received_events_by_node;
@@ -10057,6 +10087,14 @@ fn merge_sink_status_snapshots_preserves_scheduled_only_owner_primary_host_ref()
             vec!["nfs-144".to_string()],
         )]),
         primary_host_ref_by_group: BTreeMap::from([("nfs-144".to_string(), "node-a".to_string())]),
+        owner_scoped_scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs-144".to_string()],
+        )]),
+        owner_scoped_primary_host_ref_by_group: BTreeMap::from([(
+            "nfs-144".to_string(),
+            "node-a".to_string(),
+        )]),
         ..SinkStatusSnapshot::default()
     };
     let materialized_without_owner_ref = SinkStatusSnapshot {
@@ -10091,6 +10129,16 @@ fn merge_sink_status_snapshots_preserves_scheduled_only_owner_primary_host_ref()
         sink_primary_owner_node_for_group(Some(&merged), "nfs-144"),
         Some(NodeId("node-a".to_string())),
         "accepted owner-scoped sink-status primary evidence must not be dropped just because another snapshot contributed the materialized group row: {merged:?}"
+    );
+    assert_eq!(
+        merged.owner_scoped_scheduled_groups_by_node,
+        BTreeMap::from([("node-a".to_string(), vec!["nfs-144".to_string()])]),
+        "owner-scoped schedule provenance must survive merge separately from aggregate schedule evidence: {merged:?}"
+    );
+    assert_eq!(
+        merged.owner_scoped_primary_host_ref_by_group,
+        BTreeMap::from([("nfs-144".to_string(), "node-a".to_string())]),
+        "owner-scoped primary provenance must survive merge separately from aggregate primary evidence: {merged:?}"
     );
 }
 

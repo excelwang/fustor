@@ -276,6 +276,7 @@ version: 3.0.0
    > Responsibility: preserve the current low-latency projection baseline while keeping authoritative truth distinct from derived observation state across both embedded and external-worker execution shapes.
    > Cross-ref: root `L1-CONTRACTS` `AUTHORITATIVE_TRUTH_OBSERVATION_SEPARATION`, `STATEFUL_APP_OBSERVATION_PLANE_OPT_IN`, `STATEFUL_APP_OBSERVATION_PLANE_MINIMUM_DECLARATIONS`, and `OPTIONAL_STATE_CARRIER_RUNTIME_HOSTING`.
    > Verification: sink materialized tree lifecycle is hosting-bound and rebuildable (no durable snapshot dependency required for startup).
+   > Verification: any optional full-tree sink checkpoint to a runtime state carrier is bounded/best-effort and MUST NOT block scan/audit event application, initial materialization, or trusted-readiness convergence for giant roots.
    > Verification: sink state access passes through explicit in-memory carrier boundary (`SinkStateCell`) rather than scattering raw lock ownership across business handlers.
    > Verification: source mutable runtime state access passes through explicit in-memory carrier boundary (`SourceStateCell`) to keep source state hosting orthogonal to business handlers.
    > Verification: source/sink carrier boundaries keep a bounded authoritative mutation journal separate from projection state so future StateCell backend changes can replace hosting without rewriting business handlers.

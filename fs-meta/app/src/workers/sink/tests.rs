@@ -3061,6 +3061,113 @@ impl Drop for SinkWorkerReplacementShutdownHookReset {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_snapshot_stale_ack_after_retained_replay_does_not_rearm_replay() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs145 = tmp.path().join("nfs-145");
+    std::fs::create_dir_all(&nfs145).expect("create nfs-145 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs-145", &nfs145)],
+        host_object_grants: vec![sink_worker_export(
+            "node-b::nfs-145",
+            "node-b",
+            "10.0.82.145",
+            nfs145.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-b".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    let owner_status_route = sink_status_request_route_for("node-b").0;
+    let retained_envelope =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: owner_status_route,
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 7,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs-145", &["node-b::nfs-145"])],
+        }))
+        .expect("encode retained owner-scoped sink status activate");
+    let retained_signals =
+        sink_control_signals_from_envelopes(std::slice::from_ref(&retained_envelope))
+            .expect("decode retained sink activate");
+    sink.retain_control_signals(&retained_signals)
+        .await
+        .expect("retain sink control state");
+    sink.control_state_replay_required
+        .store(1, AtomicOrdering::Release);
+
+    let retry_resets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _retry_reset = SinkWorkerRetryResetHookReset;
+    install_sink_worker_retry_reset_hook(SinkWorkerRetryResetHook {
+        reset_count: retry_resets.clone(),
+    });
+
+    let ready_snapshot = SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs-145".to_string()],
+        )]),
+        primary_host_ref_by_group: std::collections::BTreeMap::from([(
+            "nfs-145".to_string(),
+            "node-b".to_string(),
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+    let _status_queue_reset = SinkWorkerStatusResponseQueueHookReset;
+    install_sink_worker_status_response_queue_hook(SinkWorkerStatusResponseQueueHook {
+        replies: std::collections::VecDeque::from([
+            Ok(SinkWorkerResponse::Ack),
+            Ok(SinkWorkerResponse::StatusSnapshot(ready_snapshot)),
+        ]),
+    });
+
+    let outcome = sink
+        .status_snapshot_with_timeout_outcome(Duration::from_secs(3))
+        .await
+        .expect("status probe should retry after a stale status Ack without replay reset");
+
+    assert_eq!(
+        outcome.snapshot.scheduled_groups_by_node.get("node-b"),
+        Some(&vec!["nfs-145".to_string()]),
+        "status probe should still return the next status snapshot after ignoring a stale Ack"
+    );
+    assert_eq!(
+        retry_resets.load(AtomicOrdering::Acquire),
+        0,
+        "a stale status Ack after retained replay has cleared must not restart the sink worker or rearm retained replay"
+    );
+    assert_eq!(
+        sink.control_state_replay_required
+            .load(AtomicOrdering::Acquire),
+        0,
+        "retained replay must remain clear after the worker accepted the retained control replay"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), sink.close())
+        .await
+        .expect("close sink worker timed out")
+        .expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_error_hook_scoped_to_target_worker_instance_is_not_consumed_by_unrelated_status_probe()
  {
     let tmp = tempdir().expect("create temp dir");
@@ -4302,6 +4409,294 @@ async fn external_sink_worker_owner_status_route_live_reply_republishes_retained
         "owner-scoped sink-status live reply must carry retained accepted primary owner evidence from the same route scope: {snapshot:?}"
     );
 
+    tokio::time::timeout(Duration::from_secs(5), sink.close())
+        .await
+        .expect("close sink worker timed out")
+        .expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_status_route_cache_fallback_preserves_live_stream_receive_readiness() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs145 = tmp.path().join("nfs-145");
+    std::fs::create_dir_all(&nfs145).expect("create nfs-145 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs-145", &nfs145)],
+        host_object_grants: vec![sink_worker_export(
+            "node-b::nfs-145",
+            "node-b",
+            "10.0.82.145",
+            nfs145.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-b".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    let owner_status_route = sink_status_request_route_for("node-b").0;
+    let owner_events_route = events_stream_route_for_scope("node-b").0;
+    let scopes = vec![bound_scope_with_resources("nfs-145", &["node-b::nfs-145"])];
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: owner_status_route.clone(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 7,
+            expires_at_ms: 1,
+            bound_scopes: scopes.clone(),
+        }))
+        .expect("encode owner-scoped sink status activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: owner_events_route,
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 7,
+            expires_at_ms: 1,
+            bound_scopes: scopes,
+        }))
+        .expect("encode owner-scoped sink events activate"),
+    ])
+    .await
+    .expect("sink worker owner routes should activate");
+
+    let mut live = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        let (snapshot, from_cache) = sink
+            .status_snapshot_nonblocking_for_status_route_key(&owner_status_route)
+            .await;
+        if !from_cache
+            && snapshot
+                .stream_receive_armed_by_node
+                .get("node-b")
+                .copied()
+                .unwrap_or(0)
+                > 0
+        {
+            live = Some(snapshot);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let live = live.expect("owner-scoped live status should observe stream receive armed");
+    assert_eq!(
+        live.scheduled_groups_by_node.get("node-b"),
+        Some(&vec!["nfs-145".to_string()]),
+        "precondition: live owner status must carry the accepted schedule: {live:?}"
+    );
+
+    let _inflight = sink.begin_control_op();
+    let (fallback, from_cache) = sink
+        .status_snapshot_nonblocking_for_status_route_key(&owner_status_route)
+        .await;
+    assert!(
+        from_cache,
+        "precondition: control-inflight owner status must use route-cache fallback"
+    );
+    assert_eq!(
+        fallback.scheduled_groups_by_node.get("node-b"),
+        Some(&vec!["nfs-145".to_string()]),
+        "route-cache fallback must retain the accepted owner schedule: {fallback:?}"
+    );
+    assert!(
+        fallback
+            .stream_receive_armed_by_node
+            .get("node-b")
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "route-cache fallback must preserve the live owner stream receive readiness needed to release source scan/audit admission: live={live:?} fallback={fallback:?}"
+    );
+
+    drop(_inflight);
+    tokio::time::timeout(Duration::from_secs(5), sink.close())
+        .await
+        .expect("close sink worker timed out")
+        .expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_status_route_cache_fallback_uses_cached_owner_evidence_after_retained_route_removed()
+{
+    let tmp = tempdir().expect("create temp dir");
+    let nfs146 = tmp.path().join("nfs-146");
+    std::fs::create_dir_all(&nfs146).expect("create nfs-146 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs-146", &nfs146)],
+        host_object_grants: vec![sink_worker_export(
+            "node-c::nfs-146",
+            "node-c",
+            "10.0.82.146",
+            nfs146.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-c".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    let owner_status_route = sink_status_request_route_for("node-c").0;
+    sink.update_cached_status_snapshot(SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-c".to_string(),
+            vec!["nfs-146".to_string()],
+        )]),
+        primary_host_ref_by_group: std::collections::BTreeMap::from([(
+            "nfs-146".to_string(),
+            "node-c".to_string(),
+        )]),
+        stream_receive_armed_by_node: std::collections::BTreeMap::from([("node-c".to_string(), 1)]),
+        ..SinkStatusSnapshot::default()
+    })
+    .expect("seed cached owner-scoped sink status evidence");
+
+    let _inflight = sink.begin_control_op();
+    let (snapshot, from_cache) = sink
+        .status_snapshot_nonblocking_for_status_route_key(&owner_status_route)
+        .await;
+
+    assert!(
+        from_cache,
+        "precondition: control-inflight owner status should use cached fallback"
+    );
+    assert_eq!(
+        snapshot.scheduled_groups_by_node.get("node-c"),
+        Some(&vec!["nfs-146".to_string()]),
+        "owner fallback must preserve previously observed owner-scoped schedule after retained route evidence was cleaned up: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.primary_host_ref_by_group.get("nfs-146"),
+        Some(&"node-c".to_string()),
+        "owner fallback must preserve previously observed owner-scoped primary evidence after retained route evidence was cleaned up: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.stream_receive_armed_by_node.get("node-c"),
+        Some(&1),
+        "owner fallback must preserve cached stream receive readiness for the scoped owner: {snapshot:?}"
+    );
+
+    drop(_inflight);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_status_route_control_inflight_probes_existing_worker_when_cache_lacks_stream_receive_readiness()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs145 = tmp.path().join("nfs-145");
+    std::fs::create_dir_all(&nfs145).expect("create nfs-145 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs-145", &nfs145)],
+        host_object_grants: vec![sink_worker_export(
+            "node-b::nfs-145",
+            "node-b",
+            "10.0.82.145",
+            nfs145.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-b".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    let owner_status_route = sink_status_request_route_for("node-b").0;
+    let owner_events_route = events_stream_route_for_scope("node-b").0;
+    let scopes = vec![bound_scope_with_resources("nfs-145", &["node-b::nfs-145"])];
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: owner_status_route.clone(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 7,
+            expires_at_ms: 1,
+            bound_scopes: scopes.clone(),
+        }))
+        .expect("encode owner-scoped sink status activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: owner_events_route,
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 7,
+            expires_at_ms: 1,
+            bound_scopes: scopes,
+        }))
+        .expect("encode owner-scoped sink events activate"),
+    ])
+    .await
+    .expect("sink worker owner routes should activate");
+
+    sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
+        .expect("seed empty cached sink status");
+    let _inflight = sink.begin_control_op();
+    let mut observed = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        let (snapshot, from_cache) = sink
+            .status_snapshot_nonblocking_for_status_route_key(&owner_status_route)
+            .await;
+        if !from_cache
+            && snapshot
+                .stream_receive_armed_by_node
+                .get("node-b")
+                .copied()
+                .unwrap_or(0)
+                > 0
+        {
+            observed = Some(snapshot);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let observed = observed.expect(
+        "control-inflight owner status should use an existing-worker route probe when cached route evidence lacks stream receive readiness",
+    );
+    assert_eq!(
+        observed.scheduled_groups_by_node.get("node-b"),
+        Some(&vec!["nfs-145".to_string()]),
+        "owner route probe during control inflight must still carry accepted schedule evidence: {observed:?}"
+    );
+
+    drop(_inflight);
     tokio::time::timeout(Duration::from_secs(5), sink.close())
         .await
         .expect("close sink worker timed out")
@@ -5590,6 +5985,55 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_sc
 }
 
 #[test]
+fn status_route_cache_probe_runs_when_stream_progress_lacks_materialized_group_row() {
+    let snapshot = SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-c".to_string(),
+            vec!["nfs-146".to_string()],
+        )]),
+        owner_scoped_scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-c".to_string(),
+            vec!["nfs-146".to_string()],
+        )]),
+        owner_scoped_primary_host_ref_by_group: std::collections::BTreeMap::from([(
+            "nfs-146".to_string(),
+            "node-c".to_string(),
+        )]),
+        stream_received_batches_by_node: std::collections::BTreeMap::from([(
+            "node-c".to_string(),
+            16,
+        )]),
+        stream_received_events_by_node: std::collections::BTreeMap::from([(
+            "node-c".to_string(),
+            29_449,
+        )]),
+        stream_received_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-c".to_string(),
+            vec!["node-c::nfs-146=29449".to_string()],
+        )]),
+        stream_applied_events_by_node: std::collections::BTreeMap::from([(
+            "node-c".to_string(),
+            29_449,
+        )]),
+        stream_applied_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-c".to_string(),
+            vec!["node-c::nfs-146=29449".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    assert_eq!(
+        classify_sink_status_snapshot_issue(&snapshot),
+        Some(SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence),
+        "fixture must model the high-NFS owner route-cache state: transport progressed, but the materialized group row is not yet visible"
+    );
+    assert!(
+        SinkWorkerClientHandle::route_cached_status_needs_existing_client_probe(&snapshot),
+        "owner-scoped status-route cache must probe the live worker when stream progress exists but the scheduled materialized group row is still missing"
+    );
+}
+
+#[test]
 fn evaluate_cached_sink_status_snapshot_propagates_error_for_worker_unavailable_regressed_scheduled_zero_uninitialized_cache_with_delivery_evidence()
  {
     let snapshot = SinkStatusSnapshot {
@@ -5690,4 +6134,27 @@ fn sink_status_scenario_outcome_returns_cached_for_not_started_coverage_gap_with
     assert_eq!(outcome.concern, Some(SinkStatusConcern::CoverageGap));
     assert!(!outcome.should_mark_replay_required);
     assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn status_observation_log_error_labels_timeout_without_clean_log_blocker_text() {
+    let label = sink_status_observation_log_error(&CnxError::Timeout);
+
+    assert_eq!(label, "timeout");
+    assert!(
+        !label.contains("operation timed out"),
+        "bounded status-route observation timeouts must not emit the clean-log blocker literal"
+    );
+}
+
+#[test]
+fn status_observation_log_error_preserves_non_timeout_context() {
+    let label = sink_status_observation_log_error(&CnxError::Internal(
+        "synthetic sink status failure".to_string(),
+    ));
+
+    assert!(
+        label.contains("synthetic sink status failure"),
+        "non-timeout diagnostics should keep their error context: {label}"
+    );
 }

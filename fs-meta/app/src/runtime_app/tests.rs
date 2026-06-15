@@ -111,6 +111,132 @@ fn source_rescan_route_groups_ignore_empty_roots_bootstrap_scope() {
     );
 }
 
+#[test]
+fn retained_sink_state_preserves_current_business_scope_across_bootstrap_only_activate() {
+    let route_key = crate::runtime::routes::events_stream_route_for_scope("panda145").0;
+    let business = crate::runtime::orchestration::sink_control_signals_from_envelopes(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            route_key.clone(),
+            &[("nfs-145", &["panda145::nfs-145"])],
+            10,
+        ),
+    ])
+    .expect("decode business sink activate");
+    let bootstrap = crate::runtime::orchestration::sink_control_signals_from_envelopes(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            route_key.clone(),
+            &[("__fsmeta_empty_roots_bootstrap", &[""])],
+            11,
+        ),
+    ])
+    .expect("decode bootstrap sink activate");
+    let current_business_groups = std::collections::BTreeSet::from(["nfs-145".to_string()]);
+    let mut retained = RetainedSinkControlState::default();
+
+    FSMetaApp::apply_sink_signals_to_state(
+        &mut retained,
+        &business,
+        Some(&current_business_groups),
+    );
+    FSMetaApp::apply_sink_signals_to_state(
+        &mut retained,
+        &bootstrap,
+        Some(&current_business_groups),
+    );
+
+    match retained
+        .active_by_route
+        .get(&(execution_units::SINK_RUNTIME_UNIT_ID.to_string(), route_key))
+    {
+        Some(SinkControlSignal::Activate {
+            generation,
+            bound_scopes,
+            ..
+        }) => {
+            assert_eq!(
+                *generation, 11,
+                "bootstrap-only route liveness should still advance retained generation"
+            );
+            assert_eq!(
+                bound_scopes
+                    .iter()
+                    .map(|scope| (
+                        scope.scope_id.as_str(),
+                        scope
+                            .resource_ids
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![("nfs-145", vec!["panda145::nfs-145"])],
+                "bootstrap-only activate must not overwrite retained business sink route scope while that logical root remains current"
+            );
+        }
+        other => panic!("expected retained sink activate after bootstrap-only update: {other:?}"),
+    }
+}
+
+#[test]
+fn retained_sink_state_allows_bootstrap_only_activate_to_clear_noncurrent_business_scope() {
+    let route_key = crate::runtime::routes::events_stream_route_for_scope("panda145").0;
+    let business = crate::runtime::orchestration::sink_control_signals_from_envelopes(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            route_key.clone(),
+            &[("nfs-145", &["panda145::nfs-145"])],
+            10,
+        ),
+    ])
+    .expect("decode business sink activate");
+    let bootstrap = crate::runtime::orchestration::sink_control_signals_from_envelopes(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            route_key.clone(),
+            &[("__fsmeta_empty_roots_bootstrap", &[""])],
+            11,
+        ),
+    ])
+    .expect("decode bootstrap sink activate");
+    let current_business_groups = std::collections::BTreeSet::new();
+    let mut retained = RetainedSinkControlState::default();
+
+    FSMetaApp::apply_sink_signals_to_state(
+        &mut retained,
+        &business,
+        Some(&current_business_groups),
+    );
+    FSMetaApp::apply_sink_signals_to_state(
+        &mut retained,
+        &bootstrap,
+        Some(&current_business_groups),
+    );
+
+    match retained
+        .active_by_route
+        .get(&(execution_units::SINK_RUNTIME_UNIT_ID.to_string(), route_key))
+    {
+        Some(SinkControlSignal::Activate {
+            generation,
+            bound_scopes,
+            ..
+        }) => {
+            assert_eq!(*generation, 11);
+            assert_eq!(
+                bound_scopes
+                    .iter()
+                    .map(|scope| scope.scope_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["__fsmeta_empty_roots_bootstrap"],
+                "empty-roots/bootstrap-only state must be allowed to clear a noncurrent business route"
+            );
+        }
+        other => panic!("expected retained bootstrap sink activate: {other:?}"),
+    }
+}
+
 fn worker_socket_tempdir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("t")
@@ -1475,6 +1601,23 @@ async fn worker_source_status_release_opens_scan_audit_admission_while_source_st
         }
     }
 
+    struct SourceWorkerReleaseDelayHookReset;
+
+    impl Drop for SourceWorkerReleaseDelayHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_scan_audit_admission_release_delay_hook();
+        }
+    }
+
+    struct SourceWorkerObservabilityHookReset;
+
+    impl Drop for SourceWorkerObservabilityHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_observability_delay_hook();
+            crate::workers::source::clear_source_worker_observability_call_count_hook();
+        }
+    }
+
     let tmp = tempdir().expect("create temp dir");
     let root_a = tmp.path().join("nfs-144");
     fs::create_dir_all(&root_a).expect("create nfs root");
@@ -1712,6 +1855,59 @@ async fn worker_source_status_release_opens_scan_audit_admission_while_source_st
         "owner-scoped release source-status must open deferred scan/audit admission and submit rescan intent even while source state observability is pending; app_proxy_trigger_count={app_proxy_trigger_count} worker_endpoint_release_seen={worker_endpoint_release_seen}\nsource stderr:\n{}\nsink stderr:\n{}",
         worker_stderr_excerpt(&source_socket_dir),
         worker_stderr_excerpt(&sink_socket_dir),
+    );
+
+    set_source_replay_required_for_tests(&app, false);
+    let current_state_events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        crate::query::api::release_scan_audit_source_status_request_payload_with_live_probe_timeout(
+            Duration::from_millis(1500),
+        ),
+        Duration::from_millis(1500),
+        Duration::ZERO,
+    )
+    .await
+    .expect("precondition: current-state release source-status should return before delay hooks");
+    assert!(
+        current_state_events
+            .iter()
+            .any(|event| event.metadata().origin_id == NodeId("node-a".to_string())),
+        "precondition: current-state release source-status must return owner evidence; events={current_state_events:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let _release_delay_reset = SourceWorkerReleaseDelayHookReset;
+    crate::workers::source::install_source_scan_audit_admission_release_delay_hook(
+        crate::workers::source::SourceScanAuditAdmissionReleaseDelayHook {
+            delay: Duration::from_millis(900),
+        },
+    );
+    let _observability_hook_reset = SourceWorkerObservabilityHookReset;
+    crate::workers::source::install_source_worker_observability_delay_hook(
+        crate::workers::source::SourceWorkerObservabilityDelayHook {
+            delay: Duration::from_millis(900),
+        },
+    );
+
+    let bounded_events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        crate::query::api::release_scan_audit_source_status_request_payload_with_live_probe_timeout(
+            Duration::from_millis(1500),
+        ),
+        Duration::from_millis(1500),
+        Duration::ZERO,
+    )
+    .await
+    .expect("release source-status must share one live-probe budget across admission release and the post-release observation read");
+    assert!(
+        bounded_events
+            .iter()
+            .any(|event| event.metadata().origin_id == NodeId("node-a".to_string())),
+        "bounded release source-status must return degraded/cache evidence from the target owner instead of timing out the owner route; events={bounded_events:?}"
     );
 
     app.close().await.expect("close app");
@@ -7157,6 +7353,48 @@ async fn sink_control_recovery_timeout_after_retryable_apply_stays_app_owned() {
     assert!(
         app.sink_state_replay_required(),
         "sink recovery exhaustion must preserve sink replay for later bounded repair"
+    );
+}
+
+#[tokio::test]
+async fn retained_sink_replay_apply_timeout_after_scope_convergence_stays_app_owned() {
+    let app = FSMetaApp::new(
+        FSMetaConfig {
+            source: local_source_config(),
+            ..FSMetaConfig::default()
+        },
+        NodeId("single-app-node".into()),
+    )
+    .expect("init app");
+    set_control_initialized_for_tests(&app, true);
+
+    let sink_signals = crate::runtime::orchestration::sink_control_signals_from_envelopes(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            &[("root-a", &["single-app-node::root-1"])],
+            3,
+        ),
+    ])
+    .expect("sink activate signals");
+
+    let _sink_apply_error_reset = SinkApplyErrorQueueHookReset;
+    install_sink_apply_error_queue_hook(SinkApplyErrorQueueHook {
+        errs: VecDeque::from([CnxError::Timeout]),
+    });
+
+    let fixed_bind_session = app.begin_fixed_bind_lifecycle_session().await;
+    app.apply_sink_signals_with_recovery(&fixed_bind_session, &sink_signals, true, false, true)
+        .await
+        .expect("retained sink replay apply timeout must stay fail-closed inside app boundary");
+
+    assert!(
+        !app.control_initialized(),
+        "retained sink replay timeout must close runtime control while recovery remains pending"
+    );
+    assert!(
+        app.sink_state_replay_required(),
+        "retained sink replay timeout must preserve sink desired state for a later recovery turn"
     );
 }
 
@@ -23258,6 +23496,121 @@ async fn owner_scoped_sink_status_serves_cached_route_schedule_while_sink_replay
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generic_sink_status_serves_cached_schedule_while_sink_replay_pending() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs144 = tmp.path().join("nfs-144");
+    fs::create_dir_all(&nfs144).expect("create nfs-144 dir");
+    let boundary = Arc::new(RuntimeProxyUnitAwareBoundary::new(
+        None,
+        None,
+        None,
+        Some(execution_units::SINK_RUNTIME_UNIT_ID),
+    ));
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("nfs-144", &nfs144)],
+                    host_object_grants: vec![granted_mount_root("node-a::nfs-144", &nfs144)],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            NodeId("node-a".into()),
+            Some(boundary.clone()),
+        )
+        .expect("init app"),
+    );
+
+    app.on_control_frame(&[
+        activate_envelope_with_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            &[("nfs-144", &["node-a::nfs-144"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+            &[("nfs-144", &["node-a::nfs-144"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("activate node-a generic sink-status route");
+
+    let first_events = internal_sink_status_request_with_timeout(
+        boundary.clone(),
+        NodeId("node-b".into()),
+        Duration::from_secs(5),
+        Duration::from_millis(250),
+    )
+    .await
+    .expect("generic sink-status should serve before replay is marked pending");
+    let first_snapshots = first_events
+        .iter()
+        .map(|event| {
+            rmp_serde::from_slice::<crate::sink::SinkStatusSnapshot>(event.payload_bytes())
+                .expect("decode first generic sink-status")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        first_snapshots.iter().any(|snapshot| {
+            snapshot
+                .scheduled_groups_by_node
+                .get("node-a")
+                .is_some_and(|groups| groups == &vec!["nfs-144".to_string()])
+                && snapshot
+                    .primary_host_ref_by_group
+                    .get("nfs-144")
+                    .is_some_and(|owner| owner == "node-a")
+        }),
+        "precondition: generic sink-status must cache node-a schedule/primary evidence before replay pending: {first_snapshots:?}"
+    );
+
+    set_sink_replay_required_for_tests(&app, true);
+    assert!(
+        app.update_runtime_control_state_for_tests(|_| {})
+            .sink_state_replay_required(),
+        "test seam must mark sink replay pending"
+    );
+
+    let pending_events = internal_sink_status_request_with_timeout(
+        boundary.clone(),
+        NodeId("node-b".into()),
+        Duration::from_millis(600),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect(
+        "generic sink-status must return cached schedule evidence while sink replay is pending",
+    );
+    let pending_snapshots = pending_events
+        .iter()
+        .map(|event| {
+            rmp_serde::from_slice::<crate::sink::SinkStatusSnapshot>(event.payload_bytes())
+                .expect("decode replay-pending generic sink-status")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        pending_snapshots.iter().any(|snapshot| {
+            snapshot
+                .scheduled_groups_by_node
+                .get("node-a")
+                .is_some_and(|groups| groups == &vec!["nfs-144".to_string()])
+                && snapshot
+                    .primary_host_ref_by_group
+                    .get("nfs-144")
+                    .is_some_and(|owner| owner == "node-a")
+                && !snapshot.has_ready_scheduled_groups()
+        }),
+        "generic sink-status must preserve schedule/primary evidence during replay-pending fan-in without claiming trusted/materialized readiness: {pending_snapshots:?}"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_owned_source_status_route_serves_without_query_facade_lane() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
@@ -36812,7 +37165,7 @@ async fn retained_generation_cutover_sink_replay_defers_inline_worker_rpc_on_pro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn trusted_materialized_sink_cutover_completes_without_worker_replay() {
+async fn trusted_materialized_sink_cutover_defers_without_owner_scoped_status_provenance() {
     let tmp = tempdir().expect("create temp dir");
     let root = tmp.path().join("test-root");
     fs::create_dir_all(&root).expect("create root");
@@ -36872,6 +37225,12 @@ async fn trusted_materialized_sink_cutover_completes_without_worker_replay() {
 
     let sink_apply_entries = Arc::new(AtomicUsize::new(0));
     let _sink_entry_reset = SinkApplyEntryCountHookReset::install(&app, sink_apply_entries.clone());
+    let _sink_apply_error_reset = SinkApplyErrorQueueHookReset;
+    install_sink_apply_error_queue_hook(SinkApplyErrorQueueHook {
+        errs: std::iter::repeat_with(|| CnxError::Timeout)
+            .take(4)
+            .collect(),
+    });
     app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
         execution_units::SINK_RUNTIME_UNIT_ID,
         format!("{}.stream", ROUTE_KEY_EVENTS),
@@ -36879,46 +37238,39 @@ async fn trusted_materialized_sink_cutover_completes_without_worker_replay() {
         3,
     )])
     .await
-    .expect("trusted/materialized sink cutover should complete locally");
+    .expect("trusted/materialized sink cutover without owner-scoped evidence should defer");
 
     assert_eq!(
         sink_apply_entries.load(AtomicOrdering::Acquire),
         0,
-        "post-materialization sink generation cutover must not enter sink.apply when source audit and sink materialization already prove the current groups"
+        "post-materialization sink generation cutover must not enter sink.apply from generic/local aggregate status alone"
     );
     assert!(
-        !app.sink_state_replay_required(),
-        "trusted/materialized cutover completion should clear retained sink replay"
+        app.sink_state_replay_required(),
+        "trusted/materialized rows without owner-scoped sink-status provenance must keep retained sink replay armed"
     );
     assert!(
-        app.control_initialized(),
-        "trusted/materialized cutover completion should reopen runtime control once source replay is already clear"
+        !app.control_initialized(),
+        "trusted/materialized rows without owner-scoped sink-status provenance must keep runtime control fail-closed"
     );
     assert!(
-        !app.sink_generation_cutover_replay_deferred
+        app.sink_generation_cutover_replay_deferred
             .load(AtomicOrdering::Acquire),
-        "trusted/materialized cutover completion must not leave deferred sink-generation-cutover repair armed"
+        "trusted/materialized rows without owner-scoped sink-status provenance must leave sink-generation-cutover repair armed"
     );
     let repair_lanes = app.api_control_gate.repair_lane_snapshot();
-    let completed_lane = repair_lanes.iter().find(|lane| {
+    assert!(
+        !repair_lanes.iter().any(|lane| {
             lane.lane == "sink-repair"
                 && lane.owner == "sink"
                 && lane.state == "completed"
                 && lane.trigger == "sink-generation-cutover"
-        })
-        .expect("trusted/materialized cutover completion must remain observable through repair-lane evidence");
-    assert_eq!(
-        completed_lane.generation,
-        Some(3),
-        "trusted/materialized cutover completion must expose the retained sink cutover generation: {repair_lanes:?}"
-    );
-    assert!(
-        completed_lane.deadline_at_us.is_none() && completed_lane.attempt.is_none(),
-        "trusted/materialized evidence completion is not a bounded retry lane and should not invent deadline/attempt metadata: {repair_lanes:?}"
-    );
-    assert!(
-        !completed_lane.signature.is_empty() && completed_lane.updated_at_us > 0,
-        "trusted/materialized cutover completion must remain observable through repair-lane evidence: {repair_lanes:?}"
+                && lane
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("trusted/materialized"))
+        }),
+        "generic/local aggregate trusted-materialized status must not record retained cutover completion: {repair_lanes:?}"
     );
 
     app.close().await.expect("close app");
@@ -37562,6 +37914,43 @@ async fn steady_sink_tick_without_app_replay_does_not_expand_to_retained_sink_ro
     assert!(
         matches!(replayed.as_slice(), [SinkControlSignal::Tick { .. }]),
         "steady sink ticks must not replay retained sink activate/deactivate state: {replayed:?}"
+    );
+}
+
+#[test]
+fn nonlocal_per_peer_sink_tick_does_not_require_local_republish_wait() {
+    let local_node = NodeId("node-c".to_string());
+    let remote_route = events_stream_route_for_scope("node-a").0;
+    let local_route = events_stream_route_for_scope("node-c").0;
+    let generic_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+
+    let tick_for = |route_key: String| SinkControlSignal::Tick {
+        unit: SinkRuntimeUnit::Sink,
+        route_key: route_key.clone(),
+        generation: 7,
+        envelope: tick_envelope_with_route_key(execution_units::SINK_RUNTIME_UNIT_ID, route_key, 7),
+    };
+
+    assert!(
+        !FSMetaApp::sink_tick_routes_require_local_republish_wait(
+            &local_node,
+            &[tick_for(remote_route)]
+        ),
+        "a node-c runtime must not wait for node-c sink scope convergence after a node-a per-peer sink tick"
+    );
+    assert!(
+        FSMetaApp::sink_tick_routes_require_local_republish_wait(
+            &local_node,
+            &[tick_for(local_route)]
+        ),
+        "the local owner-scoped sink tick still owns local sink republish convergence"
+    );
+    assert!(
+        FSMetaApp::sink_tick_routes_require_local_republish_wait(
+            &local_node,
+            &[tick_for(generic_route)]
+        ),
+        "generic sink ticks remain local-republish relevant because they are not owner-scoped away from this node"
     );
 }
 
@@ -40052,6 +40441,228 @@ async fn full_sink_repair_republishes_same_logical_roots_when_replay_remains_ope
     );
 
     app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_full_sink_repair_does_not_storm_same_source_scoped_roots_replay_without_progress()
+{
+    let tmp = tempdir().expect("create temp dir");
+    let root = tmp.path().join("nfs-145");
+    fs::create_dir_all(&root).expect("create nfs-145 root");
+    let fs_source = root.display().to_string();
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+
+    let app = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![worker_fs_watch_scan_root("nfs-145", &fs_source)],
+                host_object_grants: vec![worker_export_with_fs_source(
+                    "node-cutover-b::nfs-145",
+                    "node-cutover-b",
+                    "127.0.0.2",
+                    &fs_source,
+                    root.clone(),
+                )],
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        NodeId("node-cutover-b".into()),
+        Some(boundary.clone()),
+    )
+    .expect("init app");
+
+    app.start().await.expect("start app");
+    app.on_control_frame(&selected_group_source_control_wave(
+        2,
+        &[("nfs-145", &["node-cutover-b::nfs-145"])],
+    ))
+    .await
+    .expect("source-only runtime scope should apply");
+    set_control_initialized_for_tests(&app, false);
+    set_source_replay_required_for_tests(&app, false);
+    set_sink_replay_required_for_tests(&app, true);
+    app.control_failure_uninitialized
+        .store(true, AtomicOrdering::Release);
+    app.sink_generation_cutover_replay_deferred
+        .store(true, AtomicOrdering::Release);
+    app.api_control_gate.set_ready_state(false, false);
+
+    let _scheduled_groups_error_reset = SinkFacadeScheduledGroupsErrorHookReset;
+    crate::workers::sink::install_sink_facade_scheduled_groups_error_hook(
+        "node-cutover-b".to_string(),
+        CnxError::Internal("runtime_replay_or_sink_apply_pending".to_string()),
+    );
+
+    let replay_payload_count = || {
+        let route_key =
+            crate::runtime::routes::sink_roots_control_stream_route_for("node-cutover-b").0;
+        boundary
+            .sent_payloads_snapshot()
+            .into_iter()
+            .filter(|(route, _)| route == &route_key)
+            .flat_map(|(_, payloads)| payloads.into_iter())
+            .filter_map(|payload| {
+                crate::runtime::orchestration::decode_logical_roots_control_payload(&payload).ok()
+            })
+            .filter(|payload| !payload.sink_replay_envelopes.is_empty())
+            .count()
+    };
+
+    app.schedule_deferred_sink_repair_recovery("sink-generation-cutover")
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if replay_payload_count() >= SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_ATTEMPTS {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first source-scoped roots-control replay batch should publish");
+    let first_batch_count = replay_payload_count();
+
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    let after_no_progress_count = replay_payload_count();
+    set_sink_replay_required_for_tests(&app, false);
+    app.runtime_state_changed.notify_waiters();
+
+    assert_eq!(
+        after_no_progress_count, first_batch_count,
+        "deferred full sink-generation-cutover recovery must not republish the same source-scoped roots-control replay at retry-loop cadence when the previous attempt produced no fresh sink schedule/materialization progress"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_full_sink_repair_tx_busy_ignores_runtime_state_changes_until_no_progress_retry_interval()
+ {
+    struct SinkWorkerControlFrameErrorQueueHookReset;
+
+    impl Drop for SinkWorkerControlFrameErrorQueueHookReset {
+        fn drop(&mut self) {
+            crate::workers::sink::clear_sink_worker_control_frame_error_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let root = tmp.path().join("nfs-145");
+    fs::create_dir_all(&root).expect("create nfs-145 root");
+    let fs_source = root.display().to_string();
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = FSMetaApp::with_boundaries_and_state(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![worker_fs_watch_scan_root("nfs-145", &fs_source)],
+                host_object_grants: vec![worker_export_with_fs_source(
+                    "node-cutover-b::nfs-145",
+                    "node-cutover-b",
+                    "127.0.0.2",
+                    &fs_source,
+                    root.clone(),
+                )],
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        external_runtime_worker_binding("source", &source_socket_dir),
+        external_runtime_worker_binding("sink", &sink_socket_dir),
+        NodeId("node-cutover-b".into()),
+        Some(boundary.clone()),
+        Some(boundary),
+        state_boundary,
+    )
+    .expect("init external-worker app");
+
+    app.on_control_frame(&[activate_envelope_with_scope_rows(
+        execution_units::SINK_RUNTIME_UNIT_ID,
+        &[("nfs-145", &["node-cutover-b::nfs-145"])],
+        2,
+    )])
+    .await
+    .expect("initial sink control wave should apply");
+    set_control_initialized_for_tests(&app, false);
+    set_source_replay_required_for_tests(&app, false);
+    set_sink_replay_required_for_tests(&app, true);
+    app.control_failure_uninitialized
+        .store(true, AtomicOrdering::Release);
+    app.sink_generation_cutover_replay_deferred
+        .store(true, AtomicOrdering::Release);
+    app.api_control_gate.set_ready_state(false, false);
+
+    let _sink_error_reset = SinkWorkerControlFrameErrorQueueHookReset;
+    crate::workers::sink::install_sink_worker_control_frame_error_queue_hook(
+        crate::workers::sink::SinkWorkerControlFrameErrorQueueHook {
+            errs: (0..64).map(|_| CnxError::TxBusy).collect(),
+            sticky_worker_instance_id: None,
+            sticky_peer_err: None,
+        },
+    );
+
+    let sink_repair_attempt = || {
+        app.api_control_gate
+            .repair_lane_snapshot()
+            .into_iter()
+            .find(|lane| {
+                lane.lane == "sink-repair"
+                    && lane.owner == "sink"
+                    && lane.trigger == "sink-generation-cutover"
+            })
+            .and_then(|lane| lane.attempt)
+            .unwrap_or(0)
+    };
+
+    app.schedule_deferred_sink_repair_recovery("sink-generation-cutover")
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if sink_repair_attempt() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first deferred sink repair tx-busy attempt should be observable");
+
+    let notify_until = tokio::time::Instant::now() + Duration::from_millis(650);
+    while tokio::time::Instant::now() < notify_until {
+        app.runtime_state_changed.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let attempt_after_notifications = sink_repair_attempt();
+
+    crate::workers::sink::clear_sink_worker_control_frame_error_hook();
+    set_sink_replay_required_for_tests(&app, false);
+    app.runtime_state_changed.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !app
+                .deferred_sink_repair_recovery_scheduled
+                .load(AtomicOrdering::Acquire)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("deferred sink repair task should exit after replay requirement clears");
+    app.close().await.expect("close app");
+
+    assert_eq!(
+        attempt_after_notifications, 1,
+        "deferred sink-generation-cutover repair must not retry tx-busy/no-progress failures just because runtime_state_changed was notified"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -45453,6 +46064,66 @@ async fn uninitialized_cleanup_only_facade_deactivate_does_not_wait_for_inflight
             .expect("query-peer source-status route state"),
         "uninitialized facade cleanup should withdraw the query-peer source-status route even while an unrelated shared handoff holds shared serial",
     );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test]
+async fn internal_status_route_deactivate_does_not_wait_unbounded_for_status_remote_collection() {
+    let app = Arc::new(
+        FSMetaApp::with_boundaries(
+            FSMetaConfig::default(),
+            NodeId("node-c-status-route-drain".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init app"),
+    );
+
+    let route_scopes = [RuntimeBoundScope {
+        scope_id: "test-root".to_string(),
+        resource_ids: vec!["listener-a".to_string()],
+    }];
+    let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+
+    app.apply_facade_activate(
+        FacadeRuntimeUnit::QueryPeer,
+        &source_status_route,
+        2,
+        &route_scopes,
+    )
+    .await
+    .expect("activate query-peer source-status route");
+    set_control_initialized_for_tests(&app, true);
+
+    let status_remote_collection_guard = app.api_control_gate.begin_status_remote_collection();
+    let mut cleanup_followup = tokio::spawn({
+        let app = app.clone();
+        let source_status_route = source_status_route.clone();
+        async move {
+            app.on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route,
+                3,
+            )])
+            .await
+        }
+    });
+
+    let cleanup_result =
+        tokio::time::timeout(Duration::from_millis(600), &mut cleanup_followup).await;
+    drop(status_remote_collection_guard);
+    if cleanup_result.is_err() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut cleanup_followup).await;
+    }
+
+    assert!(
+        cleanup_result.is_ok(),
+        "internal status route cleanup must not wait unbounded for an in-flight /status remote collection; cleanup owns route turnover while /status returns degraded/partial/not-ready evidence"
+    );
+    cleanup_result
+        .expect("join status-route cleanup via timeout completion")
+        .expect("join status-route cleanup task")
+        .expect("internal status route cleanup should settle");
 
     app.close().await.expect("close app");
 }

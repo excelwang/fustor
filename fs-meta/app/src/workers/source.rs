@@ -4662,6 +4662,11 @@ pub(crate) struct SourceWorkerTriggerRescanWhenReadyCallCountHook {
 }
 
 #[cfg(test)]
+pub(crate) struct SourceScanAuditAdmissionReleaseDelayHook {
+    pub delay: Duration,
+}
+
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct SourceWorkerRearmCallCountHook {
     pub count: Arc<AtomicUsize>,
@@ -4692,6 +4697,13 @@ pub(crate) struct SourceWorkerScheduledGroupsErrorHook {
 #[derive(Clone)]
 pub(crate) struct SourceWorkerControlFrameHook {
     pub entered: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SourceWorkerPreStatusReplayHook {
+    pub entered: Arc<tokio::sync::Notify>,
+    pub release: Arc<tokio::sync::Notify>,
 }
 
 #[cfg(test)]
@@ -4765,6 +4777,14 @@ fn source_worker_update_roots_hook_cell() -> &'static Mutex<Option<SourceWorkerU
 #[cfg(test)]
 fn source_worker_control_frame_hook_cell() -> &'static Mutex<Option<SourceWorkerControlFrameHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerControlFrameHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn source_worker_pre_status_replay_hook_cell()
+-> &'static Mutex<Option<SourceWorkerPreStatusReplayHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerPreStatusReplayHook>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
@@ -4846,6 +4866,14 @@ fn source_worker_trigger_rescan_when_ready_call_count_hook_cell()
     static CELL: std::sync::OnceLock<
         Mutex<Option<SourceWorkerTriggerRescanWhenReadyCallCountHook>>,
     > = std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn source_scan_audit_admission_release_delay_hook_cell()
+-> &'static Mutex<Option<SourceScanAuditAdmissionReleaseDelayHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceScanAuditAdmissionReleaseDelayHook>>> =
+        std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
 
@@ -4972,6 +5000,15 @@ pub(crate) fn install_source_worker_control_frame_hook(hook: SourceWorkerControl
 }
 
 #[cfg(test)]
+pub(crate) fn install_source_worker_pre_status_replay_hook(hook: SourceWorkerPreStatusReplayHook) {
+    let mut guard = match source_worker_pre_status_replay_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn install_source_worker_control_frame_pause_hook(
     hook: SourceWorkerControlFramePauseHook,
 ) {
@@ -5058,6 +5095,15 @@ pub(crate) fn install_source_worker_force_find_error_queue_hook(
 #[cfg(test)]
 pub(crate) fn clear_source_worker_control_frame_hook() {
     let mut guard = match source_worker_control_frame_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_source_worker_pre_status_replay_hook() {
+    let mut guard = match source_worker_pre_status_replay_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -5327,6 +5373,17 @@ pub(crate) fn install_source_worker_trigger_rescan_when_ready_call_count_hook(
 }
 
 #[cfg(test)]
+pub(crate) fn install_source_scan_audit_admission_release_delay_hook(
+    hook: SourceScanAuditAdmissionReleaseDelayHook,
+) {
+    let mut guard = match source_scan_audit_admission_release_delay_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn install_source_worker_rearm_call_count_hook(hook: SourceWorkerRearmCallCountHook) {
     let mut guard = match source_worker_rearm_call_count_hook_cell().lock() {
         Ok(guard) => guard,
@@ -5449,6 +5506,15 @@ pub(crate) fn clear_source_worker_observability_delay_hook() {
 #[cfg(test)]
 pub(crate) fn clear_source_worker_trigger_rescan_when_ready_call_count_hook() {
     let mut guard = match source_worker_trigger_rescan_when_ready_call_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_source_scan_audit_admission_release_delay_hook() {
+    let mut guard = match source_scan_audit_admission_release_delay_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -5600,6 +5666,20 @@ fn record_source_worker_trigger_rescan_when_ready_attempt() {
     };
     if let Some(hook) = guard.as_ref() {
         hook.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+async fn maybe_delay_source_scan_audit_admission_release_attempt() {
+    let delay = {
+        let guard = match source_scan_audit_admission_release_delay_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.as_ref().map(|hook| hook.delay)
+    };
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -5792,6 +5872,27 @@ fn notify_source_worker_control_frame_started() {
     };
     if let Some(hook) = hook {
         hook.entered.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+async fn maybe_pause_before_status_retained_replay() {
+    let hook = {
+        let guard = match source_worker_pre_status_replay_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        hook.entered.notify_waiters();
+        release.await;
     }
 }
 
@@ -8355,11 +8456,6 @@ impl SourceWorkerClientHandle {
             cache.rescan_request_last_audit_completed_at_us = last_audit_completed_at_us;
             cache.rescan_request_epoch = cache.rescan_request_epoch.max(epoch);
         });
-        self.wait_for_rescan_observed_epoch_with_failure(
-            epoch,
-            SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
-        )
-        .await?;
         Ok(epoch)
     }
 
@@ -8827,17 +8923,24 @@ impl SourceWorkerClientHandle {
         }
         if read_mode.can_use_control_cache_before_live_probe()
             && self.retained_replay_required_for_status().await
-            && let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot()
         {
-            self.log_observability_cache_fallback(
-                "runtime_scope_control_cache_before_retained_replay",
-                &snapshot,
-            );
-            return Ok((snapshot, true));
+            return Ok(self
+                .source_state_pending_observability_snapshot_for_status_route()
+                .await);
+        }
+        #[cfg(test)]
+        maybe_pause_before_status_retained_replay().await;
+        if let Some(snapshot) = self
+            .source_state_pending_status_observation_if_retained_replay_required(read_mode)
+            .await
+        {
+            return Ok(snapshot);
         }
         let read_deadline = std::time::Instant::now() + live_probe_timeout;
-        self.replay_retained_control_state_before_observability_read_until(read_deadline)
-            .await?;
+        if !read_mode.can_use_control_cache_before_live_probe() {
+            self.replay_retained_control_state_before_observability_read_until(read_deadline)
+                .await?;
+        }
         let Some(_client) = self.existing_client_with_failure().await? else {
             let snapshot =
                 self.degraded_observability_snapshot_from_cache("source worker status not started");
@@ -8873,6 +8976,12 @@ impl SourceWorkerClientHandle {
             return Ok((snapshot, true));
         }
         let _read_serial = self.observability_read_serial.lock().await;
+        if let Some(snapshot) = self
+            .source_state_pending_status_observation_if_retained_replay_required(read_mode)
+            .await
+        {
+            return Ok(snapshot);
+        }
         if self.control_op_inflight() {
             if let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot() {
                 self.log_observability_cache_fallback(
@@ -8943,8 +9052,22 @@ impl SourceWorkerClientHandle {
         );
         trace_guard.complete();
         match result {
-            Ok(snapshot) => Ok((snapshot, false)),
+            Ok(snapshot) => {
+                if let Some(snapshot) = self
+                    .source_state_pending_status_observation_if_retained_replay_required(read_mode)
+                    .await
+                {
+                    return Ok(snapshot);
+                }
+                Ok((snapshot, false))
+            }
             Err(err) => {
+                if let Some(snapshot) = self
+                    .source_state_pending_status_observation_if_retained_replay_required(read_mode)
+                    .await
+                {
+                    return Ok(snapshot);
+                }
                 if let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot() {
                     self.log_observability_cache_fallback(
                         "runtime_scope_control_cache_after_live_probe_failure",
@@ -9046,6 +9169,21 @@ impl SourceWorkerClientHandle {
             };
         strip_delivery_truth_from_source_state_pending_observation(&mut snapshot);
         (snapshot, true)
+    }
+
+    async fn source_state_pending_status_observation_if_retained_replay_required(
+        &self,
+        read_mode: SourceObservabilityStatusReadMode,
+    ) -> Option<(SourceObservabilitySnapshot, bool)> {
+        if read_mode.can_use_control_cache_before_live_probe()
+            && self.retained_replay_required_for_status().await
+        {
+            return Some(
+                self.source_state_pending_observability_snapshot_for_status_route()
+                    .await,
+            );
+        }
+        None
     }
 
     fn retained_control_observability_snapshot_for_pending_source_state(
@@ -11674,10 +11812,12 @@ impl SourceFacade {
     ) -> std::result::Result<u64, SourceFailure> {
         #[cfg(test)]
         record_source_worker_trigger_rescan_when_ready_attempt();
+        #[cfg(test)]
+        maybe_delay_source_scan_audit_admission_release_attempt().await;
         match self {
             Self::Local(source) => {
                 if source.open_scan_audit_admission_if_closed() {
-                    source.trigger_rescan_when_ready_epoch_with_failure().await
+                    Ok(source.submit_rescan_request_epoch())
                 } else {
                     Ok(0)
                 }
@@ -11861,6 +12001,38 @@ impl SourceFacade {
             Some(timeout) if timeout.is_zero() => None,
             Some(timeout) => tokio::time::timeout(timeout, observation).await.ok(),
             None => Some(observation.await),
+        }
+    }
+
+    pub(crate) async fn source_state_pending_observability_snapshot_for_status_route_with_timeout_or_degraded(
+        &self,
+        timeout: Option<Duration>,
+        timeout_reason: impl Into<String>,
+    ) -> (SourceObservabilitySnapshot, bool) {
+        if let Some(snapshot) = self
+            .source_state_pending_observability_snapshot_for_status_route_with_timeout(timeout)
+            .await
+        {
+            return snapshot;
+        }
+        let timeout_reason = timeout_reason.into();
+        match self {
+            Self::Local(source) => {
+                let (mut snapshot, _) =
+                    source.observability_snapshot_nonblocking_for_status_route();
+                strip_delivery_truth_from_source_state_pending_observation(&mut snapshot);
+                snapshot
+                    .status
+                    .degraded_roots
+                    .push((SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(), timeout_reason));
+                (snapshot, true)
+            }
+            Self::Worker(client) => {
+                let mut snapshot =
+                    client.degraded_observability_snapshot_from_cache(timeout_reason);
+                strip_delivery_truth_from_source_state_pending_observation(&mut snapshot);
+                (snapshot, true)
+            }
         }
     }
 

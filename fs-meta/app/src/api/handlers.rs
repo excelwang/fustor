@@ -296,6 +296,14 @@ fn manual_rescan_response_budget_exhausted_error(
     )
 }
 
+async fn sleep_roots_put_second_wave_poll_until(deadline: tokio::time::Instant) {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return;
+    }
+    tokio::time::sleep(remaining.min(ROOTS_PUT_SOURCE_SECOND_WAVE_POLL_INTERVAL)).await;
+}
+
 fn merge_status_repair_lane_evidence(
     existing: Vec<StatusRepairLaneEvidence>,
     additional: Vec<StatusRepairLaneEvidence>,
@@ -494,6 +502,122 @@ pub(crate) struct StatusPauseHook {
 
 #[cfg(test)]
 #[derive(Clone)]
+struct StatusCancelDropHook {
+    state: std::sync::Arc<StatusCancelDropHookState>,
+}
+
+#[cfg(test)]
+struct StatusCancelDropHookState {
+    drop_started: StdMutex<bool>,
+    drop_started_cvar: std::sync::Condvar,
+    release: StdMutex<bool>,
+    release_cvar: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl StatusCancelDropHook {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new(StatusCancelDropHookState {
+                drop_started: StdMutex::new(false),
+                drop_started_cvar: std::sync::Condvar::new(),
+                release: StdMutex::new(false),
+                release_cvar: std::sync::Condvar::new(),
+            }),
+        }
+    }
+
+    fn release(&self) {
+        {
+            let mut release = match self.state.release.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *release = true;
+        }
+        self.state.release_cvar.notify_all();
+        self.state.drop_started_cvar.notify_all();
+    }
+
+    fn wait_for_drop_started_or_release(&self, budget: Duration) -> bool {
+        let started_at = StdInstant::now();
+        let mut drop_started = match self.state.drop_started.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        loop {
+            if *drop_started {
+                return true;
+            }
+            if self.is_released() {
+                return false;
+            }
+            let elapsed = started_at.elapsed();
+            if elapsed >= budget {
+                return false;
+            }
+            let remaining = budget - elapsed;
+            let (guard, timeout) = match self
+                .state
+                .drop_started_cvar
+                .wait_timeout(drop_started, remaining)
+            {
+                Ok(result) => result,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            drop_started = guard;
+            if timeout.timed_out() {
+                return *drop_started;
+            }
+        }
+    }
+
+    fn is_released(&self) -> bool {
+        let release = match self.state.release.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *release
+    }
+
+    fn block_drop_until_released(&self) {
+        {
+            let mut drop_started = match self.state.drop_started.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *drop_started = true;
+        }
+        self.state.drop_started_cvar.notify_all();
+        let mut release = match self.state.release.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while !*release {
+            release = match self.state.release_cvar.wait(release) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+struct StatusCancelDropGuard {
+    hook: Option<StatusCancelDropHook>,
+}
+
+#[cfg(test)]
+impl Drop for StatusCancelDropGuard {
+    fn drop(&mut self) {
+        if let Some(hook) = self.hook.take() {
+            hook.block_drop_until_released();
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 struct StatusRouteTraceHook {
     events: std::sync::Arc<StdMutex<Vec<String>>>,
 }
@@ -519,6 +643,12 @@ fn rescan_pause_hook_cell() -> &'static StdMutex<Option<RescanPauseHook>> {
 #[cfg(test)]
 fn status_pause_hook_cell() -> &'static StdMutex<Option<StatusPauseHook>> {
     static CELL: OnceLock<StdMutex<Option<StatusPauseHook>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn status_cancel_drop_hook_cell() -> &'static StdMutex<Option<StatusCancelDropHook>> {
+    static CELL: OnceLock<StdMutex<Option<StatusCancelDropHook>>> = OnceLock::new();
     CELL.get_or_init(|| StdMutex::new(None))
 }
 
@@ -573,6 +703,15 @@ pub(crate) fn install_status_pause_hook(hook: StatusPauseHook) {
 }
 
 #[cfg(test)]
+fn install_status_cancel_drop_hook(hook: StatusCancelDropHook) {
+    let mut guard = match status_cancel_drop_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 fn install_status_route_trace_hook(hook: StatusRouteTraceHook) {
     let mut guard = match status_route_trace_hook_cell().lock() {
         Ok(guard) => guard,
@@ -616,6 +755,15 @@ pub(crate) fn clear_rescan_pause_hook() {
 #[cfg(test)]
 pub(crate) fn clear_status_pause_hook() {
     let mut guard = match status_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+fn clear_status_cancel_drop_hook() {
+    let mut guard = match status_cancel_drop_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -888,75 +1036,10 @@ fn status_scan_audit_release_primary_owner_signature(
     parts
 }
 
-fn status_scan_audit_release_sink_group_signature(
-    sink_status: &SinkStatusSnapshot,
-    expected_groups: &BTreeSet<String>,
-) -> Vec<String> {
-    let mut parts = sink_status
-        .groups
-        .iter()
-        .filter(|group| expected_groups.contains(&group.group_id))
-        .map(|group| {
-            format!(
-                "{}|{}|{:?}|{}",
-                group.group_id,
-                group.primary_object_ref,
-                group.normalized_readiness(),
-                group.overflow_pending_materialization,
-            )
-        })
-        .collect::<Vec<_>>();
-    parts.sort();
-    parts
-}
-
 fn status_scan_audit_release_source_control_signature(
     source: &SourceObservabilitySnapshot,
-    expected_groups: &BTreeSet<String>,
 ) -> Vec<String> {
     let mut parts = Vec::new();
-    parts.push(format!(
-        "source_status_stream={}",
-        source
-            .status
-            .current_stream_generation
-            .map(|generation| generation.to_string())
-            .unwrap_or_default()
-    ));
-    for concrete in &source.status.concrete_roots {
-        if !expected_groups.contains(&concrete.logical_root_id) {
-            continue;
-        }
-        parts.push(format!(
-            "concrete={}|{}|current={}:{}|candidate={}:{}|draining={}:{}",
-            concrete.logical_root_id,
-            concrete.object_ref,
-            concrete
-                .current_revision
-                .map(|revision| revision.to_string())
-                .unwrap_or_default(),
-            concrete
-                .current_stream_generation
-                .map(|generation| generation.to_string())
-                .unwrap_or_default(),
-            concrete
-                .candidate_revision
-                .map(|revision| revision.to_string())
-                .unwrap_or_default(),
-            concrete
-                .candidate_stream_generation
-                .map(|generation| generation.to_string())
-                .unwrap_or_default(),
-            concrete
-                .draining_revision
-                .map(|revision| revision.to_string())
-                .unwrap_or_default(),
-            concrete
-                .draining_stream_generation
-                .map(|generation| generation.to_string())
-                .unwrap_or_default(),
-        ));
-    }
     for (node_id, signals) in &source.last_control_frame_signals_by_node {
         let mut route_signals = signals
             .iter()
@@ -965,7 +1048,7 @@ fn status_scan_audit_release_source_control_signature(
                     && (signal.contains("unit=runtime.exec.source")
                         || signal.contains("unit=runtime.exec.scan"))
             })
-            .cloned()
+            .map(|signal| status_repair_control_signal_stable_shape(signal))
             .collect::<Vec<_>>();
         route_signals.sort();
         if !route_signals.is_empty() {
@@ -974,6 +1057,14 @@ fn status_scan_audit_release_source_control_signature(
     }
     parts.sort();
     parts
+}
+
+fn status_repair_control_signal_stable_shape(signal: &str) -> String {
+    signal
+        .split_whitespace()
+        .filter(|part| !part.starts_with("generation="))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn status_scan_audit_release_cache_key(
@@ -1015,7 +1106,7 @@ fn status_scan_audit_release_cache_key(
     ));
     parts.push(format!(
         "source_control={}",
-        status_scan_audit_release_source_control_signature(source, expected_groups).join(",")
+        status_scan_audit_release_source_control_signature(source).join(",")
     ));
     parts.push(format!(
         "source_schedule={}",
@@ -1036,7 +1127,7 @@ fn status_scan_audit_release_cache_key(
     parts.push(format!(
         "sink_schedule={}",
         status_scan_audit_release_groups_by_node_signature(
-            &sink_status.scheduled_groups_by_node,
+            &sink_snapshot_scheduled_groups_by_node(sink_status),
             expected_groups,
         )
         .join(",")
@@ -1044,14 +1135,10 @@ fn status_scan_audit_release_cache_key(
     parts.push(format!(
         "sink_primary={}",
         status_scan_audit_release_primary_owner_signature(
-            &sink_status.primary_host_ref_by_group,
+            &sink_snapshot_primary_host_ref_by_group(sink_status),
             expected_groups,
         )
         .join(",")
-    ));
-    parts.push(format!(
-        "sink_groups={}",
-        status_scan_audit_release_sink_group_signature(sink_status, expected_groups).join(",")
     ));
     parts
 }
@@ -1634,7 +1721,7 @@ async fn send_manual_rescan_current_roots_control_second_wave_once_with_budget(
     target_node_ids: &BTreeSet<String>,
     control_gate: &Arc<ApiControlGate>,
     response_budget: &ManualRescanResponseBudget,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     if roots_control_send_cache_covers(context, roots, target_node_ids) {
         eprintln!(
             "fs_meta_api: manual rescan current-roots control send skipped duplicate generation={} roots={} targets={:?}",
@@ -1642,7 +1729,7 @@ async fn send_manual_rescan_current_roots_control_second_wave_once_with_budget(
             roots.len(),
             target_node_ids,
         );
-        return Ok(());
+        return Ok(false);
     }
 
     let wait_budget = response_budget.stage_timeout(
@@ -1710,7 +1797,7 @@ async fn send_manual_rescan_current_roots_control_second_wave_once_with_budget(
     });
 
     match tokio::time::timeout(wait_budget, task).await {
-        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Ok(()))) => Ok(true),
         Ok(Ok(Err(err))) => Err(err),
         Ok(Err(err)) => Err(ApiError::service_unavailable_with_repair_lanes(
             format!("manual rescan current roots roots-control replay task failed: {err}"),
@@ -2436,6 +2523,7 @@ async fn collect_manual_rescan_source_status_origin_snapshots(
         .collect()
 }
 
+#[cfg(not(test))]
 async fn collect_node_scoped_manual_rescan_source_status_origin_snapshot(
     boundary: std::sync::Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
@@ -2465,6 +2553,95 @@ async fn collect_node_scoped_manual_rescan_source_status_origin_snapshot(
         Err(_) => return Err(CnxError::Timeout),
     };
     events
+        .into_iter()
+        .map(|event| {
+            let snapshot =
+                rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes())
+                    .map_err(|err| {
+                        CnxError::Internal(format!("decode source observability failed: {err}"))
+                    })?;
+            Ok::<_, CnxError>((requested_node_id.clone(), snapshot))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+async fn collect_node_scoped_manual_rescan_source_status_origin_snapshot(
+    boundary: std::sync::Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    timeout: Duration,
+    node_id: &str,
+) -> Result<Vec<(String, SourceObservabilitySnapshot)>, CnxError> {
+    let requested_node_id = node_id.to_string();
+    let attempt_timeout = scoped_manual_rescan_source_status_attempt_timeout(timeout);
+    let deadline = tokio::time::Instant::now() + attempt_timeout;
+    let request_route = source_status_request_route_for(node_id);
+    let request_channel = ChannelKey(request_route.0.clone());
+    let reply_channel = ChannelKey(format!("{}:reply", request_route.0));
+    let correlation = MANUAL_RESCAN_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let event = Event::new(
+        EventMetadata {
+            origin_id,
+            timestamp_us: repair_lane_now_us(),
+            logical_ts: None,
+            correlation_id: Some(correlation),
+            ingress_auth: None,
+            trace: None,
+        },
+        scoped_manual_rescan_source_status_request_payload(timeout),
+    );
+
+    let send_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if send_remaining.is_zero() {
+        return Err(CnxError::Timeout);
+    }
+    match tokio::time::timeout(
+        send_remaining,
+        boundary.channel_send(
+            BoundaryContext::default(),
+            ChannelSendRequest {
+                channel_key: request_channel,
+                events: vec![event],
+                timeout_ms: Some(send_remaining.as_millis() as u64),
+            },
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err),
+        Err(_) => return Err(CnxError::Timeout),
+    }
+
+    let recv_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if recv_remaining.is_zero() {
+        return Err(CnxError::Timeout);
+    }
+    let events = match tokio::time::timeout(
+        recv_remaining,
+        boundary.channel_recv(
+            BoundaryContext::default(),
+            capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest {
+                channel_key: reply_channel,
+                timeout_ms: Some(recv_remaining.as_millis() as u64),
+            },
+        ),
+    )
+    .await
+    {
+        Ok(Ok(events)) => events,
+        Ok(Err(err)) => return Err(err),
+        Err(_) => return Err(CnxError::Timeout),
+    };
+
+    let matching_events = events
+        .into_iter()
+        .filter(|event| event.metadata().correlation_id == Some(correlation))
+        .collect::<Vec<_>>();
+    if matching_events.is_empty() {
+        return Err(CnxError::Timeout);
+    }
+    matching_events
         .into_iter()
         .map(|event| {
             let snapshot =
@@ -3215,13 +3392,13 @@ where
                 let source_collect_is_discovery_seed =
                     source_status_probe_targets_are_discovery_seed;
                 let source_collect_discovery_seed_node_ids = source_status_probe_node_ids.clone();
-                let mut scoped_source_collects = FuturesUnordered::new();
+                let mut scoped_source_collects = tokio::task::JoinSet::new();
                 if run_scoped_source_collect {
                     prefer_scoped_source_probe = true;
                     for node_id in scoped_target_node_ids {
                         let boundary = boundary.clone();
                         let origin_id = context.node_id.clone();
-                        scoped_source_collects.push(async move {
+                        scoped_source_collects.spawn(async move {
                             let result =
                                 collect_node_scoped_manual_rescan_source_status_origin_snapshot(
                                     boundary,
@@ -3435,9 +3612,9 @@ where
                             source_collect_done = true;
                             continue;
                         }
-                        result = scoped_source_collects.next(), if !scoped_source_collect_done => {
+                        result = scoped_source_collects.join_next(), if !scoped_source_collect_done => {
                             match result {
-                                Some((_node_id, Ok(origin_snapshots))) => {
+                                Some(Ok((_node_id, Ok(origin_snapshots)))) => {
                                     observed_per_origin.extend(origin_snapshots.iter().map(|(origin, snapshot)| {
                                         format!(
                                             "{origin}=>{}",
@@ -3498,12 +3675,21 @@ where
                                         ));
                                     }
                                 }
-                                Some((node_id, Err(err))) => {
+                                Some(Ok((node_id, Err(err)))) => {
                                     if !source_status_probe_targets_are_discovery_seed
                                         && observed_err.is_none()
                                     {
                                         observed_err = Some(CnxError::Internal(format!(
                                             "node-scoped source-status probe failed for {node_id}: {err}"
+                                        )));
+                                    }
+                                }
+                                Some(Err(err)) => {
+                                    if !source_status_probe_targets_are_discovery_seed
+                                        && observed_err.is_none()
+                                    {
+                                        observed_err = Some(CnxError::Internal(format!(
+                                            "node-scoped source-status probe task failed: {err}"
                                         )));
                                     }
                                 }
@@ -3599,6 +3785,9 @@ where
                                 }
                             }
                         }
+                    }
+                    if source_collect_done && scoped_source_collect_done && !local_source_done {
+                        local_source_done = true;
                     }
                 }
 
@@ -3920,7 +4109,7 @@ where
             next_resend_at = deadline;
         }
 
-        tokio::time::sleep(ROOTS_PUT_SOURCE_SECOND_WAVE_POLL_INTERVAL).await;
+        sleep_roots_put_second_wave_poll_until(deadline).await;
     }
 }
 
@@ -4101,6 +4290,7 @@ async fn maybe_pause_rescan_before_return() {
 
 #[cfg(test)]
 async fn maybe_pause_status_before_remote_collection() {
+    let _cancel_drop_guard = status_cancel_drop_guard();
     let hook = {
         let guard = match status_pause_hook_cell().lock() {
             Ok(guard) => guard,
@@ -4118,6 +4308,18 @@ async fn maybe_pause_status_before_remote_collection() {
         hook.entered.notify_waiters();
         release.await;
     }
+}
+
+#[cfg(test)]
+fn status_cancel_drop_guard() -> Option<StatusCancelDropGuard> {
+    let hook = {
+        let guard = match status_cancel_drop_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    hook.map(|hook| StatusCancelDropGuard { hook: Some(hook) })
 }
 
 fn next_status_trace_request_id() -> Option<u64> {
@@ -4599,10 +4801,6 @@ fn status_sink_observation_repair_lane_signature(
         status_scan_audit_release_roots_signature(&source.logical_roots).join(",")
     ));
     parts.push(format!(
-        "source_control={}",
-        status_scan_audit_release_source_control_signature(source, expected_groups).join(",")
-    ));
-    parts.push(format!(
         "source_schedule={}",
         status_scan_audit_release_groups_by_node_signature(
             &source.scheduled_source_groups_by_node,
@@ -4618,26 +4816,6 @@ fn status_sink_observation_repair_lane_signature(
         )
         .join(",")
     ));
-    parts.push(format!(
-        "sink_schedule={}",
-        status_scan_audit_release_groups_by_node_signature(
-            &sink_status.scheduled_groups_by_node,
-            expected_groups,
-        )
-        .join(",")
-    ));
-    parts.push(format!(
-        "sink_primary={}",
-        status_scan_audit_release_primary_owner_signature(
-            &sink_status.primary_host_ref_by_group,
-            expected_groups,
-        )
-        .join(",")
-    ));
-    parts.push(format!(
-        "sink_groups={}",
-        status_scan_audit_release_sink_group_signature(sink_status, expected_groups).join(",")
-    ));
     let mut sink_control = sink_status
         .last_control_frame_signals_by_node
         .iter()
@@ -4651,7 +4829,7 @@ fn status_sink_observation_repair_lane_signature(
                             .iter()
                             .any(|group_id| signal.contains(group_id))
                 })
-                .cloned()
+                .map(|signal| status_repair_control_signal_stable_shape(signal))
                 .collect::<Vec<_>>();
             signals.sort();
             (!signals.is_empty()).then(|| format!("{node_id}={}", signals.join(";")))
@@ -4698,6 +4876,23 @@ fn status_sink_observation_repair_lane_evidence(
     evidence
 }
 
+fn status_existing_sink_generation_cutover_lane(
+    lanes: &[StatusRepairLaneEvidence],
+) -> Option<StatusRepairLaneEvidence> {
+    lanes
+        .iter()
+        .find(|lane| {
+            lane.lane == "sink-repair"
+                && lane.owner == "sink"
+                && lane.trigger == "sink-generation-cutover"
+                && matches!(
+                    lane.state.as_str(),
+                    "scheduled" | "inflight" | "blocked" | "failed" | "timed-out"
+                )
+        })
+        .cloned()
+}
+
 async fn run_status_sink_observation_repair_if_needed(
     state: &ApiState,
     source: &SourceObservabilitySnapshot,
@@ -4727,6 +4922,26 @@ async fn run_status_sink_observation_repair_if_needed(
             sink_outcome,
         );
     }
+    if let Some(owner_lane) =
+        status_existing_sink_generation_cutover_lane(&state.control_gate.repair_lane_snapshot())
+    {
+        let evidence = status_sink_observation_repair_lane_evidence(
+            source,
+            sink_status,
+            &expected_groups,
+            "blocked",
+            false,
+            Some(format!(
+                "sink-generation-cutover recovery already owns sink replay state={}",
+                owner_lane.state
+            )),
+            sink_outcome,
+        );
+        state
+            .control_gate
+            .record_repair_lane_evidence(evidence.clone());
+        return evidence;
+    }
     let Some(recovery) = state.control_gate.sink_repair_recovery() else {
         return status_sink_observation_repair_lane_evidence(
             source,
@@ -4747,6 +4962,14 @@ async fn run_status_sink_observation_repair_if_needed(
         Some("status observed sink observation gap and woke background repair".to_string()),
         sink_outcome,
     );
+    if let Some(existing) = state
+        .control_gate
+        .repair_lane_evidence_for_signature(&lane.signature)
+    {
+        if existing.state == "completed" {
+            return existing;
+        }
+    }
     let (claimed, lane) = state.control_gate.claim_repair_lane_schedule(lane);
     if !claimed {
         return lane;
@@ -5044,6 +5267,8 @@ async fn execute_source_scan_audit_admission_release_lane(
             })
             .collect::<FuturesUnordered<_>>();
         let mut released_owner_nodes = BTreeSet::new();
+        let mut pending_owner_nodes = BTreeSet::new();
+        let mut failed_owner_errors = Vec::new();
         while let Some((node_id, result)) = pending.next().await {
             match result {
                 Ok(()) => {
@@ -5054,28 +5279,55 @@ async fn execute_source_scan_audit_admission_release_lane(
                     );
                 }
                 Err(err) => {
-                    eprintln!(
-                        "fs_meta_api_status: release_source_scan_audit_after_sink_scope_ready_if_needed route failed node={} err={}",
-                        node_id, err
-                    );
+                    if matches!(err, CnxError::Timeout) {
+                        pending_owner_nodes.insert(node_id.clone());
+                        eprintln!(
+                            "fs_meta_api_status: release_source_scan_audit_after_sink_scope_ready_if_needed route pending node={} outcome=timeout",
+                            node_id
+                        );
+                    } else {
+                        failed_owner_errors.push(format!("{node_id}: {err}"));
+                        eprintln!(
+                            "fs_meta_api_status: release_source_scan_audit_after_sink_scope_ready_if_needed route failed node={} err={}",
+                            node_id, err
+                        );
+                    }
                 }
             }
         }
         remember_status_scan_audit_release_owner_nodes(&release_cache_key, &released_owner_nodes);
         let released_count = released_owner_nodes.len();
+        let state = if released_count == expected_release_count {
+            "completed"
+        } else if failed_owner_errors.is_empty() {
+            "timed-out"
+        } else {
+            "failed"
+        };
+        let reason = if released_count == expected_release_count {
+            None
+        } else if failed_owner_errors.is_empty() {
+            if pending_owner_nodes.is_empty() {
+                Some(format!(
+                    "released {released_count}/{expected_release_count} source owners; pending owner routes returned no release evidence"
+                ))
+            } else {
+                Some(format!(
+                    "released {released_count}/{expected_release_count} source owners; pending source owners: {:?}",
+                    pending_owner_nodes
+                ))
+            }
+        } else {
+            Some(format!(
+                "released {released_count}/{expected_release_count} source owners; failed source owner routes: {}",
+                failed_owner_errors.join(", ")
+            ))
+        };
         return status_scan_audit_release_lane_evidence(
             &release_cache_key,
-            if released_count == expected_release_count {
-                "completed"
-            } else if released_count == 0 {
-                "failed"
-            } else {
-                "failed"
-            },
+            state,
             false,
-            (released_count != expected_release_count).then(|| {
-                format!("released {released_count}/{expected_release_count} source owners")
-            }),
+            reason,
             sink_outcome,
         );
     }
@@ -5202,6 +5454,50 @@ async fn release_source_scan_audit_after_sink_scope_ready_on_owner_route(
 }
 
 pub async fn status(
+    State(state): State<ApiState>,
+    ingress_readiness: Option<Extension<ApiRequestControlReadinessSnapshot>>,
+    headers: HeaderMap,
+) -> Result<Json<StatusResponse>, ApiError> {
+    let timeout_state = state.clone();
+    let timeout_started_at = StdInstant::now();
+    let mut status_task = tokio::spawn(status_impl(State(state), ingress_readiness, headers));
+    match tokio::time::timeout(STATUS_RESPONSE_TIMEOUT, &mut status_task).await {
+        Ok(joined) => {
+            joined.map_err(|err| ApiError::internal(format!("status task failed: {err}")))?
+        }
+        Err(_) => {
+            // Dropping the JoinHandle detaches the observation task. Aborting it can run
+            // cancellation/drop work on an API runtime worker and delay the response.
+            let lane = status_repair_lane_evidence(
+                "status-response",
+                "facade",
+                "timed-out",
+                "status-response-budget",
+                false,
+                Some("management /status response budget exceeded".to_string()),
+                None,
+            );
+            timeout_state
+                .control_gate
+                .record_repair_lane_evidence(lane.clone());
+            let repair_lanes = merge_status_repair_lane_evidence(
+                timeout_state.control_gate.repair_lane_snapshot(),
+                vec![lane],
+            );
+            eprintln!(
+                "fs_meta_api_status: response_timeout elapsed_ms={} budget_ms={}",
+                timeout_started_at.elapsed().as_millis(),
+                STATUS_RESPONSE_TIMEOUT.as_millis()
+            );
+            Err(ApiError::service_unavailable_with_repair_lanes(
+                "status response budget exceeded before bounded observation completed",
+                repair_lanes,
+            ))
+        }
+    }
+}
+
+async fn status_impl(
     State(state): State<ApiState>,
     ingress_readiness: Option<Extension<ApiRequestControlReadinessSnapshot>>,
     headers: HeaderMap,
@@ -5625,8 +5921,17 @@ pub async fn status(
         trusted_observation_readiness_for_status(&source, &sink_status);
     let status_source =
         status_source_from_observability(source, &sink_status, runner_sets, merged_inflight);
-    let (api_facade_liveness, management_write_readiness, source_repair_readiness, control_epoch) =
-        state.control_gate.readiness_snapshot();
+    let (
+        control_gate_api_facade_liveness,
+        management_write_readiness,
+        source_repair_readiness,
+        control_epoch,
+    ) = state.control_gate.readiness_snapshot();
+    let api_facade_liveness = control_gate_api_facade_liveness
+        || matches!(
+            published_facade_state,
+            FacadeServiceState::Serving | FacadeServiceState::Degraded
+        );
     repair_lanes =
         merge_status_repair_lane_evidence(repair_lanes, state.control_gate.repair_lane_snapshot());
     let runtime_artifact = runtime_artifact_evidence();
@@ -5659,7 +5964,7 @@ pub async fn status(
             blind_spot_count: sink_status.blind_spot_count,
             shadow_time_us: sink_status.shadow_time_us,
             estimated_heap_bytes: sink_status.estimated_heap_bytes,
-            primary_host_ref_by_group: sink_status.primary_host_ref_by_group,
+            primary_host_ref_by_group: sink_snapshot_primary_host_ref_by_group(&sink_status),
             groups: sink_status
                 .groups
                 .into_iter()
@@ -5758,7 +6063,7 @@ fn merge_status_vec_maps(
 
 fn status_sink_debug_from_snapshot(snapshot: &SinkStatusSnapshot) -> StatusSinkDebug {
     StatusSinkDebug {
-        scheduled_groups_by_node: snapshot.scheduled_groups_by_node.clone(),
+        scheduled_groups_by_node: sink_snapshot_scheduled_groups_by_node(snapshot),
         last_control_frame_signals_by_node: snapshot.last_control_frame_signals_by_node.clone(),
         received_batches_by_node: merge_status_count_maps(
             snapshot.received_batches_by_node.clone(),
@@ -5980,12 +6285,51 @@ fn status_sink_materialization_signature(sink: &SinkStatusSnapshot) -> String {
 }
 
 fn sink_snapshot_scheduled_groups(snapshot: &SinkStatusSnapshot) -> BTreeSet<String> {
-    snapshot
-        .scheduled_groups_by_node
+    sink_snapshot_scheduled_groups_by_node(snapshot)
         .values()
         .flatten()
         .cloned()
         .collect()
+}
+
+fn sink_snapshot_scheduled_groups_by_node(
+    snapshot: &SinkStatusSnapshot,
+) -> BTreeMap<String, Vec<String>> {
+    merge_status_vec_maps(
+        snapshot.scheduled_groups_by_node.clone(),
+        &[&snapshot.owner_scoped_scheduled_groups_by_node],
+    )
+}
+
+fn sink_snapshot_primary_host_ref_by_group(
+    snapshot: &SinkStatusSnapshot,
+) -> BTreeMap<String, String> {
+    let mut primary_host_ref_by_group = snapshot.primary_host_ref_by_group.clone();
+    for (group_id, host_ref) in &snapshot.owner_scoped_primary_host_ref_by_group {
+        if host_ref.trim().is_empty() {
+            continue;
+        }
+        primary_host_ref_by_group
+            .entry(group_id.clone())
+            .or_insert_with(|| host_ref.clone());
+    }
+    primary_host_ref_by_group
+}
+
+fn sink_snapshot_primary_host_ref_for_group<'a>(
+    snapshot: &'a SinkStatusSnapshot,
+    group_id: &str,
+) -> Option<&'a str> {
+    snapshot
+        .primary_host_ref_by_group
+        .get(group_id)
+        .or_else(|| {
+            snapshot
+                .owner_scoped_primary_host_ref_by_group
+                .get(group_id)
+        })
+        .map(|host_ref| host_ref.as_str())
+        .filter(|host_ref| !host_ref.trim().is_empty())
 }
 
 fn source_logical_root_service_state(
@@ -6548,9 +6892,11 @@ const STATUS_ROUTE_TIMEOUT: Duration = Duration::from_secs(3);
 const STATUS_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(2);
 const STATUS_MANAGEMENT_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_millis(500);
 const STATUS_ROUTE_READY_FALLBACK_GRACE: Duration = Duration::from_millis(200);
+const STATUS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const STATUS_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const STATUS_SINK_ROUTE_RECOLLECT_BUDGET: Duration = STATUS_OWNER_SCOPED_ROUTE_TIMEOUT;
-const STATUS_OWNER_SCOPED_ROUTE_TIMEOUT: Duration = Duration::from_millis(500);
+const STATUS_OWNER_SCOPED_ROUTE_TIMEOUT: Duration = Duration::from_millis(1500);
+const STATUS_PENDING_OWNER_SCOPED_ROUTE_TIMEOUT: Duration = STATUS_ROUTE_READY_FALLBACK_GRACE;
 const STATUS_SERVING_OWNER_SCOPED_ROUTE_TIMEOUT: Duration = STATUS_OWNER_SCOPED_ROUTE_TIMEOUT;
 
 fn management_status_uses_short_observation_budget(
@@ -6561,7 +6907,7 @@ fn management_status_uses_short_observation_budget(
 
 fn management_status_sink_owner_scoped_timeout(use_short_status_route_budget: bool) -> Duration {
     if use_short_status_route_budget {
-        STATUS_OWNER_SCOPED_ROUTE_TIMEOUT
+        STATUS_PENDING_OWNER_SCOPED_ROUTE_TIMEOUT
     } else {
         STATUS_SERVING_OWNER_SCOPED_ROUTE_TIMEOUT
     }
@@ -6569,7 +6915,7 @@ fn management_status_sink_owner_scoped_timeout(use_short_status_route_budget: bo
 
 fn management_status_source_owner_scoped_timeout(use_short_status_route_budget: bool) -> Duration {
     if use_short_status_route_budget {
-        STATUS_OWNER_SCOPED_ROUTE_TIMEOUT
+        STATUS_PENDING_OWNER_SCOPED_ROUTE_TIMEOUT
     } else {
         STATUS_SERVING_OWNER_SCOPED_ROUTE_TIMEOUT
     }
@@ -6578,6 +6924,19 @@ fn management_status_source_owner_scoped_timeout(use_short_status_route_budget: 
 fn status_materialized_sink_evidence_cache()
 -> &'static StdMutex<BTreeMap<String, SinkGroupStatusSnapshot>> {
     static CACHE: OnceLock<StdMutex<BTreeMap<String, SinkGroupStatusSnapshot>>> = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(BTreeMap::new()))
+}
+
+#[derive(Clone, Debug)]
+struct StatusSinkOwnerEvidence {
+    group_id: String,
+    primary_host_ref: String,
+    scheduled_node_id: String,
+}
+
+fn status_sink_owner_evidence_cache() -> &'static StdMutex<BTreeMap<String, StatusSinkOwnerEvidence>>
+{
+    static CACHE: OnceLock<StdMutex<BTreeMap<String, StatusSinkOwnerEvidence>>> = OnceLock::new();
     CACHE.get_or_init(|| StdMutex::new(BTreeMap::new()))
 }
 
@@ -6616,6 +6975,65 @@ fn sink_group_is_unready_zero_for_same_primary(group: &SinkGroupStatusSnapshot) 
         && group.primary_object_ref != group.group_id
 }
 
+fn status_sink_owner_evidence_for_group(
+    snapshot: &SinkStatusSnapshot,
+    group_id: &str,
+) -> Option<StatusSinkOwnerEvidence> {
+    let primary_host_ref = snapshot
+        .owner_scoped_primary_host_ref_by_group
+        .get(group_id)
+        .map(|host_ref| host_ref.trim())
+        .filter(|host_ref| !host_ref.is_empty())?;
+    let scheduled_node_id = snapshot
+        .owner_scoped_scheduled_groups_by_node
+        .iter()
+        .filter(|(_, groups)| groups.iter().any(|group| group == group_id))
+        .map(|(node_id, _)| node_id.as_str())
+        .find(|node_id| runtime_node_identity_matches(node_id, primary_host_ref))?;
+    Some(StatusSinkOwnerEvidence {
+        group_id: group_id.to_string(),
+        primary_host_ref: primary_host_ref.to_string(),
+        scheduled_node_id: scheduled_node_id.to_string(),
+    })
+}
+
+fn status_sink_owner_evidence_is_compatible(
+    snapshot: &SinkStatusSnapshot,
+    evidence: &StatusSinkOwnerEvidence,
+) -> bool {
+    if let Some(existing_primary) =
+        sink_snapshot_primary_host_ref_for_group(snapshot, &evidence.group_id)
+        && !runtime_node_identity_matches(existing_primary, &evidence.primary_host_ref)
+    {
+        return false;
+    }
+    let scheduled_owner_nodes =
+        status_sink_scheduled_owner_nodes_for_group(snapshot, &evidence.group_id);
+    scheduled_owner_nodes.is_empty()
+        || scheduled_owner_nodes
+            .iter()
+            .all(|node_id| runtime_node_identity_matches(node_id, &evidence.scheduled_node_id))
+}
+
+fn apply_status_sink_owner_evidence(
+    snapshot: &mut SinkStatusSnapshot,
+    evidence: StatusSinkOwnerEvidence,
+) {
+    snapshot
+        .owner_scoped_primary_host_ref_by_group
+        .entry(evidence.group_id.clone())
+        .or_insert(evidence.primary_host_ref);
+    let entry = snapshot
+        .owner_scoped_scheduled_groups_by_node
+        .entry(evidence.scheduled_node_id)
+        .or_default();
+    if !entry.iter().any(|group| group == &evidence.group_id) {
+        entry.push(evidence.group_id);
+    }
+    entry.sort();
+    entry.dedup();
+}
+
 fn apply_status_materialized_sink_evidence_cache(
     snapshot: SinkStatusSnapshot,
 ) -> SinkStatusSnapshot {
@@ -6625,8 +7043,21 @@ fn apply_status_materialized_sink_evidence_cache(
     };
     let mut merged = snapshot;
     let mut replacements = BTreeMap::<String, SinkGroupStatusSnapshot>::new();
+    let mut owner_evidence_replacements = Vec::<StatusSinkOwnerEvidence>::new();
+    let mut owner_evidence_cache = status_sink_owner_evidence_cache().lock().ok();
     for group in &merged.groups {
         let key = status_materialized_sink_evidence_key(group);
+        if let Some(owner_evidence) = status_sink_owner_evidence_for_group(&merged, &group.group_id)
+        {
+            if let Some(cache) = owner_evidence_cache.as_mut() {
+                cache.insert(key.clone(), owner_evidence);
+            }
+        } else if let Some(cache) = owner_evidence_cache.as_ref()
+            && let Some(owner_evidence) = cache.get(&key)
+            && status_sink_owner_evidence_is_compatible(&merged, owner_evidence)
+        {
+            owner_evidence_replacements.push(owner_evidence.clone());
+        }
         if sink_group_has_restorable_materialized_evidence(group) {
             cache.insert(key, group.clone());
         } else if sink_group_is_unready_zero_for_same_primary(group)
@@ -6636,13 +7067,16 @@ fn apply_status_materialized_sink_evidence_cache(
             replacements.insert(group.group_id.clone(), cached.clone());
         }
     }
-    if replacements.is_empty() {
+    if replacements.is_empty() && owner_evidence_replacements.is_empty() {
         return merged;
     }
     for group in &mut merged.groups {
         if let Some(cached) = replacements.get(&group.group_id) {
             *group = cached.clone();
         }
+    }
+    for owner_evidence in owner_evidence_replacements {
+        apply_status_sink_owner_evidence(&mut merged, owner_evidence);
     }
     merged.live_nodes = 0;
     merged.tombstoned_count = 0;
@@ -7676,7 +8110,7 @@ fn sink_status_missing_authoritative_group_ids(
 }
 
 fn sink_status_has_scheduled_group_evidence(sink: &SinkStatusSnapshot, group_id: &str) -> bool {
-    sink.scheduled_groups_by_node
+    sink_snapshot_scheduled_groups_by_node(sink)
         .values()
         .flatten()
         .any(|scheduled_group| scheduled_group == group_id)
@@ -7753,7 +8187,7 @@ fn sink_status_group_lacks_source_anchored_owner_evidence(
     let Some(source_owner_node) = source_owner_node else {
         return false;
     };
-    let Some(primary_host_ref) = sink.primary_host_ref_by_group.get(group_id) else {
+    let Some(primary_host_ref) = sink_snapshot_primary_host_ref_for_group(sink, group_id) else {
         return true;
     };
     if !runtime_node_identity_matches(primary_host_ref, &source_owner_node) {
@@ -7771,7 +8205,7 @@ fn sink_status_groups_are_speculative_zero_rows_without_sink_owner_evidence(
     group_ids: &BTreeSet<String>,
 ) -> bool {
     if group_ids.is_empty()
-        || !sink.primary_host_ref_by_group.is_empty()
+        || !sink_snapshot_primary_host_ref_by_group(sink).is_empty()
         || !sink_status_snapshot_lacks_ingress_evidence(sink)
     {
         return false;
@@ -7791,16 +8225,16 @@ fn collect_sink_owner_candidate_nodes_from_snapshot(
     sink: &SinkStatusSnapshot,
     group_ids: &BTreeSet<String>,
 ) {
-    for (group_id, host_ref) in &sink.primary_host_ref_by_group {
-        if group_ids.contains(group_id)
-            && let Some(node_id) = roots_put_control_target_node_id_for_ref_or_node(host_ref)
+    for (group_id, host_ref) in sink_snapshot_primary_host_ref_by_group(sink) {
+        if group_ids.contains(&group_id)
+            && let Some(node_id) = roots_put_control_target_node_id_for_ref_or_node(&host_ref)
         {
             nodes.insert(node_id);
         }
     }
-    for (node_id, groups) in &sink.scheduled_groups_by_node {
+    for (node_id, groups) in sink_snapshot_scheduled_groups_by_node(sink) {
         if groups.iter().any(|group| group_ids.contains(group))
-            && let Some(node_id) = roots_put_control_target_node_id_for_ref_or_node(node_id)
+            && let Some(node_id) = roots_put_control_target_node_id_for_ref_or_node(&node_id)
         {
             nodes.insert(node_id);
         }
@@ -7838,7 +8272,19 @@ fn remove_sink_status_evidence_for_groups(
         .collect();
     for group_id in group_ids {
         sink.primary_host_ref_by_group.remove(group_id);
+        sink.owner_scoped_primary_host_ref_by_group.remove(group_id);
     }
+    sink.owner_scoped_scheduled_groups_by_node = sink
+        .owner_scoped_scheduled_groups_by_node
+        .into_iter()
+        .filter_map(|(node_id, groups)| {
+            let groups = groups
+                .into_iter()
+                .filter(|group_id| !group_ids.contains(group_id))
+                .collect::<Vec<_>>();
+            (!groups.is_empty()).then_some((node_id, groups))
+        })
+        .collect();
     sink.last_control_frame_signals_by_node = sink
         .last_control_frame_signals_by_node
         .into_iter()
@@ -7879,10 +8325,7 @@ fn sink_status_snapshot_has_owner_replacement_evidence(
     snapshot: &SinkStatusSnapshot,
     group_id: &str,
 ) -> bool {
-    snapshot
-        .primary_host_ref_by_group
-        .get(group_id)
-        .is_some_and(|host_ref| !host_ref.trim().is_empty())
+    sink_snapshot_primary_host_ref_for_group(snapshot, group_id).is_some()
         || !status_sink_scheduled_owner_nodes_for_group(snapshot, group_id).is_empty()
         || !status_sink_control_frame_owner_nodes_for_group(snapshot, group_id).is_empty()
 }
@@ -7999,20 +8442,9 @@ async fn augment_management_status_sink_with_owner_scoped_evidence(
                 summarize_sink_status_route_snapshot(&sink)
             );
         }
-        if sink_status_groups_needing_owner_scoped_evidence(
-            &sink,
-            &expected_group_ids,
-            &source_runtime_scope_group_ids,
-            source,
-            authoritative_source,
-        )
-        .is_empty()
-            && status_sink_schedule_gaps_for_groups(&sink, &expected_group_ids).is_empty()
-            && status_sink_owner_partition_gaps_for_groups(&sink, source, &expected_group_ids)
-                .is_empty()
-        {
-            break;
-        }
+        // All owner probes in this batch were launched concurrently under the same short
+        // owner-scoped budget. Process every bounded reply so a late authoritative owner
+        // row can replace stale facade-wide schedule evidence for another group.
     }
     sink
 }
@@ -8174,7 +8606,13 @@ fn status_fanin_covers_authoritative_source_schedule(
 ) -> bool {
     expected_group_ids.is_empty()
         || (expected_group_ids.is_subset(&source_status_current_health_root_ids(source))
-            && expected_group_ids.is_subset(&source_runtime_scope_scheduled_group_ids(source)))
+            && expected_group_ids.is_subset(
+                &status_source_runtime_scope_covered_groups_for_status(source, expected_group_ids),
+            )
+            && expected_group_ids.is_subset(&status_scan_runtime_scope_covered_groups_for_status(
+                source,
+                expected_group_ids,
+            )))
 }
 
 fn source_status_has_runtime_scope_degraded_provenance(
@@ -8227,6 +8665,34 @@ fn source_runtime_scope_degraded_scan_group_ids(
         "unit=runtime.exec.scan",
     ));
     group_ids
+}
+
+fn status_live_concrete_source_owner_group_ids(
+    source: &SourceObservabilitySnapshot,
+    require_scan: bool,
+) -> BTreeSet<String> {
+    if source_observability_snapshot_is_worker_status_cache(source)
+        || source_observability_snapshot_is_degraded_worker_cache(source)
+        || source_observability_snapshot_has_runtime_scope_control_cache(source)
+    {
+        return BTreeSet::new();
+    }
+    let healthy_root_ids = source_status_current_health_root_ids(source);
+    source
+        .status
+        .concrete_roots
+        .iter()
+        .filter(|root| {
+            healthy_root_ids.contains(&root.logical_root_id)
+                && root.is_group_primary
+                && (!require_scan || root.scan_enabled)
+                && source_concrete_root_allows_domain_target(root)
+                && source_concrete_root_status_is_serving_owner(&root.status)
+                && source_primary_runtime_node_id_from_ref(&root.object_ref, &source.grants)
+                    .is_some()
+        })
+        .map(|root| root.logical_root_id.clone())
+        .collect()
 }
 
 fn source_runtime_scope_control_frame_owner_group_ids(
@@ -8351,8 +8817,8 @@ fn status_sink_candidate_owner_node_for_group(
     sink: &SinkStatusSnapshot,
     group_id: &str,
 ) -> Option<String> {
-    if let Some(primary_host_ref) = sink.primary_host_ref_by_group.get(group_id) {
-        return Some(primary_host_ref.clone());
+    if let Some(primary_host_ref) = sink_snapshot_primary_host_ref_for_group(sink, group_id) {
+        return Some(primary_host_ref.to_string());
     }
     let control_owner_nodes = status_sink_control_frame_owner_nodes_for_group(sink, group_id);
     if control_owner_nodes.len() == 1 {
@@ -8457,7 +8923,7 @@ fn status_sink_scheduled_owner_nodes_for_group(
     sink: &SinkStatusSnapshot,
     group_id: &str,
 ) -> BTreeSet<String> {
-    sink.scheduled_groups_by_node
+    sink_snapshot_scheduled_groups_by_node(sink)
         .iter()
         .filter(|(_, groups)| groups.iter().any(|group| group == group_id))
         .map(|(node_id, _)| node_id.clone())
@@ -8540,7 +9006,7 @@ fn status_fanin_preserves_source_anchored_sink_owner_partition(
             return false;
         };
         let control_owner_nodes = status_sink_control_frame_owner_nodes_for_group(sink, group_id);
-        if let Some(primary_host_ref) = sink.primary_host_ref_by_group.get(group_id) {
+        if let Some(primary_host_ref) = sink_snapshot_primary_host_ref_for_group(sink, group_id) {
             if !runtime_node_identity_matches(primary_host_ref, &source_owner_node) {
                 return false;
             }
@@ -8740,6 +9206,7 @@ fn status_source_runtime_scope_covered_groups_for_status(
     expected_groups: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     let mut covered = source_runtime_scope_scheduled_source_group_ids(source);
+    covered.extend(status_live_concrete_source_owner_group_ids(source, false));
     if source_status_has_runtime_scope_degraded_provenance(source) {
         covered.extend(source_runtime_scope_degraded_source_group_ids(
             source,
@@ -8754,6 +9221,7 @@ fn status_scan_runtime_scope_covered_groups_for_status(
     expected_groups: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     let mut covered = source_runtime_scope_scheduled_scan_group_ids(source);
+    covered.extend(status_live_concrete_source_owner_group_ids(source, true));
     if source_status_has_runtime_scope_degraded_provenance(source) {
         covered.extend(source_runtime_scope_degraded_scan_group_ids(
             source,
@@ -8821,7 +9289,9 @@ fn status_sink_owner_partition_gaps_for_groups(
         };
         let control_owner_nodes =
             status_sink_control_frame_owner_nodes_for_group(sink_status, group_id);
-        if let Some(primary_host_ref) = sink_status.primary_host_ref_by_group.get(group_id) {
+        if let Some(primary_host_ref) =
+            sink_snapshot_primary_host_ref_for_group(sink_status, group_id)
+        {
             if !runtime_node_identity_matches(primary_host_ref, &source_owner_node) {
                 gaps.insert(
                     group_id.clone(),
@@ -11659,8 +12129,10 @@ fn manual_rescan_retryable_nonready_current_roots_error(
         manual_rescan_runtime_scope_route_activation_gaps_by_root(roots, source_snapshot);
     let route_readiness_gaps =
         manual_rescan_runtime_scope_route_readiness_gaps_by_root(roots, source_snapshot);
+    let route_receive_armed_gaps =
+        manual_rescan_runtime_scope_route_receive_armed_gaps_by_root(roots, source_snapshot);
     ApiError::service_unavailable(format!(
-        "manual rescan current roots source-status returned only cache/degraded/non-ready evidence or route-gap evidence before scoped delivery target proof: source_status_probe_targets={:?} route_activation_gaps={route_activation_gaps:?} route_readiness_gaps={route_readiness_gaps:?} last_source={} last_source_per_origin={}",
+        "manual rescan current roots source-status returned only cache/degraded/non-ready evidence or route-gap evidence before scoped delivery target proof: source_status_probe_targets={:?} route_activation_gaps={route_activation_gaps:?} route_readiness_gaps={route_readiness_gaps:?} route_receive_armed_gaps={route_receive_armed_gaps:?} last_source={} last_source_per_origin={}",
         source_status_probe_node_ids,
         summarize_source_status_route_snapshot(source_snapshot),
         if observed_per_origin.is_empty() {
@@ -11800,23 +12272,25 @@ async fn wait_manual_rescan_current_roots_runtime_scope_readiness(
     let mut target_node_ids =
         derive_roots_put_control_target_node_ids_from_grants(&state.node_id, roots, grants);
     target_node_ids.extend(source_status_probe_seed_node_ids.iter().cloned());
-    if let Some(response_budget) = response_budget {
-        send_manual_rescan_current_roots_control_second_wave_once_with_budget(
-            &context,
-            roots,
-            &target_node_ids,
-            &state.control_gate,
-            response_budget,
-        )
-        .await?;
-    } else {
-        send_manual_rescan_current_roots_control_second_wave_once(
-            &context,
-            roots,
-            &target_node_ids,
-        )
-        .await?;
-    }
+    let current_roots_control_replay_skipped_duplicate =
+        if let Some(response_budget) = response_budget {
+            !send_manual_rescan_current_roots_control_second_wave_once_with_budget(
+                &context,
+                roots,
+                &target_node_ids,
+                &state.control_gate,
+                response_budget,
+            )
+            .await?
+        } else {
+            send_manual_rescan_current_roots_control_second_wave_once(
+                &context,
+                roots,
+                &target_node_ids,
+            )
+            .await?;
+            false
+        };
     eprintln!(
         "fs_meta_api: manual rescan current-roots control observation ready generation={} roots={} targets={:?}",
         context.roots_control_generation,
@@ -11907,7 +12381,7 @@ async fn wait_manual_rescan_current_roots_runtime_scope_readiness(
         roots,
         target_node_ids,
         source_status_probe_seed_node_ids.clone(),
-        true,
+        !current_roots_control_replay_skipped_duplicate,
         false,
         local_fast_observation,
         local_merge_observation,
@@ -12085,7 +12559,7 @@ async fn wait_manual_rescan_current_roots_runtime_scope_readiness(
                             &target_probe_node_ids,
                         );
                     if origin_snapshots.is_empty() {
-                        tokio::time::sleep(ROOTS_PUT_SOURCE_SECOND_WAVE_POLL_INTERVAL).await;
+                        sleep_roots_put_second_wave_poll_until(target_proof_deadline).await;
                         continue;
                     }
                     source_snapshot = merge_manual_rescan_source_status_origin_snapshots(
@@ -12111,7 +12585,7 @@ async fn wait_manual_rescan_current_roots_runtime_scope_readiness(
         } else {
             break;
         }
-        tokio::time::sleep(ROOTS_PUT_SOURCE_SECOND_WAVE_POLL_INTERVAL).await;
+        sleep_roots_put_second_wave_poll_until(target_proof_deadline).await;
     }
 
     let expected_roots = roots
@@ -13172,11 +13646,19 @@ async fn route_source_observability_origin_snapshots_with_per_origin_debug_and_p
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_err = None::<CnxError>;
     let mut incomplete_active_debug_retry_seen = false;
+    let mut complete_runtime_scope_fallback =
+        None::<(Vec<(String, SourceObservabilitySnapshot)>, Vec<String>)>;
     let manual_rescan_delivery_evidence =
         source_status_request_requires_manual_rescan_delivery_evidence(&source_status_payload);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            if let Some((origin_snapshots, per_origin)) = complete_runtime_scope_fallback {
+                return Ok(finalize_source_observability_origin_snapshots(
+                    origin_snapshots,
+                    per_origin,
+                ));
+            }
             return Err(last_err.unwrap_or(CnxError::Timeout));
         }
         let attempt_timeout = if manual_rescan_delivery_evidence {
@@ -13207,6 +13689,15 @@ async fn route_source_observability_origin_snapshots_with_per_origin_debug_and_p
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
+            Err(CnxError::Timeout) => {
+                if let Some((origin_snapshots, per_origin)) = complete_runtime_scope_fallback {
+                    return Ok(finalize_source_observability_origin_snapshots(
+                        origin_snapshots,
+                        per_origin,
+                    ));
+                }
+                return Err(CnxError::Timeout);
+            }
             Err(err) => return Err(err),
         };
         let mut origin_snapshots = events
@@ -13230,23 +13721,39 @@ async fn route_source_observability_origin_snapshots_with_per_origin_debug_and_p
                 )
             })
             .collect::<Vec<_>>();
-        let mut snapshots = origin_snapshots
+        let snapshots = origin_snapshots
             .iter()
             .map(|(_, snapshot)| snapshot.clone())
             .collect::<Vec<_>>();
         if source_observability_snapshots_need_retry(&snapshots) {
             let incomplete_retry_budget_exhausted = tokio::time::Instant::now() >= deadline;
+            let have_complete_runtime_scope_evidence =
+                source_observability_snapshots_have_complete_runtime_scope_evidence(&snapshots);
             if source_observability_snapshots_have_incomplete_force_find_runner_evidence(&snapshots)
-                || (source_observability_snapshots_have_complete_runtime_scope_evidence(&snapshots)
+                || (have_complete_runtime_scope_evidence
                     && (incomplete_active_debug_retry_seen || incomplete_retry_budget_exhausted))
             {
                 for (_, snapshot) in &mut origin_snapshots {
                     fail_close_incomplete_active_source_observability_snapshot(snapshot);
                 }
-                snapshots = origin_snapshots
-                    .iter()
-                    .map(|(_, snapshot)| snapshot.clone())
-                    .collect::<Vec<_>>();
+            } else if have_complete_runtime_scope_evidence {
+                let mut fallback_origin_snapshots = origin_snapshots.clone();
+                for (_, snapshot) in &mut fallback_origin_snapshots {
+                    fail_close_incomplete_active_source_observability_snapshot(snapshot);
+                }
+                complete_runtime_scope_fallback =
+                    Some((fallback_origin_snapshots, per_origin.clone()));
+                incomplete_active_debug_retry_seen = true;
+                if !incomplete_retry_budget_exhausted {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                let (origin_snapshots, per_origin) = complete_runtime_scope_fallback
+                    .expect("complete runtime scope fallback should be populated");
+                return Ok(finalize_source_observability_origin_snapshots(
+                    origin_snapshots,
+                    per_origin,
+                ));
             } else {
                 incomplete_active_debug_retry_seen = true;
                 if !incomplete_retry_budget_exhausted {
@@ -13256,28 +13763,45 @@ async fn route_source_observability_origin_snapshots_with_per_origin_debug_and_p
                 return Err(last_err.unwrap_or(CnxError::Timeout));
             }
         }
-        let runner_sets = source_runner_sets(&snapshots);
-        if debug_force_find_runner_capture_enabled() {
-            let last_runners = snapshots
-                .iter()
-                .map(|snapshot| {
-                    summarize_group_string_map(&snapshot.last_force_find_runner_by_group)
-                })
-                .collect::<Vec<_>>();
-            eprintln!(
-                "fs_meta_api_status: source_route_runner_capture snapshots={} last_runners={:?} runner_sets={:?}",
-                snapshots.len(),
-                last_runners,
-                runner_sets
-            );
-        }
-        return Ok((
-            merge_source_observability_snapshots(snapshots),
-            runner_sets,
-            per_origin,
+        return Ok(finalize_source_observability_origin_snapshots(
             origin_snapshots,
+            per_origin,
         ));
     }
+}
+
+fn finalize_source_observability_origin_snapshots(
+    origin_snapshots: Vec<(String, SourceObservabilitySnapshot)>,
+    per_origin: Vec<String>,
+) -> (
+    SourceObservabilitySnapshot,
+    BTreeMap<String, Vec<String>>,
+    Vec<String>,
+    Vec<(String, SourceObservabilitySnapshot)>,
+) {
+    let snapshots = origin_snapshots
+        .iter()
+        .map(|(_, snapshot)| snapshot.clone())
+        .collect::<Vec<_>>();
+    let runner_sets = source_runner_sets(&snapshots);
+    if debug_force_find_runner_capture_enabled() {
+        let last_runners = snapshots
+            .iter()
+            .map(|snapshot| summarize_group_string_map(&snapshot.last_force_find_runner_by_group))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "fs_meta_api_status: source_route_runner_capture snapshots={} last_runners={:?} runner_sets={:?}",
+            snapshots.len(),
+            last_runners,
+            runner_sets
+        );
+    }
+    (
+        merge_source_observability_snapshots(snapshots),
+        runner_sets,
+        per_origin,
+        origin_snapshots,
+    )
 }
 
 fn source_observability_snapshot_debug_maps_absent(snapshot: &SourceObservabilitySnapshot) -> bool {
@@ -14563,6 +15087,83 @@ mod tests {
     }
 
     #[test]
+    fn status_sink_evidence_cache_restores_owner_scoped_schedule_for_same_primary_group() {
+        let group_id = "nfs-cache-owner-evidence";
+        let node_id = "node-owner-cache";
+        let primary = format!("{node_id}::{group_id}");
+        let observed = SinkStatusSnapshot {
+            owner_scoped_primary_host_ref_by_group: BTreeMap::from([(
+                group_id.to_string(),
+                node_id.to_string(),
+            )]),
+            owner_scoped_scheduled_groups_by_node: BTreeMap::from([(
+                node_id.to_string(),
+                vec![group_id.to_string()],
+            )]),
+            groups: vec![status_test_sink_group(
+                group_id,
+                &primary,
+                GroupReadinessState::PendingMaterialization,
+                10,
+                9,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let current = SinkStatusSnapshot {
+            groups: vec![status_test_sink_group(
+                group_id,
+                &primary,
+                GroupReadinessState::PendingMaterialization,
+                10,
+                9,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let _ = apply_status_materialized_sink_evidence_cache(observed);
+        let restored = apply_status_materialized_sink_evidence_cache(current);
+
+        assert_eq!(
+            restored.owner_scoped_scheduled_groups_by_node.get(node_id),
+            Some(&vec![group_id.to_string()]),
+            "same-primary owner-scoped schedule evidence should survive a later partial fan-in sample"
+        );
+        assert_eq!(
+            restored
+                .owner_scoped_primary_host_ref_by_group
+                .get(group_id),
+            Some(&node_id.to_string()),
+            "same-primary owner-scoped primary evidence should survive a later partial fan-in sample"
+        );
+        assert_eq!(
+            restored.groups.len(),
+            1,
+            "owner evidence cache must not synthesize materialized group rows"
+        );
+
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = vec![RootSpec::new(group_id, "/mnt/nfs-cache-owner")];
+        authoritative.grants = vec![grant_for_node_root(node_id, group_id)];
+        set_live_group_primary_source_root(&mut authoritative, group_id, node_id);
+        authoritative.source_primary_by_group = BTreeMap::from([(group_id.to_string(), primary)]);
+        authoritative.scheduled_source_groups_by_node =
+            BTreeMap::from([(node_id.to_string(), vec![group_id.to_string()])]);
+        authoritative.scheduled_scan_groups_by_node =
+            authoritative.scheduled_source_groups_by_node.clone();
+        assert!(
+            !should_fail_closed_authoritative_status_fanin(
+                StatusRouteOutcome::Ok,
+                StatusRouteOutcome::Ok,
+                FacadeServiceState::Serving,
+                &restored,
+                &authoritative,
+                &authoritative,
+            ),
+            "restored same-primary owner evidence should close the schedule/owner fan-in gap without claiming trusted readiness"
+        );
+    }
+
+    #[test]
     fn management_status_authority_uses_cached_roots_when_local_source_observation_is_partial() {
         let mut partial = local_source_snapshot();
         partial.logical_roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
@@ -14933,6 +15534,7 @@ mod tests {
         sink_status_payloads: Vec<(String, Vec<u8>)>,
         source_scoped_status_payloads_by_request_channel: BTreeMap<String, (String, Vec<u8>)>,
         sink_scoped_status_payloads_by_request_channel: BTreeMap<String, (String, Vec<u8>)>,
+        source_scoped_timeout_once_by_request_channel: StdMutex<BTreeSet<String>>,
         correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
         correlation_notify: Notify,
         recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
@@ -16223,11 +16825,7 @@ mod tests {
                 .unwrap_or(reply_channel.as_str())
                 .to_string();
             if self.blocked_request_channels.contains(&request_channel) {
-                let timeout = request
-                    .timeout_ms
-                    .map(Duration::from_millis)
-                    .unwrap_or(Duration::from_secs(20));
-                tokio::time::sleep(timeout).await;
+                tokio::time::sleep(blocked_status_fixture_timeout(request.timeout_ms)).await;
                 return Err(CnxError::Timeout);
             }
             let Some((origin, snapshot)) = self
@@ -16286,11 +16884,7 @@ mod tests {
                 .unwrap_or(reply_channel.as_str())
                 .to_string();
             if self.blocked_request_channels.contains(&request_channel) {
-                let timeout = request
-                    .timeout_ms
-                    .map(Duration::from_millis)
-                    .unwrap_or(Duration::from_secs(20));
-                tokio::time::sleep(timeout).await;
+                tokio::time::sleep(blocked_status_fixture_timeout(request.timeout_ms)).await;
                 return Err(CnxError::Timeout);
             }
             if request_channel != self.generic_request_channel {
@@ -17032,10 +17626,23 @@ mod tests {
                     .collect(),
                 source_scoped_status_payloads_by_request_channel,
                 sink_scoped_status_payloads_by_request_channel,
+                source_scoped_timeout_once_by_request_channel: StdMutex::new(BTreeSet::new()),
                 correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
                 correlation_notify: Notify::new(),
                 recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
                 sent_source_status_purposes_by_route: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn with_source_scoped_timeout_once<I>(self, routes: I) -> Self
+        where
+            I: IntoIterator<Item = String>,
+        {
+            Self {
+                source_scoped_timeout_once_by_request_channel: StdMutex::new(
+                    routes.into_iter().collect(),
+                ),
+                ..self
             }
         }
 
@@ -17532,6 +18139,11 @@ mod tests {
         }
     }
 
+    fn blocked_status_fixture_timeout(request_timeout_ms: Option<u64>) -> Duration {
+        let _ = request_timeout_ms;
+        Duration::ZERO
+    }
+
     impl GenericRetryableScopedBlockedSourceStatusBoundary {
         fn new(
             generic_origin: &str,
@@ -17953,6 +18565,19 @@ mod tests {
                 .source_scoped_status_payloads_by_request_channel
                 .get(&request_channel)
             {
+                let should_timeout = self
+                    .source_scoped_timeout_once_by_request_channel
+                    .lock()
+                    .expect("source scoped timeout once lock")
+                    .remove(&request_channel);
+                if should_timeout {
+                    let timeout = request
+                        .timeout_ms
+                        .map(Duration::from_millis)
+                        .unwrap_or(STATUS_OWNER_SCOPED_ROUTE_TIMEOUT);
+                    tokio::time::sleep(timeout).await;
+                    return Err(CnxError::Timeout);
+                }
                 return Ok(vec![Event::new(
                     EventMetadata {
                         origin_id: NodeId(origin.clone()),
@@ -19571,6 +20196,390 @@ mod tests {
     }
 
     #[test]
+    fn status_scan_audit_release_cache_key_ignores_route_generation_and_progress_for_same_scope() {
+        let node_a = "node-a-29887598222925664972963841";
+        let node_b = "node-b-29887598222925664972963841";
+        let node_c = "node-c-29887598222925664972963841";
+        let root_ids = ["nfs-144", "nfs-145", "nfs-146"];
+        let mut source = local_source_snapshot();
+        source.host_object_grants_version = 7;
+        source.logical_roots = root_ids
+            .iter()
+            .map(|root_id| RootSpec::new(*root_id, format!("/mnt/{root_id}")))
+            .collect();
+        source.grants = vec![
+            grant_for_node_root(node_a, "nfs-144"),
+            grant_for_node_root(node_b, "nfs-145"),
+            grant_for_node_root(node_c, "nfs-146"),
+        ];
+        source.status.current_stream_generation = Some(41);
+        source.status.logical_roots.clear();
+        for (group_id, node_id) in [
+            ("nfs-144", node_a),
+            ("nfs-145", node_b),
+            ("nfs-146", node_c),
+        ] {
+            set_live_group_primary_source_root(&mut source, group_id, node_id);
+        }
+        source.source_primary_by_group = BTreeMap::from([
+            ("nfs-144".to_string(), format!("{node_a}::nfs-144")),
+            ("nfs-145".to_string(), format!("{node_b}::nfs-145")),
+            ("nfs-146".to_string(), format!("{node_c}::nfs-146")),
+        ]);
+        source.scheduled_source_groups_by_node = BTreeMap::from([
+            (node_a.to_string(), vec!["nfs-144".to_string()]),
+            (node_b.to_string(), vec!["nfs-145".to_string()]),
+            (node_c.to_string(), vec!["nfs-146".to_string()]),
+        ]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+        source.last_control_frame_signals_by_node = BTreeMap::from([
+            (
+                node_a.to_string(),
+                vec![format!(
+                    "activate unit=runtime.exec.source route={}.stream generation=41 scopes=[\"nfs-144=>{node_a}::nfs-144\"]",
+                    source_roots_control_route_key_for(node_a)
+                )],
+            ),
+            (
+                node_b.to_string(),
+                vec![format!(
+                    "activate unit=runtime.exec.source route={}.stream generation=41 scopes=[\"nfs-145=>{node_b}::nfs-145\"]",
+                    source_roots_control_route_key_for(node_b)
+                )],
+            ),
+            (
+                node_c.to_string(),
+                vec![format!(
+                    "activate unit=runtime.exec.source route={}.stream generation=41 scopes=[\"nfs-146=>{node_c}::nfs-146\"]",
+                    source_roots_control_route_key_for(node_c)
+                )],
+            ),
+        ]);
+        let sink = SinkStatusSnapshot {
+            primary_host_ref_by_group: BTreeMap::from([
+                ("nfs-144".to_string(), node_a.to_string()),
+                ("nfs-145".to_string(), node_b.to_string()),
+                ("nfs-146".to_string(), node_c.to_string()),
+            ]),
+            scheduled_groups_by_node: BTreeMap::from([
+                (node_a.to_string(), vec!["nfs-144".to_string()]),
+                (node_b.to_string(), vec!["nfs-145".to_string()]),
+                (node_c.to_string(), vec!["nfs-146".to_string()]),
+            ]),
+            stream_receive_armed_by_node: BTreeMap::from([
+                (node_a.to_string(), 1),
+                (node_b.to_string(), 1),
+                (node_c.to_string(), 1),
+            ]),
+            groups: vec![
+                status_test_sink_group(
+                    "nfs-144",
+                    &format!("{node_a}::nfs-144"),
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+                status_test_sink_group(
+                    "nfs-145",
+                    &format!("{node_b}::nfs-145"),
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+                status_test_sink_group(
+                    "nfs-146",
+                    &format!("{node_c}::nfs-146"),
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+        let expected_groups = root_ids
+            .iter()
+            .map(|root_id| (*root_id).to_string())
+            .collect::<BTreeSet<_>>();
+        let owner_nodes_by_group = BTreeMap::from([
+            ("nfs-144".to_string(), node_a.to_string()),
+            ("nfs-145".to_string(), node_b.to_string()),
+            ("nfs-146".to_string(), node_c.to_string()),
+        ]);
+
+        let first = status_scan_audit_release_cache_key(
+            &NodeId(node_b.to_string()),
+            &source,
+            &sink,
+            &expected_groups,
+            &owner_nodes_by_group,
+        );
+        let mut progressed_source = source.clone();
+        progressed_source.status.current_stream_generation = Some(42);
+        for concrete in &mut progressed_source.status.concrete_roots {
+            concrete.current_revision = concrete.current_revision.map(|revision| revision + 1);
+            concrete.current_stream_generation = concrete
+                .current_stream_generation
+                .map(|generation| generation + 1);
+            concrete.emitted_event_count = concrete.emitted_event_count.saturating_add(50_000);
+            concrete.forwarded_event_count = concrete.forwarded_event_count.saturating_add(10_000);
+        }
+        for signals in progressed_source
+            .last_control_frame_signals_by_node
+            .values_mut()
+        {
+            for signal in signals {
+                *signal = signal.replace("generation=41", "generation=42");
+            }
+        }
+        let mut progressed_sink = sink.clone();
+        progressed_sink.groups = vec![
+            status_test_sink_group(
+                "nfs-144",
+                &format!("{node_a}::nfs-144"),
+                GroupReadinessState::PendingMaterialization,
+                9233,
+                0,
+            ),
+            status_test_sink_group(
+                "nfs-145",
+                &format!("{node_b}::nfs-145"),
+                GroupReadinessState::Ready,
+                50262,
+                50261,
+            ),
+            status_test_sink_group(
+                "nfs-146",
+                &format!("{node_c}::nfs-146"),
+                GroupReadinessState::PendingMaterialization,
+                10018,
+                0,
+            ),
+        ];
+
+        let progressed = status_scan_audit_release_cache_key(
+            &NodeId(node_b.to_string()),
+            &progressed_source,
+            &progressed_sink,
+            &expected_groups,
+            &owner_nodes_by_group,
+        );
+
+        assert_eq!(
+            first, progressed,
+            "status scan/audit admission release duplicate suppression must key stable roots/source/sink scope, not route activation generation or materialization/publication progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_scan_audit_admission_release_partial_timeout_is_retryable_progress() {
+        clear_status_scan_audit_release_cache_for_test();
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let roots = vec![RootSpec::new("nfs1", &nfs1), RootSpec::new("nfs2", &nfs2)];
+        let grants = vec![
+            granted_mount_root("node-a::nfs1", &nfs1),
+            granted_mount_root("node-b::nfs2", &nfs2),
+        ];
+        let source_cfg = SourceConfig {
+            roots: roots.clone(),
+            host_object_grants: grants.clone(),
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, SourceConfig::default())
+                .expect("sink"),
+        )));
+
+        let mut remote_source = local_source_snapshot();
+        remote_source.logical_roots = roots.clone();
+        remote_source.grants = grants.clone();
+        remote_source.status.logical_roots.clear();
+        for (group_id, node_id) in [("nfs1", "node-a"), ("nfs2", "node-b")] {
+            set_live_group_primary_source_root(&mut remote_source, group_id, node_id);
+        }
+        remote_source.source_primary_by_group = BTreeMap::from([
+            ("nfs1".to_string(), "node-a::nfs1".to_string()),
+            ("nfs2".to_string(), "node-b::nfs2".to_string()),
+        ]);
+        remote_source.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs1".to_string()]),
+            ("node-b".to_string(), vec!["nfs2".to_string()]),
+        ]);
+        remote_source.scheduled_scan_groups_by_node =
+            remote_source.scheduled_source_groups_by_node.clone();
+
+        let remote_sink = SinkStatusSnapshot {
+            primary_host_ref_by_group: BTreeMap::from([
+                ("nfs1".to_string(), "node-a".to_string()),
+                ("nfs2".to_string(), "node-b".to_string()),
+            ]),
+            scheduled_groups_by_node: BTreeMap::from([
+                ("node-a".to_string(), vec!["nfs1".to_string()]),
+                ("node-b".to_string(), vec!["nfs2".to_string()]),
+            ]),
+            stream_receive_armed_by_node: BTreeMap::from([
+                ("node-a".to_string(), 1),
+                ("node-b".to_string(), 1),
+            ]),
+            groups: vec![
+                status_test_sink_group(
+                    "nfs1",
+                    "node-a::nfs1",
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+                status_test_sink_group(
+                    "nfs2",
+                    "node-b::nfs2",
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+        let node_b_route = source_status_request_route_for("node-b").0;
+        let boundary = Arc::new(
+            StatusReleaseAdmissionBoundary::new(
+                vec![("node-a".to_string(), remote_source.clone())],
+                vec![("node-a".to_string(), remote_sink.clone())],
+                vec![
+                    (
+                        "node-a".to_string(),
+                        "node-a".to_string(),
+                        remote_source.clone(),
+                    ),
+                    (
+                        "node-b".to_string(),
+                        "node-b".to_string(),
+                        remote_source.clone(),
+                    ),
+                ],
+                vec![],
+            )
+            .with_source_scoped_timeout_once([node_b_route.clone()]),
+        );
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(boundary.clone()),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth: auth.clone(),
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
+            published_rollout_status: test_published_rollout_status_reader(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+
+        let scheduled = release_source_scan_audit_after_sink_scope_ready_if_needed(
+            &state,
+            &remote_source,
+            &remote_sink,
+            StatusRouteOutcome::Ok,
+        )
+        .await;
+        assert_eq!(scheduled.state, "scheduled");
+        let signature = scheduled.signature.clone();
+
+        let timed_out = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(lane) = state
+                    .control_gate
+                    .repair_lane_evidence_for_signature(&signature)
+                {
+                    if lane.state == "timed-out" {
+                        return lane;
+                    }
+                    assert_ne!(
+                        lane.state, "failed",
+                        "partial source scan/audit admission release timeout must remain retryable progress, lane={lane:?}"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first partial release should settle as retryable timed-out lane evidence");
+        assert!(
+            timed_out
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("released 1/2") && reason.contains("node-b")),
+            "timed-out lane must explain partial release progress and pending owner: {timed_out:?}"
+        );
+
+        let retry = release_source_scan_audit_after_sink_scope_ready_if_needed(
+            &state,
+            &remote_source,
+            &remote_sink,
+            StatusRouteOutcome::Ok,
+        )
+        .await;
+        assert_eq!(retry.state, "scheduled");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(lane) = state
+                    .control_gate
+                    .repair_lane_evidence_for_signature(&signature)
+                {
+                    if lane.state == "completed" {
+                        return;
+                    }
+                    assert_ne!(
+                        lane.state, "failed",
+                        "retrying pending source scan/audit admission owners must not leave a failed lane: {lane:?}"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second release should complete the pending source owner");
+
+        let sent = boundary.sent_source_status_purposes();
+        for (node_id, expected_count) in [("node-a", 1), ("node-b", 2)] {
+            let route = source_status_request_route_for(node_id).0;
+            let release_count = sent
+                .iter()
+                .filter(|(sent_route, purpose)| {
+                    sent_route == &route
+                        && purpose.as_deref() == Some("release-scan-audit-after-sink-scope-ready")
+                })
+                .count();
+            assert_eq!(
+                release_count, expected_count,
+                "retry must only resend pending source owners; sent={sent:?}"
+            );
+        }
+    }
+
+    #[test]
     fn short_budget_source_owner_fanin_only_opens_for_successful_partial_source_route() {
         let roots = vec![
             RootSpec::new("nfs1", "/mnt/nfs1"),
@@ -19848,6 +20857,105 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst)
                 >= 2,
             "fixture must attempt the delayed owner reply before timing it out"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_source_fanin_waits_bounded_owner_probe_under_scan_pressure() {
+        let roots = vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+        ];
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = roots.clone();
+        authoritative.grants = vec![
+            grant_for_node_root("node-a", "nfs1"),
+            grant_for_node_root("node-d", "nfs2"),
+        ];
+        set_live_group_primary_source_root(&mut authoritative, "nfs1", "node-a");
+        set_live_group_primary_source_root(&mut authoritative, "nfs2", "node-d");
+        authoritative.source_primary_by_group = BTreeMap::from([
+            ("nfs1".to_string(), "node-a::nfs1".to_string()),
+            ("nfs2".to_string(), "node-d::nfs2".to_string()),
+        ]);
+        authoritative.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs1".to_string()]),
+            ("node-d".to_string(), vec!["nfs2".to_string()]),
+        ]);
+        authoritative.scheduled_scan_groups_by_node =
+            authoritative.scheduled_source_groups_by_node.clone();
+
+        let mut generic_partial = authoritative.clone();
+        generic_partial
+            .status
+            .logical_roots
+            .retain(|root| root.root_id == "nfs2");
+        generic_partial
+            .status
+            .concrete_roots
+            .retain(|root| root.logical_root_id == "nfs2");
+        generic_partial
+            .source_primary_by_group
+            .retain(|root_id, _| root_id == "nfs2");
+        generic_partial.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-d".to_string(), vec!["nfs2".to_string()])]);
+        generic_partial.scheduled_scan_groups_by_node =
+            generic_partial.scheduled_source_groups_by_node.clone();
+
+        let mut owner_ready = authoritative.clone();
+        owner_ready
+            .status
+            .logical_roots
+            .retain(|root| root.root_id == "nfs1");
+        owner_ready
+            .status
+            .concrete_roots
+            .retain(|root| root.logical_root_id == "nfs1");
+        owner_ready
+            .source_primary_by_group
+            .retain(|root_id, _| root_id == "nfs1");
+        owner_ready.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-a".to_string(), vec!["nfs1".to_string()])]);
+        owner_ready.scheduled_scan_groups_by_node =
+            owner_ready.scheduled_source_groups_by_node.clone();
+
+        let request_channel = source_status_request_route_for("node-a").0;
+        let boundary = Arc::new(DelayedSourceStatusCollectBoundary {
+            reply_channel: format!("{request_channel}:reply"),
+            sent_correlation: StdMutex::new(None),
+            correlation_notify: Notify::new(),
+            recv_count: std::sync::atomic::AtomicUsize::new(1),
+            delayed_reply_delay: Duration::from_millis(900),
+            fast_snapshot: local_source_snapshot(),
+            delayed_snapshot: owner_ready,
+        });
+
+        let augmented = augment_management_status_source_with_owner_scoped_evidence(
+            generic_partial,
+            &authoritative,
+            Some(boundary.clone()),
+            NodeId("node-d".to_string()),
+            management_status_source_owner_scoped_timeout(false),
+        )
+        .await;
+
+        let source_roots = augmented
+            .status
+            .logical_roots
+            .iter()
+            .map(|root| root.root_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            source_roots,
+            BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+            "serving /status owner-scoped source fan-in must tolerate a bounded slow source owner under scan/audit pressure"
+        );
+        assert!(
+            boundary
+                .recv_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "fixture must exercise the delayed owner-scoped source-status reply"
         );
     }
 
@@ -21486,6 +22594,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn management_status_sink_fanin_accepts_owner_scoped_schedule_provenance_without_aggregate_debug()
+     {
+        let node_a = "node-a-29883786154862016523665409";
+        let node_b = "node-b-29883786154862016523665409";
+        let node_c = "node-c-29883786154862016523665409";
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = vec![
+            RootSpec::new("nfs-144", "/mnt/nfs-144"),
+            RootSpec::new("nfs-145", "/mnt/nfs-145"),
+            RootSpec::new("nfs-146", "/mnt/nfs-146"),
+        ];
+        authoritative.grants = vec![
+            grant_for_node_root(node_a, "nfs-144"),
+            grant_for_node_root(node_b, "nfs-145"),
+            grant_for_node_root(node_c, "nfs-146"),
+        ];
+        for (group_id, node_id) in [
+            ("nfs-144", node_a),
+            ("nfs-145", node_b),
+            ("nfs-146", node_c),
+        ] {
+            set_live_group_primary_source_root(&mut authoritative, group_id, node_id);
+        }
+        authoritative.source_primary_by_group = BTreeMap::from([
+            ("nfs-144".to_string(), format!("{node_a}::nfs-144")),
+            ("nfs-145".to_string(), format!("{node_b}::nfs-145")),
+            ("nfs-146".to_string(), format!("{node_c}::nfs-146")),
+        ]);
+        authoritative.scheduled_source_groups_by_node = BTreeMap::from([
+            (node_a.to_string(), vec!["nfs-144".to_string()]),
+            (node_b.to_string(), vec!["nfs-145".to_string()]),
+            (node_c.to_string(), vec!["nfs-146".to_string()]),
+        ]);
+        authoritative.scheduled_scan_groups_by_node =
+            authoritative.scheduled_source_groups_by_node.clone();
+
+        let owner_scoped_only_sink = SinkStatusSnapshot {
+            owner_scoped_primary_host_ref_by_group: BTreeMap::from([
+                ("nfs-144".to_string(), node_a.to_string()),
+                ("nfs-145".to_string(), node_b.to_string()),
+                ("nfs-146".to_string(), node_c.to_string()),
+            ]),
+            owner_scoped_scheduled_groups_by_node: BTreeMap::from([
+                (node_a.to_string(), vec!["nfs-144".to_string()]),
+                (node_b.to_string(), vec!["nfs-145".to_string()]),
+                (node_c.to_string(), vec!["nfs-146".to_string()]),
+            ]),
+            groups: vec![
+                status_test_sink_group(
+                    "nfs-144",
+                    &format!("{node_a}::nfs-144"),
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+                status_test_sink_group(
+                    "nfs-145",
+                    &format!("{node_b}::nfs-145"),
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+                status_test_sink_group(
+                    "nfs-146",
+                    &format!("{node_c}::nfs-146"),
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+
+        assert!(
+            !should_fail_closed_authoritative_status_fanin(
+                StatusRouteOutcome::Ok,
+                StatusRouteOutcome::Ok,
+                FacadeServiceState::Serving,
+                &owner_scoped_only_sink,
+                &authoritative,
+                &authoritative,
+            ),
+            "owner-scoped sink-status provenance is authoritative schedule/primary evidence and must not be lost just because the aggregate debug maps are empty"
+        );
+        assert_eq!(
+            status_sink_debug_from_snapshot(&owner_scoped_only_sink)
+                .scheduled_groups_by_node
+                .get(node_a),
+            Some(&vec!["nfs-144".to_string()]),
+            "/status debug scheduled_groups_by_node must expose owner-scoped schedule provenance for final active-three validation"
+        );
+    }
+
     #[tokio::test]
     async fn node_scoped_sink_status_collect_merges_late_owner_reply_after_empty_facade_reply() {
         let empty_facade_reply = SinkStatusSnapshot::default();
@@ -22378,6 +23580,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rescan_current_roots_duplicate_control_returns_retryable_for_not_receive_armed_source_status()
+     {
+        tokio::time::pause();
+        clear_roots_control_send_cache_for_test();
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        let nfs3 = tmp.path().join("nfs3");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2");
+        std::fs::create_dir_all(&nfs3).expect("create nfs3");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let roots = vec![
+            RootSpec::new("nfs1", &nfs1),
+            RootSpec::new("nfs2", &nfs2),
+            RootSpec::new("nfs3", &nfs3),
+        ];
+        let mut node_a_grant = granted_mount_root("node-a::nfs1", &nfs1);
+        node_a_grant.host_ref = "node-a".to_string();
+        let mut node_b_grant = granted_mount_root("node-b::nfs2", &nfs2);
+        node_b_grant.host_ref = "node-b".to_string();
+        let mut node_c_grant = granted_mount_root("node-c::nfs3", &nfs3);
+        node_c_grant.host_ref = "node-c".to_string();
+        let grants = vec![node_a_grant, node_b_grant, node_c_grant];
+        let source_cfg = SourceConfig {
+            roots: roots.clone(),
+            host_object_grants: grants.clone(),
+            ..SourceConfig::default()
+        };
+        let source_runtime = Arc::new(
+            FSMetaSource::with_boundaries_and_state(
+                source_cfg.clone(),
+                NodeId("api-node".into()),
+                None,
+                in_memory_state_boundary(),
+            )
+            .expect("source"),
+        );
+        let source = Arc::new(SourceFacade::local(source_runtime));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("api-node".into()), None, source_cfg)
+                .expect("sink"),
+        )));
+
+        let mut not_receive_armed =
+            manual_rescan_source_status_snapshot_for_current_active_grants(&roots, &grants);
+        not_receive_armed.last_control_frame_signals_by_node = BTreeMap::from([
+            (
+                "node-a".to_string(),
+                vec![format!(
+                    "activate unit=runtime.exec.source route={}.req generation=1779600000001 scopes=[\"nfs1=>nfs1\"]",
+                    source_rescan_route_key_for("node-a")
+                )],
+            ),
+            (
+                "node-b".to_string(),
+                vec![format!(
+                    "activate unit=runtime.exec.source route={}.req generation=1779600000001 scopes=[\"nfs2=>nfs2\"]",
+                    source_rescan_route_key_for("node-b")
+                )],
+            ),
+            (
+                "node-c".to_string(),
+                vec![format!(
+                    "activate unit=runtime.exec.source route={}.req generation=1779600000001 scopes=[\"nfs3=>nfs3\"]",
+                    source_rescan_route_key_for("node-c")
+                )],
+            ),
+        ]);
+        assert!(
+            manual_rescan_source_snapshot_ready_for_current_roots(
+                &roots_put_second_wave_expected_groups(&roots),
+                &roots,
+                &not_receive_armed,
+            ),
+            "fixture must prove current source/scan runtime-scope ownership"
+        );
+        assert!(
+            !manual_rescan_runtime_scope_route_receive_armed_gaps_by_root(
+                &roots,
+                &not_receive_armed
+            )
+            .is_empty(),
+            "fixture must expose active-but-not-receive-armed manual-rescan routes"
+        );
+
+        let boundary = Arc::new(PartiallyBlockedNodeScopedSourceStatusCollectBoundary::new(
+            vec![(
+                "node-b".to_string(),
+                "node-b".to_string(),
+                not_receive_armed,
+            )],
+            vec!["node-a".to_string(), "node-c".to_string()],
+        ));
+        let facade_service_state = crate::api::facade_status::shared_facade_service_state_cell();
+        *facade_service_state
+            .write()
+            .expect("write facade service state") = FacadeServiceState::Serving;
+        let request_tracker = Arc::new(crate::api::ApiRequestTracker::default());
+        let state = ApiState {
+            node_id: NodeId("api-node".into()),
+            runtime_boundary: Some(boundary.clone()),
+            query_runtime_boundary: Some(boundary.clone()),
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth: auth.clone(),
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                shared_facade_pending_status_cell(),
+            ),
+            published_rollout_status: test_published_rollout_status_reader(),
+            request_tracker: request_tracker.clone(),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+        let duplicate_context = RootsPutSecondWaveFollowupContext {
+            node_id: state.node_id.clone(),
+            runtime_boundary: state.runtime_boundary.clone(),
+            query_runtime_boundary: state.query_runtime_boundary.clone(),
+            roots_control_generation: state
+                .source
+                .logical_roots_generation_with_failure()
+                .await
+                .expect("source logical roots generation"),
+        };
+        let duplicate_targets =
+            derive_roots_put_control_target_node_ids_from_grants(&state.node_id, &roots, &grants)
+                .into_iter()
+                .chain(manual_rescan_source_status_probe_seed_node_ids_from_grants(
+                    &roots, &grants,
+                ))
+                .collect::<BTreeSet<_>>();
+        remember_roots_control_send(&duplicate_context, &roots, &duplicate_targets);
+
+        let headers = management_headers(auth.as_ref());
+        let task = tokio::spawn(async move { rescan(State(state), headers).await });
+
+        let retryable_response_budget = MANUAL_RESCAN_SCOPED_SOURCE_STATUS_ATTEMPT_TIMEOUT
+            + STATUS_ROUTE_COLLECT_IDLE_GRACE
+            + Duration::from_secs(1);
+        let mut elapsed = Duration::ZERO;
+        while elapsed < retryable_response_budget && !task.is_finished() {
+            let step = Duration::from_millis(100).min(retryable_response_budget - elapsed);
+            tokio::time::advance(step).await;
+            tokio::task::yield_now().await;
+            elapsed += step;
+        }
+        assert!(
+            task.is_finished(),
+            "same-generation duplicate-control plus not-receive-armed source-status must fail closed before blocked peers spend the full request budget; sent_routes={:?}",
+            boundary.sent_routes()
+        );
+
+        let err = task
+            .await
+            .expect("rescan task join")
+            .expect_err("not-receive-armed source-status should fail closed with retryable 503");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.message.contains("route_receive_armed_gaps")
+                || err.message.contains("not receive-armed"),
+            "retryable response must explain route readiness gap, got {err:?}"
+        );
+        let sent_routes = boundary.sent_routes();
+        assert!(
+            sent_routes
+                .iter()
+                .any(|route| route == &source_status_request_route_for("node-b").0),
+            "fixture must observe node-b source-status before failing closed: {sent_routes:?}"
+        );
+        assert!(
+            sent_routes
+                .iter()
+                .all(|route| !route.contains("roots-control")),
+            "duplicate roots-control cache should skip new roots-control sends: {sent_routes:?}"
+        );
+        tokio::time::timeout(Duration::from_millis(100), request_tracker.wait_for_drain())
+            .await
+            .expect("retryable rescan response must release facade request tracker");
+    }
+
+    #[tokio::test]
     async fn manual_rescan_current_roots_preflight_bounds_generic_cache_degraded_collect_loop() {
         let roots = vec![
             RootSpec::new("nfs1", "/mnt/nfs1"),
@@ -22659,6 +24056,82 @@ mod tests {
                 true,
             ),
             "runtime-scope cache without root-health must return to preflight as retryable non-ready evidence: {per_origin:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_rescan_current_roots_readiness_bounds_stalled_local_source_observation() {
+        tokio::time::pause();
+
+        let roots = vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+            RootSpec::new("nfs3", "/mnt/nfs3"),
+        ];
+        let seed_node_ids = BTreeSet::from([
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ]);
+        let boundary = Arc::new(TimeoutSourceStatusCollectBoundary::default());
+        let context = RootsPutSecondWaveFollowupContext {
+            node_id: NodeId("node-b".into()),
+            runtime_boundary: Some(boundary),
+            query_runtime_boundary: None,
+            roots_control_generation: 4,
+        };
+
+        let task = tokio::spawn({
+            let roots = roots.clone();
+            let seed_node_ids = seed_node_ids.clone();
+            async move {
+                wait_roots_put_second_wave_readiness_evidence_with_optional_local_source(
+                    &context,
+                    &roots,
+                    seed_node_ids.clone(),
+                    seed_node_ids,
+                    false,
+                    false,
+                    |_| async { None::<SourceObservabilitySnapshot> },
+                    |_| async {
+                        std::future::pending::<Option<SourceObservabilitySnapshot>>().await
+                    },
+                    RootsPutControlReplayPolicy::ObserveOnly,
+                    manual_rescan_source_status_request_payload(),
+                    true,
+                )
+                .await
+            }
+        });
+
+        let retryable_response_budget =
+            MANUAL_RESCAN_SOURCE_SECOND_WAVE_TIMEOUT + Duration::from_secs(1);
+        let mut elapsed = Duration::ZERO;
+        while elapsed < retryable_response_budget && !task.is_finished() {
+            let step = Duration::from_millis(100).min(retryable_response_budget - elapsed);
+            tokio::time::advance(step).await;
+            tokio::task::yield_now().await;
+            elapsed += step;
+        }
+        for _ in 0..10 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            task.is_finished(),
+            "manual-rescan current-roots readiness must not wait indefinitely for a stalled local source observation"
+        );
+        let err = match task.await.expect("manual-rescan readiness join") {
+            Ok(_) => panic!("stalled local source observation should fail closed"),
+            Err(err) => err,
+        };
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.message.contains("second-wave convergence")
+                || err.message.contains("runtime-scope readiness"),
+            "retryable error should explain bounded current-roots readiness failure: {err:?}"
         );
     }
 
@@ -24357,6 +25830,108 @@ mod tests {
                 &authoritative,
             ),
             "complete owner fan-in for every authoritative root should remain a valid serving /status response"
+        );
+    }
+
+    #[test]
+    fn status_authoritative_fanin_accepts_live_concrete_source_owner_when_schedule_map_is_sparse() {
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = vec![
+            RootSpec::new("nfs-144", "/mnt/nfs-144"),
+            RootSpec::new("nfs-145", "/mnt/nfs-145"),
+            RootSpec::new("nfs-146", "/mnt/nfs-146"),
+        ];
+        authoritative.grants = vec![
+            grant_for_node_root("node-a", "nfs-144"),
+            grant_for_node_root("node-b", "nfs-145"),
+            grant_for_node_root("node-c", "nfs-146"),
+        ];
+
+        let mut source = authoritative.clone();
+        source.status.logical_roots.clear();
+        for (root_id, node_id) in [
+            ("nfs-144", "node-a"),
+            ("nfs-145", "node-b"),
+            ("nfs-146", "node-c"),
+        ] {
+            set_live_group_primary_source_root(&mut source, root_id, node_id);
+        }
+        source
+            .status
+            .concrete_roots
+            .retain(|root| root.logical_root_id.starts_with("nfs-14"));
+        source.source_primary_by_group = BTreeMap::from([
+            ("nfs-144".to_string(), "node-a::nfs-144".to_string()),
+            ("nfs-145".to_string(), "node-b::nfs-145".to_string()),
+            ("nfs-146".to_string(), "node-c::nfs-146".to_string()),
+        ]);
+        source.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-b".to_string(), vec!["nfs-145".to_string()]),
+            ("node-c".to_string(), vec!["nfs-146".to_string()]),
+        ]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+
+        let sink = SinkStatusSnapshot {
+            primary_host_ref_by_group: BTreeMap::from([
+                ("nfs-144".to_string(), "node-a".to_string()),
+                ("nfs-145".to_string(), "node-b".to_string()),
+                ("nfs-146".to_string(), "node-c".to_string()),
+            ]),
+            scheduled_groups_by_node: BTreeMap::from([
+                ("node-a".to_string(), vec!["nfs-144".to_string()]),
+                ("node-b".to_string(), vec!["nfs-145".to_string()]),
+                ("node-c".to_string(), vec!["nfs-146".to_string()]),
+            ]),
+            groups: vec![
+                status_test_sink_group(
+                    "nfs-144",
+                    "node-a::nfs-144",
+                    GroupReadinessState::PendingMaterialization,
+                    1,
+                    1,
+                ),
+                status_test_sink_group(
+                    "nfs-145",
+                    "node-b::nfs-145",
+                    GroupReadinessState::PendingMaterialization,
+                    1,
+                    1,
+                ),
+                status_test_sink_group(
+                    "nfs-146",
+                    "node-c::nfs-146",
+                    GroupReadinessState::PendingMaterialization,
+                    1,
+                    1,
+                ),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let expected_groups = BTreeSet::from([
+            "nfs-144".to_string(),
+            "nfs-145".to_string(),
+            "nfs-146".to_string(),
+        ]);
+        assert!(status_source_health_gaps_for_groups(&source, &expected_groups).is_empty());
+        assert!(
+            status_source_runtime_scope_gaps_for_groups(&source, &expected_groups).is_empty(),
+            "live group-primary source concrete-root evidence should cover source owner scope when route schedule debug maps are sparse"
+        );
+        assert!(
+            status_scan_runtime_scope_gaps_for_groups(&source, &expected_groups).is_empty(),
+            "scan-enabled live group-primary concrete-root evidence should cover scan owner scope when route schedule debug maps are sparse"
+        );
+        assert!(
+            !should_fail_closed_authoritative_status_fanin(
+                StatusRouteOutcome::Timeout,
+                StatusRouteOutcome::Ok,
+                FacadeServiceState::Serving,
+                &sink,
+                &source,
+                &authoritative,
+            ),
+            "source_route=ok with complete live concrete source owners must not fail closed solely because source/scan schedule maps omit one owner"
         );
     }
 
@@ -40409,7 +41984,8 @@ mod tests {
         *facade_service_state
             .write()
             .expect("write facade service state") = FacadeServiceState::Serving;
-        let control_gate = Arc::new(crate::api::ApiControlGate::new(true));
+        let control_gate = Arc::new(crate::api::ApiControlGate::new(false));
+        control_gate.set_ready_state_with_source_repair(false, false, true);
         control_gate.record_repair_lane_state_with_metadata(
             "sink-repair",
             "sink",
@@ -40447,6 +42023,14 @@ mod tests {
             .0;
 
         assert_eq!(response.facade.state, FacadeServiceState::Serving);
+        assert!(
+            response.readiness_planes.api_facade_liveness,
+            "serving facade status means the API facade liveness plane is open even when management writes remain closed"
+        );
+        assert!(
+            !response.readiness_planes.management_write_readiness,
+            "management write readiness must remain independent from API facade liveness"
+        );
         assert!(
             response.readiness_planes.source_repair_readiness,
             "status must expose source repair readiness as an independent readiness plane"
@@ -41657,6 +43241,528 @@ mod tests {
     }
 
     #[test]
+    fn status_sink_observation_repair_signature_ignores_sink_progress_for_same_repair_intent() {
+        let mut source = local_source_snapshot();
+        let root_ids = ["nfs-144", "nfs-145", "nfs-146"];
+        source.logical_roots = root_ids
+            .iter()
+            .map(|root_id| RootSpec::new(*root_id, format!("/mnt/{root_id}")))
+            .collect();
+        source.status.logical_roots = root_ids
+            .iter()
+            .map(|root_id| SourceLogicalRootHealthSnapshot {
+                root_id: (*root_id).to_string(),
+                status: "healthy".to_string(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            })
+            .collect();
+        source.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs-144".to_string()]),
+            ("node-b".to_string(), vec!["nfs-145".to_string()]),
+            ("node-c".to_string(), vec!["nfs-146".to_string()]),
+        ]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+
+        let expected_groups = status_sink_observation_repair_expected_groups(&source);
+        assert_eq!(
+            expected_groups,
+            BTreeSet::from([
+                "nfs-144".to_string(),
+                "nfs-145".to_string(),
+                "nfs-146".to_string()
+            ])
+        );
+
+        let early_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs-145".to_string()],
+            )]),
+            primary_host_ref_by_group: BTreeMap::from([(
+                "nfs-145".to_string(),
+                "node-b".to_string(),
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs-145",
+                "node-b::nfs-145",
+                GroupReadinessState::PendingMaterialization,
+                17,
+                17,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let mut later_sink = early_sink.clone();
+        later_sink
+            .scheduled_groups_by_node
+            .insert("node-c".to_string(), vec!["nfs-146".to_string()]);
+        later_sink
+            .primary_host_ref_by_group
+            .insert("nfs-146".to_string(), "node-c".to_string());
+        later_sink.groups.push(status_test_sink_group(
+            "nfs-146",
+            "node-c::nfs-146",
+            GroupReadinessState::PendingMaterialization,
+            22,
+            22,
+        ));
+        assert!(
+            status_should_run_sink_observation_repair(&source, &early_sink)
+                && status_should_run_sink_observation_repair(&source, &later_sink),
+            "both snapshots must represent the same accepted roots/source-scope repair intent while sink observation is still incomplete"
+        );
+        assert_eq!(
+            status_sink_schedule_gaps_for_groups(&early_sink, &expected_groups),
+            BTreeSet::from(["nfs-144".to_string(), "nfs-146".to_string()])
+        );
+        assert_eq!(
+            status_sink_schedule_gaps_for_groups(&later_sink, &expected_groups),
+            BTreeSet::from(["nfs-144".to_string()])
+        );
+
+        let early = status_sink_observation_repair_lane_signature(
+            &source,
+            &early_sink,
+            &expected_groups,
+            StatusRouteOutcome::Ok,
+        );
+        let later = status_sink_observation_repair_lane_signature(
+            &source,
+            &later_sink,
+            &expected_groups,
+            StatusRouteOutcome::Ok,
+        );
+
+        assert_eq!(
+            early, later,
+            "status-observation sink repair duplicate suppression must key the accepted repair intent, not mutable sink progress; otherwise materialization/status progress can spawn a new retained replay lane every poll"
+        );
+    }
+
+    #[test]
+    fn status_sink_observation_repair_signature_ignores_control_generation_for_same_repair_intent()
+    {
+        let mut source = local_source_snapshot();
+        let root_ids = ["nfs-144", "nfs-145", "nfs-146"];
+        source.logical_roots = root_ids
+            .iter()
+            .map(|root_id| RootSpec::new(*root_id, format!("/mnt/{root_id}")))
+            .collect();
+        source.status.logical_roots = root_ids
+            .iter()
+            .map(|root_id| SourceLogicalRootHealthSnapshot {
+                root_id: (*root_id).to_string(),
+                status: "healthy".to_string(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            })
+            .collect();
+        source.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs-144".to_string()]),
+            ("node-b".to_string(), vec!["nfs-145".to_string()]),
+            ("node-c".to_string(), vec!["nfs-146".to_string()]),
+        ]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+        source.last_control_frame_signals_by_node = BTreeMap::from([(
+            "node-c".to_string(),
+            vec![
+                "activate unit=runtime.exec.source route=source-logical-roots-control.node_c:v1.stream generation=41 scopes=[\"nfs-146=>node-c::nfs-146\"]"
+                    .to_string(),
+            ],
+        )]);
+        let mut later_source = source.clone();
+        later_source.last_control_frame_signals_by_node = BTreeMap::from([(
+            "node-c".to_string(),
+            vec![
+                "activate unit=runtime.exec.source route=source-logical-roots-control.node_c:v1.stream generation=42 scopes=[\"nfs-146=>node-c::nfs-146\"]"
+                    .to_string(),
+            ],
+        )]);
+
+        let expected_groups = status_sink_observation_repair_expected_groups(&source);
+        let sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs-145".to_string()],
+            )]),
+            primary_host_ref_by_group: BTreeMap::from([(
+                "nfs-145".to_string(),
+                "node-b".to_string(),
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-c".to_string(),
+                vec![
+                    "activate unit=runtime.exec.sink route=sink-logical-roots-control.node_c:v1.stream generation=101 scopes=[\"nfs-146=>node-c::nfs-146\"]"
+                        .to_string(),
+                ],
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs-145",
+                "node-b::nfs-145",
+                GroupReadinessState::PendingMaterialization,
+                17,
+                17,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let mut later_sink = sink.clone();
+        later_sink.last_control_frame_signals_by_node = BTreeMap::from([(
+            "node-c".to_string(),
+            vec![
+                "activate unit=runtime.exec.sink route=sink-logical-roots-control.node_c:v1.stream generation=102 scopes=[\"nfs-146=>node-c::nfs-146\"]"
+                    .to_string(),
+            ],
+        )]);
+
+        assert!(
+            status_should_run_sink_observation_repair(&source, &sink)
+                && status_should_run_sink_observation_repair(&later_source, &later_sink),
+            "fixtures must both represent one accepted source/sink repair intent"
+        );
+        assert_eq!(
+            status_sink_observation_repair_lane_signature(
+                &source,
+                &sink,
+                &expected_groups,
+                StatusRouteOutcome::Ok,
+            ),
+            status_sink_observation_repair_lane_signature(
+                &later_source,
+                &later_sink,
+                &expected_groups,
+                StatusRouteOutcome::Ok,
+            ),
+            "status-observation repair must not open a new lane only because source/sink control-frame generations advanced for the same roots/scope intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_status_sink_observation_repair_is_not_reclaimed_for_sink_progress_only_change()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_facade = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(SourceConfig::default(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, SourceConfig::default())
+                .expect("sink"),
+        )));
+        let control_gate = Arc::new(crate::api::ApiControlGate::new(true));
+        let sink_repair_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        control_gate.set_sink_repair_recovery(Some(Arc::new({
+            let sink_repair_calls = sink_repair_calls.clone();
+            move || {
+                let sink_repair_calls = sink_repair_calls.clone();
+                Box::pin(async move {
+                    sink_repair_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        })));
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: None,
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+            source: source_facade,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
+            published_rollout_status: test_published_rollout_status_reader(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate,
+        };
+
+        let mut source = local_source_snapshot();
+        let root_ids = ["nfs-144", "nfs-145", "nfs-146"];
+        source.logical_roots = root_ids
+            .iter()
+            .map(|root_id| RootSpec::new(*root_id, format!("/mnt/{root_id}")))
+            .collect();
+        source.status.logical_roots = root_ids
+            .iter()
+            .map(|root_id| SourceLogicalRootHealthSnapshot {
+                root_id: (*root_id).to_string(),
+                status: "healthy".to_string(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            })
+            .collect();
+        source.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs-144".to_string()]),
+            ("node-b".to_string(), vec!["nfs-145".to_string()]),
+            ("node-c".to_string(), vec!["nfs-146".to_string()]),
+        ]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+        let expected_groups = status_sink_observation_repair_expected_groups(&source);
+
+        let early_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs-145".to_string()],
+            )]),
+            primary_host_ref_by_group: BTreeMap::from([(
+                "nfs-145".to_string(),
+                "node-b".to_string(),
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs-145",
+                "node-b::nfs-145",
+                GroupReadinessState::PendingMaterialization,
+                17,
+                17,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let mut later_sink = early_sink.clone();
+        later_sink
+            .scheduled_groups_by_node
+            .insert("node-c".to_string(), vec!["nfs-146".to_string()]);
+        later_sink
+            .primary_host_ref_by_group
+            .insert("nfs-146".to_string(), "node-c".to_string());
+        later_sink.groups.push(status_test_sink_group(
+            "nfs-146",
+            "node-c::nfs-146",
+            GroupReadinessState::PendingMaterialization,
+            22,
+            22,
+        ));
+
+        let repair_signature = status_sink_observation_repair_lane_signature(
+            &source,
+            &early_sink,
+            &expected_groups,
+            StatusRouteOutcome::Ok,
+        );
+        assert_eq!(
+            repair_signature,
+            status_sink_observation_repair_lane_signature(
+                &source,
+                &later_sink,
+                &expected_groups,
+                StatusRouteOutcome::Ok,
+            ),
+            "fixture must change only sink progress, not the accepted repair intent"
+        );
+
+        let first = run_status_sink_observation_repair_if_needed(
+            &state,
+            &source,
+            &early_sink,
+            StatusRouteOutcome::Ok,
+        )
+        .await;
+        assert_eq!(first.state, "scheduled");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let completed = state
+                    .control_gate
+                    .repair_lane_snapshot()
+                    .iter()
+                    .any(|lane| lane.signature == repair_signature && lane.state == "completed");
+                if completed {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first sink observation repair should complete");
+
+        let second = run_status_sink_observation_repair_if_needed(
+            &state,
+            &source,
+            &later_sink,
+            StatusRouteOutcome::Ok,
+        )
+        .await;
+        assert_eq!(
+            second.state, "completed",
+            "same accepted repair intent with only sink progress changes must observe the completed lane instead of reclaiming another status-triggered repair"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            sink_repair_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "same accepted status-observation repair intent must not replay on every materialization/status progress poll"
+        );
+        let lane_count = state
+            .control_gate
+            .repair_lane_snapshot()
+            .into_iter()
+            .filter(|lane| lane.lane == "status-triggered-sink-observation-repair")
+            .count();
+        assert_eq!(
+            lane_count, 1,
+            "repair-lane evidence must stay bounded for one accepted repair intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_sink_observation_repair_does_not_compete_with_sink_generation_cutover_lane() {
+        let tmp = tempdir().expect("create temp dir");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_facade = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(SourceConfig::default(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, SourceConfig::default())
+                .expect("sink"),
+        )));
+        let control_gate = Arc::new(crate::api::ApiControlGate::new(true));
+        control_gate.record_repair_lane_state_with_metadata(
+            "sink-repair",
+            "sink",
+            "timed-out",
+            "sink-generation-cutover",
+            false,
+            Some("deferred sink repair attempt timed out".to_string()),
+            Some(1781392714282),
+            Some(90),
+            Some(1781392744707402),
+        );
+        let sink_repair_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        control_gate.set_sink_repair_recovery(Some(Arc::new({
+            let sink_repair_calls = sink_repair_calls.clone();
+            move || {
+                let sink_repair_calls = sink_repair_calls.clone();
+                Box::pin(async move {
+                    sink_repair_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        })));
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: None,
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+            source: source_facade,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
+            published_rollout_status: test_published_rollout_status_reader(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate,
+        };
+
+        let mut source = local_source_snapshot();
+        let root_ids = ["nfs-144", "nfs-145", "nfs-146"];
+        source.logical_roots = root_ids
+            .iter()
+            .map(|root_id| RootSpec::new(*root_id, format!("/mnt/{root_id}")))
+            .collect();
+        source.status.logical_roots = root_ids
+            .iter()
+            .map(|root_id| SourceLogicalRootHealthSnapshot {
+                root_id: (*root_id).to_string(),
+                status: "healthy".to_string(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            })
+            .collect();
+        source.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs-144".to_string()]),
+            ("node-b".to_string(), vec!["nfs-145".to_string()]),
+            ("node-c".to_string(), vec!["nfs-146".to_string()]),
+        ]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+        let sink_status = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs-145".to_string()],
+            )]),
+            primary_host_ref_by_group: BTreeMap::from([(
+                "nfs-145".to_string(),
+                "node-b".to_string(),
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs-145",
+                "node-b::nfs-145",
+                GroupReadinessState::PendingMaterialization,
+                17,
+                17,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        assert!(
+            status_should_run_sink_observation_repair(&source, &sink_status),
+            "fixture must model a status-observed sink gap"
+        );
+
+        let evidence = run_status_sink_observation_repair_if_needed(
+            &state,
+            &source,
+            &sink_status,
+            StatusRouteOutcome::Ok,
+        )
+        .await;
+
+        assert_eq!(evidence.state, "blocked");
+        assert_eq!(evidence.route_outcome, Some("ok".to_string()));
+        assert!(
+            evidence
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("sink-generation-cutover")),
+            "status must report the owning full sink replay lane instead of spawning another repair: {:?}",
+            evidence
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            sink_repair_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "status-triggered sink observation repair must not compete with sink-generation-cutover recovery"
+        );
+        let status_triggered_count = state
+            .control_gate
+            .repair_lane_snapshot()
+            .into_iter()
+            .filter(|lane| lane.lane == "status-triggered-sink-observation-repair")
+            .count();
+        assert_eq!(
+            status_triggered_count, 1,
+            "status may record bounded blocked evidence, but must not accumulate extra status-triggered repair lanes"
+        );
+    }
+
+    #[test]
     fn status_sink_live_nodes_does_not_inflate_empty_sink_from_active_source_grants() {
         let sink_status = SinkStatusSnapshot::default();
         assert_eq!(
@@ -41949,6 +44055,220 @@ mod tests {
             .await
             .expect("status join")
             .expect("status should complete after pause release");
+    }
+
+    #[tokio::test]
+    async fn status_returns_service_unavailable_when_internal_status_phase_never_releases() {
+        tokio::time::pause();
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            roots: vec![RootSpec::new("nfs1", &nfs1)],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: None,
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
+            published_rollout_status: test_published_rollout_status_reader(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        install_status_pause_hook(StatusPauseHook {
+            entered: entered.clone(),
+            release,
+        });
+        struct StatusPauseHookReset;
+        impl Drop for StatusPauseHookReset {
+            fn drop(&mut self) {
+                clear_status_pause_hook();
+            }
+        }
+        let _reset = StatusPauseHookReset;
+
+        let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("paused /status should enter the internal pause hook");
+
+        tokio::time::advance(STATUS_RESPONSE_TIMEOUT + Duration::from_secs(1)).await;
+
+        let err = tokio::time::timeout(Duration::from_millis(1), status_task)
+            .await
+            .expect("management /status must have a total response budget")
+            .expect("status join")
+            .expect_err("stuck internal status phase must fail closed");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.message.contains("status response budget"),
+            "unexpected status timeout error: {}",
+            err.message
+        );
+        assert!(
+            err.repair_lanes
+                .as_ref()
+                .is_some_and(|lanes| lanes.iter().any(|lane| {
+                    lane.lane == "status-response"
+                        && lane.owner == "facade"
+                        && lane.state == "timed-out"
+                })),
+            "status response timeout must expose repair-lane evidence: {:?}",
+            err.repair_lanes
+        );
+    }
+
+    #[tokio::test]
+    async fn status_response_timeout_does_not_wait_for_internal_status_cancellation() {
+        tokio::time::pause();
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            roots: vec![RootSpec::new("nfs1", &nfs1)],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: None,
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
+            published_rollout_status: test_published_rollout_status_reader(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        install_status_pause_hook(StatusPauseHook {
+            entered: entered.clone(),
+            release,
+        });
+        let cancel_drop_hook = StatusCancelDropHook::new();
+        install_status_cancel_drop_hook(cancel_drop_hook.clone());
+        struct StatusHookReset {
+            cancel_drop_hook: StatusCancelDropHook,
+        }
+        impl Drop for StatusHookReset {
+            fn drop(&mut self) {
+                self.cancel_drop_hook.release();
+                clear_status_cancel_drop_hook();
+                clear_status_pause_hook();
+            }
+        }
+        let _reset = StatusHookReset {
+            cancel_drop_hook: cancel_drop_hook.clone(),
+        };
+
+        let forced_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = {
+            let cancel_drop_hook = cancel_drop_hook.clone();
+            let forced_release = forced_release.clone();
+            std::thread::spawn(move || {
+                if cancel_drop_hook.wait_for_drop_started_or_release(Duration::from_secs(2)) {
+                    std::thread::sleep(Duration::from_millis(200));
+                    if !cancel_drop_hook.is_released() {
+                        forced_release.store(true, Ordering::SeqCst);
+                        cancel_drop_hook.release();
+                    }
+                }
+            })
+        };
+
+        let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("paused /status should enter the internal pause hook");
+
+        tokio::time::advance(STATUS_RESPONSE_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let err = tokio::time::timeout(Duration::from_millis(1), status_task)
+            .await
+            .expect("management /status timeout must not wait for stuck cancellation")
+            .expect("status join")
+            .expect_err("stuck internal status phase must fail closed");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.repair_lanes
+                .as_ref()
+                .is_some_and(|lanes| lanes.iter().any(|lane| {
+                    lane.lane == "status-response"
+                        && lane.owner == "facade"
+                        && lane.state == "timed-out"
+                })),
+            "status response timeout must expose repair-lane evidence: {:?}",
+            err.repair_lanes
+        );
+        assert!(
+            !forced_release.load(Ordering::SeqCst),
+            "management /status response waited for the stuck internal status cancellation path"
+        );
+
+        cancel_drop_hook.release();
+        watchdog.join().expect("status cancel-drop watchdog");
     }
 
     #[tokio::test]

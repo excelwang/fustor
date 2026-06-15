@@ -38,9 +38,9 @@ use crate::runtime::orchestration::{
 use crate::runtime::routes::{
     METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_ROOTS_CONTROL,
     METHOD_SINK_STATUS, METHOD_SOURCE_FIND, METHOD_SOURCE_RESCAN, METHOD_SOURCE_ROOTS_CONTROL,
-    METHOD_SOURCE_STATUS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY,
-    ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_ROOTS_CONTROL,
-    ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
+    METHOD_SOURCE_STATUS, ROUTE_KEY_EVENTS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND,
+    ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_QUERY_PROXY,
+    ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
     ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
     ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META,
     ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, events_stream_route_for_scope,
@@ -100,12 +100,15 @@ const ACTIVE_FACADE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const STATUS_SINK_OBSERVATION_REPAIR_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
+const INTERNAL_STATUS_ROUTE_CLEANUP_REMOTE_COLLECTION_DRAIN_GRACE: Duration =
+    Duration::from_millis(100);
 const SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_ATTEMPTS: usize = 3;
 const SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SOURCE_CONTROL_RECOVERY_MAX_RETRYABLE_RESETS: usize = 64;
 const DEFERRED_SOURCE_REPAIR_QUIET_WINDOW: Duration = Duration::from_millis(250);
 const DEFERRED_SOURCE_REPAIR_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 const DEFERRED_SINK_REPAIR_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+const DEFERRED_SINK_REPAIR_NO_PROGRESS_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const INTERNAL_SINK_STATUS_UNINITIALIZED_READY_BUDGET: Duration = Duration::from_millis(1500);
 const CONTROL_FRAME_LEASE_ACQUIRE_BUDGET: Duration = Duration::from_secs(1);
 const CONTROL_FRAME_LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
@@ -1386,6 +1389,7 @@ fn sink_generation_cutover_inline_action_from_evidence(
     sink_generation_cutover_replay_deferred: bool,
     initial_materialization_catchup: bool,
     trusted_materialized_current: bool,
+    trusted_owner_schedule_current: bool,
 ) -> SinkGenerationCutoverInlineAction {
     let can_defer_replay = matches!(
         generation_cutover_disposition,
@@ -1394,7 +1398,10 @@ fn sink_generation_cutover_inline_action_from_evidence(
     if !can_defer_replay {
         return SinkGenerationCutoverInlineAction::Apply;
     }
-    if !source_state_replay_required && trusted_materialized_current {
+    if !source_state_replay_required
+        && trusted_materialized_current
+        && trusted_owner_schedule_current
+    {
         return SinkGenerationCutoverInlineAction::CompleteFromTrustedMaterialized;
     }
     if !source_state_replay_required && initial_materialization_catchup {
@@ -1543,20 +1550,37 @@ enum RuntimeScopeConvergenceExpectation<'a> {
 impl RuntimeScopeConvergenceObservation {
     #[cfg(test)]
     fn matches_expected(&self, expected_groups: &RuntimeScopeExpectedGroups) -> bool {
-        self.source_groups == expected_groups.source_groups
-            && self.scan_groups == expected_groups.scan_groups
-            && self.sink_groups == expected_groups.sink_groups
+        self.business_source_groups() == expected_groups.source_groups
+            && self.business_scan_groups() == expected_groups.scan_groups
+            && self.business_sink_groups() == expected_groups.sink_groups
     }
 
     fn matches_node_local_source_scope(
         &self,
         expected_groups: &RuntimeScopeExpectedGroups,
     ) -> bool {
-        self.sink_groups == expected_groups.sink_groups
-            && self.source_groups.is_subset(&expected_groups.source_groups)
-            && self.scan_groups.is_subset(&expected_groups.scan_groups)
-            && self.source_groups.is_subset(&self.sink_groups)
-            && self.scan_groups.is_subset(&self.sink_groups)
+        let source_groups = self.business_source_groups();
+        let scan_groups = self.business_scan_groups();
+        let sink_groups = self.business_sink_groups();
+        sink_groups == expected_groups.sink_groups
+            && source_groups.is_subset(&expected_groups.source_groups)
+            && scan_groups.is_subset(&expected_groups.scan_groups)
+            && source_groups.is_subset(&sink_groups)
+            && scan_groups.is_subset(&sink_groups)
+    }
+
+    fn matches_node_local_source_scan_scope_without_sink_schedule(
+        &self,
+        expected_groups: &RuntimeScopeExpectedGroups,
+    ) -> bool {
+        let source_groups = self.business_source_groups();
+        let scan_groups = self.business_scan_groups();
+        self.business_sink_groups().is_empty()
+            && !expected_groups.sink_groups.is_empty()
+            && source_groups == expected_groups.source_groups
+            && scan_groups == expected_groups.scan_groups
+            && source_groups.is_subset(&expected_groups.sink_groups)
+            && scan_groups.is_subset(&expected_groups.sink_groups)
     }
 
     fn timeout_context(&self) -> String {
@@ -1570,12 +1594,24 @@ impl RuntimeScopeConvergenceObservation {
         &self,
         logical_roots: &[source::config::RootSpec],
     ) -> RuntimeScopeExpectedGroups {
-        let mut sink_groups = self.sink_groups.clone();
+        let mut sink_groups = self.business_sink_groups();
         if sink_groups.is_empty() {
-            sink_groups.extend(self.source_groups.iter().cloned());
-            sink_groups.extend(self.scan_groups.iter().cloned());
+            sink_groups.extend(self.business_source_groups());
+            sink_groups.extend(self.business_scan_groups());
         }
         RuntimeScopeExpectedGroups::from_logical_roots(logical_roots, &sink_groups)
+    }
+
+    fn business_source_groups(&self) -> std::collections::BTreeSet<String> {
+        business_sink_group_ids_from_set(&self.source_groups)
+    }
+
+    fn business_scan_groups(&self) -> std::collections::BTreeSet<String> {
+        business_sink_group_ids_from_set(&self.scan_groups)
+    }
+
+    fn business_sink_groups(&self) -> std::collections::BTreeSet<String> {
+        business_sink_group_ids_from_set(&self.sink_groups)
     }
 
     #[cfg(test)]
@@ -2020,10 +2056,14 @@ impl SinkRecoveryMachine {
         deadline: tokio::time::Instant,
     ) -> SinkRecoveryScopeConvergenceAction {
         let scope_converged = observation.matches_node_local_source_scope(expected_scope_groups);
+        let source_scan_scope_waiting_for_sink_schedule = observation
+            .matches_node_local_source_scan_scope_without_sink_schedule(expected_scope_groups);
         let source_rescan_pending = self.post_recovery_source_rescan_pending();
         if scope_converged && !source_rescan_pending {
             SinkRecoveryScopeConvergenceAction::Converged
-        } else if scope_converged && tokio::time::Instant::now() >= deadline {
+        } else if (scope_converged || source_scan_scope_waiting_for_sink_schedule)
+            && tokio::time::Instant::now() >= deadline
+        {
             SinkRecoveryScopeConvergenceAction::Converged
         } else if tokio::time::Instant::now() >= deadline {
             SinkRecoveryScopeConvergenceAction::ReturnTimeout
@@ -2177,6 +2217,17 @@ impl SinkRecoveryMachine {
                         )
                     })
             };
+        let cached_sink_status_ready_after_raw_timeout =
+            |sink: &Arc<SinkFacade>, expected_groups: &std::collections::BTreeSet<String>| {
+                sink.cached_status_snapshot_with_failure()
+                    .ok()
+                    .is_some_and(|snapshot| {
+                        post_recovery_cached_sink_status_ready_after_raw_timeout(
+                            &snapshot,
+                            expected_groups,
+                        )
+                    })
+            };
         loop {
             let scope_convergence_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             let converged_groups = loop {
@@ -2298,6 +2349,9 @@ impl SinkRecoveryMachine {
                         }
                     }
                     Ok(Err(err)) if matches!(err.as_error(), CnxError::Timeout) => {
+                        if cached_sink_status_ready_after_raw_timeout(sink, &converged_groups) {
+                            return Ok(None);
+                        }
                         if self
                             .maybe_schedule_post_recovery_sink_timeout_retry(
                                 source,
@@ -2331,6 +2385,11 @@ impl SinkRecoveryMachine {
                     Ok(Err(_err)) if tokio::time::Instant::now() < sink_readiness_deadline => {}
                     Ok(Err(err)) => return Err(RuntimeWorkerObservationFailure::from(err)),
                     Err(_)
+                        if cached_sink_status_ready_after_raw_timeout(sink, &converged_groups) =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(_)
                         if self
                             .maybe_schedule_post_recovery_sink_timeout_retry(
                                 source,
@@ -2343,6 +2402,9 @@ impl SinkRecoveryMachine {
                     }
                     Err(_) if tokio::time::Instant::now() < sink_readiness_deadline => {}
                     Err(_) => {
+                        if cached_sink_status_ready_after_raw_timeout(sink, &converged_groups) {
+                            return Ok(None);
+                        }
                         if cached_sink_status_has_pending_materialization_progress(
                             sink,
                             &converged_groups,
@@ -3234,8 +3296,22 @@ fn sink_recovery_machine_post_recovery_scope_action_owns_deadline_and_trigger_la
             &expected,
             tokio::time::Instant::now()
         ),
+        SinkRecoveryScopeConvergenceAction::Converged,
+        "when source/scan business scope has converged but sink scope is still empty at the post-recovery deadline, recovery must enter the sink readiness/repair gate instead of terminal-failing the runtime tick",
+    );
+    let missing_all = RuntimeScopeConvergenceObservation {
+        source_groups: std::collections::BTreeSet::new(),
+        scan_groups: std::collections::BTreeSet::new(),
+        sink_groups: std::collections::BTreeSet::new(),
+    };
+    assert_eq!(
+        pretriggered.post_recovery_scope_action(
+            &missing_all,
+            &expected,
+            tokio::time::Instant::now()
+        ),
         SinkRecoveryScopeConvergenceAction::ReturnTimeout,
-        "post-recovery scope convergence timeout should come from the wait-state-owned deadline check",
+        "post-recovery scope convergence still fails closed at the deadline when no current source, scan, or sink business scope has appeared",
     );
 }
 
@@ -3289,6 +3365,38 @@ fn sink_recovery_machine_post_recovery_accepts_node_local_source_scope_subset() 
         ),
         SinkRecoveryScopeConvergenceAction::Converged,
         "post-recovery sink replay must treat source/scan as node-local ownership evidence; requiring every sink group on each source owner keeps recovery fail-closed forever on distributed real-NFS scopes",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_post_recovery_ignores_bootstrap_only_sink_scope() {
+    let waiting = SinkRecoveryMachine::new_post_recovery(None);
+    let observation = RuntimeScopeConvergenceObservation {
+        source_groups: std::collections::BTreeSet::from([String::from("nfs-146")]),
+        scan_groups: std::collections::BTreeSet::from([String::from("nfs-146")]),
+        sink_groups: std::collections::BTreeSet::from([String::from(
+            "__fsmeta_empty_roots_bootstrap",
+        )]),
+    };
+    let expected = observation.expected_groups_for_logical_roots(&[]);
+
+    assert_eq!(
+        expected,
+        RuntimeScopeExpectedGroups {
+            source_groups: std::collections::BTreeSet::from([String::from("nfs-146")]),
+            scan_groups: std::collections::BTreeSet::from([String::from("nfs-146")]),
+            sink_groups: std::collections::BTreeSet::from([String::from("nfs-146")]),
+        },
+        "bootstrap-only sink scopes are control-route liveness, not business sink materialization coverage; expected recovery groups must be derived from source/scan business scope"
+    );
+    assert_eq!(
+        waiting.post_recovery_scope_action(
+            &observation,
+            &expected,
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        ),
+        SinkRecoveryScopeConvergenceAction::TriggerInitialAndWait,
+        "bootstrap-only sink scope must keep source-scoped sink repair open instead of converging as a business sink group"
     );
 }
 
@@ -3605,6 +3713,7 @@ fn initial_audit_catchup_applies_first_post_initial_sink_cutover_without_deferri
             false,
             true,
             false,
+            true,
         ),
         SinkGenerationCutoverInlineAction::ApplyAsInitialAuditCatchup,
         "online initial audit catch-up with materialized sink progress should not first schedule a sink-generation-cutover replay"
@@ -3617,6 +3726,7 @@ fn initial_audit_catchup_applies_first_post_initial_sink_cutover_without_deferri
             false,
             false,
             true,
+            true,
         ),
         SinkGenerationCutoverInlineAction::CompleteFromTrustedMaterialized,
         "trusted/materialized sink evidence must complete retained cutover observation without replaying sink control"
@@ -3628,7 +3738,21 @@ fn initial_audit_catchup_applies_first_post_initial_sink_cutover_without_deferri
             false,
             false,
             false,
+            true,
             false,
+        ),
+        SinkGenerationCutoverInlineAction::DeferReplay,
+        "trusted/materialized sink evidence without owner-scoped schedule/primary evidence must keep retained cutover replay armed"
+    );
+    assert_eq!(
+        sink_generation_cutover_inline_action_from_evidence(
+            SinkGenerationCutoverDisposition::FailClosedRetainedReplayOnRetryableReset,
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
         ),
         SinkGenerationCutoverInlineAction::DeferReplay,
         "without initial audit catch-up evidence, the fail-closed first-defer behavior is preserved"
@@ -3641,6 +3765,7 @@ fn initial_audit_catchup_applies_first_post_initial_sink_cutover_without_deferri
             false,
             true,
             false,
+            true,
         ),
         SinkGenerationCutoverInlineAction::Apply,
         "shared generation cutover is outside the initial-audit catch-up exception"
@@ -3651,6 +3776,7 @@ fn initial_audit_catchup_applies_first_post_initial_sink_cutover_without_deferri
             true,
             true,
             false,
+            true,
             true,
             true,
         ),
@@ -3832,6 +3958,146 @@ fn post_recovery_sink_timeout_defers_scheduled_ready_rows_without_live_materiali
 }
 
 #[test]
+fn post_recovery_raw_timeout_accepts_cached_ready_expected_groups() {
+    let expected_groups = std::collections::BTreeSet::from([String::from("g1")]);
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: String::from("g1"),
+            primary_object_ref: String::from("node-a::g1"),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            String::from("node-a"),
+            vec![String::from("g1")],
+        )]),
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        sink_status_snapshot_ready_for_expected_groups(&snapshot, &expected_groups),
+        "precondition: cached snapshot must be owner-served ready evidence"
+    );
+    assert!(
+        post_recovery_cached_sink_status_ready_after_raw_timeout(&snapshot, &expected_groups),
+        "a raw live-probe timeout after retained replay must not fail the recovery lane when cached owner-served sink status already covers the expected groups"
+    );
+}
+
+#[test]
+fn trusted_cutover_owner_schedule_requires_explicit_primary_host_ref() {
+    let expected_groups = std::collections::BTreeSet::from([String::from("g1")]);
+    let mut snapshot = crate::sink::SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: String::from("g1"),
+            primary_object_ref: String::from("node-a::g1"),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            String::from("node-a"),
+            vec![String::from("g1")],
+        )]),
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        sink_status_snapshot_ready_for_expected_groups(&snapshot, &expected_groups),
+        "precondition: materialized ready status alone is not enough to prove accepted sink ownership"
+    );
+    assert!(
+        !sink_status_snapshot_has_owner_schedule_for_expected_groups(&snapshot, &expected_groups),
+        "trusted cutover completion must not parse primary_object_ref as sink owner evidence"
+    );
+
+    snapshot
+        .primary_host_ref_by_group
+        .insert(String::from("g1"), String::from("node-a"));
+
+    assert!(
+        !sink_status_snapshot_has_owner_schedule_for_expected_groups(&snapshot, &expected_groups),
+        "aggregate primary_host_ref_by_group plus scheduled group evidence still lacks owner-scoped status provenance"
+    );
+
+    snapshot
+        .owner_scoped_scheduled_groups_by_node
+        .insert(String::from("node-a"), vec![String::from("g1")]);
+    snapshot
+        .owner_scoped_primary_host_ref_by_group
+        .insert(String::from("g1"), String::from("node-a"));
+
+    assert!(
+        sink_status_snapshot_has_owner_schedule_for_expected_groups(&snapshot, &expected_groups),
+        "explicit owner-scoped primary/schedule evidence proves owner-scoped schedule currentness"
+    );
+}
+
+#[test]
+fn trusted_cutover_owner_schedule_rejects_aggregate_without_owner_scoped_status_provenance() {
+    let expected_groups = std::collections::BTreeSet::from([
+        String::from("nfs-144"),
+        String::from("nfs-145"),
+        String::from("nfs-146"),
+    ]);
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([
+            (String::from("node-a"), vec![String::from("nfs-144")]),
+            (String::from("node-b"), vec![String::from("nfs-145")]),
+            (String::from("node-c"), vec![String::from("nfs-146")]),
+        ]),
+        primary_host_ref_by_group: std::collections::BTreeMap::from([
+            (String::from("nfs-144"), String::from("node-a")),
+            (String::from("nfs-145"), String::from("node-b")),
+            (String::from("nfs-146"), String::from("node-c")),
+        ]),
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        !sink_status_snapshot_has_owner_schedule_for_expected_groups(&snapshot, &expected_groups),
+        "generic or merged schedule/primary evidence is not enough to complete trusted cutover; every expected group needs current owner-scoped sink-status provenance"
+    );
+}
+
+#[test]
+fn local_sink_status_republish_timeout_defers_empty_status_after_scope_convergence() {
+    let expected_groups = std::collections::BTreeSet::from([String::from("g1")]);
+    let snapshot = crate::sink::SinkStatusSnapshot::default();
+
+    assert!(
+        !sink_status_snapshot_ready_for_expected_groups(&snapshot, &expected_groups),
+        "precondition: empty sink status must not become public/query readiness"
+    );
+    assert!(
+        FSMetaApp::sink_status_snapshot_should_defer_local_republish_after_retained_replay(
+            &snapshot,
+            &expected_groups
+        ),
+        "empty local sink status after retained replay and runtime-scope convergence is retryable recovery evidence; it must not terminal-fail the runtime tick"
+    );
+}
+
+#[test]
 fn local_sink_status_republish_timeout_defers_scheduled_only_zero_state() {
     let expected_groups =
         std::collections::BTreeSet::from([String::from("g1"), String::from("g2")]);
@@ -3851,11 +4117,11 @@ fn local_sink_status_republish_timeout_defers_scheduled_only_zero_state() {
         "scheduled-only local sink status after retained replay is catch-up evidence; it must not turn a steady sink tick into a terminal republish failure"
     );
     assert!(
-        !FSMetaApp::sink_status_snapshot_should_defer_local_republish_after_retained_replay(
+        !sink_status_snapshot_ready_for_expected_groups(
             &crate::sink::SinkStatusSnapshot::default(),
             &expected_groups
         ),
-        "an empty status without scheduled-group evidence must still fail closed"
+        "an empty status without scheduled-group evidence must still fail closed for readiness"
     );
 }
 
@@ -4518,6 +4784,204 @@ fn sink_status_snapshot_has_ready_scheduled_groups(
     snapshot.progress_snapshot().has_ready_scheduled_groups()
 }
 
+fn is_business_sink_group_id(group_id: &str) -> bool {
+    let group_id = group_id.trim();
+    !group_id.is_empty() && !group_id.starts_with("__fsmeta_empty_roots_bootstrap")
+}
+
+fn runtime_bound_scopes_are_empty_roots_bootstrap_only(bound_scopes: &[RuntimeBoundScope]) -> bool {
+    !bound_scopes.is_empty()
+        && bound_scopes.iter().all(|scope| {
+            scope
+                .scope_id
+                .trim()
+                .starts_with("__fsmeta_empty_roots_bootstrap")
+        })
+}
+
+fn business_sink_group_ids_from_set(
+    groups: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    groups
+        .iter()
+        .filter(|group_id| is_business_sink_group_id(group_id))
+        .cloned()
+        .collect()
+}
+
+fn sink_status_snapshot_can_reply_during_replay_or_apply_pending(
+    snapshot: &crate::sink::SinkStatusSnapshot,
+) -> bool {
+    let summary = snapshot.readiness_summary();
+    let business_scheduled_groups = summary
+        .scheduled_groups
+        .iter()
+        .filter(|group_id| is_business_sink_group_id(group_id))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if business_scheduled_groups.is_empty() {
+        return false;
+    }
+    let missing_business_groups = summary
+        .missing_scheduled_groups
+        .iter()
+        .filter(|group_id| is_business_sink_group_id(group_id))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    missing_business_groups.is_empty()
+        || missing_business_groups.is_subset(&summary.stream_evidence_groups)
+}
+
+#[test]
+fn replay_pending_sink_status_route_cache_fallback_rejects_bootstrap_only_stream_progress() {
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            String::from("node-b"),
+            vec![String::from("__fsmeta_empty_roots_bootstrap")],
+        )]),
+        stream_applied_batches_by_node: std::collections::BTreeMap::from([(
+            String::from("node-b"),
+            23,
+        )]),
+        stream_applied_events_by_node: std::collections::BTreeMap::from([(
+            String::from("node-b"),
+            74_415,
+        )]),
+        stream_applied_control_events_by_node: std::collections::BTreeMap::from([(
+            String::from("node-b"),
+            3,
+        )]),
+        stream_applied_data_events_by_node: std::collections::BTreeMap::from([(
+            String::from("node-b"),
+            74_412,
+        )]),
+        stream_last_applied_at_us_by_node: std::collections::BTreeMap::from([(
+            String::from("node-b"),
+            1_781_359_374_052_651,
+        )]),
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        !sink_status_snapshot_can_reply_during_replay_or_apply_pending(&snapshot),
+        "stream/applied telemetry without non-bootstrap sink group rows is progress evidence, not authoritative sink owner/schedule evidence for a replay-pending status reply"
+    );
+}
+
+#[test]
+fn replay_pending_sink_status_route_cache_fallback_allows_business_stream_progress_without_group_rows()
+ {
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            String::from("node-c-29887715224517813062336513"),
+            vec![String::from("nfs-146")],
+        )]),
+        owner_scoped_scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            String::from("node-c-29887715224517813062336513"),
+            vec![String::from("nfs-146")],
+        )]),
+        owner_scoped_primary_host_ref_by_group: std::collections::BTreeMap::from([(
+            String::from("nfs-146"),
+            String::from("node-c-29887715224517813062336513"),
+        )]),
+        stream_received_batches_by_node: std::collections::BTreeMap::from([(
+            String::from("node-c-29887715224517813062336513"),
+            9,
+        )]),
+        stream_received_events_by_node: std::collections::BTreeMap::from([(
+            String::from("node-c-29887715224517813062336513"),
+            21_597,
+        )]),
+        stream_received_origin_counts_by_node: std::collections::BTreeMap::from([(
+            String::from("node-c-29887715224517813062336513"),
+            vec![String::from(
+                "node-c-29887715224517813062336513::nfs-146=21597",
+            )],
+        )]),
+        stream_ready_origin_counts_by_node: std::collections::BTreeMap::from([(
+            String::from("node-c-29887715224517813062336513"),
+            vec![String::from(
+                "node-c-29887715224517813062336513::nfs-146=21597",
+            )],
+        )]),
+        stream_applied_batches_by_node: std::collections::BTreeMap::from([(
+            String::from("node-c-29887715224517813062336513"),
+            9,
+        )]),
+        stream_applied_events_by_node: std::collections::BTreeMap::from([(
+            String::from("node-c-29887715224517813062336513"),
+            21_597,
+        )]),
+        stream_applied_control_events_by_node: std::collections::BTreeMap::from([(
+            String::from("node-c-29887715224517813062336513"),
+            1,
+        )]),
+        stream_applied_data_events_by_node: std::collections::BTreeMap::from([(
+            String::from("node-c-29887715224517813062336513"),
+            21_596,
+        )]),
+        stream_applied_origin_counts_by_node: std::collections::BTreeMap::from([(
+            String::from("node-c-29887715224517813062336513"),
+            vec![String::from(
+                "node-c-29887715224517813062336513::nfs-146=21597",
+            )],
+        )]),
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        snapshot.groups.is_empty(),
+        "fixture must reproduce the route-cache coverage gap from the high-NFS node-c evidence"
+    );
+    assert!(
+        sink_status_snapshot_can_reply_during_replay_or_apply_pending(&snapshot),
+        "business owner-scoped schedule plus stream/applied origin telemetry is degraded progress evidence that /status fan-in must see during replay/apply pending"
+    );
+}
+
+#[test]
+fn replay_pending_sink_status_route_cache_fallback_allows_business_pending_materialization() {
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            String::from("node-b"),
+            vec![
+                String::from("__fsmeta_empty_roots_bootstrap"),
+                String::from("nfs-145"),
+            ],
+        )]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: String::from("nfs-145"),
+            primary_object_ref: String::from("node-b::nfs-145"),
+            total_nodes: 10,
+            live_nodes: 8,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 1_781_359_374_052_651,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        stream_applied_data_events_by_node: std::collections::BTreeMap::from([(
+            String::from("node-b"),
+            74_412,
+        )]),
+        stream_last_applied_at_us_by_node: std::collections::BTreeMap::from([(
+            String::from("node-b"),
+            1_781_359_374_052_651,
+        )]),
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        sink_status_snapshot_can_reply_during_replay_or_apply_pending(&snapshot),
+        "pending/materializing business group rows still carry authoritative sink owner/schedule evidence during retained replay"
+    );
+}
+
 fn sink_group_status_ready_for_republish_completion(
     group: &crate::sink::SinkGroupStatusSnapshot,
     has_stream_group_evidence: bool,
@@ -4552,6 +5016,30 @@ fn sink_status_snapshot_ready_for_expected_groups(
     })
 }
 
+fn sink_status_snapshot_has_owner_schedule_for_expected_groups(
+    snapshot: &crate::sink::SinkStatusSnapshot,
+    expected_groups: &std::collections::BTreeSet<String>,
+) -> bool {
+    let expected_business_groups = business_sink_group_ids_from_set(expected_groups);
+    if expected_business_groups.is_empty() {
+        return false;
+    }
+    let owner_scoped_scheduled_group_entries = snapshot
+        .owner_scoped_scheduled_groups_by_node
+        .values()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let owner_scoped_scheduled_groups =
+        business_sink_group_ids_from_set(&owner_scoped_scheduled_group_entries);
+    expected_business_groups.is_subset(&owner_scoped_scheduled_groups)
+        && expected_business_groups.iter().all(|group_id| {
+            snapshot
+                .owner_scoped_primary_host_ref_by_group
+                .get(group_id)
+                .is_some_and(|host_ref| !host_ref.trim().is_empty())
+        })
+}
+
 fn sink_status_snapshot_republish_observed_for_expected_groups(
     snapshot: &crate::sink::SinkStatusSnapshot,
     expected_groups: &std::collections::BTreeSet<String>,
@@ -4571,6 +5059,13 @@ fn sink_status_snapshot_ready_for_scheduled_groups(
 ) -> bool {
     let scheduled_groups = snapshot.scheduled_groups();
     sink_status_snapshot_ready_for_expected_groups(snapshot, &scheduled_groups)
+}
+
+fn post_recovery_cached_sink_status_ready_after_raw_timeout(
+    snapshot: &crate::sink::SinkStatusSnapshot,
+    expected_groups: &std::collections::BTreeSet<String>,
+) -> bool {
+    sink_status_snapshot_ready_for_expected_groups(snapshot, expected_groups)
 }
 
 fn sink_status_snapshot_observed_control_generation(
@@ -6645,10 +7140,12 @@ fn summarize_sink_groups(groups: &[crate::sink::SinkGroupStatusSnapshot]) -> Vec
 
 fn summarize_sink_status_endpoint(snapshot: &crate::sink::SinkStatusSnapshot) -> String {
     format!(
-        "groups={} group_details={:?} scheduled={:?} received_batches={:?} received_events={:?} received_origin_counts={:?} stream_path_capture_target={:?} stream_received_batches={:?} stream_received_events={:?} stream_received_origin_counts={:?} stream_received_path_origin_counts={:?} stream_ready_origin_counts={:?} stream_ready_path_origin_counts={:?} stream_deferred_origin_counts={:?} stream_dropped_origin_counts={:?} stream_applied_batches={:?} stream_applied_events={:?} stream_applied_control_events={:?} stream_applied_data_events={:?} stream_applied_origin_counts={:?} stream_applied_path_origin_counts={:?} stream_last_applied_at_us={:?}",
+        "groups={} group_details={:?} scheduled={:?} owner_scoped_scheduled={:?} owner_scoped_primary={:?} received_batches={:?} received_events={:?} received_origin_counts={:?} stream_path_capture_target={:?} stream_received_batches={:?} stream_received_events={:?} stream_received_origin_counts={:?} stream_received_path_origin_counts={:?} stream_ready_origin_counts={:?} stream_ready_path_origin_counts={:?} stream_deferred_origin_counts={:?} stream_dropped_origin_counts={:?} stream_applied_batches={:?} stream_applied_events={:?} stream_applied_control_events={:?} stream_applied_data_events={:?} stream_applied_origin_counts={:?} stream_applied_path_origin_counts={:?} stream_last_applied_at_us={:?}",
         snapshot.groups.len(),
         summarize_sink_groups(&snapshot.groups),
         summarize_groups_by_node(&snapshot.scheduled_groups_by_node),
+        summarize_groups_by_node(&snapshot.owner_scoped_scheduled_groups_by_node),
+        snapshot.owner_scoped_primary_host_ref_by_group,
         summarize_counts_by_node(&snapshot.received_batches_by_node),
         summarize_counts_by_node(&snapshot.received_events_by_node),
         summarize_groups_by_node(&snapshot.received_origin_counts_by_node),
@@ -10506,6 +11003,7 @@ impl FSMetaApp {
                     Some(attempt),
                     deadline_at_us,
                 );
+                let mut no_progress_retry_required = false;
                 match tokio::time::timeout(remaining, recovery()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
@@ -10513,6 +11011,7 @@ impl FSMetaApp {
                             "fs_meta_runtime_app: deferred sink repair failed reason={} err={}",
                             reason, err
                         );
+                        no_progress_retry_required = true;
                         api_control_gate.record_repair_lane_state_with_metadata(
                             "sink-repair",
                             "sink",
@@ -10566,9 +11065,33 @@ impl FSMetaApp {
                     return;
                 }
 
-                tokio::select! {
-                    _ = runtime_state_changed.notified() => {}
-                    _ = tokio::time::sleep(DEFERRED_SINK_REPAIR_RETRY_INTERVAL) => {}
+                if no_progress_retry_required {
+                    let retry_not_before = tokio::time::Instant::now()
+                        + DEFERRED_SINK_REPAIR_NO_PROGRESS_RETRY_INTERVAL;
+                    loop {
+                        if !Self::sink_repair_still_required(&runtime_gate_state) {
+                            break;
+                        }
+                        let wait_for =
+                            retry_not_before.saturating_duration_since(tokio::time::Instant::now());
+                        if wait_for.is_zero() {
+                            break;
+                        }
+                        let deadline_remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if deadline_remaining.is_zero() {
+                            break;
+                        }
+                        tokio::select! {
+                            _ = runtime_state_changed.notified() => {}
+                            _ = tokio::time::sleep(wait_for.min(deadline_remaining)) => {}
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        _ = runtime_state_changed.notified() => {}
+                        _ = tokio::time::sleep(remaining.min(DEFERRED_SINK_REPAIR_NO_PROGRESS_RETRY_INTERVAL)) => {}
+                    }
                 }
             }
         });
@@ -11026,7 +11549,8 @@ impl FSMetaApp {
         snapshot: &crate::sink::SinkStatusSnapshot,
         expected_groups: &std::collections::BTreeSet<String>,
     ) -> bool {
-        FSMetaApp::sink_status_snapshot_has_scheduled_only_republish_evidence(snapshot)
+        (!expected_groups.is_empty() && FSMetaApp::sink_status_snapshot_summary_is_empty(snapshot))
+            || FSMetaApp::sink_status_snapshot_has_scheduled_only_republish_evidence(snapshot)
             || FSMetaApp::sink_status_snapshot_has_replaced_schedule_republish_evidence(
                 snapshot,
                 expected_groups,
@@ -13444,6 +13968,40 @@ impl FSMetaApp {
         }
     }
 
+    fn sink_route_requires_local_republish_wait(node_id: &NodeId, route_key: &str) -> bool {
+        if route_key == events_stream_route_for_scope(&node_id.0).0
+            || route_key == sink_query_request_route_for(&node_id.0).0
+            || route_key == sink_status_request_route_for(&node_id.0).0
+            || route_key == sink_roots_control_stream_route_for(&node_id.0).0
+        {
+            return true;
+        }
+        if is_events_stream_route_key(route_key)
+            && route_key != format!("{}.stream", ROUTE_KEY_EVENTS)
+        {
+            return false;
+        }
+        if is_per_peer_sink_query_request_route(route_key)
+            || is_per_peer_sink_status_request_route(route_key)
+            || is_per_peer_sink_roots_control_stream_route(route_key)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn sink_tick_routes_require_local_republish_wait(
+        node_id: &NodeId,
+        sink_signals: &[SinkControlSignal],
+    ) -> bool {
+        sink_signals.iter().any(|signal| match signal {
+            SinkControlSignal::Tick { route_key, .. } => {
+                Self::sink_route_requires_local_republish_wait(node_id, route_key)
+            }
+            _ => false,
+        })
+    }
+
     fn facade_signal_can_initialize(signal: &FacadeControlSignal) -> bool {
         matches!(signal, FacadeControlSignal::Activate { .. })
     }
@@ -14114,6 +14672,8 @@ impl FSMetaApp {
                                         &replay_signals,
                                     )
                                     .unwrap_or_else(|| config_host_object_grants.clone());
+                                let current_business_groups =
+                                    Self::business_group_ids_from_root_specs(&payload.roots);
                                 if let Err(err) = sink
                                     .update_logical_roots_with_failure(
                                         payload.roots,
@@ -14137,6 +14697,7 @@ impl FSMetaApp {
                                         Self::apply_sink_signals_to_state(
                                             &mut retained,
                                             &replay_signals,
+                                            Some(&current_business_groups),
                                         );
                                     }
                                     if let Err(err) = sink
@@ -14467,7 +15028,7 @@ impl FSMetaApp {
                                             "fs_meta_runtime_app: sink status endpoint unavailable reason=runtime_replay_or_sink_apply_pending route={}",
                                             route_key
                                         );
-                                        if is_per_peer_sink_status_request_route(&route_key) {
+                                        if is_sink_status_query_request_route(&route_key) {
                                             let cached_route_status_result =
                                                 match tokio::time::timeout(
                                                     INTERNAL_SINK_STATUS_NONBLOCKING_ROUTE_BUDGET,
@@ -14482,9 +15043,9 @@ impl FSMetaApp {
                                                 };
                                             match cached_route_status_result {
                                                 Ok((snapshot, _used_cached_fallback))
-                                                    if !snapshot
-                                                        .progress_snapshot()
-                                                        .empty_summary =>
+                                                    if sink_status_snapshot_can_reply_during_replay_or_apply_pending(
+                                                        &snapshot,
+                                                    ) =>
                                                 {
                                                     eprintln!(
                                                         "fs_meta_runtime_app: sink status endpoint replay/apply pending route-cache fallback {}",
@@ -14504,7 +15065,7 @@ impl FSMetaApp {
                                                 }
                                                 Ok((snapshot, _used_cached_fallback)) => {
                                                     eprintln!(
-                                                        "fs_meta_runtime_app: sink status endpoint replay/apply pending route-cache empty {}",
+                                                        "fs_meta_runtime_app: sink status endpoint replay/apply pending route-cache not-ready {}",
                                                         summarize_sink_status_endpoint(&snapshot)
                                                     );
                                                 }
@@ -14944,12 +15505,19 @@ impl FSMetaApp {
                                             || source_state_pending_observation
                                         {
                                             source
-                                            .source_state_pending_observability_snapshot_for_status_route()
+                                            .source_state_pending_observability_snapshot_for_status_route_with_timeout_or_degraded(
+                                                source_status_live_probe_timeout,
+                                                "source worker source-state pending observation timed out",
+                                            )
                                             .await
                                         } else if scan_audit_admission_release {
-                                            let release_budget = source_status_live_probe_timeout
-                                                .unwrap_or(Duration::from_millis(500))
-                                                .min(Duration::from_secs(2));
+                                            let release_total_budget =
+                                                source_status_live_probe_timeout
+                                                    .unwrap_or(Duration::from_millis(500));
+                                            let release_deadline =
+                                                tokio::time::Instant::now() + release_total_budget;
+                                            let release_budget =
+                                                release_total_budget.min(Duration::from_secs(2));
                                             match tokio::time::timeout(
                                                 release_budget,
                                                 source
@@ -14988,14 +15556,21 @@ impl FSMetaApp {
                                                     );
                                                 }
                                             }
+                                            let post_release_probe_timeout =
+                                                Some(release_deadline.saturating_duration_since(
+                                                    tokio::time::Instant::now(),
+                                                ));
                                             if !runtime_state.source_state_current() {
                                                 source
-                                                    .source_state_pending_observability_snapshot_for_status_route()
+                                                    .source_state_pending_observability_snapshot_for_status_route_with_timeout_or_degraded(
+                                                        post_release_probe_timeout,
+                                                        "source worker source-state pending observation timed out after scan-audit release",
+                                                    )
                                                     .await
                                             } else {
                                                 source
                                                     .observability_snapshot_nonblocking_for_status_route_with_timeout(
-                                                        source_status_live_probe_timeout,
+                                                        post_release_probe_timeout,
                                                     )
                                                     .await
                                             }
@@ -15007,8 +15582,19 @@ impl FSMetaApp {
                                             .await
                                         } else if manual_rescan_delivery_evidence {
                                             if !runtime_state.source_state_current() {
+                                                let pending_timeout =
+                                                    manual_rescan_delivery_deadline
+                                                        .map(|deadline| {
+                                                            deadline.saturating_duration_since(
+                                                                tokio::time::Instant::now(),
+                                                            )
+                                                        })
+                                                        .or(source_status_live_probe_timeout);
                                                 let (mut snapshot, used_cached_fallback) = source
-                                                    .source_state_pending_observability_snapshot_for_status_route()
+                                                    .source_state_pending_observability_snapshot_for_status_route_with_timeout_or_degraded(
+                                                        pending_timeout,
+                                                        "source worker source-state pending manual-rescan observation timed out",
+                                                    )
                                                     .await;
                                                 if source.is_worker() {
                                                     annotate_pending_source_status_snapshot_with_existing_rescan_route_evidence(
@@ -15151,8 +15737,17 @@ impl FSMetaApp {
                                                         if let Some(snapshot) = app_route_snapshot {
                                                             (snapshot, true)
                                                         } else {
+                                                            let pending_timeout = Some(
+                                                                probe_deadline
+                                                                    .saturating_duration_since(
+                                                                        tokio::time::Instant::now(),
+                                                                    ),
+                                                            );
                                                             source
-                                                            .source_state_pending_observability_snapshot_for_status_route()
+                                                            .source_state_pending_observability_snapshot_for_status_route_with_timeout_or_degraded(
+                                                                pending_timeout,
+                                                                "source worker source-state pending manual-rescan route-gap observation timed out",
+                                                            )
                                                             .await
                                                         };
                                                     if source_rescan_proxy_ready {
@@ -15248,7 +15843,10 @@ impl FSMetaApp {
                                                     if acceptance_budget.is_zero() {
                                                         Some(
                                                         source
-                                                            .source_state_pending_observability_snapshot_for_status_route()
+                                                            .source_state_pending_observability_snapshot_for_status_route_with_timeout_or_degraded(
+                                                                Some(acceptance_budget),
+                                                                "source worker source-state pending manual-rescan acceptance observation timed out",
+                                                            )
                                                             .await,
                                                     )
                                                     } else {
@@ -15288,7 +15886,15 @@ impl FSMetaApp {
                                                     ) {
                                                         Some(
                                                             source
-                                                                .source_state_pending_observability_snapshot_for_status_route()
+                                                                .source_state_pending_observability_snapshot_for_status_route_with_timeout_or_degraded(
+                                                                    Some(
+                                                                        probe_deadline
+                                                                            .saturating_duration_since(
+                                                                                tokio::time::Instant::now(),
+                                                                            ),
+                                                                    ),
+                                                                    "source worker source-state pending manual-rescan acceptance rejected observation timed out",
+                                                                )
                                                                 .await,
                                                         )
                                                     } else {
@@ -20117,7 +20723,16 @@ impl FSMetaApp {
         }
 
         let mut desired = self.retained_sink_control_state.lock().await.clone();
-        Self::apply_sink_signals_to_state(&mut desired, sink_signals);
+        let current_business_groups = self
+            .source
+            .cached_logical_roots_snapshot_with_failure()
+            .ok()
+            .map(|roots| Self::business_group_ids_from_root_specs(&roots));
+        Self::apply_sink_signals_to_state(
+            &mut desired,
+            sink_signals,
+            current_business_groups.as_ref(),
+        );
         let replay_generation = sink_signals.iter().find_map(|signal| match signal {
             SinkControlSignal::Tick { generation, .. } => Some(*generation),
             _ => None,
@@ -20140,7 +20755,16 @@ impl FSMetaApp {
 
     async fn record_retained_sink_control_state(&self, sink_signals: &[SinkControlSignal]) {
         let mut retained = self.retained_sink_control_state.lock().await;
-        Self::apply_sink_signals_to_state(&mut retained, sink_signals);
+        let current_business_groups = self
+            .source
+            .cached_logical_roots_snapshot_with_failure()
+            .ok()
+            .map(|roots| Self::business_group_ids_from_root_specs(&roots));
+        Self::apply_sink_signals_to_state(
+            &mut retained,
+            sink_signals,
+            current_business_groups.as_ref(),
+        );
     }
 
     async fn sink_generation_cutover_replay_should_defer_inline(&self) -> bool {
@@ -20154,16 +20778,23 @@ impl FSMetaApp {
     fn apply_sink_signals_to_state(
         state: &mut RetainedSinkControlState,
         sink_signals: &[SinkControlSignal],
+        current_business_groups: Option<&std::collections::BTreeSet<String>>,
     ) {
         for signal in sink_signals {
             match signal {
                 SinkControlSignal::Activate {
                     unit, route_key, ..
                 } => {
-                    state.active_by_route.insert(
-                        (unit.unit_id().to_string(), route_key.clone()),
-                        signal.clone(),
-                    );
+                    let key = (unit.unit_id().to_string(), route_key.clone());
+                    if let Some(preserved) = Self::retained_sink_activate_preserving_business_scope(
+                        state.active_by_route.get(&key),
+                        signal,
+                        current_business_groups,
+                    ) {
+                        state.active_by_route.insert(key, preserved);
+                    } else {
+                        state.active_by_route.insert(key, signal.clone());
+                    }
                 }
                 SinkControlSignal::Deactivate {
                     unit, route_key, ..
@@ -20179,6 +20810,58 @@ impl FSMetaApp {
                 SinkControlSignal::Tick { .. } | SinkControlSignal::Passthrough(_) => {}
             }
         }
+    }
+
+    fn business_group_ids_from_root_specs(
+        roots: &[source::config::RootSpec],
+    ) -> std::collections::BTreeSet<String> {
+        roots
+            .iter()
+            .filter_map(|root| {
+                let id = root.id.trim();
+                is_business_sink_group_id(id).then(|| id.to_string())
+            })
+            .collect()
+    }
+
+    fn retained_activate_has_current_business_scope(
+        signal: &SinkControlSignal,
+        current_business_groups: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        let SinkControlSignal::Activate { bound_scopes, .. } = signal else {
+            return false;
+        };
+        bound_scopes.iter().any(|scope| {
+            let group_id = scope.scope_id.trim();
+            is_business_sink_group_id(group_id) && current_business_groups.contains(group_id)
+        })
+    }
+
+    fn retained_sink_activate_preserving_business_scope(
+        existing: Option<&SinkControlSignal>,
+        incoming: &SinkControlSignal,
+        current_business_groups: Option<&std::collections::BTreeSet<String>>,
+    ) -> Option<SinkControlSignal> {
+        let current_business_groups = current_business_groups?;
+        let SinkControlSignal::Activate {
+            unit,
+            bound_scopes,
+            generation,
+            ..
+        } = incoming
+        else {
+            return None;
+        };
+        if *unit != SinkRuntimeUnit::Sink
+            || !runtime_bound_scopes_are_empty_roots_bootstrap_only(bound_scopes)
+        {
+            return None;
+        }
+        let existing = existing?;
+        if !Self::retained_activate_has_current_business_scope(existing, current_business_groups) {
+            return None;
+        }
+        Some(Self::rebase_sink_signal_generation(existing, *generation))
     }
 
     fn sink_signals_from_state(state: &RetainedSinkControlState) -> Vec<SinkControlSignal> {
@@ -20443,6 +21126,11 @@ impl FSMetaApp {
             && self
                 .sink_status_and_source_audit_show_trusted_materialized_current()
                 .await;
+        let trusted_owner_schedule_current = can_defer_replay
+            && !self.runtime_control_state().source_state_replay_required()
+            && self
+                .sink_status_shows_owner_schedule_for_trusted_materialized_current()
+                .await;
         sink_generation_cutover_inline_action_from_evidence(
             generation_cutover_disposition,
             has_post_initial_single_route_activate,
@@ -20451,7 +21139,30 @@ impl FSMetaApp {
                 .load(Ordering::Acquire),
             initial_materialization_catchup,
             trusted_materialized_current,
+            trusted_owner_schedule_current,
         )
+    }
+
+    async fn sink_status_shows_owner_schedule_for_trusted_materialized_current(&self) -> bool {
+        let Ok(expected_groups) = Self::runtime_scoped_facade_group_ids(&self.source, &self.sink)
+            .await
+            .map(|groups| {
+                groups
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+        else {
+            return false;
+        };
+        self.sink
+            .cached_status_snapshot_with_failure()
+            .ok()
+            .is_some_and(|snapshot| {
+                sink_status_snapshot_has_owner_schedule_for_expected_groups(
+                    &snapshot,
+                    &expected_groups,
+                )
+            })
     }
 
     async fn sink_status_and_source_audit_show_trusted_materialized_current(&self) -> bool {
@@ -20838,9 +21549,6 @@ impl FSMetaApp {
                             fixed_bind_session,
                         )
                         .await;
-                        if !fail_closed_in_generation_cutover_lane {
-                            return Err(RuntimeWorkerControlApplyFailure::from(err));
-                        }
                         return Ok(());
                     }
                     if fail_closed_in_generation_cutover_lane
@@ -20994,9 +21702,19 @@ impl FSMetaApp {
             )
         {
             self.api_control_gate.wait_for_facade_request_drain().await;
-            self.api_control_gate
-                .wait_for_status_remote_collection_drain()
-                .await;
+            if tokio::time::timeout(
+                INTERNAL_STATUS_ROUTE_CLEANUP_REMOTE_COLLECTION_DRAIN_GRACE,
+                self.api_control_gate
+                    .wait_for_status_remote_collection_drain(),
+            )
+            .await
+            .is_err()
+            {
+                eprintln!(
+                    "fs_meta_runtime_app: internal status route cleanup continuing after bounded remote-collection drain wait route_key={} generation={}",
+                    route_key, generation
+                );
+            }
         }
         if query_lane
             && matches!(
@@ -22363,6 +23081,12 @@ impl FSMetaApp {
                 SinkControlWaveDisposition::ApplySignals {
                     wait_for_status_republish_after_apply,
                 } => {
+                    let wait_for_status_republish_after_apply =
+                        wait_for_status_republish_after_apply
+                            && Self::sink_tick_routes_require_local_republish_wait(
+                                &self.node_id,
+                                &sink_signals,
+                            );
                     if self.should_defer_sink_cleanup_wakeup_after_fail_closed_cutover(
                         sink_generation_cutover_disposition,
                         &sink_signals,

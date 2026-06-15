@@ -74,6 +74,15 @@ use crate::state::commit_boundary::CommitBoundary;
 use crate::{ControlEvent, FileMetaRecord};
 
 const SINK_STATE_SNAPSHOT_CHECKPOINT_DATA_EVENTS: u64 = 5_000_000;
+const SINK_STATE_SNAPSHOT_MAX_HEAP_BYTES_ENV: &str = "FSMETA_SINK_STATE_SNAPSHOT_MAX_HEAP_BYTES";
+const SINK_STATE_SNAPSHOT_MAX_HEAP_BYTES_DEFAULT: u64 = 512 * 1024 * 1024;
+
+fn sink_state_snapshot_max_heap_bytes() -> u64 {
+    std::env::var(SINK_STATE_SNAPSHOT_MAX_HEAP_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(SINK_STATE_SNAPSHOT_MAX_HEAP_BYTES_DEFAULT)
+}
 
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -347,6 +356,19 @@ fn summarize_bound_scopes(bound_scopes: &[RuntimeBoundScope]) -> Vec<String> {
         .iter()
         .map(|scope| format!("{}=>{}", scope.scope_id, scope.resource_ids.join("|")))
         .collect()
+}
+
+fn is_empty_roots_bootstrap_scope(scope_id: &str) -> bool {
+    scope_id
+        .trim()
+        .starts_with("__fsmeta_empty_roots_bootstrap")
+}
+
+fn bound_scopes_are_empty_roots_bootstrap_only(bound_scopes: &[RuntimeBoundScope]) -> bool {
+    !bound_scopes.is_empty()
+        && bound_scopes
+            .iter()
+            .all(|scope| is_empty_roots_bootstrap_scope(&scope.scope_id))
 }
 
 fn collect_event_origin_counts(events: &[Event]) -> BTreeMap<String, u64> {
@@ -776,6 +798,10 @@ pub struct SinkStatusSnapshot {
     pub scheduled_groups_by_node: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub primary_host_ref_by_group: BTreeMap<String, String>,
+    #[serde(default)]
+    pub owner_scoped_scheduled_groups_by_node: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub owner_scoped_primary_host_ref_by_group: BTreeMap<String, String>,
     pub last_control_frame_signals_by_node: BTreeMap<String, Vec<String>>,
     pub received_batches_by_node: BTreeMap<String, u64>,
     pub received_events_by_node: BTreeMap<String, u64>,
@@ -1501,6 +1527,19 @@ struct PersistedSinkState {
     retained_groups: Vec<PersistedGroupSinkState>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct SinkSnapshotSizeEstimate {
+    node_count: u64,
+    estimated_heap_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SinkSnapshotPersistOutcome {
+    Persisted,
+    SkippedNoSnapshotCell,
+    SkippedLargeState(SinkSnapshotSizeEstimate),
+}
+
 #[derive(Clone)]
 struct SinkStateSnapshotCell {
     scope: Arc<str>,
@@ -1644,6 +1683,19 @@ impl SinkState {
                 .map(|(group_id, group)| PersistedGroupSinkState::from_live(group_id, group))
                 .collect(),
         }
+    }
+
+    fn snapshot_size_estimate(&self) -> SinkSnapshotSizeEstimate {
+        let mut estimate = SinkSnapshotSizeEstimate::default();
+        for group in self.groups.values().chain(self.retained_groups.values()) {
+            estimate.node_count = estimate
+                .node_count
+                .saturating_add(group.tree.node_count() as u64);
+            estimate.estimated_heap_bytes = estimate
+                .estimated_heap_bytes
+                .saturating_add(group.tree.estimated_heap_bytes());
+        }
+        estimate
     }
 
     pub(crate) fn reconcile_host_object_grants(
@@ -1906,19 +1958,61 @@ impl SinkStateCell {
         }
     }
 
-    fn persist_snapshot(&self) -> Result<()> {
+    fn persist_snapshot_with_max_heap_bytes(
+        &self,
+        max_heap_bytes: u64,
+    ) -> Result<SinkSnapshotPersistOutcome> {
         let Some(snapshot_cell) = &self.snapshot_cell else {
-            return Ok(());
+            self.data_events_since_snapshot.store(0, Ordering::Release);
+            return Ok(SinkSnapshotPersistOutcome::SkippedNoSnapshotCell);
         };
-        let snapshot = self.read()?.to_persisted_snapshot(SINK_RUNTIME_UNIT_ID);
+        let state = self.read()?;
+        let estimate = state.snapshot_size_estimate();
+        if estimate.estimated_heap_bytes > max_heap_bytes {
+            log::warn!(
+                "fs_meta_sink: skipping full-tree statecell snapshot scope={} estimated_heap_bytes={} node_count={} max_heap_bytes={}",
+                SINK_RUNTIME_UNIT_ID,
+                estimate.estimated_heap_bytes,
+                estimate.node_count,
+                max_heap_bytes
+            );
+            self.record_authoritative_commit(
+                "sink.snapshot.skip",
+                format!(
+                    "reason=large_state estimated_heap_bytes={} node_count={} max_heap_bytes={}",
+                    estimate.estimated_heap_bytes, estimate.node_count, max_heap_bytes
+                ),
+            );
+            self.data_events_since_snapshot.store(0, Ordering::Release);
+            return Ok(SinkSnapshotPersistOutcome::SkippedLargeState(estimate));
+        }
+        let snapshot = state.to_persisted_snapshot(SINK_RUNTIME_UNIT_ID);
+        drop(state);
         snapshot_cell.persist(&snapshot)?;
         self.data_events_since_snapshot.store(0, Ordering::Release);
+        Ok(SinkSnapshotPersistOutcome::Persisted)
+    }
+
+    fn persist_snapshot(&self) -> Result<()> {
+        let _ = self.persist_snapshot_with_max_heap_bytes(sink_state_snapshot_max_heap_bytes())?;
         Ok(())
     }
 
     fn persist_snapshot_after_apply(&self, counts: &AppliedEventCounts) -> Result<()> {
+        self.persist_snapshot_after_apply_with_max_heap_bytes(
+            counts,
+            sink_state_snapshot_max_heap_bytes(),
+        )
+    }
+
+    fn persist_snapshot_after_apply_with_max_heap_bytes(
+        &self,
+        counts: &AppliedEventCounts,
+        max_heap_bytes: u64,
+    ) -> Result<()> {
         if counts.control_events > 0 {
-            return self.persist_snapshot();
+            let _ = self.persist_snapshot_with_max_heap_bytes(max_heap_bytes)?;
+            return Ok(());
         }
         if counts.data_events == 0 {
             return Ok(());
@@ -1928,7 +2022,16 @@ impl SinkStateCell {
             .fetch_add(counts.data_events, Ordering::AcqRel);
         if previous.saturating_add(counts.data_events) >= SINK_STATE_SNAPSHOT_CHECKPOINT_DATA_EVENTS
         {
-            return self.persist_snapshot();
+            if let Err(err) = self.persist_snapshot_with_max_heap_bytes(max_heap_bytes) {
+                log::warn!(
+                    "fs_meta_sink: data checkpoint statecell snapshot failed; continuing applied event flow: {err}"
+                );
+                self.record_authoritative_commit(
+                    "sink.snapshot.skip",
+                    format!("reason=statecell_write_failed error={err}"),
+                );
+                self.data_events_since_snapshot.store(0, Ordering::Release);
+            }
         }
         Ok(())
     }
@@ -2044,6 +2147,24 @@ impl SinkFileMeta {
     pub(crate) fn mark_fixture_stream_receive_armed(&self) {
         self.mark_before_stream_recv();
         self.notify_stream_recv_waiters();
+    }
+
+    fn mark_spawned_stream_receive_ready_if_gated(&self) {
+        if !self.should_receive_stream_events() {
+            return;
+        }
+        let route = events_stream_route_for_scope(&self.node_id.0);
+        if !self.endpoint_task_route_present(
+            &route.0,
+            "sink.mark_spawned_stream_receive_ready_if_gated.endpoint_tasks",
+        ) {
+            return;
+        }
+        if let Ok(mut stats) = self.stream_delivery_stats.lock()
+            && stats.receive_armed_count == 0
+        {
+            stats.receive_armed_count = 1;
+        }
     }
 
     fn notify_stream_recv_waiters(&self) {
@@ -2722,6 +2843,17 @@ impl SinkFileMeta {
             .any(|task| {
                 task.route_key() == route_key
                     && task.belongs_to_boundary(boundary)
+                    && !task.is_finished()
+                    && task.finish_reason().is_none()
+                    && !task.is_shutdown_requested()
+            })
+    }
+
+    fn endpoint_task_route_present(&self, route_key: &str, context: &str) -> bool {
+        lock_or_recover(&self.endpoint_tasks, context)
+            .iter()
+            .any(|task| {
+                task.route_key() == route_key
                     && !task.is_finished()
                     && task.finish_reason().is_none()
                     && !task.is_shutdown_requested()
@@ -3793,9 +3925,23 @@ impl SinkFileMeta {
         bound_scopes: &[RuntimeBoundScope],
     ) -> Result<()> {
         let unit_id = unit.unit_id();
-        let accepted =
-            self.unit_control
-                .apply_activate(unit_id, route_key, generation, bound_scopes)?;
+        let preserve_business_scope = self
+            .should_preserve_business_route_scope_for_bootstrap_only_activate(
+                unit,
+                route_key,
+                bound_scopes,
+            )?;
+        let activation_bound_scopes = if preserve_business_scope {
+            &[] as &[RuntimeBoundScope]
+        } else {
+            bound_scopes
+        };
+        let accepted = self.unit_control.apply_activate(
+            unit_id,
+            route_key,
+            generation,
+            activation_bound_scopes,
+        )?;
         if !accepted {
             log::debug!(
                 "sink-file-meta: ignore stale activate unit={} generation={}",
@@ -3806,11 +3952,22 @@ impl SinkFileMeta {
         if unit == SinkRuntimeUnit::Sink {
             for alias_route_key in legacy_public_query_sink_route_aliases(&self.node_id, route_key)
             {
+                let preserve_business_scope = self
+                    .should_preserve_business_route_scope_for_bootstrap_only_activate(
+                        unit,
+                        &alias_route_key,
+                        bound_scopes,
+                    )?;
+                let activation_bound_scopes = if preserve_business_scope {
+                    &[] as &[RuntimeBoundScope]
+                } else {
+                    bound_scopes
+                };
                 let accepted = self.unit_control.apply_activate(
                     unit_id,
                     &alias_route_key,
                     generation,
-                    bound_scopes,
+                    activation_bound_scopes,
                 )?;
                 if !accepted {
                     log::debug!(
@@ -3823,6 +3980,35 @@ impl SinkFileMeta {
             }
         }
         Ok(())
+    }
+
+    fn should_preserve_business_route_scope_for_bootstrap_only_activate(
+        &self,
+        unit: SinkRuntimeUnit,
+        route_key: &str,
+        bound_scopes: &[RuntimeBoundScope],
+    ) -> Result<bool> {
+        if unit != SinkRuntimeUnit::Sink
+            || !self.unit_control.is_runtime_managed()
+            || !self.route_contributes_to_local_schedule(route_key)
+            || !bound_scopes_are_empty_roots_bootstrap_only(bound_scopes)
+        {
+            return Ok(false);
+        }
+        let Some((_generation, active_scopes)) = self
+            .unit_control
+            .active_route_state(SINK_RUNTIME_UNIT_ID, route_key)?
+        else {
+            return Ok(false);
+        };
+        let roots = self
+            .root_specs
+            .read()
+            .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?
+            .clone();
+        Ok(!self
+            .scheduled_group_ids_from_bound_scopes(&active_scopes, &roots)
+            .is_empty())
     }
 
     fn route_contributes_to_local_schedule(&self, route_key: &str) -> bool {
@@ -4369,6 +4555,7 @@ impl SinkFileMeta {
             self.flush_buffered_stream_events()?;
         }
         self.notify_stream_recv_waiters();
+        self.mark_spawned_stream_receive_ready_if_gated();
         log::debug!("sink-file-meta accepted {} control envelope(s)", validated);
         Ok(())
     }
@@ -4559,8 +4746,15 @@ impl SinkFileMeta {
     fn build_status_snapshot_for_scope_evidence(
         &self,
         scope_evidence: SinkAcceptedScopeStatusEvidence,
+        owner_scoped_status_route: bool,
     ) -> Result<SinkStatusSnapshot> {
         let accepted_scope_primary_host_ref_by_group = &scope_evidence.primary_host_ref_by_group;
+        let owner_scoped_scheduled_groups_by_node = owner_scoped_status_route
+            .then(|| scope_evidence.scheduled_groups_by_node.clone())
+            .unwrap_or_default();
+        let owner_scoped_primary_host_ref_by_group = owner_scoped_status_route
+            .then(|| scope_evidence.primary_host_ref_by_group.clone())
+            .unwrap_or_default();
         let scheduled_groups = scope_evidence.scheduled_groups;
         let mut state = self.state.write()?;
         let now = now_us();
@@ -4643,6 +4837,8 @@ impl SinkFileMeta {
             }
             snapshot.scheduled_groups_by_node = scope_evidence.scheduled_groups_by_node;
         }
+        snapshot.owner_scoped_scheduled_groups_by_node = owner_scoped_scheduled_groups_by_node;
+        snapshot.owner_scoped_primary_host_ref_by_group = owner_scoped_primary_host_ref_by_group;
         groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
         snapshot.groups = groups;
         snapshot.stream_path_capture_target = debug_stream_path_capture_target()
@@ -4780,7 +4976,10 @@ impl SinkFileMeta {
     }
 
     pub(crate) fn build_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
-        self.build_status_snapshot_for_scope_evidence(self.scheduled_scope_status_evidence()?)
+        self.build_status_snapshot_for_scope_evidence(
+            self.scheduled_scope_status_evidence()?,
+            false,
+        )
     }
 
     pub(crate) fn build_cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
@@ -4794,7 +4993,10 @@ impl SinkFileMeta {
 
     pub(crate) fn status_snapshot_for_route(&self, route_key: &str) -> Result<SinkStatusSnapshot> {
         let _ = self.sync_logical_roots_from_authoritative_cell_if_changed();
-        self.build_status_snapshot_for_scope_evidence(self.route_scope_status_evidence(route_key)?)
+        self.build_status_snapshot_for_scope_evidence(
+            self.route_scope_status_evidence(route_key)?,
+            is_per_peer_sink_status_request_route(route_key),
+        )
     }
 
     pub(crate) fn snapshot_visibility_lag_samples_since(
@@ -4924,6 +5126,7 @@ impl SinkFileMeta {
     pub(crate) fn enable_stream_receive(&self) {
         self.stream_receive_enabled.store(true, Ordering::Release);
         self.notify_stream_recv_waiters();
+        self.mark_spawned_stream_receive_ready_if_gated();
     }
 
     pub(crate) fn disable_stream_receive(&self) {

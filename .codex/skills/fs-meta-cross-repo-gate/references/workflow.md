@@ -4,11 +4,11 @@
 
 Use this workflow for active `fs-meta` cross-repo blockers where `fustor` and `capanix` share responsibility.
 
-The blocker-state authority is one shared document.
+The blocker-state authority is one goal-trace document.
 
 In the current local environment, that document defaults to:
 
-- `/root/repo/capanix/todo.md`
+- `/root/repo/fustor/TODO.md`
 
 Do not overrule that document from memory. Re-read it before every new iteration.
 
@@ -64,7 +64,7 @@ When a preserved downstream case depends on sibling-repo binaries or environment
 - Keep repo-local `fustor` fixes separate from downstream claims about `capanix`.
 - If a `fustor` repo-local bug is identified, add or update the owning red test first, prove it fails, then fix, then run impacted verification.
 - Capture raw unretried evidence before claiming the boundary moved back to `capanix`.
-- Do not update `/root/repo/capanix/todo.md` unless the new state is supported by first-boundary evidence.
+- Do not update `/root/repo/fustor/TODO.md` unless the new state is supported by first-boundary evidence.
 - When a seam is closed or ruled out, compress it immediately instead of letting completed detail accumulate in the blocker-state document.
 
 ## Acceptance

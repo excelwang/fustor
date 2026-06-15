@@ -67,6 +67,55 @@ impl StateBoundary for RecordingStateBoundary {
     }
 }
 
+struct FailingWriteStateBoundary {
+    inner: Arc<dyn StateBoundary>,
+    writes: Mutex<Vec<StateCellWriteRequest>>,
+}
+
+impl FailingWriteStateBoundary {
+    fn new() -> Self {
+        Self {
+            inner: in_memory_state_boundary(),
+            writes: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn writes(&self) -> Vec<StateCellWriteRequest> {
+        self.writes
+            .lock()
+            .expect("failing state writes lock")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl StateBoundary for FailingWriteStateBoundary {
+    async fn statecell_read(
+        &self,
+        ctx: BoundaryContext,
+        request: StateCellReadRequest,
+    ) -> Result<capanix_app_sdk::runtime::KernelResultEnvelope> {
+        self.inner.statecell_read(ctx, request).await
+    }
+
+    async fn statecell_write(
+        &self,
+        ctx: BoundaryContext,
+        request: StateCellWriteRequest,
+    ) -> Result<capanix_app_sdk::runtime::KernelResultEnvelope> {
+        if request.handle != sink_state_handle(SINK_RUNTIME_UNIT_ID) {
+            return self.inner.statecell_write(ctx, request).await;
+        }
+        self.writes
+            .lock()
+            .expect("failing state writes lock")
+            .push(request);
+        Err(CnxError::Internal(
+            "simulated statecell backpressure".into(),
+        ))
+    }
+}
+
 struct RouteCountingTimeoutBoundary {
     recv_counts: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
     recv_notify: tokio::sync::Notify,
@@ -666,6 +715,108 @@ async fn sink_data_batches_do_not_persist_full_tree_snapshot_until_checkpoint() 
         sink_snapshot_writes(),
         1,
         "control events must still force a sink tree checkpoint for restart recovery"
+    );
+}
+
+#[tokio::test]
+async fn sink_data_checkpoint_statecell_failure_does_not_block_event_apply() {
+    let failing = Arc::new(FailingWriteStateBoundary::new());
+    let state_boundary: Arc<dyn StateBoundary> = failing.clone();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::exp",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let sink = SinkFileMeta::with_boundaries_and_state(
+        NodeId("node-a".to_string()),
+        None,
+        state_boundary,
+        cfg,
+    )
+    .expect("build sink");
+    sink.state.data_events_since_snapshot.store(
+        SINK_STATE_SNAPSHOT_CHECKPOINT_DATA_EVENTS - 1,
+        Ordering::Release,
+    );
+
+    sink.send(&[mk_source_event(
+        "node-a::exp",
+        mk_record(b"/checkpoint.txt", "checkpoint.txt", 1, EventKind::Update),
+    )])
+    .await
+    .expect("data checkpoint persistence failure must not reject applied sink events");
+
+    assert_eq!(
+        failing
+            .writes()
+            .into_iter()
+            .filter(|request| request.handle == sink_state_handle(SINK_RUNTIME_UNIT_ID))
+            .count(),
+        1,
+        "the checkpoint was attempted, but data apply must not depend on statecell persistence"
+    );
+    let snapshot = sink.status_snapshot().expect("status snapshot");
+    assert_eq!(snapshot.live_nodes, 1);
+}
+
+#[tokio::test]
+async fn sink_giant_data_checkpoint_skips_full_tree_statecell_write_before_encoding() {
+    let recording = Arc::new(RecordingStateBoundary::new());
+    let state_boundary: Arc<dyn StateBoundary> = recording.clone();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::exp",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let sink = SinkFileMeta::with_boundaries_and_state(
+        NodeId("node-a".to_string()),
+        None,
+        state_boundary,
+        cfg,
+    )
+    .expect("build sink");
+
+    sink.send(&[mk_source_event(
+        "node-a::exp",
+        mk_record(b"/too-large.txt", "too-large.txt", 1, EventKind::Update),
+    )])
+    .await
+    .expect("seed materialized tree");
+    sink.state.data_events_since_snapshot.store(
+        SINK_STATE_SNAPSHOT_CHECKPOINT_DATA_EVENTS - 1,
+        Ordering::Release,
+    );
+    let counts = AppliedEventCounts {
+        accepted_events: 1,
+        data_events: 1,
+        ..AppliedEventCounts::default()
+    };
+
+    sink.state
+        .persist_snapshot_after_apply_with_max_heap_bytes(&counts, 0)
+        .expect("oversized data checkpoint should be skipped, not failed");
+
+    assert!(
+        recording
+            .writes()
+            .into_iter()
+            .all(|request| request.handle != sink_state_handle(SINK_RUNTIME_UNIT_ID)),
+        "oversized sink state must be skipped before encoding or writing a full-tree statecell payload"
+    );
+    assert_eq!(
+        sink.state
+            .data_events_since_snapshot
+            .load(Ordering::Acquire),
+        0,
+        "a skipped oversized checkpoint must reset the checkpoint counter so the hot path does not retry on every batch"
     );
 }
 
@@ -1564,6 +1715,99 @@ async fn events_stream_stays_gated_until_route_activation() {
 }
 
 #[tokio::test]
+async fn events_stream_status_reports_receive_readiness_after_spawned_route_activation_before_first_recv()
+ {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs-delay", "/mnt/nfs-delay")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-delay-readiness::nfs-delay",
+        "node-delay-readiness",
+        "10.0.0.41",
+        "/mnt/nfs-delay",
+        true,
+    )];
+    let node_id = NodeId("node-delay-readiness".to_string());
+    let sink = SinkFileMeta::with_boundaries(node_id.clone(), None, cfg).expect("init sink");
+    let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+    let events_route = crate::runtime::routes::events_stream_route_for_scope(&node_id.0).0;
+    let status_route = crate::runtime::routes::sink_status_request_route_for(&node_id.0).0;
+
+    crate::runtime::endpoint::install_stream_endpoint_before_first_recv_delay_hook(
+        &events_route,
+        &format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
+        Duration::from_millis(750),
+    );
+
+    sink.start_runtime_endpoints(boundary.clone(), node_id.clone())
+        .expect("start runtime endpoints");
+
+    let pre_activation = sink
+        .status_snapshot_for_route(&status_route)
+        .expect("status before stream activation");
+    assert!(
+        pre_activation.stream_receive_armed_by_node.is_empty(),
+        "stream readiness must stay absent before the events route is activated: {pre_activation:?}"
+    );
+
+    let scopes = vec![bound_scope_with_resources(
+        "nfs-delay",
+        &["node-delay-readiness::nfs-delay"],
+    )];
+    sink.on_control_frame(&[
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: status_route.clone(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 1,
+            bound_scopes: scopes.clone(),
+        }))
+        .expect("encode sink status activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: events_route.clone(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 1,
+            bound_scopes: scopes,
+        }))
+        .expect("encode sink events activate"),
+    ])
+    .await
+    .expect("activate owner-scoped sink status and events routes");
+
+    assert!(
+        sink.should_receive_stream_events(),
+        "precondition: sink stream gate should be open after owner events route activation"
+    );
+    assert_eq!(
+        boundary.recv_count(&events_route),
+        0,
+        "test hook should hold the stream endpoint before the first boundary recv"
+    );
+
+    let snapshot = sink
+        .status_snapshot_for_route(&status_route)
+        .expect("owner-scoped status after stream activation");
+    assert_eq!(
+        snapshot.scheduled_groups_by_node.get(&node_id.0),
+        Some(&vec!["nfs-delay".to_string()]),
+        "precondition: owner-scoped status must preserve accepted sink schedule: {snapshot:?}"
+    );
+    assert!(
+        snapshot
+            .stream_receive_armed_by_node
+            .get(&node_id.0)
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "spawned and gated owner stream endpoint should publish receive readiness before source scan/audit admission waits for events: {snapshot:?}"
+    );
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
 async fn start_runtime_endpoints_rebinds_events_stream_on_new_boundary_after_cutover() {
     let sink = build_single_group_sink();
     let old_boundary = Arc::new(RouteCountingTimeoutBoundary::default());
@@ -1864,6 +2108,71 @@ async fn sink_runtime_exec_partial_route_activations_union_disjoint_groups() {
         groups,
         BTreeSet::from(["nfs1".to_string(), "nfs4".to_string(), "nfs5".to_string()]),
         "disjoint partial route activations are shards of the same sink schedule and must not erase each other",
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_only_sink_activate_does_not_clear_existing_business_route_scope() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs-144", "/mnt/nfs144")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::nfs-144",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs144",
+        true,
+    )];
+    let sink = SinkFileMeta::with_boundaries(
+        NodeId("node-a".to_string()),
+        Some(Arc::new(NoopBoundary)),
+        cfg,
+    )
+    .expect("init runtime-managed sink");
+    let route_key = crate::runtime::routes::events_stream_route_for_scope("node-a").0;
+
+    let business_activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: route_key.clone(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 10,
+            expires_at_ms: 10,
+            bound_scopes: vec![bound_scope_with_resources("nfs-144", &["node-a::nfs-144"])],
+        }))
+        .expect("encode business activate");
+    sink.on_control_frame(&[business_activate])
+        .await
+        .expect("business activate should pass");
+
+    assert_eq!(
+        sink.scheduled_group_ids_snapshot()
+            .expect("scheduled groups after business activate"),
+        Some(BTreeSet::from(["nfs-144".to_string()])),
+        "precondition: business sink scope should schedule nfs-144"
+    );
+
+    let bootstrap_only_activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key,
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 11,
+            expires_at_ms: 11,
+            bound_scopes: vec![bound_scope_with_resources(
+                "__fsmeta_empty_roots_bootstrap",
+                &[""],
+            )],
+        }))
+        .expect("encode bootstrap-only activate");
+    sink.on_control_frame(&[bootstrap_only_activate])
+        .await
+        .expect("bootstrap-only activate should pass");
+
+    assert_eq!(
+        sink.scheduled_group_ids_snapshot()
+            .expect("scheduled groups after bootstrap-only activate"),
+        Some(BTreeSet::from(["nfs-144".to_string()])),
+        "empty-roots bootstrap scope is route liveness only and must not erase an existing business sink schedule"
     );
 }
 
@@ -3459,6 +3768,11 @@ fn owner_scoped_sink_status_snapshot_uses_route_scope_not_unit_aggregate() {
         ]),
         "aggregate sink status primary-host evidence must come from the same accepted sink scopes as schedule debug: {aggregate:?}"
     );
+    assert!(
+        aggregate.owner_scoped_scheduled_groups_by_node.is_empty()
+            && aggregate.owner_scoped_primary_host_ref_by_group.is_empty(),
+        "deployment-scoped aggregate sink status is schedule evidence, not owner-scoped sink-status provenance: {aggregate:?}"
+    );
 
     let route_scoped = sink
         .status_snapshot_for_route(&status_route)
@@ -3476,6 +3790,16 @@ fn owner_scoped_sink_status_snapshot_uses_route_scope_not_unit_aggregate() {
         route_scoped.primary_host_ref_by_group,
         BTreeMap::from([("nfs2".to_string(), "node-b".to_string())]),
         "owner-scoped sink-status must preserve explicit accepted sink owner host evidence"
+    );
+    assert_eq!(
+        route_scoped.owner_scoped_scheduled_groups_by_node,
+        BTreeMap::from([("node-b".to_string(), vec!["nfs2".to_string()])]),
+        "owner-scoped sink-status must mark route-originated schedule provenance separately from aggregate schedule evidence"
+    );
+    assert_eq!(
+        route_scoped.owner_scoped_primary_host_ref_by_group,
+        BTreeMap::from([("nfs2".to_string(), "node-b".to_string())]),
+        "owner-scoped sink-status must mark route-originated primary host provenance separately from aggregate primary evidence"
     );
     assert_eq!(
         route_scoped
@@ -3669,6 +3993,16 @@ fn owner_scoped_sink_status_snapshot_uses_accepted_scope_resource_as_primary_hos
         route_scoped.primary_host_ref_by_group,
         BTreeMap::from([("nfs2".to_string(), "node-b".to_string())]),
         "owner-scoped sink-status must expose explicit accepted sink owner host evidence from runtime scope resources instead of leaving /status to parse group primary_object_ref or fail closed: {route_scoped:?}"
+    );
+    assert_eq!(
+        route_scoped.owner_scoped_scheduled_groups_by_node,
+        BTreeMap::from([("node-b".to_string(), vec!["nfs2".to_string()])]),
+        "owner-scoped sink-status must expose route-originated schedule provenance for trusted cutover gates: {route_scoped:?}"
+    );
+    assert_eq!(
+        route_scoped.owner_scoped_primary_host_ref_by_group,
+        BTreeMap::from([("nfs2".to_string(), "node-b".to_string())]),
+        "owner-scoped sink-status must expose route-originated primary host provenance for trusted cutover gates: {route_scoped:?}"
     );
 }
 

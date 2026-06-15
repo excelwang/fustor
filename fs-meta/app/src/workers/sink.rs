@@ -168,6 +168,13 @@ impl SinkFailure {
     }
 }
 
+fn sink_status_observation_log_error(err: &CnxError) -> String {
+    match err {
+        CnxError::Timeout => "timeout".to_string(),
+        _ => err.to_string(),
+    }
+}
+
 impl From<CnxError> for SinkFailure {
     fn from(cause: CnxError) -> Self {
         Self::from_cause(cause)
@@ -416,9 +423,11 @@ fn summarize_groups_by_node(
 
 fn summarize_sink_status_snapshot(snapshot: &SinkStatusSnapshot) -> String {
     format!(
-        "groups={} scheduled={:?} control={:?} received_batches={:?} received_events={:?} received_origins={:?} received_origin_counts={:?} stream_received_batches={:?} stream_received_events={:?} stream_received_origin_counts={:?} stream_ready_origin_counts={:?} stream_deferred_origin_counts={:?} stream_dropped_origin_counts={:?} stream_applied_batches={:?} stream_applied_events={:?} stream_applied_control_events={:?} stream_applied_data_events={:?} stream_applied_origin_counts={:?} stream_last_applied_at_us={:?}",
+        "groups={} scheduled={:?} owner_scoped_scheduled={:?} owner_scoped_primary={:?} control={:?} received_batches={:?} received_events={:?} received_origins={:?} received_origin_counts={:?} stream_received_batches={:?} stream_received_events={:?} stream_received_origin_counts={:?} stream_ready_origin_counts={:?} stream_deferred_origin_counts={:?} stream_dropped_origin_counts={:?} stream_applied_batches={:?} stream_applied_events={:?} stream_applied_control_events={:?} stream_applied_data_events={:?} stream_applied_origin_counts={:?} stream_last_applied_at_us={:?}",
         snapshot.groups.len(),
         summarize_groups_by_node(&snapshot.scheduled_groups_by_node),
+        summarize_groups_by_node(&snapshot.owner_scoped_scheduled_groups_by_node),
+        snapshot.owner_scoped_primary_host_ref_by_group,
         summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node),
         snapshot.received_batches_by_node,
         snapshot.received_events_by_node,
@@ -1524,11 +1533,17 @@ struct CachedSinkScheduleEvidence {
     primary_host_ref_by_group: std::collections::BTreeMap<String, String>,
 }
 
+fn is_business_sink_group_id(group_id: &str) -> bool {
+    let group_id = group_id.trim();
+    !group_id.is_empty() && !group_id.starts_with("__fsmeta_empty_roots_bootstrap")
+}
+
 impl CachedSinkScheduleEvidence {
     fn from_group_ids_for_node(
         node_id: &NodeId,
-        groups: std::collections::BTreeSet<String>,
+        mut groups: std::collections::BTreeSet<String>,
     ) -> Option<Self> {
+        groups.retain(|group_id| is_business_sink_group_id(group_id));
         if groups.is_empty() {
             return None;
         }
@@ -1543,15 +1558,19 @@ impl CachedSinkScheduleEvidence {
     }
 
     fn from_status_snapshot(snapshot: &SinkStatusSnapshot) -> Option<Self> {
-        let scheduled_groups = snapshot.scheduled_groups();
+        let mut scheduled_groups = snapshot.scheduled_groups();
+        scheduled_groups.retain(|group_id| is_business_sink_group_id(group_id));
         if scheduled_groups.is_empty() {
             return None;
         }
-        Some(Self {
+        let mut evidence = Self {
             scheduled_groups,
             scheduled_groups_by_node: snapshot.scheduled_groups_by_node.clone(),
             primary_host_ref_by_group: snapshot.primary_host_ref_by_group.clone(),
-        })
+        };
+        let surviving = evidence.scheduled_groups.clone();
+        evidence.retain_groups(&surviving);
+        Some(evidence)
     }
 
     fn retain_groups(&mut self, surviving_groups: &std::collections::BTreeSet<String>) {
@@ -1588,7 +1607,7 @@ fn cached_sink_schedule_evidence_from_bound_scopes<'a>(
     let mut evidence = CachedSinkScheduleEvidence::default();
     for scope in bound_scopes {
         let group_id = scope.scope_id.trim();
-        if group_id.is_empty() {
+        if !is_business_sink_group_id(group_id) {
             continue;
         }
         let group_id = group_id.to_string();
@@ -1651,7 +1670,7 @@ fn retained_scheduled_group_ids(
         })
         .flat_map(|bound_scopes| bound_scopes.iter())
         .map(|scope| scope.scope_id.trim())
-        .filter(|scope_id| !scope_id.is_empty())
+        .filter(|scope_id| is_business_sink_group_id(scope_id))
         .map(|scope_id| scope_id.to_string())
         .collect::<std::collections::BTreeSet<_>>();
     (!groups.is_empty()).then_some(groups)
@@ -1746,6 +1765,118 @@ fn retained_sink_schedule_evidence_for_route(
             .flat_map(|bound_scopes| bound_scopes.iter()),
         fallback_node_id,
         status_route_scope.as_deref(),
+    );
+    (!evidence.is_empty()).then_some(evidence)
+}
+
+fn host_ref_matches_route_scope(host_ref: &str, route_scope: &str) -> bool {
+    let host_ref = host_ref.trim();
+    !host_ref.is_empty() && normalized_route_scope_suffix(host_ref) == route_scope
+}
+
+fn merge_route_scoped_schedule_maps(
+    evidence: &mut CachedSinkScheduleEvidence,
+    route_scope: &str,
+    scheduled_groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
+    primary_host_ref_by_group: &std::collections::BTreeMap<String, String>,
+) {
+    for (node_id, groups) in scheduled_groups_by_node {
+        if !host_ref_matches_route_scope(node_id, route_scope) {
+            continue;
+        }
+        let node_id = node_id.trim();
+        if node_id.is_empty() {
+            continue;
+        }
+        let node_id = node_id.to_string();
+        for group_id in groups {
+            let group_id = group_id.trim();
+            if !is_business_sink_group_id(group_id) {
+                continue;
+            }
+            let group_id = group_id.to_string();
+            evidence.scheduled_groups.insert(group_id.clone());
+            let entry = evidence
+                .scheduled_groups_by_node
+                .entry(node_id.clone())
+                .or_default();
+            entry.push(group_id.clone());
+            if let Some(primary_host_ref) = primary_host_ref_by_group
+                .get(group_id.as_str())
+                .filter(|host_ref| host_ref_matches_route_scope(host_ref, route_scope))
+            {
+                evidence
+                    .primary_host_ref_by_group
+                    .entry(group_id.clone())
+                    .or_insert_with(|| primary_host_ref.trim().to_string());
+            } else {
+                evidence
+                    .primary_host_ref_by_group
+                    .entry(group_id)
+                    .or_insert_with(|| node_id.clone());
+            }
+        }
+    }
+
+    for (group_id, host_ref) in primary_host_ref_by_group {
+        let group_id = group_id.trim();
+        let host_ref = host_ref.trim();
+        if !is_business_sink_group_id(group_id)
+            || !host_ref_matches_route_scope(host_ref, route_scope)
+        {
+            continue;
+        }
+        let group_id = group_id.to_string();
+        let host_ref = host_ref.to_string();
+        evidence.scheduled_groups.insert(group_id.clone());
+        evidence
+            .primary_host_ref_by_group
+            .insert(group_id.clone(), host_ref.clone());
+        evidence
+            .scheduled_groups_by_node
+            .entry(host_ref)
+            .or_default()
+            .push(group_id);
+    }
+
+    for groups in evidence.scheduled_groups_by_node.values_mut() {
+        groups.sort();
+        groups.dedup();
+    }
+}
+
+fn route_scoped_schedule_evidence_from_status_snapshot(
+    snapshot: &SinkStatusSnapshot,
+    route_key: &str,
+) -> Option<CachedSinkScheduleEvidence> {
+    let route_scope = scoped_route_suffix(route_key, ROUTE_KEY_SINK_STATUS_INTERNAL, ".req")?;
+    let mut evidence = CachedSinkScheduleEvidence::default();
+    merge_route_scoped_schedule_maps(
+        &mut evidence,
+        &route_scope,
+        &snapshot.scheduled_groups_by_node,
+        &snapshot.primary_host_ref_by_group,
+    );
+    merge_route_scoped_schedule_maps(
+        &mut evidence,
+        &route_scope,
+        &snapshot.owner_scoped_scheduled_groups_by_node,
+        &snapshot.owner_scoped_primary_host_ref_by_group,
+    );
+    (!evidence.is_empty()).then_some(evidence)
+}
+
+fn route_scoped_schedule_evidence_from_cached_schedule(
+    schedule_evidence: &CachedSinkScheduleEvidence,
+    route_key: &str,
+) -> Option<CachedSinkScheduleEvidence> {
+    let route_scope = scoped_route_suffix(route_key, ROUTE_KEY_SINK_STATUS_INTERNAL, ".req")?;
+    let mut evidence = CachedSinkScheduleEvidence::default();
+    merge_route_scoped_schedule_maps(
+        &mut evidence,
+        &route_scope,
+        &schedule_evidence.scheduled_groups_by_node,
+        &schedule_evidence.primary_host_ref_by_group,
     );
     (!evidence.is_empty()).then_some(evidence)
 }
@@ -3043,6 +3174,29 @@ impl SinkWorkerClientHandle {
         Ok(())
     }
 
+    fn merge_cached_status_snapshot(&self, snapshot: SinkStatusSnapshot) -> Result<()> {
+        let mut guard = self
+            .status_cache
+            .lock()
+            .map_err(|_| CnxError::Internal("sink worker status cache lock poisoned".into()))?;
+        let merged = crate::query::api::merge_sink_status_snapshots(vec![guard.clone(), snapshot]);
+        *guard = merged;
+        Ok(())
+    }
+
+    fn status_snapshot_has_stream_receive_readiness(snapshot: &SinkStatusSnapshot) -> bool {
+        !snapshot.stream_receive_armed_by_node.is_empty()
+            || !snapshot.stream_received_batches_by_node.is_empty()
+            || !snapshot.stream_received_events_by_node.is_empty()
+    }
+
+    fn route_cached_status_needs_existing_client_probe(snapshot: &SinkStatusSnapshot) -> bool {
+        let summary = snapshot.readiness_summary();
+        !summary.scheduled_groups.is_empty()
+            && (!Self::status_snapshot_has_stream_receive_readiness(snapshot)
+                || !summary.missing_scheduled_groups.is_empty())
+    }
+
     #[cfg(test)]
     fn cached_scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
         self.scheduled_groups_cache
@@ -3143,6 +3297,27 @@ impl SinkWorkerClientHandle {
         }
     }
 
+    fn republish_route_scoped_schedule_evidence_into_status_summary(
+        snapshot: &mut SinkStatusSnapshot,
+        evidence: &CachedSinkScheduleEvidence,
+    ) {
+        Self::republish_cached_schedule_evidence_into_status_summary(snapshot, evidence);
+        for (node_id, groups) in &evidence.scheduled_groups_by_node {
+            let entry = snapshot
+                .owner_scoped_scheduled_groups_by_node
+                .entry(node_id.clone())
+                .or_default();
+            entry.extend(groups.iter().cloned());
+            entry.sort();
+            entry.dedup();
+        }
+        for (group_id, host_ref) in &evidence.primary_host_ref_by_group {
+            snapshot
+                .owner_scoped_primary_host_ref_by_group
+                .insert(group_id.clone(), host_ref.clone());
+        }
+    }
+
     fn status_snapshot_with_republished_scheduled_groups(
         &self,
         mut snapshot: SinkStatusSnapshot,
@@ -3198,13 +3373,37 @@ impl SinkWorkerClientHandle {
         if is_generic_sink_status_request_route_key(route_key) {
             return self.cached_status_snapshot_with_republished_scheduled_groups();
         }
-        let evidence = self.retained_schedule_evidence_for_status_route_key(route_key);
+        let mut snapshot = self.cached_status_snapshot_with_failure()?;
+        let mut evidence = self
+            .retained_schedule_evidence_for_status_route_key(route_key)
+            .or_else(|| route_scoped_schedule_evidence_from_status_snapshot(&snapshot, route_key))
+            .or_else(|| {
+                self.cached_schedule_evidence_for_status_route_key(route_key)
+                    .ok()
+                    .flatten()
+            });
+        if let Some(evidence) = evidence.as_mut() {
+            let current_groups = self
+                .current_logical_root_group_ids()
+                .map_err(SinkFailure::from)?;
+            if !current_groups.is_empty() {
+                evidence.retain_groups(&current_groups);
+            }
+        }
+        if evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.is_empty())
+        {
+            evidence = None;
+        }
         let Some(evidence) = evidence else {
             return Ok(SinkStatusSnapshot::default());
         };
-        let mut snapshot = self.cached_status_snapshot_with_failure()?;
         Self::retain_status_snapshot_for_groups(&mut snapshot, &evidence.scheduled_groups);
-        Self::republish_cached_schedule_evidence_into_status_summary(&mut snapshot, &evidence);
+        Self::republish_route_scoped_schedule_evidence_into_status_summary(
+            &mut snapshot,
+            &evidence,
+        );
         Ok(snapshot)
     }
 
@@ -3214,6 +3413,22 @@ impl SinkWorkerClientHandle {
     ) -> Option<CachedSinkScheduleEvidence> {
         let retained = self.retained_control_state.try_lock().ok()?;
         retained_sink_schedule_evidence_for_route(&retained, &self.node_id, route_key)
+    }
+
+    fn cached_schedule_evidence_for_status_route_key(
+        &self,
+        route_key: &str,
+    ) -> Result<Option<CachedSinkScheduleEvidence>> {
+        let schedule_evidence = self
+            .scheduled_groups_cache
+            .lock()
+            .map_err(|_| {
+                CnxError::Internal("sink worker scheduled groups cache lock poisoned".into())
+            })?
+            .clone();
+        Ok(schedule_evidence.as_ref().and_then(|evidence| {
+            route_scoped_schedule_evidence_from_cached_schedule(evidence, route_key)
+        }))
     }
 
     fn retain_status_snapshot_for_groups(
@@ -3781,7 +3996,9 @@ impl SinkWorkerClientHandle {
         mut snapshot: SinkStatusSnapshot,
     ) -> Result<SinkStatusSnapshot> {
         let current_groups = self.current_logical_root_group_ids()?;
-        let mut route_evidence = self.retained_schedule_evidence_for_status_route_key(route_key);
+        let mut route_evidence = self
+            .retained_schedule_evidence_for_status_route_key(route_key)
+            .or_else(|| route_scoped_schedule_evidence_from_status_snapshot(&snapshot, route_key));
         if let Some(evidence) = route_evidence.as_mut()
             && !current_groups.is_empty()
         {
@@ -3796,7 +4013,10 @@ impl SinkWorkerClientHandle {
             Self::retain_status_snapshot_for_groups(&mut snapshot, &current_groups);
         }
         if let Some(evidence) = route_evidence.as_ref() {
-            Self::republish_cached_schedule_evidence_into_status_summary(&mut snapshot, evidence);
+            Self::republish_route_scoped_schedule_evidence_into_status_summary(
+                &mut snapshot,
+                evidence,
+            );
         }
         let grants = self
             .config
@@ -4405,7 +4625,7 @@ impl SinkWorkerClientHandle {
                             "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason={} err={} {}",
                             self.node_id.0,
                             reason,
-                            err.as_error(),
+                            sink_status_observation_log_error(err.as_error()),
                             summarize_sink_status_snapshot(&snapshot)
                         ),
                         None => eprintln!(
@@ -4425,7 +4645,7 @@ impl SinkWorkerClientHandle {
                             "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason={} err={} {}",
                             self.node_id.0,
                             reason,
-                            err.as_error(),
+                            sink_status_observation_log_error(err.as_error()),
                             summarize_sink_status_snapshot(&snapshot)
                         ),
                         None => eprintln!(
@@ -4723,7 +4943,7 @@ impl SinkWorkerClientHandle {
                     eprintln!(
                         "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=worker_unavailable err={} {}",
                         self.node_id.0,
-                        err.as_error(),
+                        sink_status_observation_log_error(err.as_error()),
                         summarize_sink_status_snapshot(&snapshot)
                     );
                 }
@@ -4739,7 +4959,7 @@ impl SinkWorkerClientHandle {
                 eprintln!(
                     "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=status_route_probe_failed err={} {}",
                     self.node_id.0,
-                    err.as_error(),
+                    sink_status_observation_log_error(err.as_error()),
                     summarize_sink_status_snapshot(&snapshot)
                 );
             }
@@ -4760,6 +4980,26 @@ impl SinkWorkerClientHandle {
             let snapshot = self
                 .cached_status_snapshot_for_status_route_key(route_key)
                 .unwrap_or_else(|_| SinkStatusSnapshot::default());
+            if Self::route_cached_status_needs_existing_client_probe(&snapshot) {
+                match self
+                    .status_route_existing_client_probe_for_route_key(
+                        route_key,
+                        status_snapshot_nonblocking_live_probe_budget(),
+                    )
+                    .await
+                {
+                    Ok(live_snapshot) => return (live_snapshot, false),
+                    Err(err) if debug_control_scope_capture_enabled() => {
+                        eprintln!(
+                            "fs_meta_sink_worker_client: status_snapshot route existing-client probe failed node={} route={} err={}",
+                            self.node_id.0,
+                            route_key,
+                            sink_status_observation_log_error(err.as_error())
+                        );
+                    }
+                    Err(_) => {}
+                }
+            }
             if debug_control_scope_capture_enabled() {
                 let reason = if replay_required {
                     "status_route_key_retained_replay_pending"
@@ -4801,7 +5041,17 @@ impl SinkWorkerClientHandle {
                 match self
                     .prepare_status_snapshot_for_route_evaluation_with_failure(route_key, snapshot)
                 {
-                    Ok(snapshot) => (snapshot, false),
+                    Ok(snapshot) => {
+                        if let Err(err) = self.merge_cached_status_snapshot(snapshot.clone())
+                            && debug_control_scope_capture_enabled()
+                        {
+                            eprintln!(
+                                "fs_meta_sink_worker_client: status_snapshot route cache merge failed node={} route={} err={}",
+                                self.node_id.0, route_key, err
+                            );
+                        }
+                        (snapshot, false)
+                    }
                     Err(err) => {
                         let fallback = self
                             .cached_status_snapshot_for_status_route_key(route_key)
@@ -4811,7 +5061,7 @@ impl SinkWorkerClientHandle {
                                 "fs_meta_sink_worker_client: status_snapshot route_cache_fallback node={} route={} reason=route_prepare_failed err={} {}",
                                 self.node_id.0,
                                 route_key,
-                                err.as_error(),
+                                sink_status_observation_log_error(err.as_error()),
                                 summarize_sink_status_snapshot(&fallback)
                             );
                         }
@@ -4830,7 +5080,7 @@ impl SinkWorkerClientHandle {
                         "fs_meta_sink_worker_client: status_snapshot route_cache_fallback node={} route={} reason=unexpected_worker_response err={} {}",
                         self.node_id.0,
                         route_key,
-                        err.as_error(),
+                        sink_status_observation_log_error(err.as_error()),
                         summarize_sink_status_snapshot(&fallback)
                     );
                 }
@@ -4845,12 +5095,49 @@ impl SinkWorkerClientHandle {
                         "fs_meta_sink_worker_client: status_snapshot route_cache_fallback node={} route={} reason=route_probe_failed err={} {}",
                         self.node_id.0,
                         route_key,
-                        err.as_error(),
+                        sink_status_observation_log_error(err.as_error()),
                         summarize_sink_status_snapshot(&fallback)
                     );
                 }
                 (fallback, true)
             }
+        }
+    }
+
+    async fn status_route_existing_client_probe_for_route_key(
+        &self,
+        route_key: &str,
+        timeout: Duration,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        let response = match self.existing_client_with_failure().await {
+            Ok(Some(client)) => {
+                Self::call_worker_with_failure(
+                    &client,
+                    SinkWorkerRequest::StatusSnapshotForRoute {
+                        route_key: route_key.to_string(),
+                    },
+                    timeout,
+                )
+                .await
+            }
+            Ok(None) => Err(SinkFailure::from_cause(CnxError::NotReady(
+                "sink worker status not started".into(),
+            ))),
+            Err(err) => Err(err),
+        }?;
+        match response {
+            SinkWorkerResponse::StatusSnapshot(snapshot) => {
+                let snapshot = self.prepare_status_snapshot_for_route_evaluation_with_failure(
+                    route_key, snapshot,
+                )?;
+                self.merge_cached_status_snapshot(snapshot.clone())
+                    .map_err(SinkFailure::from)?;
+                Ok(snapshot)
+            }
+            other => Err(unexpected_sink_worker_response_failure(
+                "for route status snapshot",
+                other,
+            )),
         }
     }
 
@@ -4983,6 +5270,15 @@ impl SinkWorkerClientHandle {
                 .await;
             match rpc_result {
                 Ok(SinkWorkerResponse::Ack) if replay_required_for_attempt => {
+                    if self.control_state_replay_required.load(Ordering::Acquire) == 0 {
+                        if debug_control_scope_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_sink_worker_client: status_snapshot ignored stale ack after retained replay cleared node={}",
+                                self.node_id.0
+                            );
+                        }
+                        continue;
+                    }
                     machine = machine.phase_after_retry_reset();
                     self.control_state_replay_required
                         .store(1, Ordering::Release);
@@ -5103,6 +5399,7 @@ impl SinkWorkerClientHandle {
                 let groups = groups.map(|groups| {
                     groups
                         .into_iter()
+                        .filter(|group_id| is_business_sink_group_id(group_id))
                         .collect::<std::collections::BTreeSet<_>>()
                 });
                 if let Some(groups) = groups.as_ref().filter(|groups| !groups.is_empty()) {
@@ -6341,6 +6638,115 @@ impl TypedWorkerInit<SourceConfig> for SinkWorkerRpc {
             sink_tombstone_ttl_ms: config.sink_tombstone_ttl.as_millis() as u64,
             sink_tombstone_tolerance_us: config.sink_tombstone_tolerance_us,
         })
+    }
+}
+
+#[cfg(test)]
+mod schedule_evidence_unit_tests {
+    use super::*;
+    use crate::runtime::execution_units;
+    use capanix_runtime_entry_sdk::control::{
+        RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
+    };
+
+    fn activate_signal_for_route(
+        route_key: String,
+        scopes: Vec<RuntimeBoundScope>,
+    ) -> SinkControlSignal {
+        let envelope =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: route_key.clone(),
+                unit_id: execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 3,
+                expires_at_ms: 60_000,
+                bound_scopes: scopes.clone(),
+            }))
+            .expect("encode sink activate");
+        SinkControlSignal::Activate {
+            unit: crate::runtime::orchestration::SinkRuntimeUnit::Sink,
+            route_key,
+            generation: 3,
+            bound_scopes: scopes,
+            envelope,
+        }
+    }
+
+    #[test]
+    fn cached_sink_schedule_evidence_ignores_empty_roots_bootstrap_scope() {
+        let node_id = NodeId("node-c".to_string());
+        let evidence = cached_sink_schedule_evidence_from_bound_scopes(
+            [
+                RuntimeBoundScope {
+                    scope_id: "__fsmeta_empty_roots_bootstrap".to_string(),
+                    resource_ids: vec![String::new()],
+                },
+                RuntimeBoundScope {
+                    scope_id: "nfs-146".to_string(),
+                    resource_ids: vec!["node-c::nfs-146".to_string()],
+                },
+            ]
+            .iter(),
+            &node_id,
+            Some("node_c"),
+        );
+
+        assert_eq!(
+            evidence.scheduled_groups,
+            std::collections::BTreeSet::from([String::from("nfs-146")]),
+            "empty-roots bootstrap scope is route liveness only and must not replace business sink schedule evidence"
+        );
+        assert_eq!(
+            evidence.scheduled_groups_by_node,
+            std::collections::BTreeMap::from([(
+                String::from("node-c"),
+                vec![String::from("nfs-146")]
+            )])
+        );
+    }
+
+    #[test]
+    fn retained_route_status_evidence_matches_owner_scoped_roots_control_route() {
+        let node_id = NodeId("node-b-29886391018142820221321217".to_string());
+        let route_scope = "node_b_29886391018142820221321217";
+        let roots_control_route = format!("sink-logical-roots-control.{route_scope}:v1.stream");
+        let status_route = format!("sink-status.{route_scope}:v1.req");
+        let scopes = vec![
+            RuntimeBoundScope {
+                scope_id: "__fsmeta_empty_roots_bootstrap".to_string(),
+                resource_ids: vec![String::new()],
+            },
+            RuntimeBoundScope {
+                scope_id: "nfs-145".to_string(),
+                resource_ids: vec!["node-b-29886391018142820221321217::nfs-145".to_string()],
+            },
+        ];
+        let mut retained = RetainedSinkWorkerControlState::default();
+        retained.active_by_route.insert(
+            (
+                execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                roots_control_route.clone(),
+            ),
+            activate_signal_for_route(roots_control_route, scopes),
+        );
+
+        let evidence =
+            retained_sink_schedule_evidence_for_route(&retained, &node_id, &status_route).expect(
+                "owner-scoped sink-status route should recover retained roots-control schedule",
+            );
+
+        assert_eq!(
+            evidence.scheduled_groups,
+            std::collections::BTreeSet::from([String::from("nfs-145")])
+        );
+        assert_eq!(
+            evidence.scheduled_groups_by_node,
+            std::collections::BTreeMap::from([(
+                String::from("node-b-29886391018142820221321217"),
+                vec![String::from("nfs-145")]
+            )]),
+            "replay/apply-pending per-peer status fallback must expose the same business owner schedule that the owner-scoped roots-control route accepted"
+        );
     }
 }
 

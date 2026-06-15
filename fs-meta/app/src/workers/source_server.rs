@@ -697,27 +697,45 @@ async fn publish_event_stream_batch(
     origin: &str,
     event_route_scope: &str,
 ) -> Result<()> {
+    publish_event_stream_batch_with_send_timeout(
+        boundary,
+        batch,
+        origin,
+        event_route_scope,
+        SOURCE_WORKER_EVENT_STREAM_SEND_TIMEOUT,
+    )
+    .await
+}
+
+async fn publish_event_stream_batch_with_send_timeout(
+    boundary: Arc<StdMutex<Arc<dyn ChannelIoSubset>>>,
+    batch: &[Event],
+    origin: &str,
+    event_route_scope: &str,
+    send_timeout: Duration,
+) -> Result<()> {
     let mut pending = std::collections::VecDeque::from([batch.to_vec()]);
     while let Some(window) = pending.pop_front() {
         let mut publish_attempt = 0u64;
         loop {
             publish_attempt = publish_attempt.saturating_add(1);
             let target = clone_pump_boundary_target(&boundary);
-            match target
-                .channel_send(
+            let send_result = tokio::time::timeout(
+                send_timeout,
+                target.channel_send(
                     BoundaryContext::for_unit(execution_units::SOURCE_RUNTIME_UNIT_ID),
                     ChannelSendRequest {
                         channel_key: ChannelKey(events_stream_route_for_scope(event_route_scope).0),
                         events: window.clone(),
-                        timeout_ms: Some(
-                            SOURCE_WORKER_EVENT_STREAM_SEND_TIMEOUT.as_millis() as u64,
-                        ),
+                        timeout_ms: Some(send_timeout.as_millis() as u64),
                     },
-                )
-                .await
-            {
+                ),
+            )
+            .await
+            .unwrap_or(Err(CnxError::Timeout));
+            match send_result {
                 Ok(()) => break,
-                Err(CnxError::Backpressure) if window.len() > 1 => {
+                Err(CnxError::Backpressure | CnxError::Timeout) if window.len() > 1 => {
                     let midpoint = window.len() / 2;
                     let left = window[..midpoint].to_vec();
                     let right = window[midpoint..].to_vec();
@@ -725,6 +743,7 @@ async fn publish_event_stream_batch(
                     pending.push_front(left);
                     break;
                 }
+                Err(err @ (CnxError::Backpressure | CnxError::Timeout)) => return Err(err),
                 Err(err) if source_worker_publish_error_is_terminal(&err) => return Err(err),
                 Err(err) => {
                     log::warn!(
@@ -1956,6 +1975,12 @@ mod tests {
         sent_unit_ids: StdMutex<Vec<Option<String>>>,
     }
 
+    struct HangingOversizedThenOkBoundary {
+        hang_threshold: usize,
+        sent_lengths: StdMutex<Vec<usize>>,
+        sent_payloads: StdMutex<Vec<String>>,
+    }
+
     #[derive(Default)]
     struct LoopbackPublishBoundary {
         channels: tokio::sync::Mutex<std::collections::BTreeMap<String, Vec<Event>>>,
@@ -2035,6 +2060,30 @@ mod tests {
             self.sent_unit_ids
                 .lock()
                 .expect("capacity boundary sent_unit_ids lock")
+                .clone()
+        }
+    }
+
+    impl HangingOversizedThenOkBoundary {
+        fn new(hang_threshold: usize) -> Self {
+            Self {
+                hang_threshold,
+                sent_lengths: StdMutex::new(Vec::new()),
+                sent_payloads: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn sent_lengths(&self) -> Vec<usize> {
+            self.sent_lengths
+                .lock()
+                .expect("hanging boundary sent_lengths lock")
+                .clone()
+        }
+
+        fn sent_payloads(&self) -> Vec<String> {
+            self.sent_payloads
+                .lock()
+                .expect("hanging boundary sent_payloads lock")
                 .clone()
         }
     }
@@ -2128,6 +2177,33 @@ mod tests {
                 .lock()
                 .expect("capacity boundary sent_unit_ids lock")
                 .push(ctx.unit_id);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for HangingOversizedThenOkBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> Result<()> {
+            if request.events.len() > self.hang_threshold {
+                return std::future::pending::<Result<()>>().await;
+            }
+            self.sent_lengths
+                .lock()
+                .expect("hanging boundary sent_lengths lock")
+                .push(request.events.len());
+            self.sent_payloads
+                .lock()
+                .expect("hanging boundary sent_payloads lock")
+                .extend(
+                    request
+                        .events
+                        .iter()
+                        .map(|event| String::from_utf8_lossy(event.payload_bytes()).to_string()),
+                );
             Ok(())
         }
     }
@@ -2247,6 +2323,88 @@ mod tests {
                 .all(|unit_id| unit_id.as_deref() == Some(SOURCE_RUNTIME_UNIT_ID)),
             "source pump must publish events through the source runtime unit lane"
         );
+    }
+
+    #[tokio::test]
+    async fn source_pump_times_out_hanging_publication_before_splitting_batch() {
+        let boundary = Arc::new(HangingOversizedThenOkBoundary::new(2));
+        let target: Arc<dyn ChannelIoSubset> = boundary.clone();
+        let events = (0..5)
+            .map(|idx| {
+                Event::new(
+                    EventMetadata {
+                        origin_id: NodeId("node-a::nfs1".to_string()),
+                        timestamp_us: idx,
+                        logical_ts: None,
+                        correlation_id: None,
+                        ingress_auth: None,
+                        trace: None,
+                    },
+                    bytes::Bytes::from(format!("record-{idx}")),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let publish = publish_event_stream_batch_with_send_timeout(
+            Arc::new(StdMutex::new(target)),
+            &events,
+            "node-a::nfs1",
+            "node-a",
+            Duration::from_millis(20),
+        );
+        match tokio::time::timeout(Duration::from_millis(200), publish).await {
+            Ok(result) => result.expect("hanging oversized batch should be split and published"),
+            Err(_) => panic!("source pump waited forever on a hung channel_send"),
+        }
+
+        let sent_lengths = boundary.sent_lengths();
+        assert!(
+            sent_lengths.iter().all(|len| *len <= 2) && sent_lengths.iter().sum::<usize>() == 5,
+            "source pump must recover from hung oversized sends by publishing smaller windows, got {sent_lengths:?}"
+        );
+        assert_eq!(
+            boundary.sent_payloads(),
+            vec![
+                "record-0".to_string(),
+                "record-1".to_string(),
+                "record-2".to_string(),
+                "record-3".to_string(),
+                "record-4".to_string(),
+            ],
+            "source pump must preserve event order after timing out and splitting hung sends"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_pump_fails_closed_when_single_event_publication_hangs() {
+        let boundary = Arc::new(HangingOversizedThenOkBoundary::new(0));
+        let target: Arc<dyn ChannelIoSubset> = boundary.clone();
+        let events = vec![Event::new(
+            EventMetadata {
+                origin_id: NodeId("node-a::nfs1".to_string()),
+                timestamp_us: 1,
+                logical_ts: None,
+                correlation_id: None,
+                ingress_auth: None,
+                trace: None,
+            },
+            bytes::Bytes::from_static(b"record-0"),
+        )];
+
+        let publish = publish_event_stream_batch_with_send_timeout(
+            Arc::new(StdMutex::new(target)),
+            &events,
+            "node-a::nfs1",
+            "node-a",
+            Duration::from_millis(20),
+        );
+        match tokio::time::timeout(Duration::from_millis(120), publish).await {
+            Ok(result) => assert!(
+                matches!(result, Err(CnxError::Timeout)),
+                "single unsplittable publication should fail closed with timeout, got {result:?}"
+            ),
+            Err(_) => panic!("source pump retried a hung single-event publication forever"),
+        }
     }
 
     #[derive(Default)]

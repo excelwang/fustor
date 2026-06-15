@@ -15,7 +15,7 @@ use crate::runtime::routes::{
 };
 use crate::sink::SinkFileMeta;
 use crate::state::cell::LogicalRootsCell;
-use crate::{ControlEvent, SyncTrack};
+use crate::{ControlEvent, EpochType, SyncTrack};
 use bytes::Bytes;
 use capanix_app_sdk::runtime::ControlEnvelope;
 use capanix_app_sdk::runtime::RouteKey;
@@ -485,6 +485,40 @@ fn local_source_materialized_read_cache_epoch_tracks_pending_rescan_request() {
     );
 }
 
+#[test]
+fn source_progress_waits_for_audit_epoch_end_downstream_acceptance() {
+    let source = build_source(vec![test_export(
+        "node-a::nfs1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )]);
+    let request_epoch = source.state_cell.begin_rescan_request_epoch(0, 0, 0);
+    let expected_groups = BTreeSet::from(["nfs1".to_string()]);
+
+    let data_batch = vec![mk_source_record_event(
+        "node-a::nfs1",
+        b"/partial-forwarded.txt",
+        b"partial-forwarded.txt",
+        10,
+    )];
+    source.record_batch_downstream_accepted(&data_batch);
+    let after_data = source.progress_snapshot();
+    assert!(
+        !after_data.published_expected_groups_since(request_epoch, &expected_groups),
+        "partial scan/audit data publication must not satisfy request-scoped publication before the audit epoch end is downstream accepted: {after_data:?}",
+    );
+
+    let epoch_end = vec![mk_audit_epoch_end_event("node-a::nfs1", 99, 11)];
+    source.record_batch_downstream_accepted(&epoch_end);
+    let after_epoch_end = source.progress_snapshot();
+    assert!(
+        after_epoch_end.published_expected_groups_since(request_epoch, &expected_groups),
+        "accepted audit epoch-end publication should satisfy request-scoped publication: {after_epoch_end:?}",
+    );
+}
+
 fn mk_source_record_event(origin: &str, path: &[u8], file_name: &[u8], ts: u64) -> Event {
     let record = FileMetaRecord::scan_update(
         path.to_vec(),
@@ -511,6 +545,24 @@ fn mk_source_record_event(origin: &str, path: &[u8], file_name: &[u8], ts: u64) 
             trace: None,
         },
         bytes::Bytes::from(rmp_serde::to_vec_named(&record).expect("encode source record event")),
+    )
+}
+
+fn mk_audit_epoch_end_event(origin: &str, epoch_id: u64, ts: u64) -> Event {
+    let control = ControlEvent::EpochEnd {
+        epoch_id,
+        epoch_type: EpochType::Audit,
+    };
+    Event::new(
+        EventMetadata {
+            origin_id: NodeId(origin.to_string()),
+            timestamp_us: ts,
+            logical_ts: None,
+            correlation_id: None,
+            ingress_auth: None,
+            trace: None,
+        },
+        Bytes::from(rmp_serde::to_vec_named(&control).expect("encode audit epoch end event")),
     )
 }
 
@@ -6713,11 +6765,20 @@ async fn current_pub_stream_yield_does_not_advance_publication_progress_before_d
 
     source.record_batch_downstream_accepted(&yielded);
     let after_accept = source.progress_snapshot();
+    assert!(
+        !after_accept
+            .published_expected_groups_since(request_epoch, &BTreeSet::from(["nfs1".to_string()])),
+        "source progress must not treat a data batch as complete request-scoped audit publication even after downstream acceptance: {after_accept:?}"
+    );
+
+    let epoch_end = vec![mk_audit_epoch_end_event("node-a::nfs1", 1, 124)];
+    source.record_batch_downstream_accepted(&epoch_end);
+    let after_epoch_end = source.progress_snapshot();
     source.close().await.expect("close source");
     assert!(
-        after_accept
+        after_epoch_end
             .published_expected_groups_since(request_epoch, &BTreeSet::from(["nfs1".to_string()])),
-        "source progress should advance after runtime/sink downstream acceptance: {after_accept:?}"
+        "source progress should advance after runtime/sink downstream acceptance of the audit epoch end: {after_epoch_end:?}"
     );
 }
 

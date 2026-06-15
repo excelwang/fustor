@@ -51,7 +51,6 @@ use crate::query::result_ops::{
 use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::seam::resolve_host_fs_facade;
 
-use crate::FileMetaRecord;
 use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNITS};
 use crate::runtime::orchestration::{
     MANUAL_RESCAN_CONTROL_FRAME_KIND, ManualRescanControlPayload, SourceControlSignal,
@@ -75,6 +74,7 @@ use crate::source::watcher::WatchManager;
 use crate::state::cell::{AuthorityJournal, HostObjectGrantsCell, LogicalRootsCell, SignalCell};
 use crate::state::commit_boundary::CommitBoundary;
 use crate::workers::source::SourceControlState;
+use crate::{ControlEvent, EpochType, FileMetaRecord};
 
 #[cfg(test)]
 use crate::runtime::routes::ROUTE_KEY_QUERY;
@@ -2879,10 +2879,25 @@ impl FSMetaSource {
 
         let capture_target = debug_stream_path_capture_target();
         let mut counts_by_origin = BTreeMap::<String, (u64, u64, Option<u64>)>::new();
+        let mut audit_epoch_end_origins = BTreeSet::<String>::new();
         for event in events {
             let origin = event.metadata().origin_id.0.clone();
             let entry = counts_by_origin.entry(origin).or_default();
             entry.0 = entry.0.saturating_add(1);
+            if rmp_serde::from_slice::<ControlEvent>(event.payload_bytes())
+                .ok()
+                .is_some_and(|control| {
+                    matches!(
+                        control,
+                        ControlEvent::EpochEnd {
+                            epoch_type: EpochType::Audit,
+                            ..
+                        }
+                    )
+                })
+            {
+                audit_epoch_end_origins.insert(event.metadata().origin_id.0.clone());
+            }
             if let Some(target) = capture_target.as_deref()
                 && rmp_serde::from_slice::<FileMetaRecord>(event.payload_bytes())
                     .ok()
@@ -2904,7 +2919,9 @@ impl FSMetaSource {
             };
             let last_forwarded_origins = vec![format!("{origin}={event_count}")];
             for (logical_root_id, root_key) in root_rows {
-                state_cell.mark_group_published(logical_root_id);
+                if audit_epoch_end_origins.contains(&origin) {
+                    state_cell.mark_group_published(logical_root_id);
+                }
                 Self::mark_root_forwarded_batch(
                     fanout_health,
                     root_key,

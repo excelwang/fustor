@@ -345,6 +345,16 @@ impl ApiControlGate {
         });
     }
 
+    pub fn repair_lane_evidence_for_signature(
+        &self,
+        signature: &str,
+    ) -> Option<StatusRepairLaneEvidence> {
+        self.repair_lane_evidence
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(signature).cloned())
+    }
+
     pub fn repair_lane_snapshot(&self) -> Vec<StatusRepairLaneEvidence> {
         self.repair_lane_evidence
             .lock()

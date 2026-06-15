@@ -9,6 +9,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::mem::size_of;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use crate::SyncTrack;
@@ -108,6 +110,50 @@ impl DirAggregate {
         }
         agg
     }
+
+    fn apply_delta(&mut self, before: &DirAggregate, after: &DirAggregate) {
+        apply_count_delta(&mut self.total_nodes, before.total_nodes, after.total_nodes);
+        apply_count_delta(&mut self.total_files, before.total_files, after.total_files);
+        apply_count_delta(&mut self.total_dirs, before.total_dirs, after.total_dirs);
+        apply_count_delta(&mut self.total_size, before.total_size, after.total_size);
+        apply_count_delta(
+            &mut self.attested_count,
+            before.attested_count,
+            after.attested_count,
+        );
+        apply_count_delta(
+            &mut self.blind_spot_count,
+            before.blind_spot_count,
+            after.blind_spot_count,
+        );
+        if let Some(latest) = after.latest_file_mtime_us {
+            self.latest_file_mtime_us = Some(
+                self.latest_file_mtime_us
+                    .map_or(latest, |current| current.max(latest)),
+            );
+        }
+    }
+}
+
+fn apply_count_delta(current: &mut u64, before: u64, after: u64) {
+    if after >= before {
+        *current = current.saturating_add(after - before);
+    } else {
+        *current = current.saturating_sub(before - after);
+    }
+}
+
+#[cfg(test)]
+static RECOMPUTE_AGGREGATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn reset_tree_hot_path_counters() {
+    RECOMPUTE_AGGREGATE_CALLS.store(0, AtomicOrdering::SeqCst);
+}
+
+#[cfg(test)]
+fn recompute_aggregate_calls() -> usize {
+    RECOMPUTE_AGGREGATE_CALLS.load(AtomicOrdering::SeqCst)
 }
 
 #[derive(Debug, Clone)]
@@ -232,7 +278,7 @@ impl MaterializedTree {
         }
         let after = self.node(id).and_then(|node| node.meta.clone());
         self.refresh_node_health_indexes(path, before.as_ref(), after.as_ref());
-        self.refresh_aggregate_chain(id);
+        self.apply_meta_aggregate_change(id, before.as_ref(), after.as_ref());
     }
 
     pub fn remove(&mut self, path: &[u8]) -> Option<FileMetaNode> {
@@ -269,7 +315,7 @@ impl MaterializedTree {
         };
         let after = self.node(id).and_then(|node| node.meta.clone());
         self.refresh_node_health_indexes(path, Some(&before), after.as_ref());
-        self.refresh_aggregate_chain(id);
+        self.apply_meta_aggregate_change(id, Some(&before), after.as_ref());
         Some(result)
     }
 
@@ -501,9 +547,6 @@ impl MaterializedTree {
         let Some(child_path) = self.node(child_id).map(|node| node.path.clone()) else {
             return;
         };
-        if !self.prune_missing_children(parent_id) {
-            return;
-        }
         let insert_at = {
             let Some(parent) = self.node(parent_id) else {
                 return;
@@ -528,23 +571,9 @@ impl MaterializedTree {
         }
     }
 
-    fn prune_missing_children(&mut self, parent_id: NodeId) -> bool {
-        let Some(children) = self.node(parent_id).map(|node| node.children.clone()) else {
-            return false;
-        };
-        let live_children = children
-            .into_iter()
-            .filter(|child| self.node_exists(*child))
-            .collect::<Vec<_>>();
-        if let Some(parent) = self.node_mut(parent_id) {
-            parent.children = live_children;
-            true
-        } else {
-            false
-        }
-    }
-
     fn recompute_aggregate(&mut self, id: NodeId) {
+        #[cfg(test)]
+        RECOMPUTE_AGGREGATE_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
         let Some(node) = self.node(id) else {
             return;
         };
@@ -576,6 +605,68 @@ impl MaterializedTree {
             };
             self.recompute_aggregate(id);
             current = Some(parent);
+        }
+    }
+
+    fn apply_meta_aggregate_change(
+        &mut self,
+        start_id: NodeId,
+        before: Option<&FileMetaNode>,
+        after: Option<&FileMetaNode>,
+    ) {
+        let before = before.map(DirAggregate::from_node).unwrap_or_default();
+        let after = after.map(DirAggregate::from_node).unwrap_or_default();
+        if before == after {
+            return;
+        }
+        if self.aggregate_delta_may_lower_latest_file_mtime(start_id, &before, &after) {
+            self.refresh_aggregate_chain(start_id);
+            return;
+        }
+        self.apply_aggregate_delta_chain(start_id, &before, &after);
+    }
+
+    fn aggregate_delta_may_lower_latest_file_mtime(
+        &self,
+        start_id: NodeId,
+        before: &DirAggregate,
+        after: &DirAggregate,
+    ) -> bool {
+        let Some(before_latest) = before.latest_file_mtime_us else {
+            return false;
+        };
+        if after
+            .latest_file_mtime_us
+            .is_some_and(|after_latest| after_latest >= before_latest)
+        {
+            return false;
+        }
+        let mut current = Some(start_id);
+        while let Some(id) = current {
+            let Some(node) = self.node(id) else {
+                return false;
+            };
+            if node.aggregate.latest_file_mtime_us == Some(before_latest) {
+                return true;
+            }
+            current = node.parent;
+        }
+        false
+    }
+
+    fn apply_aggregate_delta_chain(
+        &mut self,
+        start_id: NodeId,
+        before: &DirAggregate,
+        after: &DirAggregate,
+    ) {
+        let mut current = Some(start_id);
+        while let Some(id) = current {
+            let parent = self.node(id).and_then(|node| node.parent);
+            if let Some(node) = self.node_mut(id) {
+                node.aggregate.apply_delta(before, after);
+            }
+            current = parent;
         }
     }
 
@@ -807,6 +898,39 @@ mod tests {
         assert_eq!(agg.latest_file_mtime_us, Some(200));
         assert_eq!(agg.attested_count, 2);
         assert_eq!(agg.blind_spot_count, 1);
+    }
+
+    #[test]
+    fn flat_wide_insert_updates_aggregate_without_full_recompute() {
+        let mut tree = MaterializedTree::new();
+        for idx in 0..512 {
+            let path = format!("/file-{idx:06}.txt").into_bytes();
+            let mut node = make_node(&path, false);
+            node.size = 1;
+            node.modified_time_us = idx + 1;
+            tree.insert(path, node);
+        }
+
+        let before = tree.aggregate_at(b"/").expect("root aggregate before");
+        assert_eq!(before.total_files, 512);
+        reset_tree_hot_path_counters();
+
+        let path = b"/file-999999.txt".to_vec();
+        let mut node = make_node(&path, false);
+        node.size = 7;
+        node.modified_time_us = 999_999;
+        tree.insert(path, node);
+
+        let recompute_calls = recompute_aggregate_calls();
+        assert_eq!(
+            recompute_calls, 0,
+            "flat data inserts must update ancestor aggregates by delta without rescanning the full sibling list"
+        );
+        let after = tree.aggregate_at(b"/").expect("root aggregate after");
+        assert_eq!(after.total_files, 513);
+        assert_eq!(after.total_nodes, 513);
+        assert_eq!(after.total_size, 519);
+        assert_eq!(after.latest_file_mtime_us, Some(999_999));
     }
 
     #[test]

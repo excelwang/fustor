@@ -1,6 +1,6 @@
 ---
 name: fs-meta-cross-repo-gate
-description: Coordinate fs-meta cross-repo blocker work between fustor and capanix with shared blocker-state tracking, direct bounded iterations, production-parity aibox predeploy validation, and safe clean-log binary build/deploy gates for fs-meta clusters. Use when the user says "fs-meta gate", "fustor cross-repo gate", "fustor blocker gate", asks how to build or deploy capanix binaries for fs-meta, wants logs cleared before redeploy validation, wants the current blocker handled through a shared blocker-state document instead of ad hoc coordination, or needs the official fs-meta deploy gate workflow.
+description: Coordinate fs-meta cross-repo blocker work between fustor and capanix with the single fustor goal trace, direct bounded iterations, production-parity aibox predeploy validation, and safe clean-log binary build/deploy gates for fs-meta clusters. Use when the user says "fs-meta gate", "fustor cross-repo gate", "fustor blocker gate", asks how to build or deploy capanix binaries for fs-meta, wants logs cleared before redeploy validation, wants the current blocker handled through the canonical goal trace instead of ad hoc coordination, or needs the official fs-meta deploy gate workflow.
 ---
 
 # Fs-meta Cross-Repo Gate
@@ -20,14 +20,14 @@ One-click activation phrases:
 - `fs-meta binary deploy`
 - `clear logs before redeploy`
 
-## Shared State
+## Goal Trace
 
-- Use one blocker-state document shared with the upstream repo.
-- In the current local environment, the default shared blocker-state document is `/root/repo/capanix/todo.md`.
+- Use exactly one goal-trace document for this work.
+- In the current local environment, the only goal trace is `/root/repo/fustor/TODO.md`.
 - Re-read it before every new bounded iteration.
 - The side named by the current first raw failing boundary is the active owner.
-- While the blocker remains on `fustor`, the active owner is the only side allowed to update `/root/repo/capanix/todo.md`.
-- Treat the blocker-state document as a rolling state document, not an append-only history log.
+- Do not create, update, or rely on `/root/repo/capanix/todo.md`.
+- Treat the goal trace as a rolling state document, not an append-only history log.
 - Keep only the active blocker, current first raw boundary, current exact seam, latest evidence that still changes the plan, and remaining validation order.
 - Compress closed seams to short "closed / do not revisit without fresh raw evidence" bullets.
 - Remove stale artifact lists, superseded reruns, and completed sub-iterations once they no longer affect the current blocker.
@@ -36,18 +36,18 @@ One-click activation phrases:
 
 - Keep exactly one active owner at a time.
 - Treat the inactive side as dormant.
-- Re-read `/root/repo/capanix/todo.md` before every new bounded iteration.
+- Re-read `/root/repo/fustor/TODO.md` before every new bounded iteration.
 - Run one bounded iteration directly in the current session for the active owner.
 - Use long blocking waits instead of polling when waiting for external validation or cluster state.
-- Process fresh evidence before updating the blocker-state document or summarizing status.
+- Process fresh evidence before updating the goal trace or summarizing status.
 
 ## Quick Start
 
-1. Read `/root/repo/capanix/todo.md`.
+1. Read `/root/repo/fustor/TODO.md`.
 2. Read the governing `fs-meta` specs for the current blocker line.
 3. Identify the active owner from the current first raw failing boundary.
 4. Run one bounded iteration for that owner directly in the current session.
-5. Re-read `/root/repo/capanix/todo.md` before starting the next bounded iteration.
+5. Re-read `/root/repo/fustor/TODO.md` before starting the next bounded iteration.
 6. Process fresh evidence before giving any status summary.
 
 ## Cluster Access
@@ -72,9 +72,9 @@ When `fustor` owns the blocker:
 - Work only on `/root/repo/fustor`.
 - Respect existing uncommitted changes; do not revert them.
 - Use red-test-first discipline at the owning layer before any fix.
-- Prefer the narrowest preserved reproducer named by the blocker-state document before broader validation.
-- Update `/root/repo/capanix/todo.md` only when new first-boundary evidence, repo-local closure, or execution order changes are proven.
-- When updating `/root/repo/capanix/todo.md`, rewrite the affected blocker section into its new minimal state instead of appending another long historical tranche.
+- Prefer the narrowest preserved reproducer named by `/root/repo/fustor/TODO.md` before broader validation.
+- Update `/root/repo/fustor/TODO.md` only when new first-boundary evidence, repo-local closure, or execution order changes are proven.
+- When updating `/root/repo/fustor/TODO.md`, rewrite the affected blocker section into its new minimal state instead of appending another long historical tranche.
 - Do not broaden to high-NFS, compatible-builder, or deploy work until the current local boundary is closed.
 
 ## Coordination Rules
@@ -82,7 +82,7 @@ When `fustor` owns the blocker:
 - Keep one active owner and one dormant side.
 - When the blocker remains on `fustor`, keep `capanix` dormant and work the `fustor` seam directly.
 - When the blocker crosses back to `capanix`, keep `fustor` dormant and work the `capanix` seam directly.
-- Never let a dormant side edit the blocker-state document or speculate about ownership.
+- Never let a dormant side edit `/root/repo/fustor/TODO.md` or speculate about ownership.
 - Do not require a separate handoff protocol to progress the blocker.
 
 ## Capanix Binary Deploy Gate

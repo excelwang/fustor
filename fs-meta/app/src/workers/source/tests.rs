@@ -1026,6 +1026,77 @@ async fn source_state_pending_status_observation_honors_timeout_when_control_sta
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_state_pending_status_observation_timeout_returns_degraded_snapshot() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![worker_source_root("nfs1", &nfs1)],
+        host_object_grants: vec![worker_source_export(
+            "node-a::nfs1",
+            "node-a",
+            "10.0.0.11",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = Arc::new(
+        SourceWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client"),
+    );
+    let facade = SourceFacade::worker(client.clone());
+    let _control_state_guard = client.control_state.lock().await;
+
+    let (snapshot, used_cached_fallback) = tokio::time::timeout(
+        Duration::from_millis(200),
+        facade
+            .source_state_pending_observability_snapshot_for_status_route_with_timeout_or_degraded(
+                Some(Duration::from_millis(25)),
+                "source worker source-state pending observation timed out",
+            ),
+    )
+    .await
+    .expect("bounded pending observation fallback must return before caller timeout");
+
+    assert!(
+        used_cached_fallback,
+        "timeout fallback must be reported as cached/degraded evidence"
+    );
+    assert!(
+        snapshot
+            .status
+            .degraded_roots
+            .iter()
+            .any(|(root_key, reason)| {
+                root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
+                    && reason.contains("source-state pending observation timed out")
+            }),
+        "timeout fallback must expose degraded pending-state evidence: {snapshot:?}"
+    );
+    assert!(
+        snapshot
+            .last_control_frame_signals_by_node
+            .values()
+            .flatten()
+            .all(|signal| {
+                !source_observability_signal_is_scoped_manual_rescan_route_ready_evidence(signal)
+            }),
+        "pending-state timeout fallback must not leak scoped manual-rescan delivery readiness"
+    );
+}
+
 #[test]
 fn source_operations_hard_cut_removed_generic_operation_machine_family() {
     let source_impl = include_str!("../source.rs");
@@ -3043,6 +3114,44 @@ fn source_worker_when_ready_requests_submit_intent_without_waiting_for_scan_read
 }
 
 #[test]
+fn source_scan_audit_admission_release_submits_intent_without_waiting_for_observed_epoch() {
+    let source_impl = include_str!("../source.rs");
+
+    let client_start = source_impl
+        .find(
+            "async fn open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure(",
+        )
+        .expect("missing source worker client admission release helper");
+    let client_tail = &source_impl[client_start..];
+    let client_end = client_tail
+        .find("\n    async fn submit_rescan_when_ready_epoch_with_failure(")
+        .expect("missing following source worker client helper");
+    let client_body = &client_tail[..client_end];
+    assert!(
+        client_body
+            .contains("SourceWorkerRequest::OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch"),
+        "source worker client admission release must use the explicit worker RPC"
+    );
+    assert!(
+        !client_body.contains("wait_for_rescan_observed_epoch_with_failure("),
+        "status-triggered scan/audit admission release must not wait for scan/audit observation before replying"
+    );
+
+    let facade_start = source_impl
+        .find("pub(crate) async fn open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure(")
+        .expect("missing source facade admission release helper");
+    let facade_tail = &source_impl[facade_start..];
+    let facade_end = facade_tail
+        .find("\n    pub(crate) async fn submit_rescan_when_ready_epoch_with_failure(")
+        .expect("missing following source facade helper");
+    let facade_body = &facade_tail[..facade_end];
+    assert!(
+        facade_body.contains("Self::Local(source) => {\n                if source.open_scan_audit_admission_if_closed() {\n                    Ok(source.submit_rescan_request_epoch())"),
+        "local source facade admission release must submit the rescan intent without waiting for scan readiness"
+    );
+}
+
+#[test]
 fn source_facade_apply_orchestration_local_branch_uses_typed_helper() {
     let source_impl = include_str!("../source.rs");
     let source_runtime_impl = include_str!("../../source/mod.rs");
@@ -3301,6 +3410,14 @@ struct SourceWorkerControlFramePauseHookReset;
 impl Drop for SourceWorkerControlFramePauseHookReset {
     fn drop(&mut self) {
         clear_source_worker_control_frame_pause_hook();
+    }
+}
+
+struct SourceWorkerPreStatusReplayHookReset;
+
+impl Drop for SourceWorkerPreStatusReplayHookReset {
+    fn drop(&mut self) {
+        clear_source_worker_pre_status_replay_hook();
     }
 }
 
@@ -16786,6 +16903,263 @@ async fn nonblocking_status_observability_returns_runtime_scope_control_cache_be
         "nonblocking source-status may report ownership from control cache but must not consume retained replay"
     );
 
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nonblocking_status_observability_returns_retained_control_evidence_without_replay_when_cache_is_empty()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![worker_watch_scan_root("nfs1", &nfs1)],
+        host_object_grants: vec![worker_source_export(
+            "node-b::nfs1",
+            "node-b",
+            "10.0.0.21",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-b".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    let signals = source_control_signals_from_envelopes(&vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+        }))
+        .expect("encode source activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+        }))
+        .expect("encode source scan activate"),
+    ])
+    .expect("decode source+scan control");
+    client.control_state.lock().await.retain_signals(&signals);
+    client.arm_control_frame_replay().await;
+
+    assert!(
+        matches!(
+            client.control_state.lock().await.replay_state(),
+            SourceControlReplayState::Required
+        ),
+        "precondition: retained source replay must be pending"
+    );
+
+    let (snapshot, used_cached_fallback) = tokio::time::timeout(
+        Duration::from_millis(150),
+        client.observability_snapshot_nonblocking_for_status_route(),
+    )
+    .await
+    .expect("management status must not synchronously replay retained source control");
+
+    assert!(
+        used_cached_fallback,
+        "generic source-status should return bounded retained-control evidence"
+    );
+    assert_eq!(
+        snapshot.scheduled_source_groups_by_node.get("node-b"),
+        Some(&vec!["nfs1".to_string()]),
+        "source-status should project source ownership from retained control without replay"
+    );
+    assert_eq!(
+        snapshot.scheduled_scan_groups_by_node.get("node-b"),
+        Some(&vec!["nfs1".to_string()]),
+        "source-status should project scan ownership from retained control without replay"
+    );
+    assert!(
+        snapshot
+            .status
+            .degraded_roots
+            .iter()
+            .any(|(root_key, reason)| {
+                root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
+                    && reason == SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON
+            }),
+        "retained-control status evidence must withhold delivery truth while source state is pending: {:?}",
+        snapshot.status.degraded_roots
+    );
+    assert!(
+        matches!(
+            client.control_state.lock().await.replay_state(),
+            SourceControlReplayState::Required
+        ),
+        "nonblocking source-status must not consume retained replay"
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nonblocking_status_observability_rechecks_retained_replay_after_initial_status_check() {
+    let _hook_guard = source_worker_observability_hook_test_guard().await;
+    let _pre_status_replay_reset = SourceWorkerPreStatusReplayHookReset;
+    let _control_pause_reset = SourceWorkerControlFramePauseHookReset;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![worker_watch_scan_root("nfs1", &nfs1)],
+        host_object_grants: vec![worker_source_export(
+            "node-b::nfs1",
+            "node-b",
+            "10.0.0.21",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-b".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    let envelopes = vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+        }))
+        .expect("encode source activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+        }))
+        .expect("encode source scan activate"),
+    ];
+    client
+        .on_control_frame(envelopes.clone())
+        .await
+        .expect("apply source+scan control before status race");
+    assert!(
+        !client.retained_replay_required_for_status().await,
+        "precondition: status must pass the initial retained-replay check"
+    );
+
+    let pre_entered = Arc::new(Notify::new());
+    let pre_release = Arc::new(Notify::new());
+    let pre_entered_wait = pre_entered.notified();
+    tokio::pin!(pre_entered_wait);
+    install_source_worker_pre_status_replay_hook(SourceWorkerPreStatusReplayHook {
+        entered: pre_entered.clone(),
+        release: pre_release.clone(),
+    });
+
+    let status_client = client.clone();
+    let mut status_task = tokio::spawn(async move {
+        status_client
+            .observability_snapshot_nonblocking_for_status_route()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), &mut pre_entered_wait)
+        .await
+        .expect("status read should reach the pre-replay race hook");
+
+    let signals = source_control_signals_from_envelopes(&envelopes)
+        .expect("decode retained source+scan control");
+    client.retain_control_signals(&signals).await;
+    client.arm_control_frame_replay().await;
+    assert!(
+        matches!(
+            client.control_state.lock().await.replay_state(),
+            SourceControlReplayState::Required
+        ),
+        "precondition: retained source replay must become pending after the initial status check"
+    );
+
+    let control_release = Arc::new(Notify::new());
+    install_source_worker_control_frame_pause_hook(SourceWorkerControlFramePauseHook {
+        entered: Arc::new(Notify::new()),
+        release: control_release.clone(),
+    });
+    pre_release.notify_waiters();
+
+    let (snapshot, used_cached_fallback) = match tokio::time::timeout(
+        Duration::from_millis(250),
+        &mut status_task,
+    )
+    .await
+    {
+        Ok(result) => result.expect("status task join"),
+        Err(_) => {
+            control_release.notify_waiters();
+            let _ = tokio::time::timeout(Duration::from_secs(2), status_task).await;
+            panic!(
+                "management status must return pending source-state evidence instead of synchronously replaying retained source control"
+            );
+        }
+    };
+
+    assert!(
+        used_cached_fallback,
+        "status should report bounded pending/cache evidence for the post-check replay race"
+    );
+    assert_eq!(
+        snapshot.scheduled_source_groups_by_node.get("node-b"),
+        Some(&vec!["nfs1".to_string()]),
+        "status should preserve source ownership evidence from retained control"
+    );
+    assert_eq!(
+        snapshot.scheduled_scan_groups_by_node.get("node-b"),
+        Some(&vec!["nfs1".to_string()]),
+        "status should preserve scan ownership evidence from retained control"
+    );
+    assert!(
+        matches!(
+            client.control_state.lock().await.replay_state(),
+            SourceControlReplayState::Required
+        ),
+        "status must not consume retained replay that appeared after the initial check"
+    );
+
+    control_release.notify_waiters();
     client.close().await.expect("close source worker");
 }
 

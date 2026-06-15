@@ -1083,10 +1083,6 @@ impl ManagedEndpointTask {
         let should_recv = Arc::new(should_recv);
         let wait_until_receivable = Arc::new(wait_until_receivable);
         let before_recv = Arc::new(before_recv);
-        let boundary: Arc<dyn ChannelIoSubset> = Arc::new(RecvEntryObservedBoundary {
-            inner: boundary,
-            before_recv: before_recv.clone(),
-        });
         let task_boundary = boundary.clone();
         let handler = Arc::new(handler);
         let runner = run_stream_loop_with_wait(
@@ -1717,7 +1713,7 @@ async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
     shutdown_for_task: CancellationToken,
     should_recv: Arc<G>,
     wait_until_receivable: Arc<W>,
-    _before_recv: Arc<H>,
+    before_recv: Arc<H>,
     handler: Arc<F>,
     terminal_reason: Arc<StdMutex<Option<String>>>,
 ) where
@@ -1744,6 +1740,7 @@ async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
             wait_until_receivable().await;
             continue;
         }
+        (before_recv)();
         #[cfg(test)]
         maybe_delay_stream_endpoint_before_first_recv(&route, &join_name);
         if debug_stream_recv
@@ -1777,7 +1774,8 @@ async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
                 events
             }
             Err(CnxError::Timeout) => {
-                stale_recv_gap_count = 0;
+                // Idle timeout is not fresh attachment evidence; keep any stale-grant
+                // streak so intermittent stale tokens still force endpoint respawn.
                 continue;
             }
             Err(err)
@@ -2080,6 +2078,11 @@ mod tests {
         close_keys: Mutex<Vec<String>>,
     }
 
+    struct IntermittentStaleGrantAttachmentBoundary {
+        recv_attempts: AtomicUsize,
+        close_keys: Mutex<Vec<String>>,
+    }
+
     struct StaleThenClosedBoundary {
         recv_attempts: AtomicUsize,
         close_keys: Mutex<Vec<String>>,
@@ -2204,6 +2207,15 @@ mod tests {
     }
 
     impl PersistentStaleGrantAttachmentBoundary {
+        fn new() -> Self {
+            Self {
+                recv_attempts: AtomicUsize::new(0),
+                close_keys: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl IntermittentStaleGrantAttachmentBoundary {
         fn new() -> Self {
             Self {
                 recv_attempts: AtomicUsize::new(0),
@@ -2470,6 +2482,35 @@ mod tests {
             Err(CnxError::AccessDenied(
                 "pid Pid(1) is drained/fenced and cannot obtain new grant attachments".into(),
             ))
+        }
+
+        fn channel_close(
+            &self,
+            _ctx: BoundaryContext,
+            channel: ChannelKey,
+        ) -> capanix_app_sdk::Result<()> {
+            self.close_keys
+                .lock()
+                .expect("close_keys lock")
+                .push(channel.0);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for IntermittentStaleGrantAttachmentBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            _request: ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            let attempt = self.recv_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt % 2 == 0 {
+                return Err(CnxError::AccessDenied(
+                    "invalid or revoked grant attachment token".into(),
+                ));
+            }
+            Err(CnxError::Timeout)
         }
 
         fn channel_close(
@@ -3780,6 +3821,56 @@ mod tests {
         assert!(
             boundary.recv_attempts.load(Ordering::SeqCst) > 1,
             "stream loop should still retry stale recv gaps before escalating"
+        );
+    }
+
+    #[test]
+    fn stream_loop_must_not_reset_stale_grant_attachment_retry_count_on_idle_timeout() {
+        let boundary = Arc::new(IntermittentStaleGrantAttachmentBoundary::new());
+        let terminal_reason = test_terminal_reason();
+        let result = crate::runtime_app::shared_tokio_runtime().block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(900),
+                run_stream_loop(
+                    boundary.clone(),
+                    RouteKey("source-logical-roots-control:v1.stream".into()),
+                    "test-stream".into(),
+                    "runtime.exec.source".to_string(),
+                    CancellationToken::new(),
+                    Arc::new(|| true),
+                    Arc::new(|| {}),
+                    Arc::new(|_events: Vec<Event>| std::future::ready(())),
+                    terminal_reason.clone(),
+                ),
+            )
+            .await
+        });
+
+        assert!(
+            result.is_ok(),
+            "intermittent stale grant-attachment recv gaps separated by idle timeouts must still terminate for endpoint respawn instead of looping forever"
+        );
+        let reason = terminal_reason
+            .lock()
+            .expect("terminal_reason lock")
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            reason.contains("stale grant-attachment"),
+            "terminal reason should preserve intermittent stale grant continuity evidence; reason={reason}"
+        );
+        assert!(
+            boundary.recv_attempts.load(Ordering::SeqCst) > STREAM_STALE_RECV_GAP_RETRY_LIMIT,
+            "stream loop should accumulate stale retries across idle timeout gaps"
+        );
+        assert!(
+            boundary
+                .close_keys
+                .lock()
+                .expect("close_keys lock")
+                .iter()
+                .any(|route| route == "source-logical-roots-control:v1.stream"),
+            "stale channel must be closed before retrying/respawning"
         );
     }
 
