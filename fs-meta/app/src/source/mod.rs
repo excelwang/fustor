@@ -2970,9 +2970,11 @@ impl FSMetaSource {
         detail.rescan_pending = true;
         detail.last_rescan_requested_at_us = Some(now_us());
         detail.last_rescan_reason = Some(reason.to_string());
-        detail.last_audit_started_at_us = None;
-        detail.last_audit_completed_at_us = None;
-        detail.last_audit_duration_ms = None;
+        if Self::audit_reason_invalidates_previous_completion(reason) {
+            detail.last_audit_started_at_us = None;
+            detail.last_audit_completed_at_us = None;
+            detail.last_audit_duration_ms = None;
+        }
     }
 
     fn mark_root_rescan_requested_if_not_pending(
@@ -2985,17 +2987,33 @@ impl FSMetaSource {
             .object_ref_detail
             .entry(root_key.to_string())
             .or_default();
-        let audit_inflight = detail.last_audit_started_at_us.is_some()
-            && detail.last_audit_completed_at_us.is_none();
+        let audit_inflight = Self::root_audit_inflight(detail);
         if detail.rescan_pending || audit_inflight {
             return;
         }
         detail.rescan_pending = true;
         detail.last_rescan_requested_at_us = Some(now_us());
         detail.last_rescan_reason = Some(reason.to_string());
-        detail.last_audit_started_at_us = None;
-        detail.last_audit_completed_at_us = None;
-        detail.last_audit_duration_ms = None;
+        if Self::audit_reason_invalidates_previous_completion(reason) {
+            detail.last_audit_started_at_us = None;
+            detail.last_audit_completed_at_us = None;
+            detail.last_audit_duration_ms = None;
+        }
+    }
+
+    fn audit_reason_invalidates_previous_completion(reason: &str) -> bool {
+        reason != "periodic"
+    }
+
+    fn root_audit_inflight(detail: &ConcreteRootHealthEntry) -> bool {
+        match (
+            detail.last_audit_started_at_us,
+            detail.last_audit_completed_at_us,
+        ) {
+            (Some(started_at_us), Some(completed_at_us)) => started_at_us > completed_at_us,
+            (Some(_), None) => true,
+            _ => false,
+        }
     }
 
     fn mark_root_overflow_observed(fanout_health: &Arc<Mutex<FanoutHealthState>>, root_key: &str) {
@@ -3023,8 +3041,10 @@ impl FSMetaSource {
         detail.rescan_pending = false;
         detail.last_rescan_reason = Some(reason.to_string());
         detail.last_audit_started_at_us = Some(started_at_us);
-        detail.last_audit_completed_at_us = None;
-        detail.last_audit_duration_ms = None;
+        if Self::audit_reason_invalidates_previous_completion(reason) {
+            detail.last_audit_completed_at_us = None;
+            detail.last_audit_duration_ms = None;
+        }
     }
 
     fn mark_root_audit_completed(

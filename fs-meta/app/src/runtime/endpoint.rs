@@ -422,15 +422,12 @@ fn maybe_pause_before_endpoint_ready_wait(name: &str) {
 #[derive(Default)]
 struct EndpointReceiveState {
     inflight_recv_count: AtomicUsize,
-    recv_poll_observation_count: AtomicU64,
     receivable_observation_count: AtomicU64,
 }
 
 impl EndpointReceiveState {
     fn enter_recv(self: &Arc<Self>) -> EndpointReceiveGuard {
         self.inflight_recv_count.fetch_add(1, Ordering::AcqRel);
-        self.recv_poll_observation_count
-            .fetch_add(1, Ordering::AcqRel);
         EndpointReceiveGuard {
             state: self.clone(),
         }
@@ -448,10 +445,6 @@ impl EndpointReceiveState {
 
     fn is_receive_polling(&self) -> bool {
         self.inflight_recv_count.load(Ordering::Acquire) > 0
-    }
-
-    fn has_receive_poll_observed(&self) -> bool {
-        self.recv_poll_observation_count.load(Ordering::Acquire) > 0
     }
 }
 
@@ -1179,10 +1172,6 @@ impl ManagedEndpointTask {
 
     pub(crate) fn is_receive_polling(&self) -> bool {
         self.receive_state.is_receive_polling()
-    }
-
-    pub(crate) fn has_receive_poll_observed(&self) -> bool {
-        self.receive_state.has_receive_poll_observed()
     }
 
     pub(crate) fn is_shutdown_requested(&self) -> bool {

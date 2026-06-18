@@ -45,6 +45,9 @@ const SOURCE_WORKER_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs
 const SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT: Duration = Duration::from_secs(4);
 const SOURCE_WORKER_SCHEDULE_REFRESH_RPC_TIMEOUT: Duration = Duration::from_secs(1);
 const SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCAL_SOURCE_EVENT_STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCAL_SOURCE_PUBLISH_BACKPRESSURE_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const LOCAL_SOURCE_PUBLISH_BACKPRESSURE_LOG_INTERVAL: u64 = 12;
 const SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL: Duration = Duration::from_secs(1);
 const SOURCE_WORKER_DEGRADED_STATE: &str = "degraded_worker_unreachable";
 const SOURCE_WORKER_DEGRADED_ROOT_KEY: &str = "source-worker";
@@ -72,8 +75,17 @@ impl SourceObservabilityStatusReadMode {
     }
 
     fn can_use_recent_live_cache_before_live_probe(self) -> bool {
-        matches!(self, Self::OwnershipFast | Self::CurrentOwnerHealth)
+        matches!(self, Self::OwnershipFast)
     }
+}
+
+#[test]
+fn current_owner_health_read_mode_requires_fresh_owner_probe_before_recent_live_cache() {
+    assert!(
+        !SourceObservabilityStatusReadMode::CurrentOwnerHealth
+            .can_use_recent_live_cache_before_live_probe(),
+        "current-owner health is used as owner-local proof for management status fan-in and must not short-circuit on recent live cache that may lack current source/scan runtime scope"
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3807,6 +3819,66 @@ fn merge_cached_observability_node_map<V: Clone>(
     merged
 }
 
+fn current_observability_root_ids(
+    snapshot: &SourceObservabilitySnapshot,
+) -> std::collections::BTreeSet<String> {
+    let mut roots = snapshot
+        .logical_roots
+        .iter()
+        .map(|root| root.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    roots.extend(
+        snapshot
+            .status
+            .logical_roots
+            .iter()
+            .map(|root| root.root_id.clone()),
+    );
+    roots.extend(
+        snapshot
+            .status
+            .concrete_roots
+            .iter()
+            .map(|root| root.logical_root_id.clone()),
+    );
+    roots.retain(|root| !root.is_empty());
+    roots
+}
+
+fn merge_cached_observability_group_map(
+    can_preserve: bool,
+    current: &std::collections::BTreeMap<String, Vec<String>>,
+    cached: Option<&std::collections::BTreeMap<String, Vec<String>>>,
+    current_root_ids: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut merged = if should_preserve_cached_observability_map(can_preserve, current, cached) {
+        cached.cloned().unwrap_or_default()
+    } else {
+        current.clone()
+    };
+    if !can_preserve || current_root_ids.is_empty() {
+        return merged;
+    }
+    let Some(cached) = cached else {
+        return merged;
+    };
+    for (node_id, cached_groups) in cached {
+        let entry = merged.entry(node_id.clone()).or_default();
+        for group in cached_groups
+            .iter()
+            .filter(|group| current_root_ids.contains(*group))
+        {
+            if !entry.iter().any(|existing| existing == group) {
+                entry.push(group.clone());
+            }
+        }
+        entry.sort();
+        entry.dedup();
+    }
+    merged.retain(|_, groups| !groups.is_empty());
+    merged
+}
+
 fn merge_cached_observability_option<T: Clone>(
     can_preserve: bool,
     current: &Option<T>,
@@ -3829,16 +3901,7 @@ fn apply_observability_snapshot_to_cache(
     let can_preserve_omitted_observability =
         source_observability_snapshot_can_preserve_cached_observability(snapshot);
     let explicit_zero_published_nodes = explicit_zero_published_counter_nodes(snapshot);
-    let preserve_last_scheduled_source_groups = should_preserve_cached_observability_map(
-        can_preserve_omitted_observability,
-        &snapshot.scheduled_source_groups_by_node,
-        cache.scheduled_source_groups_by_node.as_ref(),
-    );
-    let preserve_last_scheduled_scan_groups = should_preserve_cached_observability_map(
-        can_preserve_omitted_observability,
-        &snapshot.scheduled_scan_groups_by_node,
-        cache.scheduled_scan_groups_by_node.as_ref(),
-    );
+    let current_root_ids = current_observability_root_ids(snapshot);
     let preserve_last_control_summary = should_preserve_cached_observability_map(
         can_preserve_omitted_observability,
         &snapshot.last_control_frame_signals_by_node,
@@ -3876,13 +3939,18 @@ fn apply_observability_snapshot_to_cache(
     cache.source_primary_by_group = Some(snapshot.source_primary_by_group.clone());
     cache.last_force_find_runner_by_group = Some(snapshot.last_force_find_runner_by_group.clone());
     cache.force_find_inflight_groups = Some(snapshot.force_find_inflight_groups.clone());
-    if !preserve_last_scheduled_source_groups {
-        cache.scheduled_source_groups_by_node =
-            Some(snapshot.scheduled_source_groups_by_node.clone());
-    }
-    if !preserve_last_scheduled_scan_groups {
-        cache.scheduled_scan_groups_by_node = Some(snapshot.scheduled_scan_groups_by_node.clone());
-    }
+    cache.scheduled_source_groups_by_node = Some(merge_cached_observability_group_map(
+        can_preserve_omitted_observability,
+        &snapshot.scheduled_source_groups_by_node,
+        cache.scheduled_source_groups_by_node.as_ref(),
+        &current_root_ids,
+    ));
+    cache.scheduled_scan_groups_by_node = Some(merge_cached_observability_group_map(
+        can_preserve_omitted_observability,
+        &snapshot.scheduled_scan_groups_by_node,
+        cache.scheduled_scan_groups_by_node.as_ref(),
+        &current_root_ids,
+    ));
     if !preserve_last_control_summary {
         cache.last_control_frame_signals_by_node =
             Some(snapshot.last_control_frame_signals_by_node.clone());
@@ -7489,6 +7557,10 @@ impl SourceWorkerClientHandle {
         }
     }
 
+    fn cached_logical_roots_generation(&self) -> u64 {
+        self.with_cache_mut(|cache| cache.logical_roots_generation)
+    }
+
     fn cached_host_object_grants_snapshot_with_failure(
         &self,
     ) -> std::result::Result<Vec<GrantedMountRoot>, SourceFailure> {
@@ -8437,6 +8509,7 @@ impl SourceWorkerClientHandle {
         Ok(epoch)
     }
 
+    #[allow(dead_code)]
     async fn submit_rescan_when_ready_epoch_with_failure(
         &self,
     ) -> std::result::Result<u64, SourceFailure> {
@@ -11513,6 +11586,13 @@ impl SourceFacade {
         }
     }
 
+    pub(crate) fn cached_logical_roots_generation(&self) -> u64 {
+        match self {
+            Self::Local(source) => source.current_logical_roots_generation(),
+            Self::Worker(client) => client.cached_logical_roots_generation(),
+        }
+    }
+
     pub(crate) fn cached_host_object_grants_snapshot_with_failure(
         &self,
     ) -> std::result::Result<Vec<GrantedMountRoot>, SourceFailure> {
@@ -11795,6 +11875,7 @@ impl SourceFacade {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn submit_rescan_when_ready_epoch_with_failure(
         &self,
     ) -> std::result::Result<u64, SourceFailure> {
@@ -12068,18 +12149,9 @@ async fn run_local_source_pump(
                 .map(|event| event.metadata().origin_id.0.clone())
                 .unwrap_or_else(|| "__empty__".to_string());
             let accepted_batch = batch.clone();
-            if let Err(err) = boundary
-                .channel_send(
-                    BoundaryContext::for_unit(execution_units::SOURCE_RUNTIME_UNIT_ID),
-                    ChannelSendRequest {
-                        channel_key: ChannelKey(
-                            events_stream_route_for_scope(&event_route_scope).0,
-                        ),
-                        events: batch,
-                        timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
-                    },
-                )
-                .await
+            if let Err(err) =
+                publish_local_source_boundary_batch(&boundary, &batch, &origin, &event_route_scope)
+                    .await
             {
                 log::error!(
                     "fs-meta app pump failed to publish source batch on stream route origin={}: {:?}",
@@ -12102,6 +12174,46 @@ async fn run_local_source_pump(
             } else {
                 source.record_batch_downstream_accepted(&batch);
             }
+        }
+    }
+}
+
+async fn publish_local_source_boundary_batch(
+    boundary: &Arc<dyn ChannelIoSubset>,
+    batch: &[Event],
+    origin: &str,
+    event_route_scope: &str,
+) -> Result<()> {
+    let mut publish_attempt = 0u64;
+    loop {
+        publish_attempt = publish_attempt.saturating_add(1);
+        let send_result = boundary
+            .channel_send(
+                BoundaryContext::for_unit(execution_units::SOURCE_RUNTIME_UNIT_ID),
+                ChannelSendRequest {
+                    channel_key: ChannelKey(events_stream_route_for_scope(event_route_scope).0),
+                    events: batch.to_vec(),
+                    timeout_ms: Some(LOCAL_SOURCE_EVENT_STREAM_SEND_TIMEOUT.as_millis() as u64),
+                },
+            )
+            .await;
+        match send_result {
+            Ok(()) => return Ok(()),
+            Err(CnxError::Backpressure) => {
+                if publish_attempt == 1
+                    || publish_attempt % LOCAL_SOURCE_PUBLISH_BACKPRESSURE_LOG_INTERVAL == 0
+                {
+                    log::warn!(
+                        "fs-meta app pump preserving source batch under route backpressure origin={} batch_len={} attempt={} log_interval={}",
+                        origin,
+                        batch.len(),
+                        publish_attempt,
+                        LOCAL_SOURCE_PUBLISH_BACKPRESSURE_LOG_INTERVAL
+                    );
+                }
+                tokio::time::sleep(LOCAL_SOURCE_PUBLISH_BACKPRESSURE_RETRY_BACKOFF).await;
+            }
+            Err(err) => return Err(err),
         }
     }
 }

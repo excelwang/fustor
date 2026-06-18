@@ -50,6 +50,8 @@ Then narrow to the specific sections named by the blocker-state document or raw 
 
 Use this order unless the blocker-state document proves a narrower sequence:
 
+For official high-cardinality NFS convergence, treat `pending-materialization` as a normal patient-observation state unless fresh raw evidence shows a separate topology, route, accepted-scope, or runtime failure. Do not call `/index/rescan` merely because materialization, audit completion, trusted observation, or final index counts are not ready yet.
+
 1. Reproduce the narrowest preserved failing case first.
 2. If a repo-local `fustor` bug is identified, add or update the owning red test first and prove it fails.
 3. Fix the repo-local defect.

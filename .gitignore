@@ -15,4 +15,15 @@ fs-meta/docs/examples/*monitoring-roots*.local.json
 fs-meta.query-keys.json
 .tmp/
 .tmp-target-status-owner/
-.codex/
+.codex/*
+!.codex/skills/
+.codex/skills/*
+!.codex/skills/fs-meta-cross-repo-gate/
+.codex/skills/fs-meta-cross-repo-gate/*
+!.codex/skills/fs-meta-cross-repo-gate/SKILL.md
+!.codex/skills/fs-meta-cross-repo-gate/agents/
+!.codex/skills/fs-meta-cross-repo-gate/agents/openai.yaml
+!.codex/skills/fs-meta-cross-repo-gate/references/
+!.codex/skills/fs-meta-cross-repo-gate/references/*.md
+!.codex/skills/fs-meta-cross-repo-gate/scripts/
+!.codex/skills/fs-meta-cross-repo-gate/scripts/collect_official_node_logs.sh

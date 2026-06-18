@@ -2086,7 +2086,7 @@ impl SinkRecoveryMachine {
             SinkRecoveryScopeTriggerState::RetryPending
         ) {
             let request_epoch = source
-                .submit_rescan_when_ready_epoch_with_failure()
+                .open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure()
                 .await
                 .map_err(RuntimeWorkerObservationFailure::from)?;
             let state = self.post_recovery_state_mut();
@@ -2105,7 +2105,7 @@ impl SinkRecoveryMachine {
             SinkRecoveryScopeTriggerState::InitialNotTriggered
         ) {
             let request_epoch = source
-                .submit_rescan_when_ready_epoch_with_failure()
+                .open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure()
                 .await
                 .map_err(RuntimeWorkerObservationFailure::from)?;
             let state = self.post_recovery_state_mut();
@@ -2526,7 +2526,7 @@ impl SinkRecoveryMachine {
         source: &Arc<SourceFacade>,
     ) -> std::result::Result<(), RuntimeWorkerObservationFailure> {
         let request_epoch = source
-            .submit_rescan_when_ready_epoch_with_failure()
+            .open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure()
             .await
             .map_err(RuntimeWorkerObservationFailure::from)?;
         self.local_state_mut().source_rescan_request_epoch = Some(request_epoch);
@@ -6341,6 +6341,39 @@ impl ManagementWriteRecoveryContext {
         }
     }
 
+    async fn repair_source_runtime_scope_control_cache_if_needed(
+        &self,
+    ) -> std::result::Result<bool, CnxError> {
+        if !matches!(&*self.source, SourceFacade::Worker(_)) {
+            return Ok(false);
+        }
+        let snapshot = match tokio::time::timeout(
+            MANUAL_RESCAN_SOURCE_STATUS_DEFAULT_PROBE_BUDGET.min(Duration::from_secs(5)),
+            self.source.observability_snapshot_with_failure(),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(err)) => return Err(err.into_error()),
+            Err(_) => return Err(CnxError::Timeout),
+        };
+        if !FSMetaApp::source_observation_is_runtime_scope_control_cache_lag(&snapshot) {
+            return Ok(false);
+        }
+        let roots = self
+            .source
+            .cached_logical_roots_snapshot_with_failure()
+            .map_err(SourceFailure::into_error)?;
+        if roots.is_empty() {
+            return Ok(false);
+        }
+        self.source
+            .update_logical_roots_defer_scan_audit_with_failure(roots)
+            .await
+            .map_err(SourceFailure::into_error)?;
+        Ok(true)
+    }
+
     async fn publish_source_repair_gate_after_source_state_current(&self) {
         let source_repair_ready = self.source_repair_ready_from_runtime_or_observation().await;
         self.api_control_gate.set_ready_state_with_source_repair(
@@ -6436,6 +6469,15 @@ impl ManagementWriteRecoveryContext {
                 return Ok(());
             }
             if !self.api_control_gate.is_source_repair_ready() {
+                if self
+                    .repair_source_runtime_scope_control_cache_if_needed()
+                    .await?
+                {
+                    self.publish_recovered_facade_state().await;
+                    self.publish_source_repair_gate_after_source_state_current()
+                        .await;
+                    return Ok(());
+                }
                 self.publish_recovered_facade_state().await;
                 self.publish_source_repair_gate_after_source_state_current()
                     .await;
@@ -7996,11 +8038,31 @@ fn runtime_resource_id_targets_node(resource_id: &str, node_id: &NodeId) -> bool
             .is_some_and(|(host_ref, _)| runtime_node_identity_matches(host_ref.trim(), &node_id.0))
 }
 
+fn source_rescan_route_scoped_target_node(route_key: &str) -> Option<&str> {
+    let request_route = route_key.strip_suffix(".req")?;
+    if let Some((route_stem, route_version)) = ROUTE_KEY_SOURCE_RESCAN_INTERNAL.rsplit_once(':') {
+        let route_suffix = request_route.strip_suffix(&format!(":{route_version}"))?;
+        route_suffix
+            .strip_prefix(&format!("{route_stem}."))
+            .filter(|target| !target.trim().is_empty())
+    } else {
+        request_route
+            .strip_prefix(&format!("{ROUTE_KEY_SOURCE_RESCAN_INTERNAL}."))
+            .filter(|target| !target.trim().is_empty())
+    }
+}
+
 fn source_rescan_route_targets_node(
     facade_gate: &RuntimeUnitGate,
     route_key: &str,
     node_id: &NodeId,
 ) -> bool {
+    if route_key == source_rescan_request_route_for(&node_id.0).0 {
+        return true;
+    }
+    if let Some(target_node) = source_rescan_route_scoped_target_node(route_key) {
+        return runtime_node_identity_matches(target_node, &node_id.0);
+    }
     let Some((_generation, bound_scopes)) = facade_gate
         .active_route_state(execution_units::SOURCE_RUNTIME_UNIT_ID, route_key)
         .ok()
@@ -8099,6 +8161,8 @@ async fn worker_source_rescan_proxy_task_ready_for_current_generation(
         return false;
     }
     let current_generation = source_rescan_route_semantic_generation(facade_gate, route_key);
+    let ready_generation_matches =
+        current_generation != 0 && ready_generation.load(Ordering::Acquire) == current_generation;
     let tasks = runtime_endpoint_tasks.lock().await;
     let task_ready = tasks.iter().any(|task| {
         let route_usable = if route_active {
@@ -8114,7 +8178,7 @@ async fn worker_source_rescan_proxy_task_ready_for_current_generation(
             && task.finish_reason().is_none()
             && !task.is_shutdown_requested()
             && route_usable
-            && task.has_receive_poll_observed()
+            && (task.is_receive_armed() || ready_generation_matches)
     });
     drop(tasks);
     if task_ready {
@@ -8361,19 +8425,19 @@ async fn ensure_worker_source_rescan_proxy_ready_until(
     deadline: tokio::time::Instant,
     allow_unmanaged_local_route: bool,
 ) -> bool {
-    ensure_worker_source_rescan_proxy_endpoint_started(
-        boundary,
-        source,
-        node_id,
-        facade_gate,
-        route_key,
-        ready_generation.clone(),
-        runtime_endpoint_tasks,
-        source_repair_recovery,
-        allow_unmanaged_local_route,
-    )
-    .await;
     loop {
+        ensure_worker_source_rescan_proxy_endpoint_started(
+            boundary.clone(),
+            source.clone(),
+            node_id.clone(),
+            facade_gate,
+            route_key,
+            ready_generation.clone(),
+            runtime_endpoint_tasks,
+            source_repair_recovery.clone(),
+            allow_unmanaged_local_route,
+        )
+        .await;
         if worker_source_rescan_proxy_task_ready_for_current_generation(
             facade_gate,
             route_key,
@@ -11180,6 +11244,22 @@ impl FSMetaApp {
                 && has_only_runtime_scope_route_lag
     }
 
+    fn source_observation_is_runtime_scope_control_cache_lag(
+        snapshot: &crate::workers::source::SourceObservabilitySnapshot,
+    ) -> bool {
+        let has_runtime_scope_routes = !snapshot.scheduled_source_groups_by_node.is_empty()
+            || !snapshot.scheduled_scan_groups_by_node.is_empty();
+        has_runtime_scope_routes
+            && snapshot
+                .status
+                .degraded_roots
+                .iter()
+                .any(|(root_key, reason)| {
+                    root_key == "source-worker"
+                        && reason == SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON
+                })
+    }
+
     async fn source_repair_ready_from_runtime_or_observation(&self) -> bool {
         if self.runtime_control_state().source_repair_ready() {
             return true;
@@ -12092,7 +12172,8 @@ impl FSMetaApp {
                     .await;
                 let pretrigger_request_epoch = Some(
                     self.source
-                        .submit_rescan_when_ready_epoch_with_failure()
+                        .open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure(
+                        )
                         .await
                         .map_err(RuntimeWorkerObservationFailure::from)
                         .map_err(RuntimeWorkerObservationFailure::into_error)?,
@@ -14272,7 +14353,7 @@ impl FSMetaApp {
                     &self.facade_gate,
                     task.route_key(),
                     &self.source_rescan_proxy_ready_generation,
-                    task.has_receive_poll_observed(),
+                    task.is_receive_armed(),
                 );
             }
         }
@@ -14415,7 +14496,7 @@ impl FSMetaApp {
                         &self.facade_gate,
                         task.route_key(),
                         &self.source_rescan_proxy_ready_generation,
-                        task.has_receive_poll_observed(),
+                        task.is_receive_armed(),
                     );
                 }
                 spawned_routes.insert(task.route_key().to_string());
@@ -22898,7 +22979,7 @@ impl FSMetaApp {
                             // can be required before any facade publication exists.
                             pretriggered_source_to_sink_convergence_epoch = Some(
                                 self.source
-                                    .submit_rescan_when_ready_epoch_with_failure()
+                                    .open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure()
                                     .await
                                     .map_err(RuntimeWorkerObservationFailure::from)?,
                             );

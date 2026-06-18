@@ -1891,6 +1891,13 @@ fn source_repair_retry_classifier_treats_target_proof_as_transient_readiness() {
 }
 
 #[test]
+fn source_repair_retry_classifier_treats_duplicate_roots_control_observation_as_transient_readiness(
+) {
+    let err = "http 503 failed: {\"error\":\"manual rescan current roots runtime-scope readiness failed: manual rescan current roots source-status returned only cache/degraded/non-ready evidence or route-gap evidence before scoped delivery target proof\"}";
+    assert!(is_retryable_source_repair_not_ready(err));
+}
+
+#[test]
 fn l4_demo_evidence_accepts_bounded_materialization_unready() {
     let err = "http 503 failed: {\"error\":\"trusted-materialized reads remain unavailable until package-local materialized observation evidence is trusted: initial audit incomplete for groups [nfs2]\"}";
     assert!(is_trusted_materialized_status_unavailable(err));

@@ -5745,6 +5745,118 @@ fn rescan_request_invalidates_previous_audit_completion_evidence() {
 }
 
 #[test]
+fn periodic_rescan_preserves_previous_audit_completion_evidence() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::exp1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+        .expect("init source");
+    let primary_root = lock_or_recover(
+        &source.state_cell.roots,
+        "test.periodic_rescan_preserves_previous_audit.roots",
+    )
+    .iter()
+    .find(|root| root.is_group_primary)
+    .cloned()
+    .expect("primary root exists");
+    let root_key = FSMetaSource::root_runtime_key(&primary_root);
+
+    FSMetaSource::mark_root_audit_completed(&source.state_cell.fanout_health, &root_key, 10, 20);
+    FSMetaSource::mark_root_rescan_requested(
+        &source.state_cell.fanout_health,
+        &root_key,
+        "periodic",
+    );
+    {
+        let health = lock_or_recover(
+            &source.state_cell.fanout_health,
+            "test.periodic_rescan_preserves_previous_audit.pending",
+        );
+        let detail = health
+            .object_ref_detail
+            .get(&root_key)
+            .expect("root detail exists");
+        assert!(detail.rescan_pending);
+        assert!(detail.last_rescan_requested_at_us.is_some());
+        assert_eq!(detail.last_rescan_reason.as_deref(), Some("periodic"));
+        assert_eq!(detail.last_audit_started_at_us, Some(10));
+        assert_eq!(detail.last_audit_completed_at_us, Some(20));
+        assert!(detail.last_audit_duration_ms.is_some());
+    }
+
+    FSMetaSource::mark_root_audit_start(
+        &source.state_cell.fanout_health,
+        &root_key,
+        "periodic",
+        30,
+    );
+    {
+        let health = lock_or_recover(
+            &source.state_cell.fanout_health,
+            "test.periodic_rescan_preserves_previous_audit.started",
+        );
+        let detail = health
+            .object_ref_detail
+            .get(&root_key)
+            .expect("root detail exists");
+        assert!(!detail.rescan_pending);
+        assert_eq!(detail.last_rescan_reason.as_deref(), Some("periodic"));
+        assert_eq!(detail.last_audit_started_at_us, Some(30));
+        assert_eq!(detail.last_audit_completed_at_us, Some(20));
+        assert!(detail.last_audit_duration_ms.is_some());
+    }
+
+    FSMetaSource::mark_root_rescan_requested_if_not_pending(
+        &source.state_cell.fanout_health,
+        &root_key,
+        "manual",
+    );
+    {
+        let health = lock_or_recover(
+            &source.state_cell.fanout_health,
+            "test.periodic_rescan_preserves_previous_audit.inflight_guard",
+        );
+        let detail = health
+            .object_ref_detail
+            .get(&root_key)
+            .expect("root detail exists");
+        assert!(
+            !detail.rescan_pending,
+            "duplicate request must not overwrite an in-flight periodic audit"
+        );
+        assert_eq!(detail.last_rescan_reason.as_deref(), Some("periodic"));
+        assert_eq!(detail.last_audit_started_at_us, Some(30));
+        assert_eq!(detail.last_audit_completed_at_us, Some(20));
+    }
+
+    FSMetaSource::mark_root_audit_completed(&source.state_cell.fanout_health, &root_key, 30, 50);
+    FSMetaSource::mark_root_rescan_requested_if_not_pending(
+        &source.state_cell.fanout_health,
+        &root_key,
+        "manual",
+    );
+    let health = lock_or_recover(
+        &source.state_cell.fanout_health,
+        "test.periodic_rescan_preserves_previous_audit.manual_after_complete",
+    );
+    let detail = health
+        .object_ref_detail
+        .get(&root_key)
+        .expect("root detail exists");
+    assert!(detail.rescan_pending);
+    assert_eq!(detail.last_rescan_reason.as_deref(), Some("manual"));
+    assert_eq!(detail.last_audit_started_at_us, None);
+    assert_eq!(detail.last_audit_completed_at_us, None);
+    assert_eq!(detail.last_audit_duration_ms, None);
+}
+
+#[test]
 fn duplicate_pending_manual_rescan_intent_preserves_inflight_audit_evidence() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![root("nfs1", "/mnt/nfs1")];

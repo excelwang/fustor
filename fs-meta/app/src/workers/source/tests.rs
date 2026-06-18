@@ -18261,6 +18261,103 @@ fn merge_live_observability_snapshot_with_recent_cache_preserves_recent_control_
     );
 }
 
+#[test]
+fn merge_live_observability_snapshot_with_recent_cache_preserves_missing_current_owner_scope_from_partial_live_maps()
+ {
+    let logical_roots = ["nfs-144", "nfs-145", "nfs-146"]
+        .into_iter()
+        .map(|root_id| RootSpec::new(root_id, format!("/mnt/{root_id}")))
+        .collect::<Vec<_>>();
+    let status_logical_roots = ["nfs-144", "nfs-145", "nfs-146"]
+        .into_iter()
+        .map(|root_id| SourceLogicalRootHealthSnapshot {
+            root_id: root_id.to_string(),
+            status: "healthy".to_string(),
+            matched_grants: 1,
+            active_members: 1,
+            coverage_mode: "realtime_hotset_plus_audit".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let live = SourceObservabilitySnapshot {
+        lifecycle_state: "ready".to_string(),
+        host_object_grants_version: 7,
+        grants: Vec::new(),
+        logical_roots,
+        status: SourceStatusSnapshot {
+            current_stream_generation: Some(41),
+            logical_roots: status_logical_roots,
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: std::collections::BTreeMap::new(),
+        last_force_find_runner_by_group: std::collections::BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: std::collections::BTreeMap::from([
+            ("panda145".to_string(), vec!["nfs-145".to_string()]),
+            ("panda146".to_string(), vec!["nfs-146".to_string()]),
+        ]),
+        scheduled_scan_groups_by_node: std::collections::BTreeMap::from([
+            ("panda145".to_string(), vec!["nfs-145".to_string()]),
+            ("panda146".to_string(), vec!["nfs-146".to_string()]),
+        ]),
+        last_control_frame_signals_by_node: std::collections::BTreeMap::new(),
+        published_batches_by_node: std::collections::BTreeMap::new(),
+        published_events_by_node: std::collections::BTreeMap::new(),
+        published_control_events_by_node: std::collections::BTreeMap::new(),
+        published_data_events_by_node: std::collections::BTreeMap::new(),
+        last_published_at_us_by_node: std::collections::BTreeMap::new(),
+        last_published_origins_by_node: std::collections::BTreeMap::new(),
+        published_origin_counts_by_node: std::collections::BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        pending_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        yielded_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        summarized_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        published_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+    };
+    let cache = SourceWorkerSnapshotCache {
+        lifecycle_state: Some("ready".to_string()),
+        status: Some(live.status.clone()),
+        scheduled_source_groups_by_node: Some(std::collections::BTreeMap::from([
+            (
+                "panda144".to_string(),
+                vec!["nfs-144".to_string(), "nfs-retired".to_string()],
+            ),
+            ("panda145".to_string(), vec!["nfs-145".to_string()]),
+            ("panda146".to_string(), vec!["nfs-146".to_string()]),
+        ])),
+        scheduled_scan_groups_by_node: Some(std::collections::BTreeMap::from([
+            (
+                "panda144".to_string(),
+                vec!["nfs-144".to_string(), "nfs-retired".to_string()],
+            ),
+            ("panda145".to_string(), vec!["nfs-145".to_string()]),
+            ("panda146".to_string(), vec!["nfs-146".to_string()]),
+        ])),
+        ..SourceWorkerSnapshotCache::default()
+    };
+
+    let merged = merge_live_observability_snapshot_with_recent_cache(&cache, &live);
+
+    assert_eq!(
+        merged.scheduled_source_groups_by_node.get("panda144"),
+        Some(&vec!["nfs-144".to_string()]),
+        "a partial live source-status map must not erase a still-current cached owner scope: {merged:?}"
+    );
+    assert_eq!(
+        merged.scheduled_scan_groups_by_node.get("panda144"),
+        Some(&vec!["nfs-144".to_string()]),
+        "a partial live source-status map must not erase a still-current cached scan owner scope: {merged:?}"
+    );
+    assert!(
+        !merged
+            .scheduled_source_groups_by_node
+            .values()
+            .flatten()
+            .any(|group| group == "nfs-retired"),
+        "cached owner-scope preservation must stay bounded to roots still present in the live status"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recent_live_cache_preserves_published_observability_when_later_live_snapshot_only_has_recovered_schedule_and_control_state()
  {

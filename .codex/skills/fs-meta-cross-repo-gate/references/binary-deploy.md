@@ -25,23 +25,52 @@ Hard gates:
 - Every redeploy needs a clean-log checkpoint: stop affected processes, clear live runtime logs including external worker stdout/stderr, then start daemons or re-apply app declarations. Post-deploy diagnosis must use only logs produced by the current deploy attempt.
 - If you cannot prove logs were cleared after the last stop and before the current start/apply, stop again, clear logs, restart/re-apply, and discard the previous evidence window.
 - Use `bash -s` or `bash -lc` for remote commands because node login shells may differ.
-- Do not rely on running `stop-all.sh` or `start-all.sh` once from `panda145` for cross-node state. Run the local stop/start path through SSH on every node, then verify no stale `capanixd` or `capanix_worker_host` remains for the run root.
+- Do not rely on running `stop-all.sh`, `start-all.sh`, or all node scripts once from `panda145` for cross-node state. Run each node-owned stop/start script on that node's own host through SSH, then verify no stale `capanixd` or `capanix_worker_host` remains for the run root.
+- Correct official startup method is the node-owned script path under the stable run root:
+
+```bash
+ssh wanghuajin@10.0.82.144 'cd /home/wanghuajin/fsmeta-stable/run && nodes/panda144/stop.sh || true; cd /home/wanghuajin/fsmeta-stable/run && nodes/panda144/start.sh'
+ssh wanghuajin@10.0.82.145 'cd /home/wanghuajin/fsmeta-stable/run && nodes/panda145/stop.sh || true; cd /home/wanghuajin/fsmeta-stable/run && nodes/panda145/start.sh'
+ssh wanghuajin@10.0.82.146 'cd /home/wanghuajin/fsmeta-stable/run && nodes/panda146/stop.sh || true; cd /home/wanghuajin/fsmeta-stable/run && nodes/panda146/start.sh'
+```
+
+- Do not run `nodes/panda144/start.sh` or `nodes/panda146/start.sh` from `panda145`: each script binds its own `10.0.82.x:19401`, so the wrong host fails with `failed to bind transport`. Do not replace this with a hand-written `nohup bin/capanixd -c nodes/<host_ref>/config.yaml -b <ip>:19401`. The `start.sh` scripts source `admin.env` and `nodes/<host_ref>/node.env`, then set `CAPANIX_HOME`, `CAPANIX_NODE_SK_B64`, `CAPANIX_CONFIG`, `CAPANIX_BIND_ADDR`, `CAPANIX_LOG`, and `CAPANIX_PID`. After startup, verify each `nodes/<host_ref>/daemon.pid` on its own host points to a live process from `/home/wanghuajin/fsmeta-stable/run/bin/capanixd` with that node's config and bind address.
+- The fs-meta management account file under the stable run root must use the enabled three-field format:
+
+```text
+admin:plain$<password>:0
+```
+
+Store it at `/home/wanghuajin/fsmeta-stable/run/.fsmeta-state/fs-meta.shadow` with the real password in place of `<password>`. The `plain$` prefix is part of the password encoding, and the trailing `:0` keeps the account enabled. Do not write only `admin:<password>`, omit `plain$`, or omit the third field.
+
+- Use that account through file-based authentication. For `fsmeta` CLI commands, pass only the facade origin as `--api-base` and pass the password file:
+
+```bash
+bin/fsmeta roots apply \
+  --config config.yaml \
+  --socket nodes/panda145/home/core.sock \
+  --domain-id fsmeta-stable \
+  --api-base http://10.0.82.145:18080 \
+  --password-file /home/wanghuajin/fsmeta-stable/run/.fsmeta-state/fs-meta.shadow \
+  roots.yaml
+```
+
+Do not append `/api/fs-meta/v1` to the CLI `--api-base`; the CLI appends product paths itself. Manual HTTP clients use the full API path, for example `http://10.0.82.145:18080/api/fs-meta/v1/session/login`. Never echo the password, bearer token, or shadow-file contents into logs, TODO, or user-facing output; record only redacted login/status evidence.
 - If the branch says not to modify `fs-meta app`, do not build or deploy `libfs_meta_runtime.so`; only restore existing fs-meta declarations after daemon health is proven.
 
 ## Long Wait Discipline
 
-- Treat a long wait as an observation boundary, not as a process to monitor.
-- Separate the shell wait from the execution tool's yield behavior. The local shell command must contain the full wait before the remote sample; a yielded tool session is only a handle for the already-running foreground command.
-- Use this lifecycle:
-  - Plan the reason, duration, absolute deadline, and one post-wait evidence sample.
-  - Launch one foreground local command whose script performs the whole local wait and then the bounded sample.
-  - Stay quiet until the deadline: no process checks, SSH probes, log tails, status samples, or execution-tool session reads.
-  - Collect once at or after the deadline and classify that planned evidence.
-- Before launching a wait that may outlive the current turn, write down the active wait record: reason, duration, absolute deadline with timezone, local command shape, planned post-wait sample, and any yielded session id. Status answers during the wait must come from that record, not from probes.
-- The assistant/tool layer must not emulate waiting by periodically reading session output. Set the tool yield window as high as practical, accept a session id when the tool yields, and read it only once after the planned deadline.
-- Put cluster-convergence waits on the local side, before the remote command: `sleep 900; ssh wanghuajin@10.0.82.145 'bash -s' ...`.
-- Do not put long `sleep` calls inside SSH scripts or heredocs. Remote scripts should collect bounded evidence and return. Short remote sleeps used as process-signal grace periods, such as a local `sleep 2` between `pkill -TERM` and `pkill -KILL`, are not convergence waits.
-- Use this shape for convergence waits; run it as one local foreground tool command with a timeout covering the sleep plus the sample:
+- Implement long waits with the execution session and `write_stdin`, not with clock probes, log tails, process checks, or status-only replies.
+- Treat `exec_command` plus empty `write_stdin` as the only allowed long-wait implementation. Plans, `TODO.md`, and user-facing status must name that path directly and only; do not propose, compare against, name, or document other wait mechanisms.
+- Do not introduce any out-of-band wait facility, scheduler, CLI wrapper, helper process, or replacement tool for build, deploy, or convergence waits; if the normal CLI path is unavailable, keep using the active foreground command and empty `write_stdin`.
+- Launch build/test/deploy/convergence work as one foreground command that writes its own log and prints one terminal sentinel line when it exits, for example `AIBOX_GATE_PASS ...` or `AIBOX_GATE_FAIL ...`. Set the initial execution-tool wait window as high as practical.
+- If the command yields a session id before the terminal sentinel appears, record the wait contract: reason, command shape, session id, log path, expected terminal sentinel, and a count-based `write_stdin` wait budget. Do not use wall-clock probes to decide when to collect.
+- Continue the running command only with empty `write_stdin` calls on that session. For long waits, `yield_time_ms=300000` (300s) is mandatory on every empty `write_stdin` call. If `300000` is rejected by the tool, stop and classify it as a tooling wait-boundary; do not silently lower the value, use 30s chunks, or send characters unless the program explicitly requires input.
+- Treat each 300s empty `write_stdin` call as the wait operation itself. A shorter empty wait is a protocol violation unless the previous call already returned the terminal sentinel or a clear first raw failure. When it returns without a terminal sentinel and the command is still running, the next allowed action is another 300s empty `write_stdin` within the recorded budget.
+- Do not insert `date`, `ps`, `pgrep`, SSH checks, log tails, file probes, or status summaries between wait calls.
+- Do not interpret intermediate output as progress unless it contains the planned terminal sentinel or a clear first raw failure. If intermediate output is noisy but non-terminal, keep waiting with the next max-duration `write_stdin` within the recorded budget.
+- For cluster convergence, put the wait inside the launched local command before the single remote sample, then use `write_stdin` to wait for the command result. The `sleep` must appear before `ssh`; do not put long `sleep` inside an SSH heredoc or remote script.
+- Use this shape for convergence waits:
 
 ```bash
 set -euo pipefail
@@ -52,15 +81,11 @@ set -euo pipefail
 REMOTE
 ```
 
-- Do not use these shapes for convergence waits: `ssh host 'sleep 900; ...'`, a remote heredoc that starts with a long `sleep`, `while sleep 30; do ssh ...; done`, repeated log tails, or repeated execution-tool session reads before the planned deadline.
-- Do not background the wait just to inspect it later.
-- If the execution tool returns a session id before the planned deadline, treat that as a yielded foreground command, not as a reason to probe. Read the session once at or after the deadline to collect the planned result.
-- Do not poll the local `sleep` or long-running command just to prove it is still running. Avoid repeated `ps`, `pgrep`, SSH samples, tool-output/session-output checks, build-log tails, or "still running" heartbeats. A check whose only question is "is the sleep/build/deploy still running?" is invalid polling.
-- Before the deadline, there are no valid wait-supervision tool calls. Do not run `date` loops, empty session reads, local process checks, remote status calls, or log tails just to rebuild confidence. If the deadline is unclear, wait conservatively until after it.
-- If the first post-deadline session read still has no planned sample, classify that as a new tooling/runtime boundary and choose a fresh explicit wait window or cancel the command. Do not switch to short-interval peeking.
-- If asked for status during the wait, report the already-known wait window and deadline without running a probe. Probe only after the wait completes or after the user explicitly changes the task.
-- For builds/tests/deploys, start one command that writes logs, wait for its result with a long timeout, and report only meaningful output: success, failure, artifact hashes, GLIBC evidence, or the first raw failing boundary.
-- For cluster convergence, take one bounded sample after the local wait completes. If more waiting is needed, start a new explicit local wait window with a reason derived from the previous sample.
+- Do not use these shapes for waits: `ssh host 'sleep 900; ...'`, a remote heredoc that starts with a long `sleep`, `while sleep 30; do ssh ...; done`, repeated `date`, repeated `ps`/`pgrep`, repeated log tails, repeated SSH status samples, or status-only replies.
+- If a wait spans turns or context resumes, continue with the next planned 300s empty `write_stdin` on the recorded session. Do not use `date`, logs, process lists, SSH, or file probes to reconstruct state.
+- If `write_stdin` returns the terminal sentinel, classify the result once and inspect only the evidence paths named by the sentinel or wait contract. If it returns a clear first raw failure, classify that boundary and stop the wait.
+- If the recorded `write_stdin` budget is exhausted without a terminal sentinel or clear failure, classify this as a tooling/runtime wait-boundary and choose the next bounded action from that evidence. Do not switch to short-interval polling.
+- If asked for status during the wait, either continue the planned `write_stdin` wait or answer only from the recorded wait contract. Do not run side probes.
 
 ## Clean Redeploy Order
 
@@ -75,6 +100,20 @@ Use this order for every binary redeploy or app/source re-apply:
 7. Validate only with process state and logs generated after step 6.
 
 Never mix logs from before step 4 into acceptance evidence. If a command fails after logs are cleared but before validation finishes, repeat the stop-clear-start/apply sequence before collecting new evidence.
+
+## Per-Node Daemon Log Evidence
+
+For official `panda144` through `panda146` daemon-log diagnosis, use the gate skill's bundled helper instead of hand-writing repeated SSH/grep snippets:
+
+```bash
+.codex/skills/fs-meta-cross-repo-gate/scripts/collect_official_node_logs.sh \
+  --focus status-fanin \
+  --pattern 'nfs-146|source_coverage_gaps|scan_coverage_gaps|missing_source_owner' \
+  --lines 260 \
+  --out-dir /tmp/fsmeta-node-logs-$(date +%Y%m%d%H%M%S)
+```
+
+The helper is read-only, performs one SSH command per node, filters `nodes/<host_ref>/daemon.log` remotely, and writes `collection-plan.txt`, `collection-summary.txt`, and per-node excerpts when `--out-dir` is set. Treat each invocation as one bounded evidence collection after a deploy, wait, or status-sample boundary. Do not loop it, use it before a planned wait deadline, or replace it with ad hoc multi-node SSH log checks.
 
 ## Artifact Matrix
 
@@ -316,8 +355,9 @@ node_dir="nodes/$(hostname -s)"
 
 if [ -x "$node_dir/stop.sh" ]; then
   "$node_dir/stop.sh" || true
-elif [ -x ./stop-all.sh ]; then
-  ./stop-all.sh || true
+else
+  echo "missing official node stop script: $node_dir/stop.sh" >&2
+  exit 1
 fi
 
 pkill -TERM -f "$run_root/bin/capanix_worker_host" || true
@@ -370,13 +410,15 @@ If preserving old logs is unnecessary or disk pressure is high, the archive copy
 
 ## Replace Capanix Daemon
 
-Discover node scripts first:
+Verify the official node scripts exist first:
 
 ```bash
 ssh wanghuajin@10.0.82.145 'bash -s' <<'REMOTE'
 set -euo pipefail
 cd /home/wanghuajin/fsmeta-stable/run
-ls -l start-all.sh stop-all.sh nodes/*/start.sh nodes/*/stop.sh 2>/dev/null || true
+ls -l nodes/panda144/start.sh nodes/panda144/stop.sh \
+  nodes/panda145/start.sh nodes/panda145/stop.sh \
+  nodes/panda146/start.sh nodes/panda146/stop.sh
 REMOTE
 ```
 
@@ -419,15 +461,15 @@ node_dir="nodes/$(hostname -s)"
 
 if [ -x "$node_dir/start.sh" ]; then
   "$node_dir/start.sh"
-elif [ -x ./start-all.sh ]; then
-  ./start-all.sh
 else
-  echo "no local start script found for $(hostname -s)" >&2
+  echo "missing official node start script: $node_dir/start.sh" >&2
   exit 1
 fi
 REMOTE
 done
 ```
+
+Do not fall back to `start-all.sh`, `stop-all.sh`, or a hand-written `nohup bin/capanixd ...` path on the official stable cluster. The node-local scripts are the startup contract because they load the required admin and node identity environment.
 
 If any node fails to start because of a linker or GLIBC error, stop affected processes on every node, clear logs, rebuild or reinstall a known-good staged artifact, and start again.
 

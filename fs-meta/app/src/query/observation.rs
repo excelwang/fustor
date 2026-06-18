@@ -67,6 +67,67 @@ fn source_logical_root_reports_service_ready(
         && root.active_members > 0
 }
 
+fn source_status_logical_root_reports_service_ready(
+    source_status: &SourceStatusSnapshot,
+    group: &str,
+) -> bool {
+    source_status
+        .logical_roots
+        .iter()
+        .any(|root| root.root_id == group && source_logical_root_reports_service_ready(root))
+}
+
+fn sink_group_reports_live_materialized_ready(
+    group: &crate::sink::SinkGroupStatusSnapshot,
+) -> bool {
+    group.materialized_service_live_ready()
+}
+
+fn source_concrete_root_reports_settled_publication_for_next_audit(
+    root: &crate::source::SourceConcreteRootHealthSnapshot,
+) -> bool {
+    if !concrete_root_counts_as_materialized_candidate(root)
+        || root.rescan_pending
+        || root.overflow_pending
+        || root.last_error.is_some()
+        || root.last_audit_started_at_us.is_none()
+        || root.last_audit_completed_at_us.is_some()
+    {
+        return false;
+    }
+
+    let emitted_data = if root.emitted_data_event_count > 0 {
+        root.emitted_data_event_count
+    } else {
+        root.emitted_event_count
+            .saturating_sub(root.emitted_control_event_count)
+    };
+    let forwarded_data = root.forwarded_event_count;
+    emitted_data > 0 && forwarded_data >= emitted_data
+}
+
+fn source_status_group_reports_settled_publication_for_next_audit(
+    source_status: &SourceStatusSnapshot,
+    group: &str,
+) -> bool {
+    source_status.concrete_roots.iter().any(|root| {
+        root.logical_root_id == group
+            && source_concrete_root_reports_settled_publication_for_next_audit(root)
+    })
+}
+
+fn source_group_has_ready_logical_ready_sink_and_settled_publication(
+    source_status: &SourceStatusSnapshot,
+    sink_groups: &BTreeMap<&str, &crate::sink::SinkGroupStatusSnapshot>,
+    group: &str,
+) -> bool {
+    source_status_logical_root_reports_service_ready(source_status, group)
+        && source_status_group_reports_settled_publication_for_next_audit(source_status, group)
+        && sink_groups
+            .get(group)
+            .is_some_and(|group| sink_group_reports_live_materialized_ready(group))
+}
+
 fn source_groups_with_current_owner_evidence(
     source_status: &SourceStatusSnapshot,
 ) -> BTreeSet<String> {
@@ -205,6 +266,11 @@ pub fn materialized_query_observation_evidence(
         .filter(|root| {
             source_concrete_root_blocks_materialized_observation(root)
                 && !source_groups_with_current_owner_evidence.contains(&root.logical_root_id)
+                && !source_group_has_ready_logical_ready_sink_and_settled_publication(
+                    source_status,
+                    &sink_groups,
+                    &root.logical_root_id,
+                )
                 && group_has_local_sink_presence(
                     &root.logical_root_id,
                     &sink_groups,
@@ -291,6 +357,11 @@ pub fn candidate_group_observation_evidence(
         .filter(|root| {
             source_concrete_root_blocks_materialized_observation(root)
                 && !source_groups_with_current_owner_evidence.contains(&root.logical_root_id)
+                && !source_group_has_ready_logical_ready_sink_and_settled_publication(
+                    source_status,
+                    &sink_groups,
+                    &root.logical_root_id,
+                )
                 && candidate_groups.contains(&root.logical_root_id)
                 && group_has_local_sink_presence(
                     &root.logical_root_id,
@@ -331,10 +402,23 @@ pub fn candidate_group_observation_evidence(
 
 pub fn source_status_covers_readiness_groups(
     source_status: &SourceStatusSnapshot,
+    sink_status: &SinkStatusSnapshot,
     readiness_groups: &BTreeSet<String>,
 ) -> bool {
     let source_groups = source_groups_with_current_owner_evidence(source_status);
-    readiness_groups.is_subset(&source_groups)
+    let sink_groups = sink_status
+        .groups
+        .iter()
+        .map(|group| (group.group_id.as_str(), group))
+        .collect::<BTreeMap<_, _>>();
+    readiness_groups.iter().all(|group| {
+        source_groups.contains(group)
+            || source_group_has_ready_logical_ready_sink_and_settled_publication(
+                source_status,
+                &sink_groups,
+                group.as_str(),
+            )
+    })
 }
 
 pub fn materialized_scheduled_group_ids(snapshot: &SinkStatusSnapshot) -> BTreeSet<String> {
@@ -350,7 +434,7 @@ pub fn materialized_scheduled_group_ids(snapshot: &SinkStatusSnapshot) -> BTreeS
 pub fn sink_group_readiness_reports_live_materialized_group(
     group: &crate::sink::SinkGroupStatusSnapshot,
 ) -> bool {
-    group.materialized_service_live_ready()
+    sink_group_reports_live_materialized_ready(group)
 }
 
 pub fn sink_status_covers_ready_readiness_groups(
@@ -402,9 +486,20 @@ pub fn materialized_observation_status_for_readiness_groups(
     }
     let mut evidence =
         candidate_group_observation_evidence(source_status, sink_status, readiness_groups);
+    let sink_groups = sink_status
+        .groups
+        .iter()
+        .map(|group| (group.group_id.as_str(), group))
+        .collect::<BTreeMap<_, _>>();
     let source_groups = source_groups_with_current_owner_evidence(source_status);
     for missing_group in readiness_groups.difference(&source_groups) {
-        evidence.initial_audit_groups.insert(missing_group.clone());
+        if !source_group_has_ready_logical_ready_sink_and_settled_publication(
+            source_status,
+            &sink_groups,
+            missing_group.as_str(),
+        ) {
+            evidence.initial_audit_groups.insert(missing_group.clone());
+        }
     }
     let scheduled_groups = materialized_scheduled_group_ids(sink_status);
     let ready_groups = sink_status
@@ -428,7 +523,7 @@ pub fn materialized_status_cache_is_ready(
     readiness_groups: &BTreeSet<String>,
 ) -> bool {
     !readiness_groups.is_empty()
-        && source_status_covers_readiness_groups(source_status, readiness_groups)
+        && source_status_covers_readiness_groups(source_status, sink_status, readiness_groups)
         && sink_status_covers_ready_readiness_groups(sink_status, readiness_groups)
         && materialized_observation_status_for_readiness_groups(
             source_status,
@@ -1111,7 +1206,8 @@ mod tests {
     }
 
     #[test]
-    fn readiness_group_observation_rejects_primary_without_completed_current_audit() {
+    fn readiness_group_observation_rejects_unready_source_primary_without_completed_current_audit()
+    {
         let mut root = concrete_root("nfs1", true);
         root.last_audit_started_at_us = None;
         root.last_audit_completed_at_us = None;
@@ -1119,7 +1215,7 @@ mod tests {
         let source_status = SourceStatusSnapshot {
             logical_roots: vec![SourceLogicalRootHealthSnapshot {
                 root_id: "nfs1".to_string(),
-                status: "ready".to_string(),
+                status: "initializing".to_string(),
                 active_members: 3,
                 matched_grants: 3,
                 coverage_mode: "realtime_hotset_plus_audit".to_string(),
@@ -1145,6 +1241,58 @@ mod tests {
 
         assert_eq!(status.state, ObservationState::MaterializedUntrusted);
         assert!(!materialized_status_cache_is_ready(
+            &source_status,
+            &sink_status,
+            &readiness_groups,
+        ));
+    }
+
+    #[test]
+    fn readiness_group_observation_accepts_ready_sink_while_next_source_audit_is_in_progress() {
+        let mut root = concrete_root("nfs1", true);
+        root.status = "running".to_string();
+        root.last_audit_started_at_us = Some(30);
+        root.last_audit_completed_at_us = None;
+        root.last_audit_duration_ms = None;
+        root.emitted_event_count = 201_182_232;
+        root.emitted_control_event_count = 3;
+        root.emitted_data_event_count = 201_182_229;
+        root.forwarded_event_count = 201_182_229;
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: "ready".to_string(),
+                active_members: 1,
+                matched_grants: 1,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            }],
+            concrete_roots: vec![root],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![ready_sink_group("nfs1")],
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..SinkStatusSnapshot::default()
+        };
+        let readiness_groups = BTreeSet::from(["nfs1".to_string()]);
+
+        let status = materialized_observation_status_for_readiness_groups(
+            &source_status,
+            &sink_status,
+            &readiness_groups,
+        );
+        let evidence =
+            candidate_group_observation_evidence(&source_status, &sink_status, &readiness_groups);
+
+        assert!(
+            evidence.initial_audit_groups.is_empty(),
+            "ready sink materialization plus source logical service-ready evidence must not be downgraded by the next in-progress source audit: {evidence:?}"
+        );
+        assert_eq!(status.state, ObservationState::TrustedMaterialized);
+        assert!(trusted_materialized_status_cache_is_ready(
             &source_status,
             &sink_status,
             &readiness_groups,

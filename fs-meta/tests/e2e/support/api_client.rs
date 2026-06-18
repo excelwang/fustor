@@ -459,9 +459,15 @@ impl OperatorSession {
     }
 
     pub fn relogin(&mut self) -> Result<(), String> {
-        self.management_token = extract_token(self.client.login(&self.username, &self.password)?)?;
+        let base_url = self.client.base_url.clone();
+        let (_client, token) = login_first_available(
+            std::slice::from_ref(&base_url),
+            &self.username,
+            &self.password,
+        )?;
+        self.management_token = token;
         let (client, query_api_key) = provision_query_api_key_first_available(
-            std::slice::from_ref(&self.client.base_url),
+            std::slice::from_ref(&base_url),
             &self.management_token,
             &self.username,
         )?;
@@ -1102,6 +1108,16 @@ mod tests {
     }
 
     #[test]
+    fn management_retry_includes_duplicate_roots_control_observation_readiness() {
+        let err = r#"http 503 failed: {"error":"manual rescan current roots runtime-scope readiness failed: manual rescan current roots source-status returned only cache/degraded/non-ready evidence or route-gap evidence before scoped delivery target proof"}"#;
+
+        assert!(
+            is_retryable_management_unavailable_error(err),
+            "duplicate current-roots observation is a temporary convergence state and should stay in the management retry window"
+        );
+    }
+
+    #[test]
     fn management_retry_includes_manual_rescan_scoped_source_delivery_pending() {
         let err = r#"http 503 failed: {"error":"manual rescan scoped source route pending: manual rescan scoped source delivery pending for node node-b: operation timed out"}"#;
 
@@ -1621,5 +1637,70 @@ connection: close
         assert_eq!(token, "test-token");
         assert!(request_count.load(Ordering::SeqCst) >= 2);
         server.join().expect("join flaky login server");
+    }
+
+    #[test]
+    fn single_facade_relogin_retries_with_fresh_client_after_transport_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind flaky relogin listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_bg = request_count.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept first login request");
+            request_count_bg.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().expect("accept second login request");
+            request_count_bg.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"token":"fresh-token"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write login response");
+            stream.flush().expect("flush login response");
+
+            let (mut stream, _) = listener.accept().expect("accept query-api-key request");
+            request_count_bg.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"api_key":"fresh-query-key"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write query-api-key response");
+            stream.flush().expect("flush query-api-key response");
+        });
+
+        let base_url = format!("http://{}", addr);
+        let mut session = OperatorSession {
+            client: FsMetaApiClient::new(base_url.clone()).expect("client"),
+            candidate_base_urls: vec![base_url.clone()],
+            username: "operator".to_string(),
+            password: "operator123".to_string(),
+            management_token: "stale-token".to_string(),
+            query_api_key: "stale-query-key".to_string(),
+        };
+
+        session
+            .relogin()
+            .expect("single-facade relogin should survive one transport flap");
+
+        assert_eq!(session.client.base_url(), base_url);
+        assert_eq!(session.token(), "fresh-token");
+        assert_eq!(session.query_api_key(), "fresh-query-key");
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        server.join().expect("join flaky relogin server");
     }
 }

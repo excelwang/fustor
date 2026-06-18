@@ -112,6 +112,32 @@ fn source_rescan_route_groups_ignore_empty_roots_bootstrap_scope() {
 }
 
 #[test]
+fn node_scoped_source_rescan_route_targets_named_node_when_scope_resource_is_root_id() {
+    let facade_gate = RuntimeUnitGate::new("fs-meta", &[execution_units::SOURCE_RUNTIME_UNIT_ID]);
+    let route_key = source_rescan_request_route_for("panda146").0;
+    facade_gate
+        .apply_activate(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            &route_key,
+            1781653539329,
+            &[RuntimeBoundScope {
+                scope_id: "nfs-146".to_string(),
+                resource_ids: vec!["nfs-146".to_string()],
+            }],
+        )
+        .expect("activate scoped source rescan route with root-id resource");
+
+    assert!(
+        source_rescan_route_targets_node(&facade_gate, &route_key, &NodeId("panda146".into())),
+        "a node-scoped source-rescan route names its target node even when the bound resource id is the logical root"
+    );
+    assert!(
+        !source_rescan_route_targets_node(&facade_gate, &route_key, &NodeId("panda145".into())),
+        "another node must not claim a node-scoped source-rescan route merely because it carries a root-id scope"
+    );
+}
+
+#[test]
 fn retained_sink_state_preserves_current_business_scope_across_bootstrap_only_activate() {
     let route_key = crate::runtime::routes::events_stream_route_for_scope("panda145").0;
     let business = crate::runtime::orchestration::sink_control_signals_from_envelopes(&[
@@ -26848,6 +26874,194 @@ async fn worker_manual_rescan_status_exposes_route_proof_while_source_state_pend
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_manual_rescan_status_uses_node_scoped_root_id_route_as_local_ready_proof() {
+    struct SourceWorkerDeliveryHookReset;
+
+    impl Drop for SourceWorkerDeliveryHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_accept_targeted_delivery_call_count_hook();
+            crate::workers::source::clear_source_worker_observability_call_count_hook();
+            crate::workers::source::clear_source_worker_observability_delay_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(nfs1.join("rescan")).expect("create nfs1 rescan dir");
+    fs::write(nfs1.join("rescan").join("seed.txt"), b"a").expect("seed nfs1");
+    let nfs1_source = nfs1.display().to_string();
+    let node_id = NodeId("node-a".into());
+    let scoped_route = source_rescan_request_route_for(&node_id.0).0;
+    let boundary = Arc::new(RuntimeProxyUnitAwareBoundary::new(None, None, None, None));
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_watch_scan_root("nfs1", &nfs1_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "node-a::nfs1",
+                        "node-a",
+                        "10.0.0.11",
+                        &nfs1_source,
+                        nfs1.clone(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            node_id.clone(),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            &[("nfs1", &["nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            &[("nfs1", &["nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            scoped_route.clone(),
+            &[("nfs1", &["nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            &[("nfs1", &["nfs1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("source status root-id route wave should succeed");
+
+    set_control_initialized_for_tests(&app, true);
+    set_source_replay_required_for_tests(&app, false);
+    let route_generation = app
+        .facade_gate
+        .route_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, &scoped_route)
+        .expect("scoped source-rescan route generation")
+        .expect("scoped source-rescan route active");
+
+    let _hook_reset = SourceWorkerDeliveryHookReset;
+    let accept_count = Arc::new(AtomicUsize::new(0));
+    crate::workers::source::install_source_worker_accept_targeted_delivery_call_count_hook(
+        crate::workers::source::SourceWorkerAcceptTargetedDeliveryCallCountHook {
+            count: accept_count.clone(),
+        },
+    );
+    let observability_count = Arc::new(AtomicUsize::new(0));
+    crate::workers::source::install_source_worker_observability_call_count_hook(
+        crate::workers::source::SourceWorkerObservabilityCallCountHook {
+            count: observability_count.clone(),
+        },
+    );
+    let source_worker_instance_id = match &*app.source {
+        SourceFacade::Worker(client) => client.worker_instance_id_for_tests().await,
+        SourceFacade::Local(_) => panic!("expected external source worker client"),
+    };
+    crate::workers::source::install_source_worker_observability_delay_hook_for_worker_instance(
+        source_worker_instance_id,
+        crate::workers::source::SourceWorkerObservabilityDelayHook {
+            delay: Duration::from_secs(10),
+        },
+    );
+
+    let status_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        crate::runtime::routes::default_route_bindings(),
+    );
+    let status_events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        query::api::manual_rescan_source_status_request_payload_with_live_probe_timeout(
+            Duration::from_millis(500),
+        ),
+        Duration::from_secs(2),
+        Duration::from_millis(25),
+    )
+    .await
+    .expect("target manual-rescan source-status should treat node-scoped root-id route as local");
+    assert_eq!(
+        accept_count.load(AtomicOrdering::SeqCst),
+        0,
+        "source-status must not perform worker delivery acceptance before app-route proof"
+    );
+    assert_eq!(
+        observability_count.load(AtomicOrdering::SeqCst),
+        0,
+        "source-status must not wait for worker live observability before app-route proof"
+    );
+    let status_snapshot = status_events
+        .iter()
+        .find(|event| event.metadata().origin_id == node_id)
+        .map(|event| {
+            rmp_serde::from_slice::<crate::workers::source::SourceObservabilitySnapshot>(
+                event.payload_bytes(),
+            )
+            .expect("decode source status snapshot")
+        })
+        .expect("status reply from target source node");
+    let status_signals = status_snapshot
+        .last_control_frame_signals_by_node
+        .get(&node_id.0)
+        .unwrap_or_else(|| {
+            panic!(
+                "source-owned status control signals for {} missing; keys={:?} snapshot={:?}",
+                node_id.0,
+                status_snapshot
+                    .last_control_frame_signals_by_node
+                    .keys()
+                    .collect::<Vec<_>>(),
+                status_snapshot
+            )
+        });
+    assert!(
+        status_signals.iter().any(|signal| signal
+            == &format!(
+                "ready unit=runtime.exec.source route={scoped_route} generation={route_generation} scopes=[\"nfs1=>nfs1\"]"
+            )),
+        "manual-rescan source-status must expose same-node scoped route-ready proof for root-id scoped routes: {status_signals:?}"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_repair_rearms_scoped_rescan_after_pending_manual_status() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
@@ -37715,6 +37929,22 @@ fn local_sink_republish_recovery_uses_node_local_source_scope_convergence() {
     assert!(
         !helper.contains("scope_observation.matches_expectation("),
         "local sink-status republish recovery must not require every source owner to schedule every sink group"
+    );
+}
+
+#[test]
+fn runtime_source_to_sink_convergence_opens_scan_audit_admission() {
+    let source = include_str!("../runtime_app.rs");
+
+    assert!(
+        source.contains(
+            ".open_scan_audit_admission_and_trigger_rescan_when_ready_epoch_with_failure()"
+        ),
+        "runtime-owned source->sink convergence must open scan/audit admission before submitting the rescan intent; otherwise clean deploy can stay rescan_pending until /status wakes the release lane"
+    );
+    assert!(
+        !source.contains(".submit_rescan_when_ready_epoch_with_failure()"),
+        "runtime-owned source->sink convergence must not use the intent-only trigger that leaves scan/audit admission closed"
     );
 }
 

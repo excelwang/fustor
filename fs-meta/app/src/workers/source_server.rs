@@ -41,6 +41,7 @@ const SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_BACKOFF: Duration = Duration::from_mi
 const SOURCE_WORKER_UPDATE_ROOTS_FENCED_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const SOURCE_WORKER_EVENT_STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_WORKER_PUBLISH_TRANSIENT_PRESSURE_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const SOURCE_WORKER_SINGLE_EVENT_BACKPRESSURE_LOG_INTERVAL: u64 = 12;
 
 struct SourceWorkerState {
     source: Option<Arc<FSMetaSource>>,
@@ -743,7 +744,22 @@ async fn publish_event_stream_batch_with_send_timeout(
                     pending.push_front(left);
                     break;
                 }
-                Err(err @ (CnxError::Backpressure | CnxError::Timeout)) => return Err(err),
+                Err(CnxError::Backpressure) => {
+                    if publish_attempt == 1
+                        || publish_attempt % SOURCE_WORKER_SINGLE_EVENT_BACKPRESSURE_LOG_INTERVAL
+                            == 0
+                    {
+                        log::warn!(
+                            "source worker pump preserving single-event source publication under route backpressure origin={} attempt={} log_interval={}",
+                            origin,
+                            publish_attempt,
+                            SOURCE_WORKER_SINGLE_EVENT_BACKPRESSURE_LOG_INTERVAL
+                        );
+                    }
+                    tokio::time::sleep(SOURCE_WORKER_PUBLISH_TRANSIENT_PRESSURE_RETRY_BACKOFF)
+                        .await;
+                }
+                Err(err @ CnxError::Timeout) => return Err(err),
                 Err(err) if source_worker_publish_error_is_terminal(&err) => return Err(err),
                 Err(err) => {
                     log::warn!(
@@ -1514,10 +1530,12 @@ async fn execute_worker_action(
         }
         SourceWorkerAction::OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch { source } => {
             if source.open_scan_audit_admission_if_closed() {
-                match source.submit_rescan_request_epoch_with_failure() {
-                    Ok(epoch) => (SourceWorkerResponse::RescanRequestEpoch(epoch), false, None),
-                    Err(err) => (classify_source_worker_failure(err), false, None),
-                }
+                let (epoch, root_keys) = source.begin_rescan_request_epoch();
+                (
+                    SourceWorkerResponse::RescanRequestEpoch(epoch),
+                    false,
+                    deferred_manual_rescan_signal(source, root_keys),
+                )
             } else {
                 (SourceWorkerResponse::RescanRequestEpoch(0), false, None)
             }
@@ -1981,6 +1999,12 @@ mod tests {
         sent_payloads: StdMutex<Vec<String>>,
     }
 
+    struct TransientSingleBackpressureBoundary {
+        remaining_backpressure: AtomicUsize,
+        send_attempts: AtomicUsize,
+        sent_payloads: StdMutex<Vec<String>>,
+    }
+
     #[derive(Default)]
     struct LoopbackPublishBoundary {
         channels: tokio::sync::Mutex<std::collections::BTreeMap<String, Vec<Event>>>,
@@ -2084,6 +2108,27 @@ mod tests {
             self.sent_payloads
                 .lock()
                 .expect("hanging boundary sent_payloads lock")
+                .clone()
+        }
+    }
+
+    impl TransientSingleBackpressureBoundary {
+        fn new(remaining_backpressure: usize) -> Self {
+            Self {
+                remaining_backpressure: AtomicUsize::new(remaining_backpressure),
+                send_attempts: AtomicUsize::new(0),
+                sent_payloads: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn send_attempts(&self) -> usize {
+            self.send_attempts.load(Ordering::SeqCst)
+        }
+
+        fn sent_payloads(&self) -> Vec<String> {
+            self.sent_payloads
+                .lock()
+                .expect("transient boundary sent_payloads lock")
                 .clone()
         }
     }
@@ -2198,6 +2243,40 @@ mod tests {
             self.sent_payloads
                 .lock()
                 .expect("hanging boundary sent_payloads lock")
+                .extend(
+                    request
+                        .events
+                        .iter()
+                        .map(|event| String::from_utf8_lossy(event.payload_bytes()).to_string()),
+                );
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for TransientSingleBackpressureBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> Result<()> {
+            self.send_attempts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .remaining_backpressure
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return Err(CnxError::Backpressure);
+            }
+            self.sent_payloads
+                .lock()
+                .expect("transient boundary sent_payloads lock")
                 .extend(
                     request
                         .events
@@ -2373,6 +2452,153 @@ mod tests {
             ],
             "source pump must preserve event order after timing out and splitting hung sends"
         );
+    }
+
+    #[tokio::test]
+    async fn source_pump_retries_single_event_backpressure_until_acceptance() {
+        let boundary = Arc::new(TransientSingleBackpressureBoundary::new(2));
+        let target: Arc<dyn ChannelIoSubset> = boundary.clone();
+        let events = vec![Event::new(
+            EventMetadata {
+                origin_id: NodeId("node-a::nfs1".to_string()),
+                timestamp_us: 1,
+                logical_ts: None,
+                correlation_id: None,
+                ingress_auth: None,
+                trace: None,
+            },
+            bytes::Bytes::from_static(b"record-0"),
+        )];
+
+        let publish = publish_event_stream_batch_with_send_timeout(
+            Arc::new(StdMutex::new(target)),
+            &events,
+            "node-a::nfs1",
+            "node-a",
+            Duration::from_millis(20),
+        );
+        match tokio::time::timeout(Duration::from_millis(500), publish).await {
+            Ok(result) => result.expect("transient single-event backpressure should be retried"),
+            Err(_) => panic!("source pump waited forever on transient single-event backpressure"),
+        }
+
+        assert_eq!(
+            boundary.send_attempts(),
+            3,
+            "source pump should retry the same single event until downstream accepts it"
+        );
+        assert_eq!(
+            boundary.sent_payloads(),
+            vec!["record-0".to_string()],
+            "source pump must preserve and publish the single event after transient backpressure"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_pump_waits_when_single_event_backpressure_persists() {
+        let boundary = Arc::new(TransientSingleBackpressureBoundary::new(usize::MAX));
+        let target: Arc<dyn ChannelIoSubset> = boundary.clone();
+        let events = vec![Event::new(
+            EventMetadata {
+                origin_id: NodeId("node-a::nfs1".to_string()),
+                timestamp_us: 1,
+                logical_ts: None,
+                correlation_id: None,
+                ingress_auth: None,
+                trace: None,
+            },
+            bytes::Bytes::from_static(b"record-0"),
+        )];
+
+        let publish = publish_event_stream_batch_with_send_timeout(
+            Arc::new(StdMutex::new(target)),
+            &events,
+            "node-a::nfs1",
+            "node-a",
+            Duration::from_millis(20),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(450), publish)
+                .await
+                .is_err(),
+            "persistent single-event backpressure is route flow-control and should keep the unsent event pending"
+        );
+
+        assert!(
+            boundary.send_attempts() > 2,
+            "persistent backpressure should continue bounded retry attempts without returning success"
+        );
+        assert!(
+            boundary.sent_payloads().is_empty(),
+            "persistent backpressure must not record an unsent event as published"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_pump_does_not_close_source_output_on_route_backpressure() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        let cfg = SourceConfig {
+            roots: vec![test_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![test_export("node-a::nfs1", nfs1.clone())],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(
+            FSMetaSource::with_boundaries_and_state(
+                cfg,
+                NodeId("node-a".to_string()),
+                None,
+                in_memory_state_boundary(),
+            )
+            .expect("build source"),
+        );
+        std::fs::write(nfs1.join("record-0"), b"seed").expect("seed source file");
+        let stream = source
+            .pub_stream_with_failure()
+            .await
+            .expect("start source pub stream");
+        let boundary = Arc::new(TransientSingleBackpressureBoundary::new(usize::MAX));
+        let target: Arc<dyn ChannelIoSubset> = boundary.clone();
+        let published_stats = Arc::new(StdMutex::new(PublishedBatchStats::default()));
+
+        let handle = start_source_pump_with_stream(
+            stream,
+            Arc::new(StdMutex::new(target)),
+            published_stats.clone(),
+            Some(source.clone()),
+            "node-a".to_string(),
+        );
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        assert!(
+            !handle.is_finished(),
+            "route backpressure is flow-control; source pump must preserve the current batch and remain alive"
+        );
+
+        let detail = source
+            .status_snapshot()
+            .concrete_roots
+            .into_iter()
+            .find(|root| root.object_ref == "node-a::nfs1")
+            .expect("concrete root still exists after route backpressure");
+        assert_ne!(
+            detail.status, "output_closed",
+            "route backpressure must not permanently close source publication output"
+        );
+        assert_ne!(
+            detail.last_error.as_deref(),
+            Some("backpressure"),
+            "route backpressure must remain flow-control evidence instead of a permanent source root error"
+        );
+        assert_eq!(
+            lock_publish_stats(&published_stats).batch_count,
+            0,
+            "source pump must not record a batch as downstream-accepted while route backpressure still holds it"
+        );
+
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[tokio::test]
@@ -3055,6 +3281,232 @@ mod tests {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "zero-grant runtime-managed watch-scan trigger_rescan_when_ready must publish baseline events for both local roots through the source worker server publish pump: origin_counts={origin_counts:?} data_events={data_events} sent_batches={:?}",
+                boundary.sent_batches_snapshot(),
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        stop_source_runtime(&mut state).await;
+    }
+
+    #[tokio::test]
+    async fn open_scan_audit_admission_trigger_rescan_defers_scan_signal_until_after_reply() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("data")).expect("create nfs1 data dir");
+        std::fs::create_dir_all(nfs2.join("data")).expect("create nfs2 data dir");
+        std::fs::write(nfs1.join("data").join("a.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("data").join("b.txt"), b"b").expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: Vec::new(),
+            host_object_grants: Vec::new(),
+            ..SourceConfig::default()
+        };
+
+        let mut state = SourceWorkerState {
+            source: None,
+            pending_init: Some((NodeId("node-c-local-sink-status-release".to_string()), cfg)),
+            pump_task: None,
+            pump_boundary: None,
+            runtime_endpoint_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        };
+
+        let boundary = Arc::new(PublishCaptureBoundary::default());
+        bootstrap_start_source_runtime(&mut state, boundary.clone(), in_memory_state_boundary())
+            .await
+            .expect("bootstrap start source runtime");
+
+        let source = state
+            .source
+            .as_ref()
+            .cloned()
+            .expect("source after bootstrap");
+        source
+            .apply_logical_roots_update_defer_scan_audit(vec![
+                test_watch_scan_root("nfs1", nfs1.clone()),
+                test_watch_scan_root("nfs2", nfs2.clone()),
+            ])
+            .await
+            .expect("apply deferred logical roots");
+
+        let source_wave = |generation| {
+            vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source roots activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source rescan activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source scan activate"),
+            ]
+        };
+
+        let (response, stop, _deferred_after_reply) = execute_worker_action(plan_worker_request(
+            SourceWorkerRequest::OnControlFrame {
+                envelopes: source_wave(2),
+            },
+            &mut state,
+        ))
+        .await;
+        assert!(matches!(response, SourceWorkerResponse::Ack));
+        assert!(
+            !stop,
+            "source worker should stay alive after zero-grant watch-scan wave"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let statuses = state
+                .source
+                .as_ref()
+                .expect("source after bootstrap")
+                .status_snapshot()
+                .concrete_roots;
+            let primary_ready = statuses
+                .iter()
+                .filter(|root| root.logical_root_id == "nfs1" || root.logical_root_id == "nfs2")
+                .filter(|root| root.active && root.is_group_primary && root.scan_enabled)
+                .map(|root| root.logical_root_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if primary_ready.contains("nfs1") && primary_ready.contains("nfs2") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scan-audit admission release must wait until local scheduled scan roots are active before testing deferred signal: concrete_roots={statuses:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let (response, stop, deferred_after_reply) = execute_worker_action(plan_worker_request(
+            SourceWorkerRequest::OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch,
+            &mut state,
+        ))
+        .await;
+        let SourceWorkerResponse::RescanRequestEpoch(epoch) = response else {
+            panic!("expected rescan epoch response from scan-audit admission release");
+        };
+        assert!(
+            epoch > 0,
+            "opening a closed scan-audit admission gate must record a rescan epoch"
+        );
+        assert!(
+            !stop,
+            "scan-audit admission release should not stop the source worker"
+        );
+        let Some(DeferredSourceWorkerAction::SignalManualRescanIntents { root_keys, .. }) =
+            deferred_after_reply.as_ref()
+        else {
+            panic!(
+                "scan-audit admission release must defer the scan signal until after the worker reply is sent"
+            );
+        };
+        assert_eq!(
+            root_keys.len(),
+            2,
+            "deferred scan signal must target each local primary scan root once"
+        );
+        assert!(
+            root_keys
+                .iter()
+                .any(|key| key == "nfs1" || key.starts_with("nfs1@")),
+            "deferred scan signal must include the nfs1 runtime root key: {root_keys:?}"
+        );
+        assert!(
+            root_keys
+                .iter()
+                .any(|key| key == "nfs2" || key.starts_with("nfs2@")),
+            "deferred scan signal must include the nfs2 runtime root key: {root_keys:?}"
+        );
+
+        run_deferred_after_reply_for_test(deferred_after_reply);
+
+        let event_route = events_stream_route_for_scope("node-c-local-sink-status-release").0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let origin_counts = boundary.sent_origin_counts_for_route(&event_route);
+            let data_events = boundary.sent_data_events_for_route(&event_route);
+            let has_nfs1 = origin_counts.iter().any(|(origin, count)| {
+                *count > 0 && (origin == "nfs1" || origin.starts_with("nfs1@"))
+            });
+            let has_nfs2 = origin_counts.iter().any(|(origin, count)| {
+                *count > 0 && (origin == "nfs2" || origin.starts_with("nfs2@"))
+            });
+            if has_nfs1 && has_nfs2 && data_events > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "post-reply scan-audit admission release signal must publish baseline events for both local roots: origin_counts={origin_counts:?} data_events={data_events} sent_batches={:?}",
                 boundary.sent_batches_snapshot(),
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -5102,15 +5554,17 @@ mod tests {
         let second_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
         loop {
             let counts = second_boundary.sent_origin_counts_for_route(&event_route);
+            let data_events = second_boundary.sent_data_events_for_route(&event_route);
             if ["node-a::nfs1", "node-a::nfs2"]
                 .iter()
                 .all(|origin| counts.get(*origin).copied().unwrap_or(0) > 0)
+                && data_events > 0
             {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < second_deadline,
-                "second bootstrap must rebind the live publish pump to the replacement boundary; first_sent={:?} second_sent={:?} first_recv={:?} second_recv={:?}",
+                "second bootstrap must rebind the live publish pump to the replacement boundary; origin_counts={counts:?} data_events={data_events} first_sent={:?} second_sent={:?} first_recv={:?} second_recv={:?}",
                 first_boundary.sent_batches_snapshot(),
                 second_boundary.sent_batches_snapshot(),
                 first_boundary.recv_counts_snapshot(),
