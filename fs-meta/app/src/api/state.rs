@@ -70,6 +70,8 @@ pub struct ApiControlGate {
     management_write_ready: AtomicBool,
     source_repair_ready: AtomicBool,
     management_write_drain_closed: AtomicBool,
+    sink_observation_repair_force_republish: AtomicBool,
+    sink_observation_repair_republish_groups: Mutex<BTreeSet<String>>,
     epoch: AtomicU64,
     changed: Notify,
     facade_request_tracker: Arc<ApiRequestTracker>,
@@ -113,6 +115,8 @@ impl ApiControlGate {
             management_write_ready: AtomicBool::new(ready),
             source_repair_ready: AtomicBool::new(ready),
             management_write_drain_closed: AtomicBool::new(false),
+            sink_observation_repair_force_republish: AtomicBool::new(false),
+            sink_observation_repair_republish_groups: Mutex::new(BTreeSet::new()),
             epoch: AtomicU64::new(0),
             changed: Notify::new(),
             facade_request_tracker: Arc::new(ApiRequestTracker::default()),
@@ -185,7 +189,11 @@ impl ApiControlGate {
     pub fn close_management_write_gate(&self) {
         self.management_write_drain_closed
             .store(true, Ordering::Release);
-        self.set_ready_state(self.is_ready(), false);
+        self.set_ready_state_with_source_repair(
+            self.is_ready(),
+            false,
+            self.is_source_repair_ready(),
+        );
     }
 
     pub fn epoch(&self) -> u64 {
@@ -269,6 +277,41 @@ impl ApiControlGate {
             .read()
             .ok()
             .and_then(|guard| guard.clone())
+    }
+
+    pub fn request_sink_observation_repair_republish(&self) {
+        self.sink_observation_repair_force_republish
+            .store(true, Ordering::Release);
+    }
+
+    pub fn request_sink_observation_repair_republish_for_groups(&self, groups: &BTreeSet<String>) {
+        if !groups.is_empty()
+            && let Ok(mut guard) = self.sink_observation_repair_republish_groups.lock()
+        {
+            guard.extend(groups.iter().filter(|group| !group.is_empty()).cloned());
+        }
+        self.request_sink_observation_repair_republish();
+    }
+
+    pub fn take_sink_observation_repair_republish_groups(&self) -> Option<BTreeSet<String>> {
+        if !self
+            .sink_observation_repair_force_republish
+            .swap(false, Ordering::AcqRel)
+        {
+            return None;
+        }
+        Some(
+            self.sink_observation_repair_republish_groups
+                .lock()
+                .map(|mut guard| std::mem::take(&mut *guard))
+                .unwrap_or_default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn take_sink_observation_repair_republish(&self) -> bool {
+        self.take_sink_observation_repair_republish_groups()
+            .is_some()
     }
 
     pub fn record_repair_lane_evidence(&self, mut evidence: StatusRepairLaneEvidence) {
@@ -383,6 +426,41 @@ impl Drop for ApiRequestGuard {
     fn drop(&mut self) {
         self.tracker.inflight.fetch_sub(1, Ordering::Relaxed);
         self.tracker.changed.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiControlGate;
+
+    #[test]
+    fn close_management_write_gate_preserves_source_repair_readiness() {
+        let gate = ApiControlGate::new(true);
+
+        gate.close_management_write_gate();
+
+        assert!(
+            !gate.is_management_write_ready(),
+            "closing management-write must close only the management plane"
+        );
+        assert!(
+            gate.is_source_repair_ready(),
+            "closing management-write must not force the independent source-repair plane closed"
+        );
+    }
+
+    #[test]
+    fn close_management_write_gate_preserves_closed_source_repair_plane() {
+        let gate = ApiControlGate::new(true);
+        gate.set_ready_state_with_source_repair(true, true, false);
+
+        gate.close_management_write_gate();
+
+        assert!(!gate.is_management_write_ready());
+        assert!(
+            !gate.is_source_repair_ready(),
+            "an explicitly closed source-repair plane should stay closed"
+        );
     }
 }
 

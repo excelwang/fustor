@@ -4980,7 +4980,9 @@ impl SinkWorkerClientHandle {
             let snapshot = self
                 .cached_status_snapshot_for_status_route_key(route_key)
                 .unwrap_or_else(|_| SinkStatusSnapshot::default());
-            if Self::route_cached_status_needs_existing_client_probe(&snapshot) {
+            if Self::route_cached_status_needs_existing_client_probe(&snapshot)
+                || snapshot_looks_stale_empty(&snapshot)
+            {
                 match self
                     .status_route_existing_client_probe_for_route_key(
                         route_key,

@@ -480,6 +480,9 @@ async fn peer_cleanup_tail_panic_local_sink_status_unavailable(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_before_later_node_c_four_envelope_source_reactivation()
 {
+    let _serial = deferred_sink_owned_query_peer_publication_test_serial()
+        .lock()
+        .await;
     Box::pin(
         peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_before_later_node_c_four_envelope_source_reactivation_impl(),
     )
@@ -491,6 +494,7 @@ async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_
     struct SourceControlErrorHookReset;
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
     struct SourceWorkerControlFramePauseHookReset;
+    struct DeferredSinkOwnedQueryPeerPublicationCompletionHookReset;
 
     impl Drop for SourceControlErrorHookReset {
         fn drop(&mut self) {
@@ -507,6 +511,12 @@ async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_
     impl Drop for SourceWorkerControlFramePauseHookReset {
         fn drop(&mut self) {
             crate::workers::source::clear_source_worker_control_frame_pause_hook();
+        }
+    }
+
+    impl Drop for DeferredSinkOwnedQueryPeerPublicationCompletionHookReset {
+        fn drop(&mut self) {
+            clear_deferred_sink_owned_query_peer_publication_completion_hook();
         }
     }
 
@@ -761,6 +771,13 @@ async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_
             sticky_peer_err: None,
         },
     );
+    let deferred_publication_completed = Arc::new(Notify::new());
+    let _deferred_publication_reset = DeferredSinkOwnedQueryPeerPublicationCompletionHookReset;
+    install_deferred_sink_owned_query_peer_publication_completion_hook(
+        DeferredSinkOwnedQueryPeerPublicationCompletionHook {
+            entered: deferred_publication_completed.clone(),
+        },
+    );
 
     let mut later = source_wave(4);
     later.extend([
@@ -826,11 +843,26 @@ async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_
         std::collections::BTreeSet::from(["nfs1", "nfs2"]),
         "later node-c four-envelope source reactivation must restore local sink-status readiness before peer sink-status resumes: {local_sink_snapshot:?}"
     );
+    if !app
+        .facade_gate
+        .route_active(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            &sink_status_route,
+        )
+        .expect("query-peer sink-status route state after later node-c four-envelope source reactivation")
+    {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            deferred_publication_completed.notified(),
+        )
+        .await
+        .expect("deferred sink-owned query-peer publication should complete after local sink readiness is restored");
+    }
 
     let sink_status_events = internal_sink_status_request_with_timeout(
         boundary.clone(),
         NodeId("node-a".into()),
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         Duration::from_millis(100),
     )
     .await

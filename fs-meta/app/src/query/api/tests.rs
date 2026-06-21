@@ -560,6 +560,7 @@ enum ForceFindFixtureScenario {
 struct ForceFindFixture {
     _tempdir: TempDir,
     app: Router,
+    sink: Arc<SinkFacade>,
 }
 
 #[derive(Default)]
@@ -4338,6 +4339,7 @@ impl ForceFindFixture {
 
         Self {
             _tempdir: tempdir,
+            sink: sink.clone(),
             app: create_local_router(
                 sink,
                 source,
@@ -10911,7 +10913,7 @@ async fn selected_group_materialized_route_falls_back_to_generic_proxy_when_owne
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn selected_group_materialized_route_settles_request_scoped_omitted_ready_root_group_as_empty_tree()
+async fn selected_group_materialized_route_queries_owner_for_request_scoped_omitted_ready_root_page()
  {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_root = tmp.path().join("node-a");
@@ -10934,8 +10936,53 @@ async fn selected_group_materialized_route_settles_request_scoped_omitted_ready_
     let source = source_facade_with_group("nfs4", &grants);
     let sink = sink_facade_with_group(&grants);
     let boundary = Arc::new(ReusableObservedRouteBoundary::default());
-    let state =
-        test_api_state_for_route_source(source, sink, boundary, NodeId("node-d".to_string()));
+    let owner_route = sink_query_request_route_for("node-a");
+    let mut owner_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        owner_route.clone(),
+        "test-omitted-ready-root-page-owner-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            let mut responses = Vec::new();
+            for req in requests {
+                let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                    .expect("decode owner root page query request");
+                let group_id = params
+                    .scope
+                    .selected_group
+                    .clone()
+                    .expect("selected group for owner root page request");
+                let tree_options = params
+                    .tree_options
+                    .as_ref()
+                    .expect("tree options for owner root page request");
+                assert_eq!(params.scope.path, b"/".to_vec());
+                assert_eq!(tree_options.entry_offset, 0);
+                assert_eq!(tree_options.entry_limit, Some(21));
+                assert!(
+                    tree_options.payload_limit_bytes.is_some(),
+                    "root page owner route must keep the route payload byte budget"
+                );
+                responses.push(mk_event_with_correlation(
+                    &group_id,
+                    req.metadata()
+                        .correlation_id
+                        .expect("owner root page request correlation"),
+                    real_materialized_tree_payload_with_entries_for_test(
+                        &params.scope.path,
+                        &[b"/layout-a/page-0001.txt".as_ref()],
+                    ),
+                ));
+            }
+            responses
+        },
+    );
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+    );
 
     let selected_group_sink_status = SinkStatusSnapshot {
         scheduled_groups_by_node: BTreeMap::from([(
@@ -10967,12 +11014,14 @@ async fn selected_group_materialized_route_settles_request_scoped_omitted_ready_
         query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
             &state,
             &ProjectionPolicy::default(),
-            build_materialized_tree_request(
+            build_materialized_tree_request_with_entry_window(
                 b"/",
                 true,
                 None,
                 ReadClass::TrustedMaterialized,
                 Some("nfs4".to_string()),
+                0,
+                Some(21),
             ),
             Duration::from_millis(1200),
             None,
@@ -10996,7 +11045,8 @@ async fn selected_group_materialized_route_settles_request_scoped_omitted_ready_
 
     assert!(
         result.is_ok(),
-        "request-scoped omitted ready selected-group root query should settle as a synthetic empty tree instead of plain empty/no-payload: err={:?}",
+        "request-scoped omitted ready selected-group root query must keep the materialized owner lane instead of synthesizing an empty root page: owner_send_batches={} err={:?}",
+        boundary.send_batch_count(&owner_route.0),
         result.as_ref().err(),
     );
     let payload = decode_materialized_selected_group_response(
@@ -11007,14 +11057,26 @@ async fn selected_group_materialized_route_settles_request_scoped_omitted_ready_
     )
     .expect("decode request-scoped omitted ready selected-group response");
     assert!(
-        !payload.root.exists,
-        "request-scoped omitted ready selected-group root query must synthesize an empty tree payload"
+        payload.root.exists,
+        "request-scoped omitted ready selected-group root query must not synthesize an empty tree payload"
     );
     assert_eq!(
         payload.root.path,
         b"/".to_vec(),
-        "synthetic empty selected-group tree should preserve the root request path"
+        "selected-group root page should preserve the root request path"
     );
+    assert_eq!(
+        payload.entries.len(),
+        1,
+        "selected-group root page should return the bounded first-page owner payload"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&owner_route.0),
+        1,
+        "request-scoped omitted ready root page must query the owner once instead of returning synthetic empty"
+    );
+
+    owner_endpoint.shutdown(Duration::from_secs(2)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

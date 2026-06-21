@@ -137,6 +137,42 @@ fn quiet_anchor_for_direct_query(tree: &MaterializedTree, dir_path: &[u8]) -> Op
     }
 }
 
+fn observe_node_for_reliability(reliability: &mut ReliabilityAccumulator, node: &FileMetaNode) {
+    reliability.observe_flags(
+        node.monitoring_attested,
+        node.is_currently_suspect(),
+        node.blind_spot,
+    );
+}
+
+fn observe_node_quiet_anchor(quiet_anchor: &mut Option<Instant>, node: &FileMetaNode) {
+    if let Some(anchor) = node.subtree_last_write_significant_change_at {
+        *quiet_anchor = quiet_anchor.map_or(Some(anchor), |current| Some(current.max(anchor)));
+    }
+}
+
+fn observe_direct_subtree_aggregate_for_reliability(
+    reliability: &mut ReliabilityAccumulator,
+    tree: &MaterializedTree,
+    dir_path: &[u8],
+) {
+    let Some(aggregate) = tree.aggregate_at(dir_path) else {
+        return;
+    };
+    if aggregate.attested_count < aggregate.total_nodes {
+        reliability.observe_reason(UnreliableReason::Unattested);
+    }
+    if aggregate.blind_spot_count > 0 {
+        reliability.observe_reason(UnreliableReason::BlindSpotsDetected);
+    }
+}
+
+fn observe_group_reliability(reliability: &mut ReliabilityAccumulator, group: &GroupReliability) {
+    if let Some(reason) = group.unreliable_reason.as_ref() {
+        reliability.observe_reason(reason.clone());
+    }
+}
+
 fn evaluate_tree_stability(
     response: &RawQueryResult,
     overflow_pending_materialization: bool,
@@ -327,6 +363,12 @@ fn entry_from_rebased_node(query_root: &[u8], path: &[u8], node: &FileMetaNode) 
     }
 }
 
+struct TreePageWithEvidence {
+    entries: Vec<TreePageEntry>,
+    reliability: GroupReliability,
+    quiet_anchor: Option<Instant>,
+}
+
 fn page_entries_from_tree(
     tree: &MaterializedTree,
     dir_path: &[u8],
@@ -335,6 +377,25 @@ fn page_entries_from_tree(
     entry_offset: usize,
     entry_limit: Option<usize>,
 ) -> Vec<TreePageEntry> {
+    page_entries_with_evidence_from_tree(
+        tree,
+        dir_path,
+        recursive,
+        max_depth,
+        entry_offset,
+        entry_limit,
+    )
+    .entries
+}
+
+fn page_entries_with_evidence_from_tree(
+    tree: &MaterializedTree,
+    dir_path: &[u8],
+    recursive: bool,
+    max_depth: Option<usize>,
+    entry_offset: usize,
+    entry_limit: Option<usize>,
+) -> TreePageWithEvidence {
     let mut entries = Vec::<TreePageEntry>::new();
     let depth_limit = if recursive {
         max_depth.unwrap_or(usize::MAX)
@@ -343,6 +404,8 @@ fn page_entries_from_tree(
     };
     let entry_limit = entry_limit.unwrap_or(usize::MAX);
     let mut skipped = 0usize;
+    let mut reliability = ReliabilityAccumulator::new();
+    let mut quiet_anchor = None::<Instant>;
 
     if recursive {
         for (path, node) in tree.descendant_iter(dir_path) {
@@ -362,6 +425,8 @@ fn page_entries_from_tree(
             if entries.len() >= entry_limit {
                 break;
             }
+            observe_node_for_reliability(&mut reliability, node);
+            observe_node_quiet_anchor(&mut quiet_anchor, node);
             entries.push(entry_from_node(dir_path, path, node, tree));
         }
     } else {
@@ -376,11 +441,73 @@ fn page_entries_from_tree(
             if entries.len() >= entry_limit {
                 break;
             }
+            observe_node_for_reliability(&mut reliability, node);
+            observe_node_quiet_anchor(&mut quiet_anchor, node);
             entries.push(entry_from_node(dir_path, path, node, tree));
         }
     }
 
-    entries
+    TreePageWithEvidence {
+        entries,
+        reliability: reliability.finish(),
+        quiet_anchor,
+    }
+}
+
+fn get_paged_direct_materialized_tree_payload(
+    tree: &MaterializedTree,
+    dir_path: &[u8],
+    overflow_pending_materialization: bool,
+    recursive: bool,
+    max_depth: Option<usize>,
+    stability_mode: StabilityMode,
+    quiet_window_ms: Option<u64>,
+    entry_offset: usize,
+    entry_limit: Option<usize>,
+    last_coverage_recovered_at: Option<Instant>,
+) -> TreeGroupPayload {
+    let root = page_root_from_tree(tree, dir_path);
+    let page = page_entries_with_evidence_from_tree(
+        tree,
+        dir_path,
+        recursive,
+        max_depth,
+        entry_offset,
+        entry_limit,
+    );
+
+    let mut reliability = ReliabilityAccumulator::new();
+    let mut quiet_anchor = page.quiet_anchor;
+    observe_direct_subtree_aggregate_for_reliability(&mut reliability, tree, dir_path);
+    observe_group_reliability(&mut reliability, &page.reliability);
+    if let Some(root) = tree.get(dir_path)
+        && !root.is_tombstoned
+    {
+        observe_node_for_reliability(&mut reliability, root);
+        observe_node_quiet_anchor(&mut quiet_anchor, root);
+    }
+    reliability.observe_overflow(overflow_pending_materialization);
+    let reliability = reliability.finish();
+    let direct = RawQueryResult {
+        nodes: Vec::new(),
+        reliable: reliability.reliable,
+        unreliable_reason: reliability.unreliable_reason.clone(),
+    };
+    let stability = evaluate_tree_stability(
+        &direct,
+        overflow_pending_materialization,
+        stability_mode,
+        quiet_window_ms,
+        quiet_anchor,
+        last_coverage_recovered_at,
+    );
+
+    TreeGroupPayload {
+        reliability,
+        stability,
+        root,
+        entries: page.entries,
+    }
 }
 
 fn page_entries_from_rebased_nodes(
@@ -507,6 +634,20 @@ pub fn get_materialized_tree_payload(
     };
     let direct_query = tree.has_path(dir_path);
     if direct_query {
+        if entry_limit.is_some() {
+            return get_paged_direct_materialized_tree_payload(
+                tree,
+                dir_path,
+                overflow_pending_materialization,
+                recursive,
+                max_depth,
+                stability_mode,
+                quiet_window_ms,
+                entry_offset,
+                entry_limit,
+                last_coverage_recovered_at,
+            );
+        }
         let direct = get_directory_tree(
             tree,
             dir_path,
@@ -875,6 +1016,99 @@ mod tests {
                 .any(|entry| entry.path == b"/nested/peer.txt".to_vec()),
             "direct query must still expose live descendants when the query root only exists as a structural placeholder: {:?}",
             resp.entries
+        );
+    }
+
+    #[test]
+    fn materialized_tree_query_limited_direct_page_uses_bounded_page_suspect_evidence() {
+        let mut tree = MaterializedTree::new();
+        insert_node(&mut tree, b"/a.txt", false, 10, 1_000_000);
+        insert_node(&mut tree, b"/b.txt", false, 10, 1_000_001);
+        insert_node(&mut tree, b"/z.txt", false, 10, 1_000_002);
+        tree.with_node_mut(b"/z.txt", |node| {
+            node.suspect_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        })
+        .expect("far page node exists");
+        let clock = SinkClock::new();
+        let settled = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+
+        let limited = get_materialized_tree_payload(
+            &tree,
+            b"/",
+            &clock,
+            false,
+            true,
+            None,
+            ReadClass::Materialized,
+            0,
+            Some(2),
+            settled,
+        );
+
+        assert_eq!(
+            limited
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![b"/a.txt".to_vec(), b"/b.txt".to_vec()]
+        );
+        assert!(
+            limited.reliability.reliable,
+            "a paged direct tree response must not scan unreturned entries for page-local suspect evidence: {:?}",
+            limited.reliability
+        );
+
+        let unbounded = get_materialized_tree_payload(
+            &tree,
+            b"/",
+            &clock,
+            false,
+            true,
+            None,
+            ReadClass::Materialized,
+            0,
+            None,
+            settled,
+        );
+        assert_eq!(
+            unbounded.reliability.unreliable_reason,
+            Some(UnreliableReason::SuspectNodes),
+            "the legacy unbounded path still evaluates suspect state across the full subtree"
+        );
+    }
+
+    #[test]
+    fn materialized_tree_query_limited_direct_page_uses_subtree_aggregate_reliability() {
+        let mut tree = MaterializedTree::new();
+        insert_node(&mut tree, b"/a.txt", false, 10, 1_000_000);
+        insert_node(&mut tree, b"/b.txt", false, 10, 1_000_001);
+        insert_node(&mut tree, b"/z.txt", false, 10, 1_000_002);
+        tree.with_node_mut(b"/z.txt", |node| {
+            node.blind_spot = true;
+        })
+        .expect("far page node exists");
+        let clock = SinkClock::new();
+
+        let limited = get_materialized_tree_payload(
+            &tree,
+            b"/",
+            &clock,
+            false,
+            true,
+            None,
+            ReadClass::Materialized,
+            0,
+            Some(2),
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60)),
+        );
+
+        assert_eq!(limited.entries.len(), 2);
+        assert_eq!(
+            limited.reliability.unreliable_reason,
+            Some(UnreliableReason::BlindSpotsDetected),
+            "paged direct tree responses must keep fail-closed subtree reliability without full descendant scans"
         );
     }
 

@@ -177,14 +177,20 @@ pub struct MaterializedTree {
     suspect_count: usize,
 }
 
+struct ChildFrame<'a> {
+    child_ids: &'a [NodeId],
+    index: usize,
+}
+
 struct TreeIter<'a> {
     tree: &'a MaterializedTree,
-    stack: Vec<NodeId>,
+    pending_node: Option<NodeId>,
+    stack: Vec<ChildFrame<'a>>,
 }
 
 struct ChildIter<'a> {
     tree: &'a MaterializedTree,
-    child_ids: Vec<NodeId>,
+    child_ids: &'a [NodeId],
     index: usize,
 }
 
@@ -192,18 +198,39 @@ impl<'a> Iterator for TreeIter<'a> {
     type Item = (&'a [u8], &'a FileMetaNode);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(id) = self.stack.pop() {
+        loop {
+            if let Some(id) = self.pending_node.take() {
+                let Some(node) = self.tree.node(id) else {
+                    continue;
+                };
+                self.stack.push(ChildFrame {
+                    child_ids: &node.children,
+                    index: 0,
+                });
+                if let Some(meta) = node.meta.as_ref() {
+                    return Some((node.path.as_ref(), meta));
+                }
+                continue;
+            }
+
+            let frame = self.stack.last_mut()?;
+            if frame.index >= frame.child_ids.len() {
+                self.stack.pop();
+                continue;
+            }
+            let id = frame.child_ids[frame.index];
+            frame.index += 1;
             let Some(node) = self.tree.node(id) else {
                 continue;
             };
-            for child in node.children.iter().rev() {
-                self.stack.push(*child);
-            }
+            self.stack.push(ChildFrame {
+                child_ids: &node.children,
+                index: 0,
+            });
             if let Some(meta) = node.meta.as_ref() {
                 return Some((node.path.as_ref(), meta));
             }
         }
-        None
     }
 }
 
@@ -333,7 +360,8 @@ impl MaterializedTree {
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &FileMetaNode)> {
         TreeIter {
             tree: self,
-            stack: vec![0],
+            pending_node: Some(0),
+            stack: Vec::new(),
         }
     }
 
@@ -407,14 +435,18 @@ impl MaterializedTree {
         &'a self,
         dir_path: &[u8],
     ) -> impl Iterator<Item = (&'a [u8], &'a FileMetaNode)> + 'a {
-        let stack = self
+        let child_ids = self
             .lookup_id(dir_path)
-            .and_then(|id| {
-                self.node(id)
-                    .map(|node| node.children.iter().rev().copied().collect())
-            })
+            .and_then(|id| self.node(id).map(|node| node.children.as_slice()))
             .unwrap_or_default();
-        TreeIter { tree: self, stack }
+        TreeIter {
+            tree: self,
+            pending_node: None,
+            stack: vec![ChildFrame {
+                child_ids,
+                index: 0,
+            }],
+        }
     }
 
     pub fn child_iter<'a>(
@@ -423,7 +455,7 @@ impl MaterializedTree {
     ) -> impl Iterator<Item = (&'a [u8], &'a FileMetaNode)> + 'a {
         let child_ids = self
             .lookup_id(dir_path)
-            .and_then(|id| self.node(id).map(|node| node.children.clone()))
+            .and_then(|id| self.node(id).map(|node| node.children.as_slice()))
             .unwrap_or_default();
         ChildIter {
             tree: self,

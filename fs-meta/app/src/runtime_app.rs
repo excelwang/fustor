@@ -32,6 +32,7 @@ use crate::runtime::orchestration::{
     FacadeControlSignal, FacadeRuntimeUnit, SinkControlSignal, SinkRuntimeUnit,
     SourceControlSignal, SourceRuntimeUnit, decode_logical_roots_control_payload,
     encode_logical_roots_control_payload_with_generation_and_sink_replay,
+    encode_manual_rescan_envelope_with_request_id_and_scoped_target_acceptance_timeout,
     manual_rescan_scoped_target_acceptance_timeout_from_payload,
     sink_control_signals_from_envelopes, split_app_control_signals,
 };
@@ -47,7 +48,8 @@ use crate::runtime::routes::{
     is_events_stream_route_key, sink_query_request_route_for, sink_query_route_bindings_for,
     sink_roots_control_stream_route_for, sink_status_request_route_for,
     source_find_route_bindings_for, source_rescan_request_route_for,
-    source_roots_control_stream_route_for, source_status_request_route_for,
+    source_rescan_route_bindings_for, source_roots_control_stream_route_for,
+    source_status_request_route_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::workers::sink::{SinkFacade, SinkFailure, SinkWorkerClientHandle};
@@ -5232,6 +5234,18 @@ impl ManagementWriteRecoveryContext {
             .store(false, Ordering::Release);
     }
 
+    async fn ensure_source_runtime_endpoints_started_after_source_repair(
+        &self,
+    ) -> std::result::Result<(), CnxError> {
+        let Some(boundary) = self.runtime_boundary.clone() else {
+            return Ok(());
+        };
+        if let SourceFacade::Local(source) = &*self.source {
+            source.start_runtime_endpoints(boundary).await?;
+        }
+        Ok(())
+    }
+
     async fn app_retained_sink_replay_signals(&self) -> Vec<SinkControlSignal> {
         let retained = self.retained_sink_control_state.lock().await.clone();
         let retained_sink_generation = retained
@@ -5850,6 +5864,7 @@ impl ManagementWriteRecoveryContext {
         Ok(signals)
     }
 
+    #[cfg(test)]
     async fn replay_source_scoped_sink_state_if_present(
         &self,
         total_timeout: Duration,
@@ -6136,6 +6151,147 @@ impl ManagementWriteRecoveryContext {
                     SOURCE_SCOPED_SINK_ROOTS_CONTROL_REPLAY_ATTEMPTS
                 );
             }
+        }
+        Ok(true)
+    }
+
+    async fn source_scoped_sink_replay_bound_scopes_for_groups(
+        &self,
+        target_groups: &BTreeSet<String>,
+    ) -> std::result::Result<Vec<RuntimeBoundScope>, CnxError> {
+        if target_groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let roots = self
+            .source
+            .logical_roots_snapshot_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)?;
+        let grants = self
+            .source
+            .host_object_grants_snapshot_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)?;
+        let bound_scopes = Self::source_scoped_sink_replay_scopes(&roots, &grants, target_groups);
+        let bound_groups = bound_scopes
+            .iter()
+            .map(|scope| scope.scope_id.clone())
+            .collect::<BTreeSet<_>>();
+        let missing_groups = target_groups
+            .difference(&bound_groups)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_groups.is_empty() {
+            return Err(CnxError::NotReady(format!(
+                "source-scoped sink repair source-rescan missing bound source owner for groups {}",
+                missing_groups.join(",")
+            )));
+        }
+        Ok(bound_scopes)
+    }
+
+    fn source_rescan_delivery_payload_summary(events: &[Event]) -> String {
+        events
+            .iter()
+            .take(8)
+            .map(|event| String::from_utf8_lossy(event.payload_bytes()).into_owned())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    async fn publish_source_scoped_source_rescan_requests_for_groups(
+        &self,
+        target_groups: &BTreeSet<String>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> std::result::Result<bool, CnxError> {
+        if target_groups.is_empty() {
+            return Ok(false);
+        }
+        let Some(boundary) = self.runtime_boundary.clone() else {
+            return Err(CnxError::NotReady(
+                "source-scoped sink repair source-rescan requires runtime boundary".into(),
+            ));
+        };
+        let bound_scopes = self
+            .source_scoped_sink_replay_bound_scopes_for_groups(target_groups)
+            .await?;
+        let owner_node_ids = Self::source_scoped_sink_replay_owner_node_ids(&bound_scopes);
+        if owner_node_ids.is_empty() {
+            return Err(CnxError::NotReady(format!(
+                "source-scoped sink repair source-rescan has no target owners for groups {}",
+                target_groups.iter().cloned().collect::<Vec<_>>().join(",")
+            )));
+        }
+        let requested_at_us = now_us();
+        let request_id = format!(
+            "status-sink-observation-repair:{}:{}:{}",
+            self.node_id.0,
+            requested_at_us,
+            target_groups.iter().cloned().collect::<Vec<_>>().join(",")
+        );
+        let initial_budget = deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or(MANUAL_RESCAN_SOURCE_STATUS_DEFAULT_PROBE_BUDGET);
+        if initial_budget.is_zero() {
+            return Err(CnxError::Timeout);
+        }
+        let envelope =
+            encode_manual_rescan_envelope_with_request_id_and_scoped_target_acceptance_timeout(
+                request_id,
+                requested_at_us,
+                Some(initial_budget.min(MANUAL_RESCAN_SOURCE_STATUS_DEFAULT_PROBE_BUDGET)),
+            )?;
+        let payload = bytes::Bytes::from(rmp_serde::to_vec_named(&envelope).map_err(|err| {
+            CnxError::Internal(format!(
+                "encode source-scoped sink repair source-rescan payload failed: {err}"
+            ))
+        })?);
+        for owner_node_id in owner_node_ids {
+            let call_timeout = deadline
+                .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+                .unwrap_or(MANUAL_RESCAN_SOURCE_STATUS_DEFAULT_PROBE_BUDGET)
+                .min(MANUAL_RESCAN_SOURCE_STATUS_DEFAULT_PROBE_BUDGET);
+            if call_timeout.is_zero() {
+                return Err(CnxError::Timeout);
+            }
+            let route_key = source_rescan_request_route_for(&owner_node_id).0;
+            eprintln!(
+                "fs_meta_runtime_app: source-scoped sink repair source-rescan send begin owner={} route={} groups={:?} timeout_ms={}",
+                owner_node_id,
+                route_key,
+                target_groups,
+                call_timeout.as_millis()
+            );
+            let adapter = crate::runtime::seam::exchange_host_adapter(
+                boundary.clone(),
+                self.node_id.clone(),
+                source_rescan_route_bindings_for(&owner_node_id),
+            );
+            let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+                &adapter,
+                ROUTE_TOKEN_FS_META_INTERNAL,
+                METHOD_SOURCE_RESCAN,
+                payload.clone(),
+                call_timeout,
+                Duration::from_millis(100).min(call_timeout),
+            )
+            .await?;
+            if !events
+                .iter()
+                .any(|event| event.payload_bytes() == b"accepted")
+            {
+                return Err(CnxError::Internal(format!(
+                    "source-scoped sink repair source-rescan was not accepted owner={} route={} groups={:?} replies={}",
+                    owner_node_id,
+                    route_key,
+                    target_groups,
+                    Self::source_rescan_delivery_payload_summary(&events)
+                )));
+            }
+            eprintln!(
+                "fs_meta_runtime_app: source-scoped sink repair source-rescan accepted owner={} route={} groups={:?}",
+                owner_node_id, route_key, target_groups
+            );
         }
         Ok(true)
     }
@@ -6463,6 +6619,8 @@ impl ManagementWriteRecoveryContext {
                 self.repair_worker_source_replay_if_retained_after_app_replay_cleared()
                     .await?;
                 self.restore_control_after_retained_replay_recovery();
+                self.ensure_source_runtime_endpoints_started_after_source_repair()
+                    .await?;
                 self.publish_recovered_facade_state().await;
                 self.publish_source_repair_gate_after_source_state_current()
                     .await;
@@ -6473,11 +6631,15 @@ impl ManagementWriteRecoveryContext {
                     .repair_source_runtime_scope_control_cache_if_needed()
                     .await?
                 {
+                    self.ensure_source_runtime_endpoints_started_after_source_repair()
+                        .await?;
                     self.publish_recovered_facade_state().await;
                     self.publish_source_repair_gate_after_source_state_current()
                         .await;
                     return Ok(());
                 }
+                self.ensure_source_runtime_endpoints_started_after_source_repair()
+                    .await?;
                 self.publish_recovered_facade_state().await;
                 self.publish_source_repair_gate_after_source_state_current()
                     .await;
@@ -6492,6 +6654,8 @@ impl ManagementWriteRecoveryContext {
         let _serial = self.control_frame_serial.lock().await;
         self.repair_source_replay_if_required().await?;
         self.restore_control_after_retained_replay_recovery();
+        self.ensure_source_runtime_endpoints_started_after_source_repair()
+            .await?;
         self.publish_recovered_facade_state().await;
         self.publish_source_repair_gate_after_source_state_current()
             .await;
@@ -6713,8 +6877,42 @@ impl ManagementWriteRecoveryContext {
             if remaining.is_zero() {
                 return Ok(());
             }
-            self.replay_source_scoped_sink_state_if_present(remaining, Some(deadline))
-                .await?
+            let source_rescan_groups = self
+                .api_control_gate
+                .take_sink_observation_repair_republish_groups();
+            let duplicate_policy = if source_rescan_groups.is_some() {
+                SourceScopedSinkReplayDuplicatePolicy::AllowFullRecoveryRepublish
+            } else {
+                SourceScopedSinkReplayDuplicatePolicy::SuppressStatusObservationDuplicate
+            };
+            let replayed = self
+                .replay_source_scoped_sink_state_if_present_with_policy(
+                    remaining,
+                    Some(deadline),
+                    duplicate_policy,
+                )
+                .await?;
+            if replayed {
+                if let Some(groups) = source_rescan_groups
+                    .as_ref()
+                    .filter(|groups| !groups.is_empty())
+                {
+                    self.publish_source_scoped_source_rescan_requests_for_groups(
+                        groups,
+                        Some(deadline),
+                    )
+                    .await?;
+                }
+            } else if let Some(groups) = source_rescan_groups
+                .as_ref()
+                .filter(|groups| !groups.is_empty())
+            {
+                return Err(CnxError::NotReady(format!(
+                    "source-scoped sink repair source-rescan withheld because sink replay state was not republished for groups {}",
+                    groups.iter().cloned().collect::<Vec<_>>().join(",")
+                )));
+            }
+            replayed
         };
 
         if replayed_sink_state {
@@ -10832,7 +11030,7 @@ impl FSMetaApp {
                 None,
                 deadline_at_us,
             );
-        let recovery = self.source_repair_recovery();
+        let recovery = self.source_repair_recovery_without_proxy_ready();
         let runtime_gate_state = self.runtime_gate_state.clone();
         let runtime_state_changed = self.runtime_state_changed.clone();
         let scheduled = self.deferred_source_repair_recovery_scheduled.clone();
@@ -12363,6 +12561,17 @@ impl FSMetaApp {
                 );
                 return;
             }
+            {
+                let mut state = runtime_gate_state
+                    .lock()
+                    .expect("lock runtime gate state before deferred query-peer publication");
+                if state.replay_fully_cleared() {
+                    state.mark_initialized();
+                    control_failure_uninitialized.store(false, Ordering::Release);
+                    internal_status_withdrawn_after_control_failure.store(false, Ordering::Release);
+                }
+            }
+            runtime_state_changed.notify_waiters();
             for signal in deferred_signals {
                 if let Err(err) =
                     Self::apply_deferred_sink_owned_query_peer_publication_signal_from_parts(
@@ -15075,8 +15284,12 @@ impl FSMetaApp {
                                                 "fs_meta_runtime_app: sink status endpoint unavailable reason=runtime_uninitialized_sink_apply_inflight route={}",
                                                 route_key
                                             );
+                                            let request_origin_is_local =
+                                                req.metadata().origin_id == local_node_id;
                                             if internal_status_withdrawn_after_control_failure
                                                 .load(Ordering::Acquire)
+                                                || !request_origin_is_local
+                                                || runtime_state.source_state_replay_required()
                                             {
                                                 // A fail-closed runtime boundary is not an empty
                                                 // sink-status snapshot. Let callers observe the

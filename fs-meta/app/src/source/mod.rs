@@ -3005,6 +3005,14 @@ impl FSMetaSource {
         reason != "periodic"
     }
 
+    fn audit_completion_satisfies_initial_scan_pending(
+        kind: RootAuditKind,
+        reason_label: &str,
+    ) -> bool {
+        matches!(kind, RootAuditKind::Initial)
+            || (matches!(kind, RootAuditKind::Rescan) && reason_label == "manual")
+    }
+
     fn root_audit_inflight(detail: &ConcreteRootHealthEntry) -> bool {
         match (
             detail.last_audit_started_at_us,
@@ -7265,18 +7273,27 @@ impl FSMetaSource {
                                             audit.record_count
                                         );
                                     }
-                                    if matches!(completion.kind, RootAuditKind::Initial) {
+                                    if Self::audit_completion_satisfies_initial_scan_pending(
+                                        completion.kind,
+                                        completion.reason_label,
+                                    ) {
                                         initial_scan_pending = false;
                                         initial_scan_inflight = false;
-                                        if let Some(target) = initial_scan_satisfies_manual_target.take() {
-                                            Self::mark_manual_rescan_intent_completed_up_to(
-                                                &manual_rescan_intents,
-                                                &root_key,
-                                                target,
-                                            );
-                                            if target >= last_manual_dispatch_target {
-                                                last_manual_dispatch_target = target;
+                                        if matches!(completion.kind, RootAuditKind::Initial) {
+                                            if let Some(target) =
+                                                initial_scan_satisfies_manual_target.take()
+                                            {
+                                                Self::mark_manual_rescan_intent_completed_up_to(
+                                                    &manual_rescan_intents,
+                                                    &root_key,
+                                                    target,
+                                                );
+                                                if target >= last_manual_dispatch_target {
+                                                    last_manual_dispatch_target = target;
+                                                }
                                             }
+                                        } else if matches!(completion.kind, RootAuditKind::Rescan) {
+                                            initial_scan_satisfies_manual_target = None;
                                         }
                                     }
                                     if let Some(target) = completion.manual_requested_target {

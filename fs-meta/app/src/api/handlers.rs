@@ -1126,7 +1126,7 @@ fn status_scan_audit_release_cache_key(
 fn status_release_owner_source_evidence_cache_key(
     node_id: &NodeId,
     authoritative_source: &SourceObservabilitySnapshot,
-    sink_status: &SinkStatusSnapshot,
+    _sink_status: &SinkStatusSnapshot,
     expected_groups: &BTreeSet<String>,
 ) -> StatusReleaseOwnerSourceEvidenceCacheKey {
     let mut parts = Vec::new();
@@ -1146,22 +1146,6 @@ fn status_release_owner_source_evidence_cache_key(
     parts.push(format!(
         "source_grants={}",
         status_scan_audit_release_grants_signature(&authoritative_source.grants).join(",")
-    ));
-    parts.push(format!(
-        "sink_schedule={}",
-        status_scan_audit_release_groups_by_node_signature(
-            &sink_snapshot_scheduled_groups_by_node(sink_status),
-            expected_groups,
-        )
-        .join(",")
-    ));
-    parts.push(format!(
-        "sink_primary={}",
-        status_scan_audit_release_primary_owner_signature(
-            &sink_snapshot_primary_host_ref_by_group(sink_status),
-            expected_groups,
-        )
-        .join(",")
     ));
     parts
 }
@@ -2964,12 +2948,15 @@ async fn collect_node_scoped_status_sink_snapshot(
         .await
         {
             Ok(Ok(events)) => break events,
-            Ok(Err(err)) if status_owner_scoped_probe_tx_busy(&err) => {
+            Ok(Err(err)) if status_owner_scoped_probe_retryable_transient(&err) => {
                 sleep_status_owner_scoped_probe_retry(deadline).await;
                 continue;
             }
             Ok(Err(err)) => return Err(err),
-            Err(_) => return Err(CnxError::Timeout),
+            Err(_) => {
+                sleep_status_owner_scoped_probe_retry(deadline).await;
+                continue;
+            }
         }
     };
     let snapshots = events
@@ -4056,6 +4043,13 @@ where
                                 next_resend_at,
                             );
                     }
+                    if source_only_manual_rescan
+                        && control_replay_policy == RootsPutControlReplayPolicy::ObserveOnly
+                        && observed_source_snapshot.is_none()
+                    {
+                        fallback_budget =
+                            fallback_budget.min(ROOTS_PUT_SOURCE_SECOND_WAVE_DISCOVERY_TIMEOUT);
+                    }
                     if !fallback_budget.is_zero() {
                         match collect_roots_put_source_second_wave_status_snapshot_until_manual_rescan_targets(
                             boundary.clone(),
@@ -4271,6 +4265,20 @@ where
                     last_runtime_scope =
                         Some(summarize_roots_put_source_runtime_scope(&source_snapshot));
                 } else {
+                    if source_only_manual_rescan
+                        && control_replay_policy == RootsPutControlReplayPolicy::ObserveOnly
+                        && !source_status_probe_targets_are_discovery_seed
+                        && !source_status_probe_node_ids.is_empty()
+                    {
+                        let last_err = observed_err
+                            .as_ref()
+                            .map(|err| err.to_string())
+                            .unwrap_or_else(|| "none".to_string());
+                        return Err(ApiError::service_unavailable(format!(
+                            "manual rescan current roots source-status did not return readiness evidence before duplicate roots-control retry: source_status_probe_targets={:?} last_err={last_err}",
+                            source_status_probe_node_ids,
+                        )));
+                    }
                     if !source_status_probe_targets_are_discovery_seed
                         && !source_status_probe_node_ids.is_empty()
                     {
@@ -4609,6 +4617,48 @@ fn record_status_route_trace(_trace_id: Option<u64>, _stage: impl Into<String>) 
             events.push(format!("{trace_id}:{}", _stage.into()));
         }
     }
+}
+
+#[cfg(test)]
+async fn wait_for_status_route_trace_stage(events: &StdMutex<Vec<String>>, stage: &str) {
+    for _ in 0..1000 {
+        let found = {
+            let events = match events.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            events.iter().any(|event| event.ends_with(stage))
+        };
+        if found {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("status route trace stage not observed: {stage}");
+}
+
+#[cfg(test)]
+async fn advance_paused_time_until_task_finishes<T>(
+    task: &tokio::task::JoinHandle<T>,
+    budget: Duration,
+) {
+    let mut elapsed = Duration::ZERO;
+    while elapsed < budget && !task.is_finished() {
+        let step = Duration::from_millis(100).min(budget - elapsed);
+        tokio::time::advance(step).await;
+        tokio::task::yield_now().await;
+        elapsed += step;
+    }
+    for _ in 0..10 {
+        if task.is_finished() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        task.is_finished(),
+        "paused-time task did not settle within {budget:?}"
+    );
 }
 
 fn summarize_sorted_set(groups: &BTreeSet<String>) -> String {
@@ -5029,6 +5079,20 @@ fn status_should_run_sink_observation_repair(
     {
         return true;
     }
+    if sink_status_snapshot_has_under_materialized_published_group(
+        source,
+        sink_status,
+        &expected_groups,
+    ) {
+        return true;
+    }
+    if sink_status_snapshot_has_under_ingested_published_group(
+        source,
+        sink_status,
+        &expected_groups,
+    ) {
+        return true;
+    }
     source_snapshot_has_publication_evidence_for_groups(source, &expected_groups)
         && sink_status_snapshot_lacks_transport_ingress_evidence(sink_status)
 }
@@ -5094,6 +5158,14 @@ fn status_sink_observation_repair_lane_signature(
         .collect::<Vec<_>>();
     sink_control.sort();
     parts.push(format!("sink_control={}", sink_control.join(",")));
+    let under_ingested = status_sink_observation_repair_under_ingested_signature_parts(
+        source,
+        sink_status,
+        expected_groups,
+    );
+    if !under_ingested.is_empty() {
+        parts.push(format!("under_ingested={}", under_ingested.join(",")));
+    }
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part.as_bytes());
@@ -5104,6 +5176,58 @@ fn status_sink_observation_repair_lane_signature(
         "sink:status-triggered-sink-observation-repair:status-observation:{}:{digest:x}",
         sink_outcome.as_str()
     )
+}
+
+fn status_sink_observation_repair_under_ingested_signature_parts(
+    source: &SourceObservabilitySnapshot,
+    sink_status: &SinkStatusSnapshot,
+    expected_groups: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut parts = expected_groups
+        .iter()
+        .filter_map(|group| {
+            if !source_snapshot_has_publication_evidence_for_group(source, group)
+                || !sink_status_snapshot_has_transport_ingress_evidence_for_group(
+                    sink_status,
+                    group,
+                )
+            {
+                return None;
+            }
+            let source_count = source_snapshot_max_publication_count_for_group(source, group);
+            let transport_count =
+                sink_status_max_transport_event_count_for_group(sink_status, group);
+            let gap = source_count.saturating_sub(transport_count);
+            if source_count < STATUS_UNDER_MATERIALIZED_SOURCE_MIN_EVENTS
+                || gap < STATUS_UNDER_MATERIALIZED_MIN_GAP_EVENTS
+                || transport_count.saturating_mul(STATUS_UNDER_MATERIALIZED_RATIO_DENOMINATOR)
+                    >= source_count
+            {
+                return None;
+            }
+            Some(format!(
+                "{}:source_bucket={}:transport_bucket={}:gap_bucket={}",
+                group,
+                source_count / STATUS_UNDER_INGESTED_REPAIR_SIGNATURE_BUCKET_EVENTS,
+                transport_count / STATUS_UNDER_INGESTED_REPAIR_SIGNATURE_BUCKET_EVENTS,
+                gap / STATUS_UNDER_INGESTED_REPAIR_SIGNATURE_BUCKET_EVENTS
+            ))
+        })
+        .collect::<Vec<_>>();
+    parts.sort();
+    parts
+}
+
+fn status_sink_observation_repair_under_ingested_groups(
+    source: &SourceObservabilitySnapshot,
+    sink_status: &SinkStatusSnapshot,
+    expected_groups: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    expected_groups
+        .iter()
+        .filter(|group| sink_status_snapshot_group_is_under_ingested(source, sink_status, group))
+        .cloned()
+        .collect()
 }
 
 fn status_sink_observation_repair_lane_evidence(
@@ -5179,6 +5303,8 @@ async fn run_status_sink_observation_repair_if_needed(
             sink_outcome,
         );
     }
+    let under_ingested_groups =
+        status_sink_observation_repair_under_ingested_groups(source, sink_status, &expected_groups);
     if let Some(owner_lane) =
         status_existing_sink_generation_cutover_lane(&state.control_gate.repair_lane_snapshot())
     {
@@ -5230,6 +5356,11 @@ async fn run_status_sink_observation_repair_if_needed(
     let (claimed, lane) = state.control_gate.claim_repair_lane_schedule(lane);
     if !claimed {
         return lane;
+    }
+    if !under_ingested_groups.is_empty() {
+        state
+            .control_gate
+            .request_sink_observation_repair_republish_for_groups(&under_ingested_groups);
     }
     let control_gate = state.control_gate.clone();
     let mut inflight = lane.clone();
@@ -5539,9 +5670,20 @@ async fn release_source_scan_audit_after_sink_scope_ready_if_needed(
         &expected_groups,
         &owner_nodes_by_group,
     );
+    let source_evidence_authority = source_snapshot_with_status_authority(
+        source.clone(),
+        state
+            .source
+            .cached_logical_roots_snapshot_with_failure()
+            .ok(),
+        state
+            .source
+            .cached_host_object_grants_snapshot_with_failure()
+            .ok(),
+    );
     let source_evidence_cache_key = status_release_owner_source_evidence_cache_key(
         &state.node_id,
-        source,
+        &source_evidence_authority,
         sink_status,
         &expected_groups,
     );
@@ -5979,8 +6121,24 @@ async fn status_impl(
         });
 
     let mut repair_lanes = state.control_gate.repair_lane_snapshot();
-    repair_lanes.push(run_status_source_repair_recovery_if_needed(&state, false).await);
-    repair_lanes.push(run_status_management_write_recovery_if_needed(&state).await);
+    let source_repair_lane = run_status_source_repair_recovery_if_needed(&state, false).await;
+    let source_repair_owns_this_status = source_repair_lane.lane == "source-repair"
+        && source_repair_lane.owner == "source"
+        && matches!(source_repair_lane.state.as_str(), "scheduled" | "inflight");
+    repair_lanes.push(source_repair_lane);
+    repair_lanes.push(if source_repair_owns_this_status {
+        status_repair_lane_evidence(
+            "management-write-recovery",
+            "facade",
+            "blocked",
+            "status-preflight",
+            false,
+            Some("source repair recovery owns current replay first".to_string()),
+            None,
+        )
+    } else {
+        run_status_management_write_recovery_if_needed(&state).await
+    });
 
     let (local_sink, local_sink_used_cached_fallback) = match state
         .sink
@@ -6234,6 +6392,7 @@ async fn status_impl(
     )
     .await;
     let sink_short_budget_owner_fanin_needed = use_short_status_route_budget
+        && management_status_route_has_owner_probe_seed_evidence(sink_outcome, source_outcome)
         && management_status_should_attempt_short_budget_sink_owner_scoped_fanin(
             &sink_status,
             &source,
@@ -6290,13 +6449,19 @@ async fn status_impl(
         &authoritative_source_for_status_fanin,
     );
     sink_status = apply_status_materialized_sink_evidence_cache(sink_status);
+    let sink_hint_source_owner_scoped_timeout =
+        if use_short_status_route_budget && !source_short_budget_owner_fanin_needed {
+            management_status_sink_owner_scoped_timeout(use_short_sink_owner_scoped_timeout)
+        } else {
+            management_status_source_owner_scoped_timeout(use_short_status_route_budget)
+        };
     source = augment_management_status_source_with_sink_owner_probe_hints(
         source,
         &authoritative_source_for_status_fanin,
         &sink_status,
         preferred_sink_owner_scoped_boundary.clone(),
         state.node_id.clone(),
-        management_status_source_owner_scoped_timeout(use_short_status_route_budget),
+        sink_hint_source_owner_scoped_timeout,
     )
     .await;
     source = augment_management_status_source_with_sink_owner_probe_hints(
@@ -6305,7 +6470,7 @@ async fn status_impl(
         &sink_status,
         fallback_sink_owner_scoped_boundary.clone(),
         state.node_id.clone(),
-        management_status_source_owner_scoped_timeout(use_short_status_route_budget),
+        sink_hint_source_owner_scoped_timeout,
     )
     .await;
     source = augment_management_status_source_with_cached_release_owner_evidence(
@@ -7310,6 +7475,10 @@ fn sink_status_snapshot_lacks_transport_ingress_evidence(snapshot: &SinkStatusSn
         && snapshot.stream_last_applied_at_us_by_node.is_empty()
 }
 
+// Path-origin vectors can be per-file in large NFS roots; keep /status fan-in bounded
+// and prefer aggregate group/owner counters when available.
+const STATUS_TRANSPORT_PATH_ORIGIN_SCAN_LIMIT: usize = 256;
+
 fn sink_status_entries_by_node_mention_group(
     entries_by_node: &BTreeMap<String, Vec<String>>,
     group: &str,
@@ -7317,6 +7486,17 @@ fn sink_status_entries_by_node_mention_group(
     entries_by_node
         .values()
         .flatten()
+        .any(|entry| origin_count_entry_mentions_group(entry, group))
+}
+
+fn sink_status_path_entries_by_node_mention_group_bounded(
+    entries_by_node: &BTreeMap<String, Vec<String>>,
+    group: &str,
+) -> bool {
+    entries_by_node
+        .values()
+        .flatten()
+        .take(STATUS_TRANSPORT_PATH_ORIGIN_SCAN_LIMIT)
         .any(|entry| origin_count_entry_mentions_group(entry, group))
 }
 
@@ -7333,7 +7513,7 @@ fn sink_status_snapshot_has_transport_ingress_evidence_for_group(
             &snapshot.stream_received_origin_counts_by_node,
             group,
         )
-        || sink_status_entries_by_node_mention_group(
+        || sink_status_path_entries_by_node_mention_group_bounded(
             &snapshot.stream_received_path_origin_counts_by_node,
             group,
         )
@@ -7341,7 +7521,7 @@ fn sink_status_snapshot_has_transport_ingress_evidence_for_group(
             &snapshot.stream_ready_origin_counts_by_node,
             group,
         )
-        || sink_status_entries_by_node_mention_group(
+        || sink_status_path_entries_by_node_mention_group_bounded(
             &snapshot.stream_ready_path_origin_counts_by_node,
             group,
         )
@@ -7349,7 +7529,7 @@ fn sink_status_snapshot_has_transport_ingress_evidence_for_group(
             &snapshot.stream_applied_origin_counts_by_node,
             group,
         )
-        || sink_status_entries_by_node_mention_group(
+        || sink_status_path_entries_by_node_mention_group_bounded(
             &snapshot.stream_applied_path_origin_counts_by_node,
             group,
         )
@@ -7391,6 +7571,20 @@ fn sink_status_owner_node_schedules_only_group(
                     .iter()
                     .any(|scheduled_group| scheduled_group == group)
         })
+}
+
+fn sink_status_path_entries_by_owner_node_mention_group_bounded(
+    entries_by_node: &BTreeMap<String, Vec<String>>,
+    group: &str,
+    owner_node: &str,
+) -> bool {
+    entries_by_node.iter().any(|(node_id, entries)| {
+        runtime_node_identity_matches(node_id, owner_node)
+            && entries
+                .iter()
+                .take(STATUS_TRANSPORT_PATH_ORIGIN_SCAN_LIMIT)
+                .any(|entry| origin_count_entry_mentions_group(entry, group))
+    })
 }
 
 fn sink_status_count_ingress_evidence_for_group_on_owner(
@@ -7442,39 +7636,47 @@ fn sink_status_snapshot_has_transport_ingress_evidence_for_group_on_owner(
     group: &str,
     owner_node: &str,
 ) -> bool {
-    sink_status_entries_by_owner_node_mention_group(
-        &snapshot.last_received_origins_by_node,
-        group,
-        owner_node,
-    ) || sink_status_entries_by_owner_node_mention_group(
-        &snapshot.received_origin_counts_by_node,
-        group,
-        owner_node,
-    ) || sink_status_entries_by_owner_node_mention_group(
-        &snapshot.stream_received_origin_counts_by_node,
-        group,
-        owner_node,
-    ) || sink_status_entries_by_owner_node_mention_group(
-        &snapshot.stream_received_path_origin_counts_by_node,
-        group,
-        owner_node,
-    ) || sink_status_entries_by_owner_node_mention_group(
-        &snapshot.stream_ready_origin_counts_by_node,
-        group,
-        owner_node,
-    ) || sink_status_entries_by_owner_node_mention_group(
-        &snapshot.stream_ready_path_origin_counts_by_node,
-        group,
-        owner_node,
-    ) || sink_status_entries_by_owner_node_mention_group(
-        &snapshot.stream_applied_origin_counts_by_node,
-        group,
-        owner_node,
-    ) || sink_status_entries_by_owner_node_mention_group(
-        &snapshot.stream_applied_path_origin_counts_by_node,
-        group,
-        owner_node,
-    ) || sink_status_count_ingress_evidence_for_group_on_owner(snapshot, group, owner_node)
+    sink_status_count_ingress_evidence_for_group_on_owner(snapshot, group, owner_node)
+        || sink_status_entries_by_owner_node_mention_group(
+            &snapshot.last_received_origins_by_node,
+            group,
+            owner_node,
+        )
+        || sink_status_entries_by_owner_node_mention_group(
+            &snapshot.received_origin_counts_by_node,
+            group,
+            owner_node,
+        )
+        || sink_status_entries_by_owner_node_mention_group(
+            &snapshot.stream_received_origin_counts_by_node,
+            group,
+            owner_node,
+        )
+        || sink_status_path_entries_by_owner_node_mention_group_bounded(
+            &snapshot.stream_received_path_origin_counts_by_node,
+            group,
+            owner_node,
+        )
+        || sink_status_entries_by_owner_node_mention_group(
+            &snapshot.stream_ready_origin_counts_by_node,
+            group,
+            owner_node,
+        )
+        || sink_status_path_entries_by_owner_node_mention_group_bounded(
+            &snapshot.stream_ready_path_origin_counts_by_node,
+            group,
+            owner_node,
+        )
+        || sink_status_entries_by_owner_node_mention_group(
+            &snapshot.stream_applied_origin_counts_by_node,
+            group,
+            owner_node,
+        )
+        || sink_status_path_entries_by_owner_node_mention_group_bounded(
+            &snapshot.stream_applied_path_origin_counts_by_node,
+            group,
+            owner_node,
+        )
 }
 
 fn sink_status_snapshot_lacks_ingress_for_published_group(
@@ -7486,6 +7688,250 @@ fn sink_status_snapshot_lacks_ingress_for_published_group(
         source_snapshot_has_publication_evidence_for_group(source, group)
             && !sink_status_snapshot_has_transport_ingress_evidence_for_group(sink_status, group)
     })
+}
+
+const STATUS_UNDER_MATERIALIZED_SOURCE_MIN_EVENTS: u64 = 100_000;
+const STATUS_UNDER_MATERIALIZED_MIN_GAP_EVENTS: u64 = 50_000;
+const STATUS_UNDER_MATERIALIZED_RATIO_DENOMINATOR: u64 = 4;
+const STATUS_UNDER_INGESTED_REPAIR_SIGNATURE_BUCKET_EVENTS: u64 = 1_000_000;
+
+fn origin_count_entry_value_for_group(entry: &str, group: &str) -> Option<u64> {
+    if !origin_count_entry_mentions_group(entry, group) {
+        return None;
+    }
+    entry
+        .rsplit('=')
+        .next()
+        .and_then(|count| count.parse::<u64>().ok())
+}
+
+fn source_snapshot_max_publication_count_for_group(
+    source: &SourceObservabilitySnapshot,
+    group: &str,
+) -> u64 {
+    let concrete_count = source
+        .status
+        .concrete_roots
+        .iter()
+        .filter(|root| root.logical_root_id == group && root.active && root.is_group_primary)
+        .map(|root| {
+            root.forwarded_event_count
+                .max(root.emitted_event_count)
+                .max(root.forwarded_batch_count)
+                .max(root.emitted_batch_count)
+        })
+        .max()
+        .unwrap_or_default();
+    let origin_count = [
+        &source.published_origin_counts_by_node,
+        &source.last_published_origins_by_node,
+        &source.published_path_origin_counts_by_node,
+    ]
+    .into_iter()
+    .flat_map(|entries_by_node| entries_by_node.values())
+    .flat_map(|entries| entries.iter())
+    .filter_map(|entry| origin_count_entry_value_for_group(entry, group))
+    .max()
+    .unwrap_or_default();
+    concrete_count.max(origin_count)
+}
+
+fn status_node_matches_any_owner(node_id: &str, owner_nodes: &BTreeSet<String>) -> bool {
+    owner_nodes.is_empty()
+        || owner_nodes
+            .iter()
+            .any(|owner_node| runtime_node_identity_matches(node_id, owner_node))
+}
+
+fn sink_status_entry_values_for_group_on_owners(
+    entries_by_node: &BTreeMap<String, Vec<String>>,
+    group: &str,
+    owner_nodes: &BTreeSet<String>,
+    scan_limit: Option<usize>,
+) -> u64 {
+    entries_by_node
+        .iter()
+        .filter(|(node_id, _)| status_node_matches_any_owner(node_id, owner_nodes))
+        .flat_map(|(_, entries)| entries.iter())
+        .take(scan_limit.unwrap_or(usize::MAX))
+        .filter_map(|entry| origin_count_entry_value_for_group(entry, group))
+        .max()
+        .unwrap_or_default()
+}
+
+fn sink_status_event_count_map_max_for_group_on_owners(
+    snapshot: &SinkStatusSnapshot,
+    counts_by_node: &BTreeMap<String, u64>,
+    group: &str,
+    owner_nodes: &BTreeSet<String>,
+) -> u64 {
+    counts_by_node
+        .iter()
+        .filter(|(node_id, _)| {
+            status_node_matches_any_owner(node_id, owner_nodes)
+                && sink_status_owner_node_schedules_only_group(snapshot, node_id, group)
+        })
+        .map(|(_, count)| *count)
+        .max()
+        .unwrap_or_default()
+}
+
+fn sink_status_max_transport_event_count_for_group(
+    sink_status: &SinkStatusSnapshot,
+    group: &str,
+) -> u64 {
+    let mut owner_nodes = status_sink_scheduled_owner_nodes_for_group(sink_status, group);
+    if let Some(primary) = sink_snapshot_primary_host_ref_for_group(sink_status, group) {
+        owner_nodes.insert(primary.to_string());
+    }
+    [
+        sink_status_event_count_map_max_for_group_on_owners(
+            sink_status,
+            &sink_status.received_events_by_node,
+            group,
+            &owner_nodes,
+        ),
+        sink_status_event_count_map_max_for_group_on_owners(
+            sink_status,
+            &sink_status.received_data_events_by_node,
+            group,
+            &owner_nodes,
+        ),
+        sink_status_event_count_map_max_for_group_on_owners(
+            sink_status,
+            &sink_status.stream_received_events_by_node,
+            group,
+            &owner_nodes,
+        ),
+        sink_status_event_count_map_max_for_group_on_owners(
+            sink_status,
+            &sink_status.stream_applied_events_by_node,
+            group,
+            &owner_nodes,
+        ),
+        sink_status_event_count_map_max_for_group_on_owners(
+            sink_status,
+            &sink_status.stream_applied_data_events_by_node,
+            group,
+            &owner_nodes,
+        ),
+        sink_status_entry_values_for_group_on_owners(
+            &sink_status.last_received_origins_by_node,
+            group,
+            &owner_nodes,
+            None,
+        ),
+        sink_status_entry_values_for_group_on_owners(
+            &sink_status.received_origin_counts_by_node,
+            group,
+            &owner_nodes,
+            None,
+        ),
+        sink_status_entry_values_for_group_on_owners(
+            &sink_status.stream_received_origin_counts_by_node,
+            group,
+            &owner_nodes,
+            None,
+        ),
+        sink_status_entry_values_for_group_on_owners(
+            &sink_status.stream_ready_origin_counts_by_node,
+            group,
+            &owner_nodes,
+            None,
+        ),
+        sink_status_entry_values_for_group_on_owners(
+            &sink_status.stream_applied_origin_counts_by_node,
+            group,
+            &owner_nodes,
+            None,
+        ),
+        sink_status_entry_values_for_group_on_owners(
+            &sink_status.stream_received_path_origin_counts_by_node,
+            group,
+            &owner_nodes,
+            Some(STATUS_TRANSPORT_PATH_ORIGIN_SCAN_LIMIT),
+        ),
+        sink_status_entry_values_for_group_on_owners(
+            &sink_status.stream_ready_path_origin_counts_by_node,
+            group,
+            &owner_nodes,
+            Some(STATUS_TRANSPORT_PATH_ORIGIN_SCAN_LIMIT),
+        ),
+        sink_status_entry_values_for_group_on_owners(
+            &sink_status.stream_applied_path_origin_counts_by_node,
+            group,
+            &owner_nodes,
+            Some(STATUS_TRANSPORT_PATH_ORIGIN_SCAN_LIMIT),
+        ),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or_default()
+}
+
+fn sink_status_group_materialized_live_count(
+    sink_status: &SinkStatusSnapshot,
+    group: &str,
+) -> Option<(u64, crate::sink::GroupReadinessState)> {
+    sink_status
+        .groups
+        .iter()
+        .find(|candidate| candidate.group_id == group)
+        .map(|candidate| (candidate.live_nodes, candidate.normalized_readiness()))
+}
+
+fn sink_status_snapshot_has_under_materialized_published_group(
+    source: &SourceObservabilitySnapshot,
+    sink_status: &SinkStatusSnapshot,
+    expected_groups: &BTreeSet<String>,
+) -> bool {
+    expected_groups.iter().any(|group| {
+        if !source_snapshot_has_publication_evidence_for_group(source, group)
+            || !sink_status_snapshot_has_transport_ingress_evidence_for_group(sink_status, group)
+        {
+            return false;
+        }
+        let Some((live_nodes, readiness)) =
+            sink_status_group_materialized_live_count(sink_status, group)
+        else {
+            return false;
+        };
+        if matches!(readiness, crate::sink::GroupReadinessState::Ready) {
+            return false;
+        }
+        let source_count = source_snapshot_max_publication_count_for_group(source, group);
+        source_count >= STATUS_UNDER_MATERIALIZED_SOURCE_MIN_EVENTS
+            && source_count.saturating_sub(live_nodes) >= STATUS_UNDER_MATERIALIZED_MIN_GAP_EVENTS
+            && live_nodes.saturating_mul(STATUS_UNDER_MATERIALIZED_RATIO_DENOMINATOR) < source_count
+    })
+}
+
+fn sink_status_snapshot_has_under_ingested_published_group(
+    source: &SourceObservabilitySnapshot,
+    sink_status: &SinkStatusSnapshot,
+    expected_groups: &BTreeSet<String>,
+) -> bool {
+    expected_groups
+        .iter()
+        .any(|group| sink_status_snapshot_group_is_under_ingested(source, sink_status, group))
+}
+
+fn sink_status_snapshot_group_is_under_ingested(
+    source: &SourceObservabilitySnapshot,
+    sink_status: &SinkStatusSnapshot,
+    group: &str,
+) -> bool {
+    if !source_snapshot_has_publication_evidence_for_group(source, group)
+        || !sink_status_snapshot_has_transport_ingress_evidence_for_group(sink_status, group)
+    {
+        return false;
+    }
+    let source_count = source_snapshot_max_publication_count_for_group(source, group);
+    let transport_count = sink_status_max_transport_event_count_for_group(sink_status, group);
+    source_count >= STATUS_UNDER_MATERIALIZED_SOURCE_MIN_EVENTS
+        && source_count.saturating_sub(transport_count) >= STATUS_UNDER_MATERIALIZED_MIN_GAP_EVENTS
+        && transport_count.saturating_mul(STATUS_UNDER_MATERIALIZED_RATIO_DENOMINATOR)
+            < source_count
 }
 
 fn sink_status_snapshot_is_zeroish_for_active_source_groups(snapshot: &SinkStatusSnapshot) -> bool {
@@ -7547,6 +7993,132 @@ fn status_sink_owner_evidence_cache() -> &'static StdMutex<BTreeMap<String, Stat
     CACHE.get_or_init(|| StdMutex::new(BTreeMap::new()))
 }
 
+#[derive(Clone, Debug)]
+struct StatusSinkOwnerTransportEvidence {
+    owner: StatusSinkOwnerEvidence,
+    received_batches_by_node: BTreeMap<String, u64>,
+    received_events_by_node: BTreeMap<String, u64>,
+    received_control_events_by_node: BTreeMap<String, u64>,
+    received_data_events_by_node: BTreeMap<String, u64>,
+    last_received_at_us_by_node: BTreeMap<String, u64>,
+    last_received_origins_by_node: BTreeMap<String, Vec<String>>,
+    received_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    stream_receive_armed_by_node: BTreeMap<String, u64>,
+    stream_received_batches_by_node: BTreeMap<String, u64>,
+    stream_received_events_by_node: BTreeMap<String, u64>,
+    stream_received_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    stream_ready_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    stream_applied_batches_by_node: BTreeMap<String, u64>,
+    stream_applied_events_by_node: BTreeMap<String, u64>,
+    stream_applied_control_events_by_node: BTreeMap<String, u64>,
+    stream_applied_data_events_by_node: BTreeMap<String, u64>,
+    stream_applied_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    stream_last_applied_at_us_by_node: BTreeMap<String, u64>,
+}
+
+fn status_sink_owner_transport_evidence_cache()
+-> &'static StdMutex<BTreeMap<String, StatusSinkOwnerTransportEvidence>> {
+    static CACHE: OnceLock<StdMutex<BTreeMap<String, StatusSinkOwnerTransportEvidence>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(BTreeMap::new()))
+}
+
+fn status_sink_owner_evidence_from_maps(
+    group_id: &str,
+    primary_host_ref_by_group: &BTreeMap<String, String>,
+    scheduled_groups_by_node: &BTreeMap<String, Vec<String>>,
+) -> Option<StatusSinkOwnerEvidence> {
+    let primary_host_ref = primary_host_ref_by_group
+        .get(group_id)
+        .map(|host_ref| host_ref.trim())
+        .filter(|host_ref| !host_ref.is_empty())?;
+    let scheduled_node_id = scheduled_groups_by_node
+        .iter()
+        .filter(|(_, groups)| groups.iter().any(|group| group == group_id))
+        .map(|(node_id, _)| node_id.as_str())
+        .find(|node_id| runtime_node_identity_matches(node_id, primary_host_ref))?;
+    Some(StatusSinkOwnerEvidence {
+        group_id: group_id.to_string(),
+        primary_host_ref: primary_host_ref.to_string(),
+        scheduled_node_id: scheduled_node_id.to_string(),
+    })
+}
+
+fn status_sink_owner_count_entries(
+    counts_by_node: &BTreeMap<String, u64>,
+    owner_node: &str,
+) -> BTreeMap<String, u64> {
+    counts_by_node
+        .iter()
+        .filter(|(node_id, count)| {
+            **count > 0 && runtime_node_identity_matches(node_id, owner_node)
+        })
+        .map(|(node_id, count)| (node_id.clone(), *count))
+        .collect()
+}
+
+fn status_sink_owner_timestamp_entries(
+    timestamps_by_node: &BTreeMap<String, u64>,
+    owner_node: &str,
+) -> BTreeMap<String, u64> {
+    timestamps_by_node
+        .iter()
+        .filter(|(node_id, timestamp)| {
+            **timestamp > 0 && runtime_node_identity_matches(node_id, owner_node)
+        })
+        .map(|(node_id, timestamp)| (node_id.clone(), *timestamp))
+        .collect()
+}
+
+fn status_sink_owner_group_vec_entries(
+    entries_by_node: &BTreeMap<String, Vec<String>>,
+    group_id: &str,
+    owner_node: &str,
+) -> BTreeMap<String, Vec<String>> {
+    entries_by_node
+        .iter()
+        .filter(|(node_id, _)| runtime_node_identity_matches(node_id, owner_node))
+        .filter_map(|(node_id, entries)| {
+            let mut group_entries = entries
+                .iter()
+                .filter(|entry| origin_count_entry_mentions_group(entry, group_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            group_entries.sort();
+            group_entries.dedup();
+            (!group_entries.is_empty()).then(|| (node_id.clone(), group_entries))
+        })
+        .collect()
+}
+
+fn status_sink_owner_transport_evidence_has_proof(
+    evidence: &StatusSinkOwnerTransportEvidence,
+) -> bool {
+    [
+        &evidence.received_batches_by_node,
+        &evidence.received_events_by_node,
+        &evidence.received_control_events_by_node,
+        &evidence.received_data_events_by_node,
+        &evidence.stream_received_batches_by_node,
+        &evidence.stream_received_events_by_node,
+        &evidence.stream_applied_batches_by_node,
+        &evidence.stream_applied_events_by_node,
+        &evidence.stream_applied_control_events_by_node,
+        &evidence.stream_applied_data_events_by_node,
+    ]
+    .iter()
+    .any(|entries| !entries.is_empty())
+        || [
+            &evidence.last_received_origins_by_node,
+            &evidence.received_origin_counts_by_node,
+            &evidence.stream_received_origin_counts_by_node,
+            &evidence.stream_ready_origin_counts_by_node,
+            &evidence.stream_applied_origin_counts_by_node,
+        ]
+        .iter()
+        .any(|entries| !entries.is_empty())
+}
+
 fn status_materialized_sink_evidence_key(group: &SinkGroupStatusSnapshot) -> String {
     format!("{}\0{}", group.group_id, group.primary_object_ref)
 }
@@ -7586,21 +8158,17 @@ fn status_sink_owner_evidence_for_group(
     snapshot: &SinkStatusSnapshot,
     group_id: &str,
 ) -> Option<StatusSinkOwnerEvidence> {
-    let primary_host_ref = snapshot
-        .owner_scoped_primary_host_ref_by_group
-        .get(group_id)
-        .map(|host_ref| host_ref.trim())
-        .filter(|host_ref| !host_ref.is_empty())?;
-    let scheduled_node_id = snapshot
-        .owner_scoped_scheduled_groups_by_node
-        .iter()
-        .filter(|(_, groups)| groups.iter().any(|group| group == group_id))
-        .map(|(node_id, _)| node_id.as_str())
-        .find(|node_id| runtime_node_identity_matches(node_id, primary_host_ref))?;
-    Some(StatusSinkOwnerEvidence {
-        group_id: group_id.to_string(),
-        primary_host_ref: primary_host_ref.to_string(),
-        scheduled_node_id: scheduled_node_id.to_string(),
+    status_sink_owner_evidence_from_maps(
+        group_id,
+        &snapshot.owner_scoped_primary_host_ref_by_group,
+        &snapshot.owner_scoped_scheduled_groups_by_node,
+    )
+    .or_else(|| {
+        status_sink_owner_evidence_from_maps(
+            group_id,
+            &snapshot.primary_host_ref_by_group,
+            &snapshot.scheduled_groups_by_node,
+        )
     })
 }
 
@@ -7622,6 +8190,108 @@ fn status_sink_owner_evidence_is_compatible(
             .all(|node_id| runtime_node_identity_matches(node_id, &evidence.scheduled_node_id))
 }
 
+fn status_sink_owner_transport_evidence_for_group(
+    snapshot: &SinkStatusSnapshot,
+    owner: &StatusSinkOwnerEvidence,
+) -> Option<StatusSinkOwnerTransportEvidence> {
+    if !sink_status_snapshot_has_transport_ingress_evidence_for_group_on_owner(
+        snapshot,
+        &owner.group_id,
+        &owner.scheduled_node_id,
+    ) {
+        return None;
+    }
+    let evidence = StatusSinkOwnerTransportEvidence {
+        owner: owner.clone(),
+        received_batches_by_node: status_sink_owner_count_entries(
+            &snapshot.received_batches_by_node,
+            &owner.scheduled_node_id,
+        ),
+        received_events_by_node: status_sink_owner_count_entries(
+            &snapshot.received_events_by_node,
+            &owner.scheduled_node_id,
+        ),
+        received_control_events_by_node: status_sink_owner_count_entries(
+            &snapshot.received_control_events_by_node,
+            &owner.scheduled_node_id,
+        ),
+        received_data_events_by_node: status_sink_owner_count_entries(
+            &snapshot.received_data_events_by_node,
+            &owner.scheduled_node_id,
+        ),
+        last_received_at_us_by_node: status_sink_owner_timestamp_entries(
+            &snapshot.last_received_at_us_by_node,
+            &owner.scheduled_node_id,
+        ),
+        last_received_origins_by_node: status_sink_owner_group_vec_entries(
+            &snapshot.last_received_origins_by_node,
+            &owner.group_id,
+            &owner.scheduled_node_id,
+        ),
+        received_origin_counts_by_node: status_sink_owner_group_vec_entries(
+            &snapshot.received_origin_counts_by_node,
+            &owner.group_id,
+            &owner.scheduled_node_id,
+        ),
+        stream_receive_armed_by_node: status_sink_owner_count_entries(
+            &snapshot.stream_receive_armed_by_node,
+            &owner.scheduled_node_id,
+        ),
+        stream_received_batches_by_node: status_sink_owner_count_entries(
+            &snapshot.stream_received_batches_by_node,
+            &owner.scheduled_node_id,
+        ),
+        stream_received_events_by_node: status_sink_owner_count_entries(
+            &snapshot.stream_received_events_by_node,
+            &owner.scheduled_node_id,
+        ),
+        stream_received_origin_counts_by_node: status_sink_owner_group_vec_entries(
+            &snapshot.stream_received_origin_counts_by_node,
+            &owner.group_id,
+            &owner.scheduled_node_id,
+        ),
+        stream_ready_origin_counts_by_node: status_sink_owner_group_vec_entries(
+            &snapshot.stream_ready_origin_counts_by_node,
+            &owner.group_id,
+            &owner.scheduled_node_id,
+        ),
+        stream_applied_batches_by_node: status_sink_owner_count_entries(
+            &snapshot.stream_applied_batches_by_node,
+            &owner.scheduled_node_id,
+        ),
+        stream_applied_events_by_node: status_sink_owner_count_entries(
+            &snapshot.stream_applied_events_by_node,
+            &owner.scheduled_node_id,
+        ),
+        stream_applied_control_events_by_node: status_sink_owner_count_entries(
+            &snapshot.stream_applied_control_events_by_node,
+            &owner.scheduled_node_id,
+        ),
+        stream_applied_data_events_by_node: status_sink_owner_count_entries(
+            &snapshot.stream_applied_data_events_by_node,
+            &owner.scheduled_node_id,
+        ),
+        stream_applied_origin_counts_by_node: status_sink_owner_group_vec_entries(
+            &snapshot.stream_applied_origin_counts_by_node,
+            &owner.group_id,
+            &owner.scheduled_node_id,
+        ),
+        stream_last_applied_at_us_by_node: status_sink_owner_timestamp_entries(
+            &snapshot.stream_last_applied_at_us_by_node,
+            &owner.scheduled_node_id,
+        ),
+    };
+    status_sink_owner_transport_evidence_has_proof(&evidence).then_some(evidence)
+}
+
+fn status_sink_owner_transport_evidence_is_compatible(
+    snapshot: &SinkStatusSnapshot,
+    evidence: &StatusSinkOwnerTransportEvidence,
+) -> bool {
+    status_sink_owner_evidence_is_compatible(snapshot, &evidence.owner)
+        && status_sink_owner_transport_evidence_has_proof(evidence)
+}
+
 fn apply_status_sink_owner_evidence(
     snapshot: &mut SinkStatusSnapshot,
     evidence: StatusSinkOwnerEvidence,
@@ -7641,6 +8311,107 @@ fn apply_status_sink_owner_evidence(
     entry.dedup();
 }
 
+fn apply_status_owner_transport_count_entries(
+    target: &mut BTreeMap<String, u64>,
+    evidence: &BTreeMap<String, u64>,
+) {
+    for (node_id, count) in evidence {
+        let entry = target.entry(node_id.clone()).or_default();
+        *entry = (*entry).max(*count);
+    }
+}
+
+fn apply_status_owner_transport_vec_entries(
+    target: &mut BTreeMap<String, Vec<String>>,
+    evidence: &BTreeMap<String, Vec<String>>,
+) {
+    for (node_id, entries) in evidence {
+        let target_entries = target.entry(node_id.clone()).or_default();
+        target_entries.extend(entries.iter().cloned());
+        target_entries.sort();
+        target_entries.dedup();
+    }
+}
+
+fn apply_status_sink_owner_transport_evidence(
+    snapshot: &mut SinkStatusSnapshot,
+    evidence: StatusSinkOwnerTransportEvidence,
+) {
+    apply_status_sink_owner_evidence(snapshot, evidence.owner);
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.received_batches_by_node,
+        &evidence.received_batches_by_node,
+    );
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.received_events_by_node,
+        &evidence.received_events_by_node,
+    );
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.received_control_events_by_node,
+        &evidence.received_control_events_by_node,
+    );
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.received_data_events_by_node,
+        &evidence.received_data_events_by_node,
+    );
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.last_received_at_us_by_node,
+        &evidence.last_received_at_us_by_node,
+    );
+    apply_status_owner_transport_vec_entries(
+        &mut snapshot.last_received_origins_by_node,
+        &evidence.last_received_origins_by_node,
+    );
+    apply_status_owner_transport_vec_entries(
+        &mut snapshot.received_origin_counts_by_node,
+        &evidence.received_origin_counts_by_node,
+    );
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.stream_receive_armed_by_node,
+        &evidence.stream_receive_armed_by_node,
+    );
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.stream_received_batches_by_node,
+        &evidence.stream_received_batches_by_node,
+    );
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.stream_received_events_by_node,
+        &evidence.stream_received_events_by_node,
+    );
+    apply_status_owner_transport_vec_entries(
+        &mut snapshot.stream_received_origin_counts_by_node,
+        &evidence.stream_received_origin_counts_by_node,
+    );
+    apply_status_owner_transport_vec_entries(
+        &mut snapshot.stream_ready_origin_counts_by_node,
+        &evidence.stream_ready_origin_counts_by_node,
+    );
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.stream_applied_batches_by_node,
+        &evidence.stream_applied_batches_by_node,
+    );
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.stream_applied_events_by_node,
+        &evidence.stream_applied_events_by_node,
+    );
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.stream_applied_control_events_by_node,
+        &evidence.stream_applied_control_events_by_node,
+    );
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.stream_applied_data_events_by_node,
+        &evidence.stream_applied_data_events_by_node,
+    );
+    apply_status_owner_transport_vec_entries(
+        &mut snapshot.stream_applied_origin_counts_by_node,
+        &evidence.stream_applied_origin_counts_by_node,
+    );
+    apply_status_owner_transport_count_entries(
+        &mut snapshot.stream_last_applied_at_us_by_node,
+        &evidence.stream_last_applied_at_us_by_node,
+    );
+}
+
 fn apply_status_materialized_sink_evidence_cache(
     snapshot: SinkStatusSnapshot,
 ) -> SinkStatusSnapshot {
@@ -7651,22 +8422,51 @@ fn apply_status_materialized_sink_evidence_cache(
     let mut merged = snapshot;
     let mut replacements = BTreeMap::<String, SinkGroupStatusSnapshot>::new();
     let mut owner_evidence_replacements = Vec::<StatusSinkOwnerEvidence>::new();
+    let mut transport_evidence_replacements = Vec::<StatusSinkOwnerTransportEvidence>::new();
     let mut owner_evidence_cache = status_sink_owner_evidence_cache().lock().ok();
+    let mut transport_evidence_cache = status_sink_owner_transport_evidence_cache().lock().ok();
     for group in &merged.groups {
         let key = status_materialized_sink_evidence_key(group);
-        if let Some(owner_evidence) = status_sink_owner_evidence_for_group(&merged, &group.group_id)
+        let owner_evidence = if let Some(owner_evidence) =
+            status_sink_owner_evidence_for_group(&merged, &group.group_id)
         {
             if let Some(cache) = owner_evidence_cache.as_mut() {
-                cache.insert(key.clone(), owner_evidence);
+                cache.insert(key.clone(), owner_evidence.clone());
             }
+            Some(owner_evidence)
         } else if let Some(cache) = owner_evidence_cache.as_ref()
             && let Some(owner_evidence) = cache.get(&key)
             && status_sink_owner_evidence_is_compatible(&merged, owner_evidence)
         {
             owner_evidence_replacements.push(owner_evidence.clone());
+            Some(owner_evidence.clone())
+        } else {
+            None
+        };
+        if let Some(owner_evidence) = owner_evidence.as_ref() {
+            if let Some(transport_evidence) =
+                status_sink_owner_transport_evidence_for_group(&merged, owner_evidence)
+            {
+                if let Some(cache) = transport_evidence_cache.as_mut() {
+                    cache.insert(key.clone(), transport_evidence);
+                }
+            } else if let Some(cache) = transport_evidence_cache.as_ref()
+                && let Some(transport_evidence) = cache.get(&key)
+                && status_sink_owner_transport_evidence_is_compatible(&merged, transport_evidence)
+            {
+                transport_evidence_replacements.push(transport_evidence.clone());
+            }
         }
         if sink_group_has_restorable_materialized_evidence(group) {
-            cache.insert(key, group.clone());
+            if !group.overflow_pending_materialization
+                && let Some(cached) = cache.get(&key)
+                && sink_group_has_restorable_materialized_evidence(cached)
+                && status_sink_group_merge_score(group) < status_sink_group_merge_score(cached)
+            {
+                replacements.insert(group.group_id.clone(), cached.clone());
+            } else {
+                cache.insert(key, group.clone());
+            }
         } else if sink_group_is_unready_zero_for_same_primary(group)
             && let Some(cached) = cache.get(&key)
             && sink_group_has_restorable_materialized_evidence(cached)
@@ -7674,7 +8474,10 @@ fn apply_status_materialized_sink_evidence_cache(
             replacements.insert(group.group_id.clone(), cached.clone());
         }
     }
-    if replacements.is_empty() && owner_evidence_replacements.is_empty() {
+    if replacements.is_empty()
+        && owner_evidence_replacements.is_empty()
+        && transport_evidence_replacements.is_empty()
+    {
         return merged;
     }
     for group in &mut merged.groups {
@@ -7684,6 +8487,9 @@ fn apply_status_materialized_sink_evidence_cache(
     }
     for owner_evidence in owner_evidence_replacements {
         apply_status_sink_owner_evidence(&mut merged, owner_evidence);
+    }
+    for transport_evidence in transport_evidence_replacements {
+        apply_status_sink_owner_transport_evidence(&mut merged, transport_evidence);
     }
     merged.live_nodes = 0;
     merged.tombstoned_count = 0;
@@ -8403,6 +9209,14 @@ fn management_status_should_attempt_short_budget_sink_owner_scoped_fanin(
     !candidate_node_ids.is_empty() || !speculative_zero_rows_without_sink_owner_evidence
 }
 
+fn management_status_route_has_owner_probe_seed_evidence(
+    sink_outcome: StatusRouteOutcome,
+    source_outcome: StatusRouteOutcome,
+) -> bool {
+    matches!(sink_outcome, StatusRouteOutcome::Ok)
+        || matches!(source_outcome, StatusRouteOutcome::Ok)
+}
+
 fn management_status_should_use_short_sink_owner_scoped_timeout(
     sink_outcome: StatusRouteOutcome,
     sink: &SinkStatusSnapshot,
@@ -9112,6 +9926,95 @@ fn remove_sink_status_evidence_for_groups(
     sink
 }
 
+fn status_sink_group_merge_score(group: &SinkGroupStatusSnapshot) -> (u8, u64, u64, u64) {
+    (
+        u8::from(matches!(
+            group.normalized_readiness(),
+            GroupReadinessState::Ready
+        )),
+        group.total_nodes,
+        group.live_nodes,
+        group.shadow_time_us,
+    )
+}
+
+fn status_sink_group_by_id<'a>(
+    snapshot: &'a SinkStatusSnapshot,
+    group_id: &str,
+) -> Option<&'a SinkGroupStatusSnapshot> {
+    snapshot
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+}
+
+fn status_owner_node_from_ref(value: &str) -> Option<String> {
+    let node = value
+        .split_once("::")
+        .map(|(node, _)| node)
+        .unwrap_or(value)
+        .trim();
+    (!node.is_empty()).then(|| node.to_string())
+}
+
+fn status_sink_owner_evidence_nodes_for_group(
+    snapshot: &SinkStatusSnapshot,
+    group_id: &str,
+) -> BTreeSet<String> {
+    let mut nodes = BTreeSet::new();
+    if let Some(primary) = sink_snapshot_primary_host_ref_for_group(snapshot, group_id)
+        && let Some(node) = status_owner_node_from_ref(&primary)
+    {
+        nodes.insert(node);
+    }
+    nodes.extend(status_sink_scheduled_owner_nodes_for_group(
+        snapshot, group_id,
+    ));
+    nodes.extend(status_sink_control_frame_owner_nodes_for_group(
+        snapshot, group_id,
+    ));
+    if let Some(group) = status_sink_group_by_id(snapshot, group_id)
+        && let Some(node) = status_owner_node_from_ref(&group.primary_object_ref)
+    {
+        nodes.insert(node);
+    }
+    nodes
+}
+
+fn status_owner_node_sets_equivalent(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
+    !left.is_empty()
+        && !right.is_empty()
+        && left.iter().all(|left_node| {
+            right
+                .iter()
+                .any(|right_node| runtime_node_identity_matches(left_node, right_node))
+        })
+        && right.iter().all(|right_node| {
+            left.iter()
+                .any(|left_node| runtime_node_identity_matches(left_node, right_node))
+        })
+}
+
+fn owner_scoped_sink_status_has_lower_same_owner_group(
+    current: &SinkStatusSnapshot,
+    owner_scoped: &SinkStatusSnapshot,
+    group_id: &str,
+) -> bool {
+    let Some(current_group) = status_sink_group_by_id(current, group_id) else {
+        return false;
+    };
+    let Some(owner_group) = status_sink_group_by_id(owner_scoped, group_id) else {
+        return false;
+    };
+    if status_sink_group_merge_score(owner_group) >= status_sink_group_merge_score(current_group) {
+        return false;
+    }
+    status_owner_node_sets_equivalent(
+        &status_sink_owner_evidence_nodes_for_group(current, group_id),
+        &status_sink_owner_evidence_nodes_for_group(owner_scoped, group_id),
+    )
+}
+
 fn merge_owner_scoped_sink_status_snapshot(
     current: SinkStatusSnapshot,
     owner_scoped: SinkStatusSnapshot,
@@ -9124,6 +10027,11 @@ fn merge_owner_scoped_sink_status_snapshot(
         .iter()
         .filter(|group_id| {
             sink_status_snapshot_has_owner_replacement_evidence(&owner_scoped, group_id)
+                && !owner_scoped_sink_status_has_lower_same_owner_group(
+                    &current,
+                    &owner_scoped,
+                    group_id,
+                )
         })
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -9265,6 +10173,7 @@ async fn augment_management_status_sink_with_owner_scoped_evidence(
 fn classify_status_route_error(err: &CnxError) -> StatusRouteOutcome {
     match err {
         CnxError::Timeout => StatusRouteOutcome::Timeout,
+        CnxError::TxBusy => StatusRouteOutcome::Transport,
         CnxError::ChannelClosed => StatusRouteOutcome::Transport,
         CnxError::TransportClosed(_) => StatusRouteOutcome::Transport,
         CnxError::ProtocolViolation(_) => StatusRouteOutcome::Protocol,
@@ -14642,12 +15551,9 @@ fn status_sink_with_degraded_runtime_scope_owner_map(
     let mut group_ids = management_status_authoritative_source_root_ids(authoritative_source);
     group_ids.extend(sink_status_reported_group_ids(&sink));
     group_ids.retain(|group| !group.is_empty());
-    if group_ids.is_empty()
-        || !source_runtime_scope_fanin_covers_authoritative_schedule_as_degraded_status(
-            source, &group_ids,
-        )
-        || !status_fanin_preserves_source_anchored_sink_owner_partition(&sink, source, &group_ids)
-    {
+    let source_schedule_covers =
+        management_status_source_fanin_covers_authoritative_schedule(source, &group_ids);
+    if group_ids.is_empty() || !source_schedule_covers {
         return sink;
     }
 
@@ -14658,10 +15564,15 @@ fn status_sink_with_degraded_runtime_scope_owner_map(
             continue;
         };
         let control_owner_nodes = status_sink_control_frame_owner_nodes_for_group(&sink, &group_id);
+        if control_owner_nodes
+            .iter()
+            .any(|node_id| !runtime_node_identity_matches(node_id, &owner_node))
+        {
+            continue;
+        }
         if control_owner_nodes.is_empty()
-            || control_owner_nodes
-                .iter()
-                .any(|node_id| !runtime_node_identity_matches(node_id, &owner_node))
+            && !sink_snapshot_primary_host_ref_for_group(&sink, &group_id)
+                .is_some_and(|primary| runtime_node_identity_matches(primary, &owner_node))
         {
             continue;
         }
@@ -16375,6 +17286,47 @@ mod tests {
     }
 
     #[test]
+    fn status_materialized_sink_evidence_cache_preserves_higher_pending_same_primary_count() {
+        let group_id = "nfs-cache-pending-high-water";
+        let primary = "panda146::nfs-cache-pending-high-water";
+        let high_pending = SinkStatusSnapshot {
+            groups: vec![status_test_sink_group(
+                group_id,
+                primary,
+                GroupReadinessState::PendingMaterialization,
+                8_500_459,
+                8_500_458,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let low_pending = SinkStatusSnapshot {
+            groups: vec![status_test_sink_group(
+                group_id,
+                primary,
+                GroupReadinessState::PendingMaterialization,
+                32_341,
+                32_340,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let cached = apply_status_materialized_sink_evidence_cache(high_pending);
+        assert_eq!(cached.groups[0].live_nodes, 8_500_458);
+        let restored = apply_status_materialized_sink_evidence_cache(low_pending);
+
+        assert_eq!(
+            restored.groups[0].readiness,
+            GroupReadinessState::PendingMaterialization
+        );
+        assert_eq!(restored.groups[0].total_nodes, 8_500_459);
+        assert_eq!(restored.groups[0].live_nodes, 8_500_458);
+        assert_eq!(
+            restored.live_nodes, 8_500_458,
+            "same-primary pending materialization high-water evidence must prevent /status count regression"
+        );
+    }
+
+    #[test]
     fn status_materialized_sink_evidence_cache_does_not_cross_primary_epoch() {
         let group_id = "nfs-cache-primary-epoch";
         let cached = SinkStatusSnapshot {
@@ -16564,6 +17516,223 @@ mod tests {
                 &authoritative,
             ),
             "restored same-primary owner evidence should close the schedule/owner fan-in gap without claiming trusted readiness"
+        );
+    }
+
+    #[test]
+    fn status_sink_evidence_cache_restores_regular_schedule_for_same_primary_group() {
+        let group_id = "nfs-cache-regular-owner-evidence";
+        let node_id = "node-owner-regular-cache";
+        let primary = format!("{node_id}::{group_id}");
+        let observed = SinkStatusSnapshot {
+            primary_host_ref_by_group: BTreeMap::from([(
+                group_id.to_string(),
+                node_id.to_string(),
+            )]),
+            scheduled_groups_by_node: BTreeMap::from([(
+                node_id.to_string(),
+                vec![group_id.to_string()],
+            )]),
+            groups: vec![status_test_sink_group(
+                group_id,
+                &primary,
+                GroupReadinessState::PendingMaterialization,
+                10,
+                9,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let current = SinkStatusSnapshot {
+            groups: vec![status_test_sink_group(
+                group_id,
+                &primary,
+                GroupReadinessState::PendingMaterialization,
+                10,
+                9,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let _ = apply_status_materialized_sink_evidence_cache(observed);
+        let restored = apply_status_materialized_sink_evidence_cache(current);
+
+        assert_eq!(
+            restored.owner_scoped_scheduled_groups_by_node.get(node_id),
+            Some(&vec![group_id.to_string()]),
+            "ordinary complete /status owner schedule evidence should survive a later partial fan-in sample"
+        );
+        assert_eq!(
+            restored
+                .owner_scoped_primary_host_ref_by_group
+                .get(group_id),
+            Some(&node_id.to_string()),
+            "ordinary complete /status primary evidence should seed the same-primary owner cache"
+        );
+
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = vec![RootSpec::new(group_id, "/mnt/nfs-cache-owner")];
+        authoritative.grants = vec![grant_for_node_root(node_id, group_id)];
+        set_live_group_primary_source_root(&mut authoritative, group_id, node_id);
+        authoritative.source_primary_by_group = BTreeMap::from([(group_id.to_string(), primary)]);
+        authoritative.scheduled_source_groups_by_node =
+            BTreeMap::from([(node_id.to_string(), vec![group_id.to_string()])]);
+        authoritative.scheduled_scan_groups_by_node =
+            authoritative.scheduled_source_groups_by_node.clone();
+        assert!(
+            !should_fail_closed_authoritative_status_fanin(
+                StatusRouteOutcome::Ok,
+                StatusRouteOutcome::Ok,
+                FacadeServiceState::Serving,
+                &restored,
+                &authoritative,
+                &authoritative,
+            ),
+            "cached regular owner evidence should close the same-primary sink schedule/owner fan-in gap"
+        );
+    }
+
+    #[test]
+    fn status_sink_evidence_cache_restores_owner_transport_for_same_primary_group() {
+        let group_id = "nfs-cache-owner-transport";
+        let node_id = "node-owner-transport-cache";
+        let primary = format!("{node_id}::{group_id}");
+        let observed = SinkStatusSnapshot {
+            primary_host_ref_by_group: BTreeMap::from([(
+                group_id.to_string(),
+                node_id.to_string(),
+            )]),
+            scheduled_groups_by_node: BTreeMap::from([(
+                node_id.to_string(),
+                vec![group_id.to_string()],
+            )]),
+            received_events_by_node: BTreeMap::from([(node_id.to_string(), 127_313_149)]),
+            received_origin_counts_by_node: BTreeMap::from([(
+                node_id.to_string(),
+                vec![format!("{primary}=127313149")],
+            )]),
+            stream_receive_armed_by_node: BTreeMap::from([(node_id.to_string(), 133_176)]),
+            last_received_at_us_by_node: BTreeMap::from([(
+                node_id.to_string(),
+                1_781_929_361_034_822,
+            )]),
+            groups: vec![status_test_sink_group(
+                group_id,
+                &primary,
+                GroupReadinessState::PendingMaterialization,
+                127_313_149,
+                127_313_147,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let current = SinkStatusSnapshot {
+            groups: vec![status_test_sink_group(
+                group_id,
+                &primary,
+                GroupReadinessState::PendingMaterialization,
+                127_313_149,
+                127_313_147,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let _ = apply_status_materialized_sink_evidence_cache(observed);
+        let restored = apply_status_materialized_sink_evidence_cache(current);
+
+        assert_eq!(
+            restored.received_events_by_node.get(node_id),
+            Some(&127_313_149),
+            "same-primary owner transport counts should survive a later partial fan-in sample"
+        );
+        assert_eq!(
+            restored.received_origin_counts_by_node.get(node_id),
+            Some(&vec![format!("{primary}=127313149")]),
+            "same-primary owner origin counts should survive a later partial fan-in sample"
+        );
+
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = vec![RootSpec::new(group_id, "/mnt/nfs-cache-transport")];
+        authoritative.grants = vec![grant_for_node_root(node_id, group_id)];
+        set_live_group_primary_source_root(&mut authoritative, group_id, node_id);
+        authoritative.source_primary_by_group =
+            BTreeMap::from([(group_id.to_string(), primary.clone())]);
+        authoritative.scheduled_source_groups_by_node =
+            BTreeMap::from([(node_id.to_string(), vec![group_id.to_string()])]);
+        authoritative.scheduled_scan_groups_by_node =
+            authoritative.scheduled_source_groups_by_node.clone();
+        authoritative.published_origin_counts_by_node =
+            BTreeMap::from([(node_id.to_string(), vec![format!("{primary}=127313149")])]);
+
+        assert!(
+            !should_fail_closed_authoritative_status_fanin(
+                StatusRouteOutcome::Ok,
+                StatusRouteOutcome::Ok,
+                FacadeServiceState::Serving,
+                &restored,
+                &authoritative,
+                &authoritative,
+            ),
+            "cached same-primary owner transport evidence should close the owner transport fan-in gap"
+        );
+    }
+
+    #[test]
+    fn status_sink_evidence_cache_does_not_restore_owner_transport_across_owner_conflict() {
+        let group_id = "nfs-cache-owner-transport-conflict";
+        let primary = format!("node-a::{group_id}");
+        let observed = SinkStatusSnapshot {
+            primary_host_ref_by_group: BTreeMap::from([(
+                group_id.to_string(),
+                "node-a".to_string(),
+            )]),
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec![group_id.to_string()],
+            )]),
+            received_events_by_node: BTreeMap::from([("node-a".to_string(), 41)]),
+            received_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec![format!("{primary}=41")],
+            )]),
+            groups: vec![status_test_sink_group(
+                group_id,
+                &primary,
+                GroupReadinessState::PendingMaterialization,
+                41,
+                41,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let conflicting_current = SinkStatusSnapshot {
+            primary_host_ref_by_group: BTreeMap::from([(
+                group_id.to_string(),
+                "node-b".to_string(),
+            )]),
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec![group_id.to_string()],
+            )]),
+            groups: vec![status_test_sink_group(
+                group_id,
+                &primary,
+                GroupReadinessState::PendingMaterialization,
+                41,
+                41,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let _ = apply_status_materialized_sink_evidence_cache(observed);
+        let restored = apply_status_materialized_sink_evidence_cache(conflicting_current);
+
+        assert!(
+            !restored.received_events_by_node.contains_key("node-a"),
+            "owner transport evidence must fail closed instead of crossing a current owner conflict"
+        );
+        assert!(
+            !restored
+                .received_origin_counts_by_node
+                .contains_key("node-a"),
+            "owner origin evidence must fail closed instead of crossing a current owner conflict"
         );
     }
 
@@ -16874,6 +18043,17 @@ mod tests {
         sent_correlation: StdMutex<Option<u64>>,
         correlation_notify: Notify,
         first_send_busy: std::sync::atomic::AtomicBool,
+        sink_snapshot: SinkStatusSnapshot,
+    }
+
+    struct TimeoutThenScopedSinkStatusCollectBoundary {
+        request_channel: String,
+        reply_channel: String,
+        origin: String,
+        sent_routes: StdMutex<Vec<String>>,
+        sent_correlation: StdMutex<Option<u64>>,
+        correlation_notify: Notify,
+        first_recv_timeout: std::sync::atomic::AtomicBool,
         sink_snapshot: SinkStatusSnapshot,
     }
 
@@ -18334,6 +19514,61 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl ChannelIoSubset for TimeoutThenScopedSinkStatusCollectBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            let route = request.channel_key.0.clone();
+            self.sent_routes
+                .lock()
+                .expect("timeout scoped sink-status sent routes lock")
+                .push(route.clone());
+            if route == self.request_channel
+                && let Some(correlation) = request
+                    .events
+                    .first()
+                    .and_then(|event| event.metadata().correlation_id)
+            {
+                *self
+                    .sent_correlation
+                    .lock()
+                    .expect("timeout scoped sink-status correlation lock") = Some(correlation);
+                self.correlation_notify.notify_waiters();
+            }
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            if request.channel_key.0 != self.reply_channel {
+                return Err(CnxError::Timeout);
+            }
+            let correlation = wait_for_manual_rescan_test_correlation(
+                &self.sent_correlation,
+                &self.correlation_notify,
+                "timeout scoped sink-status correlation lock",
+            )
+            .await;
+            if self
+                .first_recv_timeout
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CnxError::Timeout);
+            }
+            Ok(vec![sink_status_event(
+                &self.origin,
+                correlation,
+                self.sink_snapshot.clone(),
+            )])
+        }
+    }
+
+    #[async_trait::async_trait]
     impl ChannelIoSubset for NodeScopedSinkStatusCollectBoundary {
         async fn channel_send(
             &self,
@@ -18777,6 +20012,8 @@ mod tests {
                 .expect("scoped source-status budget recv timeouts lock")
                 .push(request.timeout_ms);
             let correlation = loop {
+                let notified = self.correlation_notify.notified();
+                tokio::pin!(notified);
                 if let Some(correlation) = *self
                     .sent_correlation
                     .lock()
@@ -18784,7 +20021,7 @@ mod tests {
                 {
                     break correlation;
                 }
-                self.correlation_notify.notified().await;
+                notified.as_mut().await;
             };
             Ok(vec![source_status_event(
                 "node-a-29776175872804197050089473",
@@ -19248,6 +20485,8 @@ mod tests {
 
         async fn wait_for_correlation(&self, request_channel: &str) -> u64 {
             loop {
+                let notified = self.correlation_notify.notified();
+                tokio::pin!(notified);
                 if let Some(correlation) = self
                     .correlations_by_channel
                     .lock()
@@ -19257,7 +20496,7 @@ mod tests {
                 {
                     return correlation;
                 }
-                self.correlation_notify.notified().await;
+                notified.as_mut().await;
             }
         }
     }
@@ -19365,6 +20604,8 @@ mod tests {
 
         async fn wait_for_correlation(&self, request_channel: &str) -> u64 {
             loop {
+                let notified = self.correlation_notify.notified();
+                tokio::pin!(notified);
                 if let Some(correlation) = self
                     .correlations_by_channel
                     .lock()
@@ -19374,7 +20615,7 @@ mod tests {
                 {
                     return correlation;
                 }
-                self.correlation_notify.notified().await;
+                notified.as_mut().await;
             }
         }
     }
@@ -19663,6 +20904,8 @@ mod tests {
 
         async fn wait_for_correlation(&self, request_channel: &str) -> u64 {
             loop {
+                let notified = self.correlation_notify.notified();
+                tokio::pin!(notified);
                 if let Some(correlation) = self
                     .correlations_by_channel
                     .lock()
@@ -19672,7 +20915,7 @@ mod tests {
                 {
                     return correlation;
                 }
-                self.correlation_notify.notified().await;
+                notified.as_mut().await;
             }
         }
     }
@@ -19701,6 +20944,8 @@ mod tests {
 
         async fn wait_for_source_status_correlation(&self, request_channel: &str) -> u64 {
             loop {
+                let notified = self.correlation_notify.notified();
+                tokio::pin!(notified);
                 if let Some(correlation) = self
                     .correlations_by_channel
                     .lock()
@@ -19710,7 +20955,7 @@ mod tests {
                 {
                     return correlation;
                 }
-                self.correlation_notify.notified().await;
+                notified.as_mut().await;
             }
         }
     }
@@ -19718,6 +20963,8 @@ mod tests {
     impl NodeScopedSinkStatusCollectBoundary {
         async fn wait_for_sink_status_correlation(&self, request_channel: &str) -> u64 {
             loop {
+                let notified = self.correlation_notify.notified();
+                tokio::pin!(notified);
                 if let Some(correlation) = self
                     .correlations_by_channel
                     .lock()
@@ -19727,7 +20974,7 @@ mod tests {
                 {
                     return correlation;
                 }
-                self.correlation_notify.notified().await;
+                notified.as_mut().await;
             }
         }
     }
@@ -19735,6 +20982,8 @@ mod tests {
     impl SequencedNodeScopedSinkStatusCollectBoundary {
         async fn wait_for_sink_status_correlation(&self, request_channel: &str) -> u64 {
             loop {
+                let notified = self.correlation_notify.notified();
+                tokio::pin!(notified);
                 if let Some(correlation) = self
                     .correlations_by_channel
                     .lock()
@@ -19744,7 +20993,7 @@ mod tests {
                 {
                     return correlation;
                 }
-                self.correlation_notify.notified().await;
+                notified.as_mut().await;
             }
         }
     }
@@ -19801,6 +21050,8 @@ mod tests {
 
         async fn wait_for_source_status_correlation(&self, request_channel: &str) -> u64 {
             loop {
+                let notified = self.correlation_notify.notified();
+                tokio::pin!(notified);
                 if let Some(correlation) = self
                     .correlations_by_channel
                     .lock()
@@ -19810,7 +21061,7 @@ mod tests {
                 {
                     return correlation;
                 }
-                self.correlation_notify.notified().await;
+                notified.as_mut().await;
             }
         }
     }
@@ -22206,6 +23457,222 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_release_owner_source_evidence_cache_key_ignores_transient_sink_schedule_gap() {
+        let node_a = "panda144";
+        let node_b = "panda145";
+        let node_c = "panda146";
+        let root_ids = ["nfs-144", "nfs-145", "nfs-146"];
+        let mut source = local_source_snapshot();
+        source.logical_roots = root_ids
+            .iter()
+            .map(|root_id| RootSpec::new(*root_id, format!("/mnt/{root_id}")))
+            .collect();
+        source.grants = vec![
+            grant_for_node_root(node_a, "nfs-144"),
+            grant_for_node_root(node_b, "nfs-145"),
+            grant_for_node_root(node_c, "nfs-146"),
+        ];
+        let expected_groups = root_ids
+            .iter()
+            .map(|root_id| (*root_id).to_string())
+            .collect::<BTreeSet<_>>();
+        let stable_sink = SinkStatusSnapshot {
+            primary_host_ref_by_group: BTreeMap::from([
+                ("nfs-144".to_string(), node_a.to_string()),
+                ("nfs-145".to_string(), node_b.to_string()),
+                ("nfs-146".to_string(), node_c.to_string()),
+            ]),
+            scheduled_groups_by_node: BTreeMap::from([
+                (node_a.to_string(), vec!["nfs-144".to_string()]),
+                (node_b.to_string(), vec!["nfs-145".to_string()]),
+                (node_c.to_string(), vec!["nfs-146".to_string()]),
+            ]),
+            groups: vec![
+                status_test_sink_group(
+                    "nfs-144",
+                    &format!("{node_a}::nfs-144"),
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+                status_test_sink_group(
+                    "nfs-145",
+                    &format!("{node_b}::nfs-145"),
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+                status_test_sink_group(
+                    "nfs-146",
+                    &format!("{node_c}::nfs-146"),
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+        let mut transient_gap_sink = stable_sink.clone();
+        transient_gap_sink.scheduled_groups_by_node.remove(node_a);
+        let mut transient_primary_gap_sink = transient_gap_sink.clone();
+        transient_primary_gap_sink
+            .primary_host_ref_by_group
+            .remove("nfs-144");
+
+        let stable = status_release_owner_source_evidence_cache_key(
+            &NodeId(node_b.to_string()),
+            &source,
+            &stable_sink,
+            &expected_groups,
+        );
+        let transient_gap = status_release_owner_source_evidence_cache_key(
+            &NodeId(node_b.to_string()),
+            &source,
+            &transient_gap_sink,
+            &expected_groups,
+        );
+        let transient_primary_gap = status_release_owner_source_evidence_cache_key(
+            &NodeId(node_b.to_string()),
+            &source,
+            &transient_primary_gap_sink,
+            &expected_groups,
+        );
+
+        assert_eq!(
+            stable, transient_gap,
+            "source-owner evidence cache must survive transient sink schedule gaps so prior owner-scoped source-status evidence can heal status fan-in without rescan"
+        );
+        assert_eq!(
+            stable, transient_primary_gap,
+            "source-owner evidence cache must survive transient sink primary-map gaps; source owner evidence is keyed by authoritative roots/grants, not by incomplete sink observation"
+        );
+    }
+
+    #[test]
+    fn management_status_reuses_release_owner_source_status_across_transient_sink_primary_gap() {
+        clear_status_scan_audit_release_cache_for_test();
+        let node_a = "panda144";
+        let node_b = "panda145";
+        let node_c = "panda146";
+        let roots = vec![
+            RootSpec::new("nfs-144", "/mnt/nfs-144"),
+            RootSpec::new("nfs-145", "/mnt/nfs-145"),
+            RootSpec::new("nfs-146", "/mnt/nfs-146"),
+        ];
+        let grants = vec![
+            grant_for_node_root(node_a, "nfs-144"),
+            grant_for_node_root(node_b, "nfs-145"),
+            grant_for_node_root(node_c, "nfs-146"),
+        ];
+        let authoritative =
+            manual_rescan_source_status_snapshot_for_current_active_grants(&roots, &grants);
+        let mut current_source = authoritative.clone();
+        current_source
+            .status
+            .logical_roots
+            .retain(|root| root.root_id != "nfs-144");
+        current_source
+            .status
+            .concrete_roots
+            .retain(|root| root.logical_root_id != "nfs-144");
+        current_source
+            .source_primary_by_group
+            .retain(|root_id, _| root_id != "nfs-144");
+        current_source
+            .scheduled_source_groups_by_node
+            .remove(node_a);
+        current_source.scheduled_scan_groups_by_node.remove(node_a);
+
+        let stable_sink = SinkStatusSnapshot {
+            primary_host_ref_by_group: BTreeMap::from([
+                ("nfs-144".to_string(), node_a.to_string()),
+                ("nfs-145".to_string(), node_b.to_string()),
+                ("nfs-146".to_string(), node_c.to_string()),
+            ]),
+            scheduled_groups_by_node: BTreeMap::from([
+                (node_a.to_string(), vec!["nfs-144".to_string()]),
+                (node_b.to_string(), vec!["nfs-145".to_string()]),
+                (node_c.to_string(), vec!["nfs-146".to_string()]),
+            ]),
+            groups: vec![
+                status_test_sink_group(
+                    "nfs-144",
+                    &format!("{node_a}::nfs-144"),
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+                status_test_sink_group(
+                    "nfs-145",
+                    &format!("{node_b}::nfs-145"),
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+                status_test_sink_group(
+                    "nfs-146",
+                    &format!("{node_c}::nfs-146"),
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+        let expected_groups = BTreeSet::from([
+            "nfs-144".to_string(),
+            "nfs-145".to_string(),
+            "nfs-146".to_string(),
+        ]);
+        let cache_key = status_release_owner_source_evidence_cache_key(
+            &NodeId(node_b.to_string()),
+            &authoritative,
+            &stable_sink,
+            &expected_groups,
+        );
+        let mut cached_owner_source = authoritative.clone();
+        cached_owner_source
+            .status
+            .logical_roots
+            .retain(|root| root.root_id == "nfs-144");
+        cached_owner_source
+            .status
+            .concrete_roots
+            .retain(|root| root.logical_root_id == "nfs-144");
+        cached_owner_source
+            .source_primary_by_group
+            .retain(|root_id, _| root_id == "nfs-144");
+        cached_owner_source.scheduled_source_groups_by_node =
+            BTreeMap::from([(node_a.to_string(), vec!["nfs-144".to_string()])]);
+        cached_owner_source.scheduled_scan_groups_by_node =
+            cached_owner_source.scheduled_source_groups_by_node.clone();
+        remember_status_release_owner_source_evidence(&cache_key, node_a, cached_owner_source);
+
+        let mut transient_sink_gap = stable_sink.clone();
+        transient_sink_gap.scheduled_groups_by_node.remove(node_a);
+        transient_sink_gap
+            .primary_host_ref_by_group
+            .remove("nfs-144");
+        let merged = augment_management_status_source_with_cached_release_owner_evidence(
+            current_source,
+            &authoritative,
+            &transient_sink_gap,
+            &NodeId(node_b.to_string()),
+        );
+
+        assert_eq!(
+            merged.scheduled_source_groups_by_node.get(node_a),
+            Some(&vec!["nfs-144".to_string()]),
+            "cached release owner source-status must fill missing source owner evidence despite transient sink primary observation gaps"
+        );
+        assert_eq!(
+            merged.scheduled_scan_groups_by_node.get(node_a),
+            Some(&vec!["nfs-144".to_string()]),
+            "cached release owner source-status must fill missing scan owner evidence despite transient sink primary observation gaps"
+        );
+    }
+
     #[tokio::test]
     async fn status_scan_audit_admission_release_partial_timeout_is_retryable_progress() {
         clear_status_scan_audit_release_cache_for_test();
@@ -23210,10 +24677,14 @@ mod tests {
         };
 
         let panda146_route = source_status_request_route_for("panda146").0;
+        let mut transient_gap_sink = full_sink.clone();
+        transient_gap_sink
+            .scheduled_groups_by_node
+            .remove("panda146");
         let boundary = Arc::new(
             StatusReleaseAdmissionBoundary::new(
                 vec![("panda145".to_string(), partial_source)],
-                vec![("panda145".to_string(), full_sink.clone())],
+                vec![("panda145".to_string(), transient_gap_sink)],
                 vec![
                     (
                         "panda144".to_string(),
@@ -23259,9 +24730,13 @@ mod tests {
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
+        let mut release_observed_source = full_source.clone();
+        release_observed_source.logical_roots.clear();
+        release_observed_source.grants.clear();
+
         let initial_release = release_source_scan_audit_after_sink_scope_ready_if_needed(
             &state,
-            &full_source,
+            &release_observed_source,
             &full_sink,
             StatusRouteOutcome::Ok,
         )
@@ -24172,6 +25647,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pending_status_sink_owner_fanin_requires_generic_route_seed_evidence() {
+        assert!(
+            !management_status_route_has_owner_probe_seed_evidence(
+                StatusRouteOutcome::Timeout,
+                StatusRouteOutcome::Timeout,
+            ),
+            "pending /status must not spend owner-scoped fan-in budget when both generic status routes timed out"
+        );
+        assert!(
+            management_status_route_has_owner_probe_seed_evidence(
+                StatusRouteOutcome::Ok,
+                StatusRouteOutcome::Timeout,
+            ),
+            "pending /status may use bounded owner fan-in when generic sink-status returned seed evidence"
+        );
+        assert!(
+            management_status_route_has_owner_probe_seed_evidence(
+                StatusRouteOutcome::Timeout,
+                StatusRouteOutcome::Ok,
+            ),
+            "pending /status may use bounded owner fan-in when generic source-status returned seed evidence"
+        );
+    }
+
     #[tokio::test]
     async fn management_status_source_fanin_uses_status_roots_when_config_roots_are_absent() {
         let mut authoritative = local_source_snapshot();
@@ -25015,6 +26515,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn management_status_sink_fanin_retries_timeout_before_owner_schedule_gap() {
+        let authoritative = local_source_snapshot();
+        let ready_without_schedule = SinkStatusSnapshot {
+            live_nodes: 1,
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::Ready,
+                1,
+                1,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let node_a_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::Ready,
+                1,
+                1,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let node_a_route = sink_status_route_bindings_for("node-a")
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("node-a sink-status route")
+            .0;
+        let boundary = Arc::new(TimeoutThenScopedSinkStatusCollectBoundary {
+            request_channel: node_a_route.clone(),
+            reply_channel: format!("{node_a_route}:reply"),
+            origin: "node-a".to_string(),
+            sent_routes: StdMutex::new(Vec::new()),
+            sent_correlation: StdMutex::new(None),
+            correlation_notify: Notify::new(),
+            first_recv_timeout: std::sync::atomic::AtomicBool::new(true),
+            sink_snapshot: node_a_sink,
+        });
+
+        let augmented = augment_management_status_sink_with_owner_scoped_evidence(
+            ready_without_schedule,
+            &authoritative,
+            &authoritative,
+            Some(boundary.clone()),
+            NodeId("node-d".to_string()),
+            STATUS_OWNER_SCOPED_ROUTE_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(
+            augmented.scheduled_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string()]),
+            "management /status must retry transient owner-scoped sink-status timeout before reporting a sink owner schedule gap"
+        );
+        let sent_routes = boundary
+            .sent_routes
+            .lock()
+            .expect("timeout sink-status sent routes lock")
+            .clone();
+        assert!(
+            sent_routes.len() >= 2,
+            "status sink owner probe should reissue after timeout instead of dropping owner schedule evidence: {sent_routes:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn management_status_sink_fanin_queries_owner_scoped_route_when_ready_sink_lacks_all_debug_without_source_runtime_scope()
      {
         let mut authoritative = local_source_snapshot();
@@ -25646,6 +27220,81 @@ mod tests {
                 &authoritative,
             ),
             "same-epoch partial owner reply must not regress a previously complete /status owner fan-in into missing_sink_owner"
+        );
+    }
+
+    #[test]
+    fn management_status_sink_fanin_preserves_higher_same_owner_materialization_count_across_owner_probe()
+     {
+        let node_c = "panda146";
+        let current_sink = SinkStatusSnapshot {
+            live_nodes: 12_254_965,
+            primary_host_ref_by_group: BTreeMap::from([(
+                "nfs-146".to_string(),
+                node_c.to_string(),
+            )]),
+            scheduled_groups_by_node: BTreeMap::from([(
+                node_c.to_string(),
+                vec!["nfs-146".to_string()],
+            )]),
+            received_events_by_node: BTreeMap::from([(node_c.to_string(), 12_254_967)]),
+            received_origin_counts_by_node: BTreeMap::from([(
+                node_c.to_string(),
+                vec!["panda146::nfs-146=12254967".to_string()],
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs-146",
+                "panda146::nfs-146",
+                GroupReadinessState::PendingMaterialization,
+                12_254_966,
+                12_254_965,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let lower_same_owner_probe = SinkStatusSnapshot {
+            live_nodes: 8_190,
+            primary_host_ref_by_group: BTreeMap::from([(
+                "nfs-146".to_string(),
+                node_c.to_string(),
+            )]),
+            scheduled_groups_by_node: BTreeMap::from([(
+                node_c.to_string(),
+                vec!["nfs-146".to_string()],
+            )]),
+            received_events_by_node: BTreeMap::from([(node_c.to_string(), 8_192)]),
+            received_origin_counts_by_node: BTreeMap::from([(
+                node_c.to_string(),
+                vec!["panda146::nfs-146=8192".to_string()],
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs-146",
+                "panda146::nfs-146",
+                GroupReadinessState::PendingMaterialization,
+                8_191,
+                8_190,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let merged = merge_owner_scoped_sink_status_snapshot(current_sink, lower_same_owner_probe);
+        let nfs146 = merged
+            .groups
+            .iter()
+            .find(|group| group.group_id == "nfs-146")
+            .expect("merged nfs-146 group");
+
+        assert_eq!(
+            nfs146.live_nodes, 12_254_965,
+            "same-owner owner-scoped status probe must not regress a higher current materialization count"
+        );
+        assert_eq!(
+            merged.live_nodes, 12_254_965,
+            "aggregate /status index count must not regress when a lower same-owner probe arrives"
+        );
+        assert_eq!(
+            merged.primary_host_ref_by_group.get("nfs-146"),
+            Some(&node_c.to_string()),
+            "same-owner probe still preserves authoritative owner evidence"
         );
     }
 
@@ -27488,7 +29137,10 @@ mod tests {
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             err.message.contains("second-wave convergence")
-                || err.message.contains("runtime-scope readiness"),
+                || err.message.contains("runtime-scope readiness")
+                || err
+                    .message
+                    .contains("source-status did not return readiness evidence"),
             "retryable error should explain bounded current-roots readiness failure: {err:?}"
         );
     }
@@ -28600,6 +30252,169 @@ mod tests {
         assert!(
             status_should_run_sink_observation_repair(&source, &sink),
             "high-NFS partial transport must trigger repair when published nfs-144/nfs-146 lack corresponding sink stream/materialization evidence even if nfs-145 has ingress"
+        );
+    }
+
+    #[test]
+    fn status_sink_observation_repair_runs_when_published_group_is_severely_under_materialized() {
+        let mut source = local_source_snapshot();
+        source.logical_roots = vec![RootSpec::new("nfs-146", "/mnt/nfs-146")];
+        source.status.logical_roots = vec![SourceLogicalRootHealthSnapshot {
+            root_id: "nfs-146".to_string(),
+            status: "healthy".to_string(),
+            matched_grants: 1,
+            active_members: 1,
+            coverage_mode: "realtime_hotset_plus_audit".to_string(),
+        }];
+        source.status.concrete_roots[0].root_key = "nfs-146@node-c".to_string();
+        source.status.concrete_roots[0].logical_root_id = "nfs-146".to_string();
+        source.status.concrete_roots[0].object_ref = "node-c::nfs-146".to_string();
+        source.status.concrete_roots[0].emitted_event_count = 11_419_969;
+        source.status.concrete_roots[0].forwarded_event_count = 11_158_316;
+        source.status.concrete_roots[0].emitted_batch_count = 195_716;
+        source.status.concrete_roots[0].forwarded_batch_count = 194_563;
+        source.published_origin_counts_by_node.insert(
+            "node-c".to_string(),
+            vec!["node-c::nfs-146=2613551".to_string()],
+        );
+        source.source_primary_by_group =
+            BTreeMap::from([("nfs-146".to_string(), "node-c".to_string())]);
+        source.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-c".to_string(), vec!["nfs-146".to_string()])]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+
+        let mut sink = SinkStatusSnapshot {
+            live_nodes: 29_930,
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-c".to_string(),
+                vec!["nfs-146".to_string()],
+            )]),
+            primary_host_ref_by_group: BTreeMap::from([(
+                "nfs-146".to_string(),
+                "node-c".to_string(),
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs-146",
+                "node-c::nfs-146",
+                GroupReadinessState::PendingMaterialization,
+                29_931,
+                29_930,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        sink.stream_received_origin_counts_by_node.insert(
+            "node-c".to_string(),
+            vec!["node-c::nfs-146=29932".to_string()],
+        );
+        sink.stream_applied_origin_counts_by_node.insert(
+            "node-c".to_string(),
+            vec!["node-c::nfs-146=25158".to_string()],
+        );
+
+        assert!(
+            status_should_run_sink_observation_repair(&source, &sink),
+            "a tiny partial ingress sample must not suppress sink observation repair when source has already forwarded millions of events for the same pending group"
+        );
+    }
+
+    #[test]
+    fn status_sink_observation_repair_runs_when_transport_high_water_lags_source_even_if_cached_live_is_close()
+     {
+        let mut source = local_source_snapshot();
+        source.logical_roots = vec![RootSpec::new("nfs-146", "/mnt/nfs-146")];
+        source.status.logical_roots = vec![SourceLogicalRootHealthSnapshot {
+            root_id: "nfs-146".to_string(),
+            status: "healthy".to_string(),
+            matched_grants: 1,
+            active_members: 1,
+            coverage_mode: "realtime_hotset_plus_audit".to_string(),
+        }];
+        source.status.concrete_roots[0].root_key = "nfs-146@node-c".to_string();
+        source.status.concrete_roots[0].logical_root_id = "nfs-146".to_string();
+        source.status.concrete_roots[0].object_ref = "node-c::nfs-146".to_string();
+        source.status.concrete_roots[0].emitted_event_count = 35_913_848;
+        source.status.concrete_roots[0].forwarded_event_count = 35_624_445;
+        source.status.concrete_roots[0].emitted_batch_count = 302_845;
+        source.status.concrete_roots[0].forwarded_batch_count = 301_692;
+        source.published_origin_counts_by_node.insert(
+            "node-c".to_string(),
+            vec!["node-c::nfs-146=35624445".to_string()],
+        );
+        source.source_primary_by_group =
+            BTreeMap::from([("nfs-146".to_string(), "node-c".to_string())]);
+        source.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-c".to_string(), vec!["nfs-146".to_string()])]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+
+        let mut sink = SinkStatusSnapshot {
+            live_nodes: 28_070_036,
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-c".to_string(),
+                vec!["nfs-146".to_string()],
+            )]),
+            primary_host_ref_by_group: BTreeMap::from([(
+                "nfs-146".to_string(),
+                "node-c".to_string(),
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs-146",
+                "node-c::nfs-146",
+                GroupReadinessState::PendingMaterialization,
+                28_070_037,
+                28_070_036,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        sink.stream_received_origin_counts_by_node.insert(
+            "node-c".to_string(),
+            vec!["node-c::nfs-146=100043".to_string()],
+        );
+        sink.stream_applied_origin_counts_by_node.insert(
+            "node-c".to_string(),
+            vec!["node-c::nfs-146=100043".to_string()],
+        );
+        let expected_groups = BTreeSet::from(["nfs-146".to_string()]);
+
+        assert!(
+            !sink_status_snapshot_has_under_materialized_published_group(
+                &source,
+                &sink,
+                &expected_groups
+            ),
+            "fixture must model the official followup5 gap where cached live count is close enough to source to suppress the old materialized-ratio repair"
+        );
+        assert!(
+            status_should_run_sink_observation_repair(&source, &sink),
+            "a low current sink transport/apply high-water must still wake sink observation repair when source has forwarded far beyond that transport count"
+        );
+    }
+
+    #[test]
+    fn status_sink_observation_repair_stays_idle_for_small_pending_materialization_gap() {
+        let mut source = local_source_snapshot();
+        source.status.concrete_roots[0].emitted_event_count = 80_000;
+        source.status.concrete_roots[0].forwarded_event_count = 80_000;
+        source
+            .published_origin_counts_by_node
+            .insert("node-a".to_string(), vec!["node-a::nfs1=80000".to_string()]);
+
+        let mut sink = local_sink_snapshot();
+        sink.live_nodes = 20_000;
+        sink.groups[0] = status_test_sink_group(
+            "nfs1",
+            "node-a::nfs1",
+            GroupReadinessState::PendingMaterialization,
+            20_001,
+            20_000,
+        );
+        sink.stream_received_origin_counts_by_node
+            .insert("node-a".to_string(), vec!["node-a::nfs1=20001".to_string()]);
+        sink.stream_applied_origin_counts_by_node
+            .insert("node-a".to_string(), vec!["node-a::nfs1=20000".to_string()]);
+
+        assert!(
+            !status_should_run_sink_observation_repair(&source, &sink),
+            "ordinary small pending-materialization gaps with proven stream ingress should remain patient and not wake repair"
         );
     }
 
@@ -30829,6 +32644,129 @@ mod tests {
         assert!(
             reason.contains("sink_owner_transport_gaps={\"nfs-145\"}"),
             "fail-closed reason must identify the owner transport gap: {reason}"
+        );
+    }
+
+    #[test]
+    fn status_authoritative_fanin_bounds_path_origin_transport_scan_and_fails_closed() {
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = vec![RootSpec::new("nfs-144", "/mnt/nfs-144")];
+        authoritative.grants = vec![grant_for_node_root("node-a", "nfs-144")];
+
+        let mut source = authoritative.clone();
+        set_live_group_primary_source_root(&mut source, "nfs-144", "node-a");
+        source.source_primary_by_group =
+            BTreeMap::from([("nfs-144".to_string(), "node-a::nfs-144".to_string())]);
+        source.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-a".to_string(), vec!["nfs-144".to_string()])]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+        source.published_origin_counts_by_node =
+            BTreeMap::from([("node-a".to_string(), vec!["node-a::nfs-144=29".to_string()])]);
+
+        let mut path_origin_counts = (0..STATUS_TRANSPORT_PATH_ORIGIN_SCAN_LIMIT)
+            .map(|idx| format!("node-a::other-{idx}=1"))
+            .collect::<Vec<_>>();
+        path_origin_counts.push("node-a::nfs-144/late=1".to_string());
+
+        let sink = SinkStatusSnapshot {
+            live_nodes: 29,
+            primary_host_ref_by_group: BTreeMap::from([(
+                "nfs-144".to_string(),
+                "node-a".to_string(),
+            )]),
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs-144".to_string()],
+            )]),
+            stream_received_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                path_origin_counts,
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs-144",
+                "node-a::nfs-144",
+                GroupReadinessState::PendingMaterialization,
+                29,
+                29,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let reason = status_fail_closed_management_reason(
+            StatusRouteOutcome::Ok,
+            StatusRouteOutcome::Ok,
+            FacadeServiceState::Serving,
+            false,
+            &sink,
+            &source,
+            &authoritative,
+            &BTreeMap::new(),
+        )
+        .expect("path-origin-only owner evidence past the scan cap must fail closed");
+
+        assert!(
+            reason.contains("sink_owner_transport_gaps={\"nfs-144\"}"),
+            "bounded /status fan-in must report the owner transport gap instead of scanning all path-origin rows: {reason}"
+        );
+    }
+
+    #[test]
+    fn status_authoritative_fanin_accepts_owner_count_ingress_without_path_origin_scan() {
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = vec![RootSpec::new("nfs-144", "/mnt/nfs-144")];
+        authoritative.grants = vec![grant_for_node_root("node-a", "nfs-144")];
+
+        let mut source = authoritative.clone();
+        set_live_group_primary_source_root(&mut source, "nfs-144", "node-a");
+        source.source_primary_by_group =
+            BTreeMap::from([("nfs-144".to_string(), "node-a::nfs-144".to_string())]);
+        source.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-a".to_string(), vec!["nfs-144".to_string()])]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+        source.published_origin_counts_by_node =
+            BTreeMap::from([("node-a".to_string(), vec!["node-a::nfs-144=29".to_string()])]);
+
+        let unrelated_path_origin_counts = (0..(STATUS_TRANSPORT_PATH_ORIGIN_SCAN_LIMIT * 4))
+            .map(|idx| format!("node-a::other-{idx}=1"))
+            .collect::<Vec<_>>();
+        let sink = SinkStatusSnapshot {
+            live_nodes: 29,
+            primary_host_ref_by_group: BTreeMap::from([(
+                "nfs-144".to_string(),
+                "node-a".to_string(),
+            )]),
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs-144".to_string()],
+            )]),
+            stream_received_events_by_node: BTreeMap::from([("node-a".to_string(), 29)]),
+            stream_received_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                unrelated_path_origin_counts,
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs-144",
+                "node-a::nfs-144",
+                GroupReadinessState::PendingMaterialization,
+                29,
+                29,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        assert!(
+            status_fail_closed_management_reason(
+                StatusRouteOutcome::Ok,
+                StatusRouteOutcome::Ok,
+                FacadeServiceState::Serving,
+                false,
+                &sink,
+                &source,
+                &authoritative,
+                &BTreeMap::new(),
+            )
+            .is_none(),
+            "owner aggregate ingress counters must satisfy /status fan-in without scanning path-origin rows"
         );
     }
 
@@ -43955,6 +45893,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn classify_status_route_error_treats_tx_busy_as_retryable_transport() {
+        assert_eq!(
+            classify_status_route_error(&CnxError::TxBusy),
+            StatusRouteOutcome::Transport,
+            "status fan-in TxBusy is runtime pressure, not terminal internal evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_status_route_collect_error_treats_tx_busy_after_deadline_as_timeout() {
+        let elapsed_deadline = tokio::time::Instant::now() - Duration::from_millis(1);
+
+        assert_eq!(
+            classify_status_route_collect_error(&CnxError::TxBusy, elapsed_deadline),
+            StatusRouteOutcome::Timeout,
+            "once the bounded status route budget is exhausted, TxBusy should report as timeout rather than internal"
+        );
+    }
+
     #[tokio::test]
     async fn status_remote_merge_retries_sequentially_when_both_collectors_return_internal_concurrently()
      {
@@ -45858,16 +47816,26 @@ mod tests {
         )
         .await;
 
+        let err = match wait_result
+            .expect("duplicate current-roots observe-only preflight should fail closed before the roots-control resend window")
+        {
+            Ok(_) => panic!(
+                "missing source-status evidence should stay retryable instead of accepting manual rescan"
+            ),
+            Err(err) => err,
+        };
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            wait_result.is_err(),
-            "fixture should keep manual-rescan readiness pending past the roots-control resend window"
+            err.message
+                .contains("source-status did not return readiness evidence"),
+            "retryable response should explain missing source-status evidence: {err:?}"
         );
         let sent_routes = boundary.sent_routes();
         assert!(
             sent_routes
                 .iter()
                 .any(|route| route == &source_status_request_route_for(node_a).0),
-            "manual-rescan readiness must keep probing source-status while waiting: {sent_routes:?}"
+            "manual-rescan readiness must still attempt source-status before failing closed: {sent_routes:?}"
         );
         let roots_control_routes = sent_routes
             .iter()
@@ -47410,9 +49378,13 @@ mod tests {
             "status must not block on background recovery"
         );
 
-        tokio::time::timeout(Duration::from_secs(1), recovery_entered.notified())
-            .await
-            .expect("status should wake background management recovery");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while recovery_calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                recovery_entered.notified().await;
+            }
+        })
+        .await
+        .expect("status should wake background management recovery");
         assert_eq!(recovery_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -47527,9 +49499,20 @@ mod tests {
             response.repair_lanes
         );
 
-        tokio::time::timeout(Duration::from_secs(1), source_repair_entered.notified())
-            .await
-            .expect("status should wake background source repair");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if recovery_order
+                    .lock()
+                    .expect("recovery order lock")
+                    .contains(&"source-repair")
+                {
+                    break;
+                }
+                source_repair_entered.notified().await;
+            }
+        })
+        .await
+        .expect("status should wake background source repair");
         assert_eq!(
             *recovery_order.lock().expect("recovery order lock"),
             vec!["source-repair"],
@@ -48227,6 +50210,183 @@ mod tests {
         assert_eq!(
             lane_count, 1,
             "repair-lane evidence must stay bounded for one accepted repair intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_status_sink_observation_repair_reclaims_when_transport_high_water_still_lags_source()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_facade = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(SourceConfig::default(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, SourceConfig::default())
+                .expect("sink"),
+        )));
+        let control_gate = Arc::new(crate::api::ApiControlGate::new(true));
+        let sink_repair_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let force_republish_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        control_gate.set_sink_repair_recovery(Some(Arc::new({
+            let control_gate = control_gate.clone();
+            let sink_repair_calls = sink_repair_calls.clone();
+            let force_republish_calls = force_republish_calls.clone();
+            move || {
+                let control_gate = control_gate.clone();
+                let sink_repair_calls = sink_repair_calls.clone();
+                let force_republish_calls = force_republish_calls.clone();
+                Box::pin(async move {
+                    sink_repair_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if control_gate.take_sink_observation_repair_republish() {
+                        force_republish_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(())
+                })
+            }
+        })));
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: None,
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+            source: source_facade,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
+            published_rollout_status: test_published_rollout_status_reader(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate,
+        };
+
+        let mut source = local_source_snapshot();
+        source.logical_roots = vec![RootSpec::new("nfs-146", "/mnt/nfs-146")];
+        source.status.logical_roots = vec![SourceLogicalRootHealthSnapshot {
+            root_id: "nfs-146".to_string(),
+            status: "healthy".to_string(),
+            matched_grants: 1,
+            active_members: 1,
+            coverage_mode: "realtime_hotset_plus_audit".to_string(),
+        }];
+        source.status.concrete_roots[0].root_key = "nfs-146@node-c".to_string();
+        source.status.concrete_roots[0].logical_root_id = "nfs-146".to_string();
+        source.status.concrete_roots[0].object_ref = "node-c::nfs-146".to_string();
+        source.status.concrete_roots[0].emitted_event_count = 35_913_848;
+        source.status.concrete_roots[0].forwarded_event_count = 35_624_445;
+        source.published_origin_counts_by_node.insert(
+            "node-c".to_string(),
+            vec!["node-c::nfs-146=35624445".to_string()],
+        );
+        source.source_primary_by_group =
+            BTreeMap::from([("nfs-146".to_string(), "node-c".to_string())]);
+        source.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-c".to_string(), vec!["nfs-146".to_string()])]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+
+        let mut sink_status = SinkStatusSnapshot {
+            live_nodes: 28_070_036,
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-c".to_string(),
+                vec!["nfs-146".to_string()],
+            )]),
+            primary_host_ref_by_group: BTreeMap::from([(
+                "nfs-146".to_string(),
+                "node-c".to_string(),
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs-146",
+                "node-c::nfs-146",
+                GroupReadinessState::PendingMaterialization,
+                28_070_037,
+                28_070_036,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        sink_status.stream_received_origin_counts_by_node.insert(
+            "node-c".to_string(),
+            vec!["node-c::nfs-146=100043".to_string()],
+        );
+        sink_status.stream_applied_origin_counts_by_node.insert(
+            "node-c".to_string(),
+            vec!["node-c::nfs-146=100043".to_string()],
+        );
+
+        let first = run_status_sink_observation_repair_if_needed(
+            &state,
+            &source,
+            &sink_status,
+            StatusRouteOutcome::Ok,
+        )
+        .await;
+        assert_eq!(first.state, "scheduled");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if sink_repair_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first under-ingested sink repair should run");
+
+        let mut later_source = source.clone();
+        later_source.status.concrete_roots[0].emitted_event_count = 37_000_000;
+        later_source.status.concrete_roots[0].forwarded_event_count = 36_700_000;
+        later_source.published_origin_counts_by_node.insert(
+            "node-c".to_string(),
+            vec!["node-c::nfs-146=36700000".to_string()],
+        );
+        let second = run_status_sink_observation_repair_if_needed(
+            &state,
+            &later_source,
+            &sink_status,
+            StatusRouteOutcome::Ok,
+        )
+        .await;
+        assert_eq!(
+            second.state, "scheduled",
+            "continued source-vs-sink transport high-water lag must open a fresh bounded repair lane"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if sink_repair_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second under-ingested sink repair should run");
+        assert_eq!(
+            force_republish_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "under-ingested high-water repairs must grant runtime a one-shot source-scoped republish"
+        );
+        assert_eq!(
+            state
+                .control_gate
+                .repair_lane_snapshot()
+                .into_iter()
+                .filter(|lane| lane.lane == "status-triggered-sink-observation-repair")
+                .count(),
+            2,
+            "high-water bucket changes should bound retries by evidence, not collapse them into one completed lane"
         );
     }
 
@@ -49896,8 +52056,8 @@ mod tests {
         };
 
         let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(25)).await;
+        wait_for_status_route_trace_stage(trace_events.as_ref(), "source.collect.begin").await;
+        advance_paused_time_until_task_finishes(&status_task, Duration::from_secs(25)).await;
 
         let response = status_task
             .await
@@ -50029,8 +52189,8 @@ mod tests {
         };
 
         let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(25)).await;
+        wait_for_status_route_trace_stage(trace_events.as_ref(), "source.collect.begin").await;
+        advance_paused_time_until_task_finishes(&status_task, Duration::from_secs(25)).await;
 
         let response = status_task
             .await
@@ -50158,8 +52318,7 @@ mod tests {
         };
 
         let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(25)).await;
+        advance_paused_time_until_task_finishes(&status_task, Duration::from_secs(25)).await;
 
         let response = status_task
             .await
@@ -50231,8 +52390,7 @@ mod tests {
         };
 
         let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(25)).await;
+        advance_paused_time_until_task_finishes(&status_task, Duration::from_secs(25)).await;
 
         let response = status_task
             .await
@@ -50466,8 +52624,7 @@ mod tests {
         };
 
         let status_task = tokio::spawn(async move { status(State(state), None, headers).await });
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(25)).await;
+        advance_paused_time_until_task_finishes(&status_task, Duration::from_secs(25)).await;
 
         let err = status_task
             .await

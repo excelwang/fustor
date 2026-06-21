@@ -143,6 +143,244 @@ async fn trusted_root_tree_reuses_same_authority_pit_session_without_rerouting_s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trusted_root_tree_group_key_first_page_routes_only_visible_group() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_nfs1 = tmp.path().join("node-a-nfs1");
+    let node_b_nfs2 = tmp.path().join("node-b-nfs2");
+    let node_c_nfs3 = tmp.path().join("node-c-nfs3");
+    fs::create_dir_all(&node_a_nfs1).expect("create node-a nfs1 dir");
+    fs::create_dir_all(&node_b_nfs2).expect("create node-b nfs2 dir");
+    fs::create_dir_all(&node_c_nfs3).expect("create node-c nfs3 dir");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_nfs1,
+            fs_source: "nfs1".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-b::nfs2".to_string(),
+            host_ref: "node-b".to_string(),
+            host_ip: "10.0.0.2".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_b_nfs2,
+            fs_source: "nfs2".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-c::nfs3".to_string(),
+            host_ref: "node-c".to_string(),
+            host_ip: "10.0.0.3".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_c_nfs3,
+            fs_source: "nfs3".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = source_facade_with_roots(
+        vec![
+            root_spec_with_fs_source("nfs1"),
+            root_spec_with_fs_source("nfs2"),
+            root_spec_with_fs_source("nfs3"),
+        ],
+        &grants,
+    );
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let node_a_route = sink_query_request_route_for("node-a");
+    let node_b_route = sink_query_request_route_for("node-b");
+    let node_c_route = sink_query_request_route_for("node-c");
+    let mut endpoints = Vec::new();
+    for (node, route) in [
+        ("node-a", node_a_route.clone()),
+        ("node-b", node_b_route.clone()),
+        ("node-c", node_c_route.clone()),
+    ] {
+        endpoints.push(ManagedEndpointTask::spawn(
+            boundary.clone(),
+            route,
+            format!("test-root-tree-page-scoped-{node}"),
+            CancellationToken::new(),
+            move |requests| async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        let params = rmp_serde::from_slice::<InternalQueryRequest>(
+                            req.payload_bytes(),
+                        )
+                        .expect("decode selected group tree request");
+                        let group_id = params
+                            .scope
+                            .selected_group
+                            .clone()
+                            .expect("selected group for tree request");
+                        mk_event_with_correlation(
+                            &group_id,
+                            req.metadata()
+                                .correlation_id
+                                .expect("tree request correlation"),
+                            real_materialized_tree_payload_with_entries_for_test(
+                                &params.scope.path,
+                                &[
+                                    format!("/{group_id}-a.txt").as_bytes(),
+                                    format!("/{group_id}-b.txt").as_bytes(),
+                                    format!("/{group_id}-c.txt").as_bytes(),
+                                ],
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+        ));
+    }
+
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+    );
+    let request_source_status = SourceStatusSnapshot {
+        current_stream_generation: Some(1),
+        logical_roots: ["nfs1", "nfs2", "nfs3"]
+            .into_iter()
+            .map(|root_id| crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: root_id.to_string(),
+                status: "ok".to_string(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            })
+            .collect(),
+        concrete_roots: Vec::new(),
+        degraded_roots: Vec::new(),
+    };
+    let request_sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs1".to_string()]),
+            ("node-b".to_string(), vec!["nfs2".to_string()]),
+            ("node-c".to_string(), vec!["nfs3".to_string()]),
+        ]),
+        primary_host_ref_by_group: BTreeMap::from([
+            ("nfs1".to_string(), "node-a".to_string()),
+            ("nfs2".to_string(), "node-b".to_string()),
+            ("nfs3".to_string(), "node-c".to_string()),
+        ]),
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                primary_object_ref: "node-a::nfs1".to_string(),
+                ..sink_group_status("nfs1", true)
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                primary_object_ref: "node-b::nfs2".to_string(),
+                ..sink_group_status("nfs2", true)
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                primary_object_ref: "node-c::nfs3".to_string(),
+                ..sink_group_status("nfs3", true)
+            },
+        ],
+        ..SinkStatusSnapshot::default()
+    };
+    let params = NormalizedApiParams {
+        path: b"/".to_vec(),
+        group: None,
+        recursive: true,
+        max_depth: None,
+        pit_id: None,
+        group_order: GroupOrder::GroupKey,
+        group_page_size: Some(1),
+        group_after: None,
+        entry_page_size: Some(2),
+        entry_after: None,
+        read_class: Some(ReadClass::TrustedMaterialized),
+    };
+
+    let first = query_tree_page_response(
+        &state,
+        &ProjectionPolicy::default(),
+        &params,
+        Duration::from_secs(2),
+        ObservationStatus::trusted_materialized(),
+        Some(request_source_status.clone()),
+        Some(request_sink_status.clone()),
+        None,
+    )
+    .await
+    .expect("first trusted root tree page");
+    assert_eq!(first["groups"][0]["group"], serde_json::json!("nfs1"));
+    assert_eq!(first["groups"][0]["entry_page"]["returned_entries"], 2);
+    assert_eq!(first["groups"][0]["entry_page"]["has_more_entries"], true);
+    assert_eq!(first["group_page"]["returned_groups"], 1);
+    assert_eq!(first["group_page"]["has_more_groups"], true);
+    assert!(first["group_page"]["next_cursor"].as_str().is_some());
+    assert!(first["group_page"]["next_entry_after"].as_str().is_some());
+    assert_eq!(boundary.send_batch_count(&node_a_route.0), 1);
+    assert_eq!(
+        boundary.send_batch_count(&node_b_route.0),
+        0,
+        "first group-key root page must not route the second group before its group cursor is requested"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&node_c_route.0),
+        0,
+        "first group-key root page must not route the third group before its group cursor is requested"
+    );
+
+    let mut second_params = params.clone();
+    second_params.pit_id = Some(first["pit"]["id"].as_str().expect("pit id").to_string());
+    second_params.group_after = Some(
+        first["group_page"]["next_cursor"]
+            .as_str()
+            .expect("group cursor")
+            .to_string(),
+    );
+    let second = query_tree_page_response(
+        &state,
+        &ProjectionPolicy::default(),
+        &second_params,
+        Duration::from_secs(2),
+        ObservationStatus::trusted_materialized(),
+        Some(request_source_status),
+        Some(request_sink_status),
+        None,
+    )
+    .await
+    .expect("second trusted root tree page");
+    assert_eq!(second["groups"][0]["group"], serde_json::json!("nfs2"));
+    assert_eq!(second["group_page"]["returned_groups"], 1);
+    assert_eq!(second["group_page"]["has_more_groups"], true);
+    assert_eq!(boundary.send_batch_count(&node_a_route.0), 1);
+    assert_eq!(boundary.send_batch_count(&node_b_route.0), 1);
+    assert_eq!(boundary.send_batch_count(&node_c_route.0), 0);
+
+    for endpoint in endpoints.iter_mut() {
+        endpoint.shutdown(Duration::from_secs(2)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialized_tree_pit_extends_entry_window_without_full_subtree_payload() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_root = tmp.path().join("node-a-nfs2");

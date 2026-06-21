@@ -5857,6 +5857,36 @@ fn periodic_rescan_preserves_previous_audit_completion_evidence() {
 }
 
 #[test]
+fn successful_manual_full_audit_satisfies_pending_initial_scan() {
+    assert!(
+        FSMetaSource::audit_completion_satisfies_initial_scan_pending(
+            RootAuditKind::Initial,
+            "initial_scan",
+        )
+    );
+    assert!(
+        FSMetaSource::audit_completion_satisfies_initial_scan_pending(
+            RootAuditKind::Rescan,
+            "manual",
+        )
+    );
+    assert!(
+        !FSMetaSource::audit_completion_satisfies_initial_scan_pending(
+            RootAuditKind::Rescan,
+            "periodic",
+        ),
+        "periodic audits must not claim the initial full-audit boundary"
+    );
+    assert!(
+        !FSMetaSource::audit_completion_satisfies_initial_scan_pending(
+            RootAuditKind::Rescan,
+            "overflow",
+        ),
+        "overflow repair remains a separate recovery state"
+    );
+}
+
+#[test]
 fn duplicate_pending_manual_rescan_intent_preserves_inflight_audit_evidence() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![root("nfs1", "/mnt/nfs1")];

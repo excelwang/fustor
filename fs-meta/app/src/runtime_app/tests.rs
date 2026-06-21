@@ -475,6 +475,49 @@ impl ChannelIoSubset for RouteCountingTimeoutBoundary {
     }
 }
 
+#[derive(Default)]
+struct StaleGrantRouteCountingBoundary {
+    recv_counts: StdMutex<std::collections::BTreeMap<String, usize>>,
+}
+
+impl StaleGrantRouteCountingBoundary {
+    fn recv_count(&self, route_key: &str) -> usize {
+        self.recv_counts
+            .lock()
+            .expect("stale grant route recv counts lock")
+            .get(route_key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn recv_counts_snapshot(&self) -> std::collections::BTreeMap<String, usize> {
+        self.recv_counts
+            .lock()
+            .expect("stale grant route recv counts lock")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelIoSubset for StaleGrantRouteCountingBoundary {
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelRecvRequest,
+    ) -> Result<Vec<Event>> {
+        let route_key = request.channel_key.0;
+        *self
+            .recv_counts
+            .lock()
+            .expect("stale grant route recv counts lock")
+            .entry(route_key)
+            .or_default() += 1;
+        Err(CnxError::AccessDenied(
+            "pid Pid(1) is drained/fenced and cannot use grant attachments".to_string(),
+        ))
+    }
+}
+
 fn facade_control_stream_route() -> String {
     format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
 }
@@ -38789,14 +38832,26 @@ async fn deferred_source_cutover_schedules_bounded_source_repair_outside_control
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if !app.source_state_replay_required() && !app.source.retained_replay_required().await {
+            let completed_lane_visible = app.api_control_gate.repair_lane_snapshot().iter().any(
+                |lane| {
+                    lane.lane == "source-repair"
+                        && lane.owner == "source"
+                        && lane.trigger == "source-generation-cutover"
+                        && lane.state == "completed"
+                        && !lane.blocking
+                },
+            );
+            if !app.source_state_replay_required()
+                && !app.source.retained_replay_required().await
+                && completed_lane_visible
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("deferred source cutover should schedule bounded source repair without an external API/status request");
+    .expect("deferred source cutover should schedule bounded source repair and publish completion evidence without an external API/status request");
     let completed_lanes = app.api_control_gate.repair_lane_snapshot();
     let completed_lane = completed_lanes
         .iter()
@@ -39229,6 +39284,94 @@ async fn source_repair_recovery_replays_after_drained_worker_reconnect() {
         !app.source.retained_replay_required().await,
         "source repair must clear worker retained replay after the replacement worker accepts retained control"
     );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_repair_rearms_source_runtime_control_streams_after_stale_grant_recv_gap() {
+    let tmp = tempdir().expect("create temp dir");
+    let root = tmp.path().join("root-a");
+    fs::create_dir_all(&root).expect("create root");
+    let boundary = Arc::new(StaleGrantRouteCountingBoundary::default());
+    let app = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![worker_root("root-a", &root)],
+                host_object_grants: vec![granted_mount_root("single-app-node::root-1", &root)],
+                ..local_source_config()
+            },
+            ..FSMetaConfig::default()
+        },
+        NodeId("single-app-node".into()),
+        Some(boundary.clone()),
+    )
+    .expect("init app");
+
+    let rescan_control_route = format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL);
+    let roots_control_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            rescan_control_route.clone(),
+            &[("root-a", &["single-app-node::root-1"])],
+            1,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            roots_control_route.clone(),
+            &[("root-a", &["single-app-node::root-1"])],
+            1,
+        ),
+    ])
+    .await
+    .expect("activate source control streams");
+    app.ensure_runtime_endpoints_started()
+        .await
+        .expect("start source runtime endpoints");
+
+    let first_recv_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if boundary.recv_count(&rescan_control_route) > 0
+            && boundary.recv_count(&roots_control_route) > 0
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < first_recv_deadline,
+            "source control streams must attempt recv before stale termination; counts={:?}",
+            boundary.recv_counts_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let rescan_recv_before_repair = boundary.recv_count(&rescan_control_route);
+    let roots_recv_before_repair = boundary.recv_count(&roots_control_route);
+
+    set_control_initialized_for_tests(&app, false);
+    set_source_replay_required_for_tests(&app, true);
+    app.api_control_gate
+        .set_ready_state_with_source_repair(false, false, false);
+
+    let recovery = app.source_repair_recovery_for_tests();
+    recovery()
+        .await
+        .expect("source repair should rearm source-owned runtime endpoints");
+
+    let rearm_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if boundary.recv_count(&rescan_control_route) > rescan_recv_before_repair
+            && boundary.recv_count(&roots_control_route) > roots_recv_before_repair
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < rearm_deadline,
+            "source repair must restart stale source control streams; before=({rescan_recv_before_repair},{roots_recv_before_repair}) counts={:?}",
+            boundary.recv_counts_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     app.close().await.expect("close app");
 }
@@ -40125,10 +40268,35 @@ async fn sink_observation_repair_does_not_replay_source_scoped_sink_control_ever
         "same-signature status-triggered sink observation repair must not republish roots-control replay while sink replay remains pending"
     );
 
+    app.api_control_gate
+        .request_sink_observation_repair_republish();
+    let recovery = app.sink_observation_repair_recovery_for_tests();
+    tokio::time::timeout(Duration::from_millis(500), recovery())
+        .await
+        .expect("one-shot status repair republish must remain bounded")
+        .expect(
+            "one-shot status repair republish should bypass source-scoped duplicate suppression",
+        );
+    let after_force_replay_payload_generations = replay_payload_generations();
+    assert!(
+        after_force_replay_payload_generations.len() > first_replay_payload_generations.len(),
+        "under-ingested status evidence must be able to republish the same source-scoped sink replay once"
+    );
+    let recovery = app.sink_observation_repair_recovery_for_tests();
+    tokio::time::timeout(Duration::from_millis(500), recovery())
+        .await
+        .expect("post-force status repair duplicate must remain bounded")
+        .expect("post-force status repair should return to duplicate suppression");
+    assert_eq!(
+        replay_payload_generations().len(),
+        after_force_replay_payload_generations.len(),
+        "one-shot status repair republish must be consumed after a single replay"
+    );
+
     assert_eq!(
         sink_apply_entries.load(AtomicOrdering::Acquire),
-        1,
-        "status-triggered sink observation repair should apply the owner-scoped sink replay once, not on every status poll"
+        2,
+        "status-triggered sink observation repair should apply the owner-scoped sink replay once, plus one high-water-lag forced republish"
     );
     assert_eq!(
         local_republish_entries.load(AtomicOrdering::Acquire),
@@ -40164,7 +40332,7 @@ async fn sink_observation_repair_does_not_replay_source_scoped_sink_control_ever
         .expect("roots-generation repair replay should republish current declaration");
     assert_eq!(
         sink_apply_entries.load(AtomicOrdering::Acquire),
-        2,
+        3,
         "source-scoped sink observation repair must replay again when the logical-roots declaration generation changes"
     );
     let replay_payloads = boundary
@@ -40189,6 +40357,118 @@ async fn sink_observation_repair_does_not_replay_source_scoped_sink_control_ever
             .iter()
             .map(|payload| payload.generation)
             .collect::<Vec<_>>()
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn under_ingested_sink_observation_repair_triggers_scoped_source_rescan_once() {
+    let tmp = tempdir().expect("create temp dir");
+    let root = tmp.path().join("nfs-145");
+    fs::create_dir_all(root.join("rescan")).expect("create root");
+    fs::write(root.join("rescan").join("seed.txt"), b"seed").expect("seed root");
+    let fs_source = root.display().to_string();
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let source_rescan_route = source_rescan_request_route_for("node-b").0;
+    let unrelated_source_rescan_route = source_rescan_request_route_for("node-c").0;
+
+    let app = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![worker_fs_watch_scan_root("nfs-145", &fs_source)],
+                host_object_grants: vec![worker_export_with_fs_source(
+                    "node-b::nfs-145",
+                    "node-b",
+                    "127.0.0.2",
+                    &fs_source,
+                    root.clone(),
+                )],
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        NodeId("node-b".into()),
+        Some(boundary.clone()),
+    )
+    .expect("init app");
+
+    app.start().await.expect("start app");
+    app.on_control_frame(&selected_group_source_control_wave(
+        2,
+        &[("nfs-145", &["node-b::nfs-145"])],
+    ))
+    .await
+    .expect("source-only runtime scope should apply");
+    set_control_initialized_for_tests(&app, true);
+    set_source_replay_required_for_tests(&app, false);
+    set_sink_replay_required_for_tests(&app, false);
+    app.control_failure_uninitialized
+        .store(false, AtomicOrdering::Release);
+    app.api_control_gate.set_ready_state(true, true);
+
+    let source_rescan_send_count = |route_key: &str| {
+        boundary
+            .sent_payloads_snapshot()
+            .into_iter()
+            .filter(|(route, _)| route == route_key)
+            .map(|(_, payloads)| payloads.len())
+            .sum::<usize>()
+    };
+
+    let recovery = app.sink_observation_repair_recovery_for_tests();
+    tokio::time::timeout(Duration::from_secs(2), recovery())
+        .await
+        .expect("initial sink observation repair must remain bounded")
+        .expect("initial sink observation repair should publish sink replay");
+    assert_eq!(
+        source_rescan_send_count(&source_rescan_route),
+        0,
+        "ordinary status-triggered sink replay must not submit a source-rescan"
+    );
+
+    app.api_control_gate
+        .request_sink_observation_repair_republish();
+    let recovery = app.sink_observation_repair_recovery_for_tests();
+    tokio::time::timeout(Duration::from_secs(2), recovery())
+        .await
+        .expect("unscoped force republish must remain bounded")
+        .expect("unscoped force republish should only replay sink control");
+    assert_eq!(
+        source_rescan_send_count(&source_rescan_route),
+        0,
+        "unscoped force republish must not submit a source-rescan"
+    );
+
+    app.api_control_gate
+        .request_sink_observation_repair_republish_for_groups(&std::collections::BTreeSet::from([
+            "nfs-145".to_string(),
+        ]));
+    let recovery = app.sink_observation_repair_recovery_for_tests();
+    tokio::time::timeout(Duration::from_secs(2), recovery())
+        .await
+        .expect("under-ingested force republish must remain bounded")
+        .expect("under-ingested force republish should request scoped source-rescan");
+    let after_under_ingested = source_rescan_send_count(&source_rescan_route);
+    assert!(
+        after_under_ingested > 0,
+        "under-ingested status evidence must request scoped source-rescan from the affected owner"
+    );
+    assert_eq!(
+        source_rescan_send_count(&unrelated_source_rescan_route),
+        0,
+        "under-ingested source-rescan must not fan out to unrelated source owners"
+    );
+
+    let recovery = app.sink_observation_repair_recovery_for_tests();
+    tokio::time::timeout(Duration::from_secs(2), recovery())
+        .await
+        .expect("post-under-ingested duplicate must remain bounded")
+        .expect("post-under-ingested duplicate should be suppressed");
+    assert_eq!(
+        source_rescan_send_count(&source_rescan_route),
+        after_under_ingested,
+        "under-ingested source-rescan token must be consumed after one delivery"
     );
 
     app.close().await.expect("close app");

@@ -181,6 +181,67 @@ async fn force_find_defaults_when_query_params_omitted_local() {
     );
 }
 
+// @verify_spec("CONTRACTS.QUERY_OUTCOME.DUAL_QUERY_PATH_AVAILABILITY", mode="system")
+// @verify_spec("RUNTIME.STATE_MODEL.QueryServiceAvailabilityWindows", mode="system")
+#[tokio::test]
+async fn force_find_fresh_path_serves_while_materialization_is_pending_local() {
+    let fixture = ForceFindFixture::new(ForceFindFixtureScenario::Standard);
+    let sink_status = fixture
+        .sink
+        .status_snapshot_with_failure()
+        .await
+        .expect("read fixture sink status");
+    let pending_groups = sink_status
+        .groups
+        .iter()
+        .filter_map(|group| {
+            matches!(
+                group.readiness,
+                crate::sink::GroupReadinessState::PendingMaterialization
+            )
+            .then(|| group.group_id.clone())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !pending_groups.is_empty(),
+        "fixture must expose at least one pending-materialization group before force-find: {sink_status:?}"
+    );
+
+    let force_req = Request::builder()
+        .uri("/on-demand-force-find?path=/&group_order=group-key&group_page_size=2")
+        .method("GET")
+        .body(Body::empty())
+        .expect("build force-find request");
+    let force_resp = fixture
+        .app
+        .clone()
+        .oneshot(force_req)
+        .await
+        .expect("serve force-find request");
+    assert_eq!(force_resp.status(), StatusCode::OK);
+
+    let force_body = to_bytes(force_resp.into_body(), 1024 * 1024)
+        .await
+        .expect("force-find response body");
+    let force_json: serde_json::Value =
+        serde_json::from_slice(&force_body).expect("force-find json");
+    assert_eq!(force_json["status"], "ok");
+    assert_eq!(force_json["read_class"], "fresh");
+    let groups = force_json["groups"]
+        .as_array()
+        .expect("force-find groups array");
+    let served_groups = groups
+        .iter()
+        .filter_map(|group| group["group"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    assert!(
+        pending_groups
+            .iter()
+            .any(|pending| served_groups.contains(pending)),
+        "force-find must serve at least one group that was pending before request; pending={pending_groups:?} served={served_groups:?} response={force_json}"
+    );
+}
+
 // @verify_spec("CONTRACTS.API_BOUNDARY.GIANT_ROOT_PUBLIC_API_PARAMETER_GOVERNANCE", mode="system")
 #[tokio::test]
 async fn public_query_endpoints_reject_unknown_query_params_local() {
