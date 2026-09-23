@@ -25,7 +25,7 @@ cargo test -p fs-meta-tooling -- --nocapture
 ## Dependency Overrides
 
 Workspace-internal crates inherit `capanix-*` dependencies from the root
-[`Cargo.toml`](/home/huajin/fustor/Cargo.toml) via `workspace = true`.
+[`Cargo.toml`](Cargo.toml) via `workspace = true`.
 
 This repository does not default unresolved `capanix-*` dependencies to any
 local checkout. When unpublished upstream crates need to come from a local

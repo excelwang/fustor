@@ -253,10 +253,10 @@ mod tests {
             r#"{
               "roots": [
                 {
-                  "id": "nfs-144-smoke",
+                  "id": "nfs-a-smoke",
                   "selector": {
-                    "host_ip": "10.0.82.144",
-                    "mount_point": "/mnt/fustor-peers/nfs144"
+                    "host_ip": "192.0.2.144",
+                    "mount_point": "/mnt/example/nfs-a"
                   },
                   "subpath_scope": "/fsmeta-smoke",
                   "watch": true,

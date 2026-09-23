@@ -25,5 +25,5 @@ pub fn capanix_repo_root() -> PathBuf {
     workspace_root()
         .join("../capanix")
         .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from("/home/huajin/capanix"))
+        .unwrap_or_else(|_| PathBuf::from("../capanix"))
 }

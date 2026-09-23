@@ -1320,15 +1320,15 @@ mod tests {
     #[test]
     fn route_plan_node_discovery_collects_unique_nodes_from_config_dump() {
         let dump = json!({
-            "node_id": "panda145",
+            "node_id": "node-b",
             "announced_resources": [
-                {"node_id": "panda144"},
-                {"node_id": "panda145"},
-                {"node_id": "panda147"}
+                {"node_id": "node-a"},
+                {"node_id": "node-b"},
+                {"node_id": "node-d"}
             ],
             "management_peers": [
-                {"node_id": "panda146"},
-                {"node_id": "panda147"},
+                {"node_id": "node-c"},
+                {"node_id": "node-d"},
                 {"node_id": ""}
             ]
         });
@@ -1338,10 +1338,10 @@ mod tests {
         assert_eq!(
             actual,
             vec![
-                "panda144".to_string(),
-                "panda145".to_string(),
-                "panda146".to_string(),
-                "panda147".to_string(),
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string(),
+                "node-d".to_string(),
             ]
         );
     }

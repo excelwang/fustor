@@ -13736,7 +13736,7 @@ fn trusted_materialized_root_tree_session_rejects_groups_outside_expected_roots(
 #[test]
 fn merge_source_status_snapshots_preserves_completed_audit_evidence_from_older_snapshot() {
     let audited_root = crate::source::SourceConcreteRootHealthSnapshot {
-        root_key: "nfs1@node-a::nfs1@/mnt/fustor-peers/nfs145".to_string(),
+        root_key: "nfs1@node-a::nfs1@/mnt/example/nfs-b".to_string(),
         logical_root_id: "nfs1".to_string(),
         object_ref: "node-a::nfs1".to_string(),
         status: "serving".to_string(),
@@ -13836,7 +13836,7 @@ fn merge_source_status_snapshots_preserves_completed_audit_evidence_from_older_s
     let merged_root = merged
         .concrete_roots
         .iter()
-        .find(|root| root.root_key == "nfs1@node-a::nfs1@/mnt/fustor-peers/nfs145")
+        .find(|root| root.root_key == "nfs1@node-a::nfs1@/mnt/example/nfs-b")
         .expect("merged root should be preserved");
 
     assert_eq!(merged_root.current_revision, Some(2));
@@ -13865,7 +13865,7 @@ fn merge_source_status_snapshots_preserves_completed_audit_evidence_from_older_s
     let pending_root = pending_merged
         .concrete_roots
         .iter()
-        .find(|root| root.root_key == "nfs1@node-a::nfs1@/mnt/fustor-peers/nfs145")
+        .find(|root| root.root_key == "nfs1@node-a::nfs1@/mnt/example/nfs-b")
         .expect("pending root should be preserved");
 
     assert!(pending_root.rescan_pending);
