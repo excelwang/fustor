@@ -3,6 +3,7 @@ use capanix_app_sdk::{CnxError, Result};
 
 pub mod api;
 pub mod domain_state;
+pub mod fustor_integration;
 pub mod product_model;
 pub mod query;
 pub mod shared_types;
@@ -16,19 +17,10 @@ pub use shared_types::{
 use source::config::SourceConfig;
 pub use source::config::{GrantedMountRoot, RootSelector, RootSpec};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct FSMetaConfig {
     pub source: SourceConfig,
     pub api: api::ApiConfig,
-}
-
-impl Default for FSMetaConfig {
-    fn default() -> Self {
-        Self {
-            source: SourceConfig::default(),
-            api: api::ApiConfig::default(),
-        }
-    }
 }
 
 impl FSMetaConfig {

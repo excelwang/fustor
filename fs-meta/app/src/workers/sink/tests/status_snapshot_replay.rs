@@ -4276,11 +4276,6 @@ async fn status_snapshot_nonblocking_retries_ack_reply_after_retained_replay_and
         ..Default::default()
     };
 
-    let reset_count = Arc::new(AtomicUsize::new(0));
-    let _reset_hook = SinkWorkerRetryResetHookReset;
-    install_sink_worker_retry_reset_hook(SinkWorkerRetryResetHook {
-        reset_count: reset_count.clone(),
-    });
     let _reply_reset = SinkWorkerStatusResponseQueueHookReset;
     install_sink_worker_status_response_queue_hook(SinkWorkerStatusResponseQueueHook {
         replies: std::collections::VecDeque::from([
@@ -4301,14 +4296,10 @@ async fn status_snapshot_nonblocking_retries_ack_reply_after_retained_replay_and
             "status_snapshot_nonblocking after retained replay should reset and retry instead of surfacing a typed Ack as a protocol violation",
         );
 
-    assert!(
-        reset_count.load(Ordering::SeqCst) >= 1,
-        "a typed Ack on the first live status probe after retained replay must reset the shared sink worker client before publishing status",
-    );
     assert_eq!(
         snapshot.scheduled_groups_by_node.get("node-d"),
         Some(&vec!["nfs1".to_string()]),
-        "status_snapshot_nonblocking must retry a typed Ack after retained replay and restore the live scheduled groups instead of surfacing a protocol violation: {snapshot:?}"
+        "status_snapshot_nonblocking must retry one stale Ack on the same live client after retained replay and restore the live scheduled groups: {snapshot:?}"
     );
 
     sink.close().await.expect("close sink worker");
@@ -5532,7 +5523,7 @@ async fn status_snapshot_rearms_replay_required_after_pending_materialization_wi
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn status_snapshot_does_not_publish_unscheduled_zero_uninitialized_snapshot_after_schedule_cache_converged()
+async fn status_snapshot_preserves_live_pending_materialization_after_schedule_cache_converged()
  {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
@@ -5685,16 +5676,34 @@ async fn status_snapshot_does_not_publish_unscheduled_zero_uninitialized_snapsho
         },
     );
 
-    let err = sink
+    let returned = sink
         .status_snapshot_with_failure()
         .await
-        .expect_err(
-            "blocking status_snapshot must fail close instead of publishing an unscheduled zero-state snapshot after schedule convergence already cached the scheduled groups",
-        );
+        .expect("blocking status_snapshot must return live pending-materialization evidence");
 
-    assert!(
-        matches!(err.as_error(), CnxError::Timeout),
-        "blocking status_snapshot must fail close on an unscheduled zero-state live snapshot after schedule cache convergence instead of returning ok empty groups: zero={zero_snapshot:?} err={err:?}"
+    assert_eq!(
+        returned.scheduled_groups_by_node.get("node-d"),
+        Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+        "blocking status_snapshot must restore accepted schedule evidence around the live pending rows: {returned:?}"
+    );
+    for group_id in ["nfs1", "nfs2"] {
+        let group = returned
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .unwrap_or_else(|| panic!("missing live pending group {group_id}: {returned:?}"));
+        assert_eq!(
+            group.readiness,
+            crate::sink::GroupReadinessState::PendingMaterialization,
+            "live pending materialization is bounded catch-up evidence, not a transport timeout: {returned:?}"
+        );
+        assert_eq!(group.live_nodes, 0);
+        assert_eq!(group.materialized_revision, 1);
+    }
+    assert_eq!(
+        returned.readiness_summary().pending_materialization_groups,
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        "pending live rows must remain explicitly not ready: {returned:?}"
     );
 
     source.close().await.expect("close source");
@@ -6157,6 +6166,7 @@ async fn status_snapshot_does_not_rearm_same_retained_replay_after_zero_uninitia
         entered: entered.clone(),
         release: release.clone(),
     });
+    let retained_control_guard = sink.retained_control_state.lock().await;
 
     let second_status = tokio::spawn({
         let sink = sink.clone();
@@ -6183,7 +6193,126 @@ async fn status_snapshot_does_not_rearm_same_retained_replay_after_zero_uninitia
         matches!(second_err.as_error(), CnxError::Timeout),
         "second blocking status_snapshot should fail close without replaying retained control: {second_err:?}"
     );
+    assert_eq!(
+        sink.control_state_replay_required.load(Ordering::Acquire),
+        0,
+        "retained-state lock contention must not turn pending materialization into another identical replay"
+    );
+    drop(retained_control_guard);
 
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_live_status_returns_current_receive_armed_pending_materialization_snapshot() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs1", &nfs1)],
+        host_object_grants: vec![sink_worker_export(
+            "node-d::nfs1",
+            "node-d",
+            "10.0.0.41",
+            nfs1,
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    let pending_snapshot = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-d::nfs1".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+            materialized_revision: 0,
+            estimated_heap_bytes: 0,
+        }],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        stream_receive_armed_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            1,
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+    let current_worker_instance_id = sink.worker_instance_id_for_tests().await;
+    let _status_snapshot_reset = SinkWorkerStatusSnapshotHookReset;
+    install_sink_worker_status_snapshot_hook_for_worker_instance(
+        current_worker_instance_id,
+        SinkWorkerStatusSnapshotHook {
+            snapshot: pending_snapshot,
+        },
+    );
+
+    let snapshot = sink
+        .live_status_snapshot_for_recovery_with_failure(Duration::from_millis(500))
+        .await
+        .expect("recovery probe must return direct current receive-armed evidence");
+    assert_eq!(
+        snapshot.stream_receive_armed_by_node.get("node-d"),
+        Some(&1),
+        "recovery probe must preserve the worker-owned receive-armed marker"
+    );
+    assert!(
+        matches!(
+            snapshot.concern_projection().concern,
+            Some(crate::sink::SinkStatusConcern::ReplayPending)
+        ),
+        "the direct recovery proof must not relabel pending materialization as trusted readiness"
+    );
+
+    sink.control_ops_inflight.store(1, Ordering::Release);
+    let err = sink
+        .live_status_snapshot_for_recovery_with_failure(Duration::from_millis(500))
+        .await
+        .expect_err("direct readiness probing must not race an in-flight control apply");
+    assert!(
+        matches!(err.as_error(), CnxError::NotReady(_)),
+        "in-flight sink control must remain a closed recovery boundary: {err:?}"
+    );
+    sink.control_ops_inflight.store(0, Ordering::Release);
+
+    sink.control_state_replay_required
+        .store(1, Ordering::Release);
+    let err = sink
+        .live_status_snapshot_for_recovery_with_failure(Duration::from_millis(500))
+        .await
+        .expect_err("direct readiness probing must not bypass retained control replay");
+    assert!(
+        matches!(err.as_error(), CnxError::NotReady(_)),
+        "pending retained replay must remain a closed recovery boundary: {err:?}"
+    );
+
+    sink.control_state_replay_required
+        .store(0, Ordering::Release);
     sink.close().await.expect("close sink worker");
 }
 
@@ -6671,6 +6800,128 @@ async fn authoritative_sink_replay_control_frame_clears_worker_replay_required_f
     assert!(
         sink.current_generation_tick_fast_path_eligible().await,
         "successful authoritative retained replay should reopen the steady tick fast path"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fragmented_same_worker_control_acks_clear_observation_replay_requirement() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs1", &nfs1)],
+        host_object_grants: Vec::new(),
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    let activate = |route_key: String, generation: u64| {
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key,
+            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+        }))
+        .expect("encode sink activate")
+    };
+    let query_route = ROUTE_KEY_QUERY.to_string();
+    let initial_routes = vec![
+        activate(query_route.clone(), 2),
+        activate(
+            format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+            2,
+        ),
+        activate(
+            format!(
+                "{}.stream",
+                crate::runtime::routes::ROUTE_KEY_SINK_ROOTS_CONTROL
+            ),
+            2,
+        ),
+    ];
+    let host_grant_change = encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+        version: 1,
+        grants: Vec::new(),
+    })
+    .expect("encode host grant change");
+
+    sink.on_control_frame(vec![host_grant_change.clone()])
+        .await
+        .expect("apply host grant fragment");
+    sink.on_control_frame(initial_routes.clone())
+        .await
+        .expect("apply route fragment");
+    sink.control_state_replay_required
+        .store(1, Ordering::Release);
+
+    let changed_query = activate(query_route.clone(), 3);
+    sink.on_control_frame(vec![changed_query.clone()])
+        .await
+        .expect("apply changed route on the same worker");
+    assert_eq!(
+        sink.control_state_replay_required.load(Ordering::Acquire),
+        0,
+        "ACKed host and route fragments on the same current worker must cumulatively cover retained control state"
+    );
+
+    let retired_worker_client = sink.client().await.expect("retired worker client");
+    let retired_full_wave = std::iter::once(host_grant_change)
+        .chain(initial_routes)
+        .chain(std::iter::once(changed_query))
+        .collect::<Vec<_>>();
+    let retired_full_signals = sink_control_signals_from_envelopes(&retired_full_wave)
+        .expect("decode retired worker full ACK wave");
+    sink.replace_shared_worker_client_after_stale_shutdown(
+        Duration::from_millis(250),
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("replace sink worker client");
+    sink.retain_control_signals(&retired_full_signals, &retired_worker_client)
+        .await
+        .expect("account delayed retired-worker ACK");
+    assert_eq!(
+        sink.control_state_replay_required.load(Ordering::Acquire),
+        1,
+        "an ACK accounted after its worker transport was retired must not satisfy successor replay"
+    );
+    sink.on_control_frame(vec![activate(query_route, 4)])
+        .await
+        .expect("apply one fragment on the successor worker");
+    assert_eq!(
+        sink.control_state_replay_required.load(Ordering::Acquire),
+        1,
+        "a successor worker must not inherit accumulated ACK coverage from the retired transport"
+    );
+
+    sink.replay_retained_control_state_if_needed()
+        .await
+        .expect("replay complete retained state to successor");
+    assert_eq!(
+        sink.control_state_replay_required.load(Ordering::Acquire),
+        0,
+        "the successor's own complete ACK coverage must close retained replay"
     );
 
     sink.close().await.expect("close sink worker");

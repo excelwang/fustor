@@ -1,5 +1,5 @@
 ---
-version: 3.0.0
+version: 3.1.5
 ---
 
 # L2: fs-meta Domain Architecture
@@ -23,6 +23,13 @@ version: 3.0.0
    3.1. Constraint: this boundary is a downstream app product container, not a generic reusable shared library package.
    4. Stateful fs-meta authoring and runtime participation consume bounded upstream observation, service, and runtime-entry surfaces above the low-level kernel mirror; exact crate topology and helper layering remain engineering-governance material.
    5. Product-facing execution vocabulary stays at `embedded | external`; realization mechanics remain internal.
+   6. Runtime-control ingress owns Fustor's interpretation of generic bound scopes: a logical source/scan group marker becomes every active matching grant on the selected local runtime node, while a logical sink group marker remains cardinality-one. Typed signals and their re-encoded envelopes carry the same localized scopes before retained state or worker delivery.
+   6.1. Recovery observes these as independent sets: source/scan ownership can be either narrower or wider than local sink materialization, and only their intersection is checked against each sink root's watch/scan capability. Sink assignment coverage remains exact.
+   6.2. Runtime-control ingress may consume generic per-PID dispatch-wave position only to keep background source/sink replay behind the final route callback in that wave. After any earlier callback in the same wave has established the worker path, a later callback that carries source route state merges that callback's source and companion sink desired state into retained state and returns without another inline worker turn; the single-flight source/sink recovery lanes replay the accumulated state only after the final callback returns. The same accumulation rule applies from ordinal one when a multi-route wave enters with retained source or sink route state from an earlier turn; ordinal one alone is not fresh-bootstrap evidence and cannot reopen the sink initial-materialization inline exception. This metadata is not retained source/sink desired state and does not change group placement, route semantics, authority, readiness, or worker payload meaning.
+   6.3. Dispatch-wave settlement is a bounded scheduling gate in front of the recovery service window. Its elapsed time is not charged to the source/sink worker replay budget; a fresh bounded replay deadline is created only after the gate opens, while a carrier wave that never settles fails closed before worker entry.
+   6.4. Source-event destination projection is Fustor coordination state, not Capanix routing policy and not Source placement inference. Once recovery has proven one current receive-armed sink owner per group, the coordinator embeds a `group -> (opaque event route scope, accepted sink-control generation)` map in the targeted source-rescan control payload. The Source fences and stores each group independently, resolves emitted object refs only to logical groups, and partitions mixed batches by the supplied scopes. Capanix continues to attach and transport explicit opaque route keys without inspecting fs-meta group payloads. No component widens an unresolved destination to all nodes.
+   6.5. In worker-backed mode, externally addressed Sink status routes terminate at the app endpoint layer exactly once. That layer interprets fs-meta status purpose, owns replay/apply gating, and combines a typed current Sink worker snapshot with app-retained control-generation evidence. The internal Sink worker owns the typed snapshot RPC and data/query lanes, but does not also bind generic or node-scoped `sink-status` product routes.
+   7. Management status completion is group-directed. It derives a deduplicated owner-route set from the strongest current group-scoped source/sink hints and consults matching active grants only when stronger hints are absent; the owner replies, not the route-selection hints, remain authoritative evidence.
 
 3. **Meta-Index Service (App Internal)**:
    1. Inputs: realtime watch stream, initial full scan batches, audit pass results, sentinel feedback.
@@ -57,7 +64,10 @@ version: 3.0.0
    2. Outputs: bounded status-visible recovery lane snapshots with owner, state, trigger, diagnostic signature, generation/attempt/deadline evidence, route outcome, and reason.
    3. Role: publish asynchronous recovery progress to `/status` and diagnostics without making the status endpoint own repair execution.
    4. Invariant: the registry records and exposes lane state; it does not decide source/sink placement, fabricate materialized readiness, or convert a status poll into synchronous repair work.
-   5. Invariant: nonblocking `/status` wakes are single-flight for a lane diagnostic signature. A registry entry already in `scheduled` or `inflight` state is the active owner for that signature; another status request observes that active owner instead of spawning a duplicate replay/recovery task.
+   5. Invariant: nonblocking `/status` wakes are single-flight for a lane diagnostic signature. A registry entry already in `scheduled` or `inflight` state is the active owner for that signature; another status request observes that active owner instead of spawning a duplicate replay/recovery task. Once a status-preflight Source Repair or Management Write wake for that signature reaches `completed`, later polls continue to observe the completed evidence instead of reclaiming the same work while the owning background source/sink recovery lane converges.
+   6. Invariant: the status-triggered sink-observation lane adds one app-instance-wide execution lease above diagnostic signatures because all of those signatures share one sink replay transaction and one pending owner-targeted request. A differing signature can be recorded as blocked observation evidence while the lease is held, but cannot start work or alter the pending request. The app runtime owns the detached task, so task completion, cancellation, runtime shutdown, or unwind drops the lease; no per-wake OS thread/runtime may outlive the app lifecycle.
+   7. Invariant: source scan/audit admission release composes two independent proofs per group: current source-primary authority names the release target, and current sink-owner receive-arm evidence names a destination that can accept publication. Schedule-only or replay/apply-pending cache evidence cannot bridge either proof.
+   8. Invariant: after both proofs hold, the source-owner release endpoint records one fresh rescan intent for the lane's stable scope signature even if admission was already open. It returns qualifying owner evidence only after that intent is accepted; a no-op epoch, unrelated owner evidence, or partial group proof remains retryable pending evidence.
 
 8. **Observation Eligibility Path (App Internal)**:
    1. Inputs: authoritative journal revision, replayed monitoring roots/runtime grants, current projection/materialized-tree status, stale-writer fencing evidence.
@@ -97,6 +107,7 @@ version: 3.0.0
    2. runtime binds/runs worker roles on those groups without interpreting grouping semantics.
    3. internal desired-state wiring for those groups remains app-private execution shape rather than product vocabulary.
    4. kernel/runtime participate only as generic routing and bind/run mechanisms.
+   5. app-owned sink repair consumes runtime placement evidence without widening it: each logical group resolves to at most one sink repair owner, and ambiguous replicas close that group's repair path instead of becoming broadcast targets.
 
 5. **Management API Path**:
    1. client issues fs-meta API request on bounded HTTP namespace.
@@ -113,7 +124,35 @@ version: 3.0.0
    4. newly activated generation rebuilds in-memory observation state through baseline scan/audit/rescan rather than expecting durable tree carry-over.
    5. observation-eligibility path evaluates whether rebuilt observation has caught up far enough to be trusted as the current external result source.
    6. trusted external exposure remains on the previous eligible generation or explicit degraded observation state until the candidate reaches app-owned `observation_eligible`.
-   7. runtime-managed source/sink endpoints are current-boundary resources: after a generation or boundary replacement, an endpoint on a stale boundary MAY drain or shut down, but it MUST NOT suppress endpoint creation on the current boundary for the same route key.
+   7. runtime-managed source/sink endpoints are current-boundary resources: after a generation or boundary replacement, an endpoint on a stale boundary MAY drain or shut down, but it MUST NOT suppress endpoint creation on the current boundary for the same route key. The app-owned endpoint registry is the strong lifecycle owner; endpoint handlers and recovery contexts reference that registry weakly, and process-wide fixed-bind registries are cleared by app instance on Drop so omitted explicit close cannot retain endpoint/API/worker process trees indefinitely.
+
+## ARCHITECTURE.FUSTOR_INTEGRATION
+
+1. **Source Provider Mapping**:
+   1. The source-side live observation path and fs-meta authoritative journal together form the authoritative `SourceProvider` side of the integration.
+   2. Exported direct results carry a stable source authority reference, source-native anchors, change identity, source revision, authority epoch, schema identity, payload, and observation time.
+   3. `/on-demand-force-find` is a direct source observation path; it does not acquire projection authority merely because its result passes through the facade.
+
+2. **Optional Source Projection Mapping**:
+   1. The sink-side materialized tree is an optional `SourceProjection`, not a second source of truth.
+   2. `materialized` and `trusted-materialized` reads are projection-backed paths and carry projection revision, applied change identity, coverage, readiness, and source revision evidence.
+   3. A projection-backed result is eligible for external commit only when its projection apply evidence is present and consistent with the selected read class.
+
+3. **Path Selection Boundary**:
+   1. Every exported one-shot result explicitly identifies either the `direct` path or the `projection-backed` path.
+   2. fs-meta MUST NOT silently fan out across both paths, fall back from one path to the other, or conceal which observation path produced the result.
+   3. Path selection does not change fs-meta truth ownership: source/journal evidence remains authoritative and materialized state remains rebuildable observation state.
+
+4. **Normalization Boundary**:
+   1. fs-meta emits schema-tagged filesystem result payloads and evidence; it does not emit caller-owned DataView identities, global graph identifiers, or graph relationship assertions.
+   2. Source-specific payload normalization, identity derivation, and DataView commit policy belong to the external consumer.
+   3. The integration contract therefore preserves fs-meta-native identity and evidence without making fs-meta depend on consumer-specific graph or orchestration semantics.
+
+5. **Streaming Refresh Boundary**:
+   1. Realtime export is a separately bounded subscription path over result references already tracked by the external consumer.
+   2. Each refresh entry identifies one tracked result and performs only `refresh`, `invalidate`, or `delete`.
+   3. A filesystem object without a tracked result reference is outside that subscription even when fs-meta observes or materializes it; admitting that object requires a later explicit bounded query or action.
+   4. Streaming export preserves ordering, watermark, source revision, and optional projection evidence, but does not create a new external result or initiate consumer-side reprojection.
 
 ## ARCHITECTURE.OWNERSHIP
 

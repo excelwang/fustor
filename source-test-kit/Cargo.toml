@@ -1,0 +1,16 @@
+[package]
+name = "source-test-kit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Disposable Capanix bound-route harness for Fustor source acceptance tests"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+capanix-app-sdk = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio-util = { workspace = true, features = ["rt"] }

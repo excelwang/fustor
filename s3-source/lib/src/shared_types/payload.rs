@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use source_kit::SourceErrorPayload;
+use source_kit::{SourceErrorPayload, SourceRuntimeStatus};
 
 use super::S3SourceCursor;
 
@@ -8,8 +8,10 @@ use super::S3SourceCursor;
 #[serde(tag = "kind", content = "payload", rename_all = "kebab-case")]
 pub enum S3SourcePayload {
     Objects(S3ObjectBatch),
+    Content(source_kit::SourceContentSample),
     Fields(S3FieldCatalog),
     Probe(S3ProbeStatus),
+    Status(SourceRuntimeStatus),
     Error(SourceErrorPayload),
 }
 
@@ -18,6 +20,8 @@ pub struct S3ObjectBatch {
     pub object_ref: String,
     pub bucket: String,
     pub prefix: String,
+    #[serde(default)]
+    pub source_revision: String,
     #[serde(default)]
     pub objects: Vec<S3ObjectEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

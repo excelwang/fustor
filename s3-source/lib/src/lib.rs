@@ -17,7 +17,7 @@ pub use shared_types::{
 };
 pub use source_kit::{
     CredentialSource, ResolvedCredential, SourceCredentialConfig, SourceErrorPayload,
-    decode_msgpack, encode_msgpack,
+    SourceRuntimeStatus, decode_msgpack, encode_msgpack,
 };
 
 pub fn from_manifest_config(cfg: &HashMap<String, ConfigValue>) -> Result<S3SourceRuntimeConfig> {

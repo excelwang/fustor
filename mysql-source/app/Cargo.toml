@@ -9,11 +9,15 @@ description = "MySQL source deployable runtime artifact package"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
+[features]
+# One-shot tools embed services, not the shared-library plugin entry symbol.
+embedded-inspection = []
+
 [dependencies]
 async-trait = { workspace = true }
 capanix-app-sdk = { workspace = true }
 capanix-runtime-entry-sdk = { workspace = true }
-mysql = { workspace = true }
+mysql = { workspace = true, features = ["native-tls"] }
 mysql-source = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -22,3 +26,7 @@ source-kit = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+source-test-kit = { workspace = true }

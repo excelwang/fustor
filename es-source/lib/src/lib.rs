@@ -14,7 +14,8 @@ pub use config::{
 pub use shared_types::{
     EsDocumentEvent, EsDocumentEventKind, EsFieldCatalog, EsFieldDescriptor, EsPollCursor,
     EsProbeStatus, EsSnapshotCursor, EsSourceBatch, EsSourceCursor, EsSourceErrorPayload,
-    EsSourceOperation, EsSourcePayload, EsSourceRequest, decode_msgpack, encode_msgpack,
+    EsSourceOperation, EsSourcePayload, EsSourceRequest, EsSourceStatus, decode_msgpack,
+    encode_msgpack,
 };
 
 pub fn from_manifest_config(cfg: &HashMap<String, ConfigValue>) -> Result<EsSourceRuntimeConfig> {

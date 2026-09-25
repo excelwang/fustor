@@ -9,12 +9,25 @@ description = "Union graph deployable runtime artifact package"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
+[features]
+# One-shot tools embed services, not the shared-library plugin entry symbol.
+embedded-inspection = []
+
 [dependencies]
 async-trait = { workspace = true }
 capanix-app-sdk = { workspace = true }
 capanix-runtime-entry-sdk = { workspace = true }
+data-view = { workspace = true }
+data-view-normalizers = { workspace = true }
+private-discovery = { workspace = true }
 rmp-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 source-kit = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 tokio-util = { workspace = true, features = ["rt"] }
 union-graph = { workspace = true }
+
+[dev-dependencies]
+s3-source = { workspace = true }
+serde_json = { workspace = true }

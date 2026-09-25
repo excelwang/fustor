@@ -9,16 +9,20 @@ use capanix_app_sdk::raw::{
 };
 use capanix_app_sdk::runtime::{NodeId, RouteKey};
 use capanix_app_sdk::{BoundRouteClient, BoundRouteServer, CnxError, Event, Result};
-use s3_source::product_model::routes::fetch_request_route_for;
+use s3_source::product_model::routes::{fetch_request_route_for, status_request_route_for};
 use s3_source::shared_types::{
     S3FieldCatalog, S3PollCursor, S3ProbeStatus, S3SnapshotCursor, S3SourceOperation,
     S3SourcePayload, S3SourceRequest,
 };
 use s3_source::{
     GrantedS3Endpoint, ResolvedCredential, ResolvedS3Endpoint, S3EndpointConfig, S3SourceConfig,
-    S3SourceRuntimeConfig, S3SourceRuntimeInputs, decode_msgpack, encode_msgpack,
+    S3SourceRuntimeConfig, S3SourceRuntimeInputs, decode_msgpack,
 };
 use s3_source_runtime::{S3ObjectPage, S3SourceDriver, S3SourceService};
+use source_kit::{
+    DecodedSourceResponse, SourceExecutionContext, SourceExecutionEnvelope,
+    SourceOperationCapability, decode_source_response, encode_source_request, source_now_ms,
+};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -227,9 +231,23 @@ async fn fetch_bound_route_returns_typed_msgpack_reply() {
         cursor: None,
     };
 
+    let now_ms = source_now_ms();
+    let request = SourceExecutionEnvelope::new(
+        SourceExecutionContext::one_shot(
+            "s3-bound-route-probe",
+            9,
+            now_ms,
+            now_ms + 2_000,
+            1,
+            64 * 1024,
+        ),
+        request,
+    );
     let replies = client
         .ask(
-            encode_msgpack(&request).expect("encode request"),
+            encode_source_request(&request)
+                .expect("encode request")
+                .into(),
             Duration::from_secs(2),
         )
         .await
@@ -240,7 +258,20 @@ async fn fetch_bound_route_returns_typed_msgpack_reply() {
         replies[0].metadata().correlation_id.is_some(),
         "server must preserve bound-route correlation id"
     );
-    let payload: S3SourcePayload = decode_msgpack(replies[0].payload_bytes()).expect("reply");
+    let DecodedSourceResponse::Envelope(response) =
+        decode_source_response::<S3SourcePayload>(replies[0].payload_bytes()).expect("reply")
+    else {
+        panic!("expected versioned source response");
+    };
+    assert_eq!(response.request_id, "s3-bound-route-probe");
+    let receipt = response.receipt.expect("source receipt");
+    assert_eq!(receipt.source_kind, "s3");
+    assert_eq!(receipt.grant_epoch, 9);
+    assert_eq!(
+        receipt.actual.bytes,
+        replies[0].payload_bytes().len() as u64
+    );
+    let payload = response.payload;
     match payload {
         S3SourcePayload::Probe(status) => {
             assert_eq!(status.object_ref, "s3-prod");
@@ -256,6 +287,82 @@ async fn fetch_bound_route_returns_typed_msgpack_reply() {
     channel
         .channel_close(BoundaryContext::default(), ChannelKey(route.0.clone()))
         .expect("close request route");
+    let server_result = tokio::time::timeout(Duration::from_secs(1), server_task)
+        .await
+        .expect("server shutdown")
+        .expect("server join");
+    assert!(server_result.is_ok(), "server_result={server_result:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_bound_route_returns_typed_local_readiness_without_driver_call() {
+    let fetch_route: RouteKey = fetch_request_route_for("s3-source-node-a");
+    let status_route: RouteKey = status_request_route_for("s3-source-node-a");
+    let channel = Arc::new(InMemoryChannelIo::default());
+    let driver = Arc::new(ProbeDriver::new());
+    let service = Arc::new(S3SourceService::new(
+        test_config(),
+        driver.clone(),
+        NodeId("s3-source-test".into()),
+    ));
+    let server = BoundRouteServer::open(channel.clone(), status_route.clone()).expect("server");
+    let shutdown = CancellationToken::new();
+    let server_shutdown = shutdown.clone();
+    let fetch_route_key = fetch_route.0.clone();
+    let status_route_key = status_route.0.clone();
+    let server_task = tokio::spawn({
+        let service = service.clone();
+        async move {
+            server
+                .bind_concurrent_until(&server_shutdown, 2, move |events| {
+                    service.handle_status_events(events, &fetch_route_key, &status_route_key)
+                })
+                .await
+        }
+    });
+
+    let client = BoundRouteClient::open(
+        channel.clone(),
+        status_route.clone(),
+        NodeId("caller".into()),
+    )
+    .expect("client");
+    let replies = client
+        .ask(Vec::<u8>::new().into(), Duration::from_secs(2))
+        .await
+        .expect("route ask");
+
+    assert_eq!(replies.len(), 1);
+    let payload: S3SourcePayload = decode_msgpack(replies[0].payload_bytes()).expect("reply");
+    match payload {
+        S3SourcePayload::Status(status) => {
+            assert!(status.ready);
+            assert_eq!(status.source_kind, "s3");
+            assert_eq!(status.configured_endpoints, 1);
+            assert_eq!(status.active_grants, 1);
+            assert!(
+                status
+                    .capabilities
+                    .supports(SourceOperationCapability::BoundedSnapshot)
+            );
+            assert!(
+                status
+                    .capabilities
+                    .supports(SourceOperationCapability::IncrementalPoll)
+            );
+        }
+        other => panic!("expected status payload, got {other:?}"),
+    }
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 0);
+
+    shutdown.cancel();
+    drop(client);
+    channel
+        .channel_close(
+            BoundaryContext::default(),
+            ChannelKey(status_route.0.clone()),
+        )
+        .expect("close status route");
     let server_result = tokio::time::timeout(Duration::from_secs(1), server_task)
         .await
         .expect("server shutdown")

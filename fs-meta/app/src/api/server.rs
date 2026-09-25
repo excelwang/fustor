@@ -54,6 +54,8 @@ pub struct ApiServerHandle {
     join: Option<ApiServerJoin>,
 }
 
+const API_SERVER_DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[cfg(test)]
 static SHUTDOWN_BLOCKING_JOIN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
@@ -95,6 +97,33 @@ impl ApiServerHandle {
                     log::warn!("fs-meta api server thread panicked: {:?}", err);
                 }
             }
+        }
+    }
+}
+
+impl Drop for ApiServerHandle {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        let Some(ApiServerJoin::Thread(join)) = self.join.take() else {
+            return;
+        };
+        if join.thread().id() == std::thread::current().id() {
+            log::warn!("fs-meta api server handle dropped on its own thread");
+            return;
+        }
+        let deadline = std::time::Instant::now() + API_SERVER_DROP_JOIN_TIMEOUT;
+        while !join.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if join.is_finished() {
+            if let Err(err) = join.join() {
+                log::warn!("fs-meta api server thread panicked: {:?}", err);
+            }
+        } else {
+            log::warn!(
+                "fs-meta api server did not exit within {:?} during drop",
+                API_SERVER_DROP_JOIN_TIMEOUT
+            );
         }
     }
 }
@@ -547,6 +576,7 @@ async fn request_logging(
                 control_gate_fully_ready: state.control_gate.is_ready()
                     && state.control_gate.is_management_write_ready()
                     && state.control_gate.is_source_repair_ready(),
+                source_repair_ready: state.control_gate.is_source_repair_ready(),
             });
     }
     let request_guard = api_request_route_policy(&method, &path)

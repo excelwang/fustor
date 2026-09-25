@@ -96,6 +96,36 @@ fn app_count(doc: &Value, id_or_app: &str) -> usize {
         .unwrap_or(0)
 }
 
+#[test]
+fn test_fustor_source_provider_projection_contracts_are_traceable() {
+    let l0 = read_fs_meta_spec_file("fs-meta/specs/L0-VISION.md");
+    let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
+    let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/FUSTOR_INTEGRATION.md");
+
+    for contract in [
+        "SOURCE_PROVIDER_EVIDENCE_EXPORT",
+        "SOURCE_PROJECTION_EVIDENCE_EXPORT",
+        "TRACKED_RESULT_STREAM_REFRESH_ONLY",
+    ] {
+        assert!(l0.contains(contract), "L0 should declare {contract}");
+        assert!(l1.contains(contract), "L1 should declare {contract}");
+    }
+
+    assert!(l2.contains("ARCHITECTURE.FUSTOR_INTEGRATION"));
+    assert!(l2.contains("authoritative `SourceProvider`"));
+    assert!(l2.contains("optional `SourceProjection`"));
+    assert!(l2.contains("`direct` path or the `projection-backed` path"));
+    assert!(l2.contains("does not create a new external result"));
+
+    assert!(l3.contains("FsMetaSourceProviderEvidence"));
+    assert!(l3.contains("FsMetaProjectionApplyEvidence"));
+    assert!(l3.contains("FsMetaStreamingRefreshBatch"));
+    assert!(l3.contains("tracked_result_ref"));
+    assert!(l3.contains("stream-created external result"));
+    assert!(l3.contains("does not silently retry through the direct path"));
+}
+
 // @verify_spec("CONTRACTS.DOMAIN_IDENTITY.DOMAIN_CONSTITUTION_SCOPE_DISCIPLINE", mode="system")
 #[test]
 fn test_domain_constitution_scope_discipline() {
@@ -780,6 +810,11 @@ fn test_in_memory_materialized_index_baseline_contract() {
     assert!(l1.contains("statecell_retire_binding"));
     assert!(l1.contains("runtime-owned carrier lifecycle seams"));
     assert!(l1.contains("domain truth ledger"));
+    assert!(l1.contains("without synchronously waiting for a reverse `StateCell`"));
+    assert!(l1.contains("single-flight asynchronous flush"));
+    assert!(l1.contains("drained during orderly worker close"));
+    assert!(l1.contains("only source request that replaces authoritative logical-roots"));
+    assert!(l1.contains("blocked authority write MUST NOT delay the follower acknowledgement"));
     assert!(!l1.contains("statecell_authority_journal_dir"));
     assert!(l1.contains("removed authority carrier fields"));
     assert!(!l1.contains("sink_execution_mode"));
@@ -856,7 +891,35 @@ fn test_in_memory_materialized_index_baseline_contract() {
     assert!(state_cell_mod.contains("from_state_boundary"));
     assert!(state_cell_mod.contains("StateClass::Authoritative"));
     assert!(state_cell_mod.contains("local_state_boundary_bridge"));
+    assert!(state_cell_mod.contains("flush_deferred_batch"));
+    assert!(state_cell_mod.contains("pub(crate) async fn refresh_from_boundary"));
+    assert!(state_cell_mod.contains("pub(crate) fn accept_propagated"));
+    assert!(state_cell_mod.contains("authority.pending.compacted"));
     assert!(!state_cell_mod.contains("embedded_state_plane_bridge"));
+
+    let worker_runtime_support =
+        read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md");
+    assert!(worker_runtime_support.contains("ExternalWorkerAuthorityCommitOrdering"));
+    assert!(worker_runtime_support.contains("bounded FIFO"));
+    assert!(worker_runtime_support.contains("single-flight asynchronous flusher"));
+    assert!(worker_runtime_support.contains("ExternalWorkerStateCarrierExecutorIsolation"));
+    assert!(worker_runtime_support.contains("MUST NOT call a blocking `StateCell` bridge"));
+    assert!(worker_runtime_support.contains("single authoritative logical-roots replace"));
+    assert!(worker_runtime_support.contains("without writing the authoritative cell again"));
+    let source_ipc = read_fs_meta_spec_file("fs-meta/app/src/workers/source_ipc.rs");
+    assert!(source_ipc.contains("ApplyPropagatedLogicalRoots"));
+    let source_server = read_fs_meta_spec_file("fs-meta/app/src/workers/source_server.rs");
+    assert!(source_server
+        .contains("propagated_logical_roots_ack_without_rewriting_authoritative_statecell"));
+    let sink_server = read_fs_meta_spec_file("fs-meta/app/src/workers/sink_server.rs");
+    assert!(sink_server
+        .contains("worker_on_control_frame_ack_precedes_deferred_authority_read_and_stream_arm"));
+    assert!(sink_server.contains("cached_status_snapshot_with_failure"));
+    assert!(
+        sink_server.contains("management roots ACK must not wait for the deferred authority flush")
+    );
+    let sink_mod = read_fs_meta_spec_file("fs-meta/app/src/sink/mod.rs");
+    assert!(sink_mod.contains("build_cached_status_snapshot_for_route"));
 
     let cargo = read_fs_meta_spec_file("fs-meta/app/Cargo.toml");
     assert!(
@@ -1141,7 +1204,20 @@ fn test_global_http_api_resource_scoped_app_facade_contract() {
 #[test]
 fn test_manual_rescan_operation_contract() {
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let workflows = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKFLOWS.md");
+    let handlers = read_fs_meta_spec_file("fs-meta/app/src/api/handlers.rs");
     assert!(l1.contains("MANUAL_RESCAN_OPERATION"));
+    assert!(l1.contains("cancel the watchdog wait immediately"));
+    assert!(workflows.contains("wait is cancellation-aware"));
+    assert!(
+        handlers.contains("ManualRescanPreflightWatchdog")
+            && handlers.contains("recv_timeout(wait_budget)")
+            && handlers.contains("watchdog.cancel()")
+            && handlers.contains(
+                "manual_rescan_preflight_watchdog_cancellation_retires_threads_immediately"
+            ),
+        "manual-rescan preflight watchdog must remain wall-clock independent without accumulating sleeping retry threads"
+    );
     assert_domain_fs_meta_contract_test(
         "CONTRACTS.API_BOUNDARY.MANUAL_RESCAN_OPERATION",
         "test_manual_rescan_operation_contract",
@@ -1603,7 +1679,18 @@ fn test_source_side_scan_unit_bootstrap_contract() {
 #[test]
 fn test_online_root_reconfig_without_restart_contract() {
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
+    let runtime_app_tests = read_fs_meta_spec_file("fs-meta/app/src/runtime_app/tests.rs");
     assert!(l1.contains("ONLINE_ROOT_RECONFIG_WITHOUT_RESTART"));
+    assert!(l1.contains("endpoint reconciliation MUST then retire that fallback"));
+    assert!(l1.contains("every generic and owner-scoped route copy in that publication wave MUST preserve the same identity"));
+    assert!(l1.contains(
+        "deduplicate the identity across all of its corresponding roots-control endpoints"
+    ));
+    assert!(runtime_app_tests
+        .contains("source_status_endpoint_migrates_from_query_fallback_to_source_owner"));
+    assert!(runtime_app_tests.contains(
+        "roots_control_application_wave_deduplicates_distinct_route_events_and_allows_recovery_wave"
+    ));
     assert_domain_fs_meta_contract_test(
         "CONTRACTS.API_BOUNDARY.ONLINE_ROOT_RECONFIG_WITHOUT_RESTART",
         "test_online_root_reconfig_without_restart_contract",

@@ -49,6 +49,16 @@ macro_rules! define_trigger_rescan_republish_tests {
             .expect("start source worker");
 
         let source_wave = |generation| {
+            if generation == 1 {
+                return source_runtime_control_wave_with_schedules(
+                    generation,
+                    &[("nfs1", "node-a::nfs1")],
+                    &[
+                        ("nfs1", "node-a::nfs1"),
+                        ("nfs2", "node-a::nfs2"),
+                    ],
+                );
+            }
             vec![
                 encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                     route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
@@ -273,6 +283,16 @@ macro_rules! define_trigger_rescan_republish_tests {
             .expect("start source worker");
 
         let source_wave = |generation| {
+            if generation == 1 {
+                return source_runtime_control_wave_with_schedules(
+                    generation,
+                    &[("nfs1", "node-a::nfs1")],
+                    &[
+                        ("nfs1", "node-a::nfs1"),
+                        ("nfs2", "node-a::nfs2"),
+                    ],
+                );
+            }
             vec![
                 encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                     route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),

@@ -27,7 +27,7 @@ pub(crate) fn scenario_audit_query_path() -> Result<(), String> {
                 "value": 32u64
             }))?;
             let audit = c.ctl_ok_a_local(json!({ "command": "audit_tail", "count": 20usize }))?;
-            if !audit.as_array().is_some_and(|a| !a.is_empty()) {
+            if audit.as_array().is_none_or(|a| a.is_empty()) {
                 return Err(format!("audit query returned no entries: {audit}"));
             }
             Ok(())

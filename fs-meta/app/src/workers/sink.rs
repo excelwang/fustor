@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -17,7 +17,10 @@ use crate::query::models::QueryNode;
 use crate::query::path::root_file_name_bytes;
 use crate::query::request::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
 use crate::runtime::orchestration::{SinkControlSignal, sink_control_signals_from_envelopes};
-use crate::runtime::routes::{ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SINK_STATUS_INTERNAL};
+use crate::runtime::routes::{
+    ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_ROOTS_CONTROL,
+    ROUTE_KEY_SINK_STATUS_INTERNAL,
+};
 #[cfg(test)]
 use crate::sink::SinkStatusSnapshotIssue;
 use crate::sink::VisibilityLagSample;
@@ -1319,17 +1322,13 @@ fn apply_live_sink_status_snapshot_outcome_side_effects(
     sink: &SinkWorkerClientHandle,
     snapshot: &SinkStatusSnapshot,
     outcome: &SinkStatusSnapshotOutcome,
-    replay_required_for_attempt: bool,
 ) -> Result<()> {
-    let completed_retained_replay_should_not_rearm = replay_required_for_attempt
-        && outcome.should_mark_replay_required
-        && matches!(outcome.concern, Some(SinkStatusConcern::ReplayPending))
-        && sink
-            .retained_control_state
-            .try_lock()
-            .map(|retained| retained_sink_state_has_complete_materialized_replay_routes(&retained))
-            .unwrap_or(false);
-    if outcome.should_mark_replay_required && !completed_retained_replay_should_not_rearm {
+    let should_rearm_replay = sink_status_outcome_should_rearm_for_route_completeness(
+        sink.retained_materialized_replay_routes_complete
+            .load(Ordering::Acquire),
+        outcome,
+    );
+    if should_rearm_replay {
         sink.control_state_replay_required
             .store(1, Ordering::Release);
     }
@@ -1483,6 +1482,7 @@ fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<Que
 
 #[derive(Clone)]
 pub struct SinkWorkerClientHandle {
+    owner_lease: Arc<SinkWorkerOwnerLease>,
     _shared: Arc<SharedSinkWorkerHandleState>,
     node_id: NodeId,
     worker_factory: RuntimeWorkerClientFactory,
@@ -1494,6 +1494,8 @@ pub struct SinkWorkerClientHandle {
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
     scheduled_groups_cache: Arc<Mutex<Option<CachedSinkScheduleEvidence>>>,
     retained_control_state: Arc<tokio::sync::Mutex<RetainedSinkWorkerControlState>>,
+    applied_control_state: Arc<tokio::sync::Mutex<AppliedSinkWorkerControlState>>,
+    retained_materialized_replay_routes_complete: Arc<AtomicBool>,
     control_state_replay_required: Arc<AtomicUsize>,
     control_ops_inflight: Arc<AtomicUsize>,
     control_ops_state_tx: tokio::sync::watch::Sender<usize>,
@@ -1502,6 +1504,7 @@ pub struct SinkWorkerClientHandle {
 }
 
 struct SharedSinkWorkerHandleState {
+    lifecycle: Mutex<SharedSinkWorkerHandleLifecycle>,
     worker: Arc<tokio::sync::Mutex<SharedSinkWorkerClient>>,
     config: Arc<Mutex<SourceConfig>>,
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
@@ -1509,10 +1512,26 @@ struct SharedSinkWorkerHandleState {
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
     scheduled_groups_cache: Arc<Mutex<Option<CachedSinkScheduleEvidence>>>,
     retained_control_state: Arc<tokio::sync::Mutex<RetainedSinkWorkerControlState>>,
+    applied_control_state: Arc<tokio::sync::Mutex<AppliedSinkWorkerControlState>>,
+    retained_materialized_replay_routes_complete: Arc<AtomicBool>,
     control_state_replay_required: Arc<AtomicUsize>,
     control_ops_inflight: Arc<AtomicUsize>,
     control_ops_state: tokio::sync::watch::Sender<usize>,
     inflight_control_frame_summaries: Arc<Mutex<Vec<Vec<String>>>>,
+    #[cfg(test)]
+    control_frame_pause_hook: Arc<Mutex<Option<SinkWorkerLocalControlFramePauseHook>>>,
+}
+
+struct SharedSinkWorkerHandleLifecycle {
+    active_owners: usize,
+    retiring: bool,
+}
+
+struct SinkWorkerOwnerLease {
+    registry_key: String,
+    shared: Weak<SharedSinkWorkerHandleState>,
+    released: AtomicBool,
+    shutdown_owner: AtomicBool,
 }
 
 struct SharedSinkWorkerClient {
@@ -1524,6 +1543,12 @@ struct SharedSinkWorkerClient {
 struct RetainedSinkWorkerControlState {
     latest_host_grant_change: Option<SinkControlSignal>,
     active_by_route: std::collections::BTreeMap<(String, String), SinkControlSignal>,
+}
+
+#[derive(Default)]
+struct AppliedSinkWorkerControlState {
+    worker_client: Option<TypedWorkerClient<SinkWorkerRpc>>,
+    state: RetainedSinkWorkerControlState,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1929,25 +1954,54 @@ fn snapshot_control_signal_scope_ids(
 fn retained_sink_state_has_complete_materialized_replay_routes(
     retained: &RetainedSinkWorkerControlState,
 ) -> bool {
-    let roots_control_stream_route = format!(
-        "{}.stream",
-        crate::runtime::routes::ROUTE_KEY_SINK_ROOTS_CONTROL
-    );
-    let has_route = |route_key: &str| {
-        retained
-            .active_by_route
-            .keys()
-            .any(|(_, active_route_key)| active_route_key == route_key)
+    let is_generic_or_scoped_route = |route_key: &str, base: &str, suffix: &str| {
+        let Some(route_without_suffix) = route_key.strip_suffix(suffix) else {
+            return false;
+        };
+        if route_without_suffix == base {
+            return true;
+        }
+        let Some((base_stem, base_version)) = base.rsplit_once(':') else {
+            return route_without_suffix.starts_with(&format!("{base}."));
+        };
+        let Some((route_stem, route_version)) = route_without_suffix.rsplit_once(':') else {
+            return false;
+        };
+        route_version == base_version && route_stem.starts_with(&format!("{base_stem}."))
     };
-    let has_events_stream_route = retained
-        .active_by_route
-        .keys()
-        .any(|(_, active_route_key)| {
-            crate::runtime::routes::is_events_stream_route_key(active_route_key)
-        });
-    has_route(crate::runtime::routes::ROUTE_KEY_QUERY)
-        && has_events_stream_route
-        && has_route(&roots_control_stream_route)
+    let mut has_query_route = false;
+    let mut has_events_stream_route = false;
+    let mut has_roots_control_route = false;
+    for (_, route_key) in retained.active_by_route.keys() {
+        has_query_route |= route_key == ROUTE_KEY_QUERY
+            || is_generic_or_scoped_route(route_key, ROUTE_KEY_SINK_QUERY_INTERNAL, ".req");
+        has_events_stream_route |= crate::runtime::routes::is_events_stream_route_key(route_key);
+        has_roots_control_route |=
+            is_generic_or_scoped_route(route_key, ROUTE_KEY_SINK_ROOTS_CONTROL, ".stream");
+    }
+    has_query_route && has_events_stream_route && has_roots_control_route
+}
+
+#[cfg(test)]
+fn sink_status_outcome_should_rearm_retained_control(
+    retained: &RetainedSinkWorkerControlState,
+    outcome: &SinkStatusSnapshotOutcome,
+) -> bool {
+    sink_status_outcome_should_rearm_for_route_completeness(
+        retained_sink_state_has_complete_materialized_replay_routes(retained),
+        outcome,
+    )
+}
+
+fn sink_status_outcome_should_rearm_for_route_completeness(
+    retained_materialized_replay_routes_complete: bool,
+    outcome: &SinkStatusSnapshotOutcome,
+) -> bool {
+    outcome.should_mark_replay_required
+        && !(matches!(
+            outcome.concern,
+            Some(SinkStatusConcern::ReplayPending | SinkStatusConcern::CoverageGap)
+        ) && retained_materialized_replay_routes_complete)
 }
 
 fn retained_sink_state_after_signals(
@@ -1981,34 +2035,31 @@ fn retained_sink_state_after_signals(
     state
 }
 
-fn signal_sink_state(signals: &[SinkControlSignal]) -> RetainedSinkWorkerControlState {
-    retained_sink_state_after_signals(&RetainedSinkWorkerControlState::default(), signals)
+fn sink_control_signals_match(left: &SinkControlSignal, right: &SinkControlSignal) -> bool {
+    match (left.envelope(), right.envelope()) {
+        (ControlEnvelope::Frame(left), ControlEnvelope::Frame(right)) => left == right,
+        _ => false,
+    }
 }
 
-fn control_frame_covers_retained_sink_state_after_apply(
+fn applied_sink_state_covers_retained_sink_state(
     retained: &RetainedSinkWorkerControlState,
-    signals: &[SinkControlSignal],
+    applied: &RetainedSinkWorkerControlState,
 ) -> bool {
-    if signals.is_empty() {
-        return false;
-    }
-    if signals.iter().all(|signal| {
-        matches!(
-            signal,
-            SinkControlSignal::Tick { .. } | SinkControlSignal::Passthrough(_)
-        )
-    }) {
-        return false;
-    }
-
-    let desired_after_apply = retained_sink_state_after_signals(retained, signals);
-    let signal_state = signal_sink_state(signals);
-    let host_grant_covered = desired_after_apply.latest_host_grant_change.is_none()
-        || signal_state.latest_host_grant_change.is_some();
-    let active_routes_covered = desired_after_apply
-        .active_by_route
-        .keys()
-        .all(|route| signal_state.active_by_route.contains_key(route));
+    let host_grant_covered = match (
+        retained.latest_host_grant_change.as_ref(),
+        applied.latest_host_grant_change.as_ref(),
+    ) {
+        (None, _) => true,
+        (Some(retained), Some(applied)) => sink_control_signals_match(retained, applied),
+        (Some(_), None) => false,
+    };
+    let active_routes_covered = retained.active_by_route.iter().all(|(route, retained)| {
+        applied
+            .active_by_route
+            .get(route)
+            .is_some_and(|applied| sink_control_signals_match(retained, applied))
+    });
     host_grant_covered && active_routes_covered
 }
 
@@ -2146,6 +2197,74 @@ fn lock_sink_worker_handle_registry() -> std::sync::MutexGuard<
     }
 }
 
+impl SharedSinkWorkerHandleState {
+    fn try_acquire_owner(&self) -> bool {
+        let mut lifecycle = match self.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(poisoned) => {
+                log::warn!(
+                    "sink worker handle lifecycle lock poisoned; recovering shared owner state"
+                );
+                poisoned.into_inner()
+            }
+        };
+        if lifecycle.retiring {
+            return false;
+        }
+        lifecycle.active_owners = lifecycle.active_owners.saturating_add(1);
+        true
+    }
+
+    #[cfg(test)]
+    fn active_owner_count(&self) -> usize {
+        match self.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle.active_owners,
+            Err(poisoned) => poisoned.into_inner().active_owners,
+        }
+    }
+}
+
+impl SinkWorkerOwnerLease {
+    fn release(&self) -> bool {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return self.shutdown_owner.load(Ordering::Acquire);
+        }
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        let mut registry = lock_sink_worker_handle_registry();
+        let mut lifecycle = match shared.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(poisoned) => {
+                log::warn!(
+                    "sink worker handle lifecycle lock poisoned; recovering shared owner state"
+                );
+                poisoned.into_inner()
+            }
+        };
+        debug_assert!(lifecycle.active_owners > 0);
+        lifecycle.active_owners = lifecycle.active_owners.saturating_sub(1);
+        let shutdown_owner = lifecycle.active_owners == 0;
+        if shutdown_owner {
+            lifecycle.retiring = true;
+            let registered_here = registry
+                .get(&self.registry_key)
+                .is_some_and(|registered| std::ptr::eq(registered.as_ptr(), Arc::as_ptr(&shared)));
+            if registered_here {
+                registry.remove(&self.registry_key);
+            }
+        }
+        self.shutdown_owner.store(shutdown_owner, Ordering::Release);
+        shutdown_owner
+    }
+}
+
+impl Drop for SinkWorkerOwnerLease {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct SinkWorkerCloseHook {
@@ -2176,6 +2295,12 @@ pub(crate) struct SinkWorkerControlFrameErrorQueueHook {
 pub(crate) struct SinkWorkerControlFramePauseHook {
     pub entered: Arc<tokio::sync::Notify>,
     pub release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+struct SinkWorkerLocalControlFramePauseHook {
+    expected_summary: Vec<String>,
+    hook: SinkWorkerControlFramePauseHook,
 }
 
 #[cfg(test)]
@@ -2809,14 +2934,32 @@ fn take_sink_worker_control_frame_error_hook(current_worker_instance_id: u64) ->
 }
 
 #[cfg(test)]
-async fn maybe_pause_before_on_control_frame_rpc() {
-    let hook = {
+async fn maybe_pause_before_on_control_frame_rpc(
+    local_hook: Arc<Mutex<Option<SinkWorkerLocalControlFramePauseHook>>>,
+    current_summary: Option<Vec<String>>,
+) {
+    let local_hook = {
+        let mut guard = match local_hook.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.as_ref().is_some_and(|slot| {
+            current_summary
+                .as_ref()
+                .is_some_and(|summary| summary == &slot.expected_summary)
+        }) {
+            guard.take().map(|slot| slot.hook)
+        } else {
+            None
+        }
+    };
+    let hook = local_hook.or_else(|| {
         let mut guard = match sink_worker_control_frame_pause_hook_cell().lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.take()
-    };
+    });
     if let Some(hook) = hook {
         let mut release = std::pin::pin!(hook.release.notified());
         std::future::poll_fn(|cx| {
@@ -2824,7 +2967,7 @@ async fn maybe_pause_before_on_control_frame_rpc() {
             std::task::Poll::Ready(())
         })
         .await;
-        hook.entered.notify_waiters();
+        hook.entered.notify_one();
         release.await;
     }
 }
@@ -2839,7 +2982,7 @@ fn notify_sink_worker_close_started() {
         guard.clone()
     };
     if let Some(hook) = hook {
-        hook.entered.notify_waiters();
+        hook.entered.notify_one();
     }
 }
 
@@ -2869,8 +3012,14 @@ async fn shutdown_stale_sink_worker_client_for_replacement(
         };
         guard.clone()
     } {
-        hook.entered.notify_waiters();
-        hook.release.notified().await;
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        hook.entered.notify_one();
+        release.await;
     }
 
     SinkWorkerClientHandle::checkpoint_stale_worker_client_before_replacement(
@@ -2897,7 +3046,7 @@ async fn maybe_pause_before_update_logical_roots_rpc() {
             std::task::Poll::Ready(())
         })
         .await;
-        hook.entered.notify_waiters();
+        hook.entered.notify_one();
         release.await;
     }
 }
@@ -2912,11 +3061,19 @@ impl SinkWorkerClientHandle {
         let key = sink_worker_handle_registry_key(&node_id, &worker_binding, &worker_factory);
         let shared = {
             let mut registry = lock_sink_worker_handle_registry();
-            if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            if let Some(existing) = registry
+                .get(&key)
+                .and_then(Weak::upgrade)
+                .filter(|existing| existing.try_acquire_owner())
+            {
                 existing
             } else {
                 let (control_ops_state, _control_ops_state_rx) = tokio::sync::watch::channel(0);
                 let shared = Arc::new(SharedSinkWorkerHandleState {
+                    lifecycle: Mutex::new(SharedSinkWorkerHandleLifecycle {
+                        active_owners: 1,
+                        retiring: false,
+                    }),
                     worker: Arc::new(tokio::sync::Mutex::new(SharedSinkWorkerClient {
                         instance_id: next_shared_sink_worker_instance_id(),
                         client: Arc::new(worker_factory.connect(
@@ -2933,16 +3090,28 @@ impl SinkWorkerClientHandle {
                     retained_control_state: Arc::new(tokio::sync::Mutex::new(
                         RetainedSinkWorkerControlState::default(),
                     )),
+                    applied_control_state: Arc::new(tokio::sync::Mutex::new(
+                        AppliedSinkWorkerControlState::default(),
+                    )),
+                    retained_materialized_replay_routes_complete: Arc::new(AtomicBool::new(false)),
                     control_state_replay_required: Arc::new(AtomicUsize::new(0)),
                     control_ops_inflight: Arc::new(AtomicUsize::new(0)),
                     control_ops_state,
                     inflight_control_frame_summaries: Arc::new(Mutex::new(Vec::new())),
+                    #[cfg(test)]
+                    control_frame_pause_hook: Arc::new(Mutex::new(None)),
                 });
-                registry.insert(key, Arc::downgrade(&shared));
+                registry.insert(key.clone(), Arc::downgrade(&shared));
                 shared
             }
         };
         Ok(Self {
+            owner_lease: Arc::new(SinkWorkerOwnerLease {
+                registry_key: key,
+                shared: Arc::downgrade(&shared),
+                released: AtomicBool::new(false),
+                shutdown_owner: AtomicBool::new(false),
+            }),
             _shared: shared.clone(),
             node_id,
             worker_factory,
@@ -2954,6 +3123,10 @@ impl SinkWorkerClientHandle {
             status_cache: shared.status_cache.clone(),
             scheduled_groups_cache: shared.scheduled_groups_cache.clone(),
             retained_control_state: shared.retained_control_state.clone(),
+            applied_control_state: shared.applied_control_state.clone(),
+            retained_materialized_replay_routes_complete: shared
+                .retained_materialized_replay_routes_complete
+                .clone(),
             control_state_replay_required: shared.control_state_replay_required.clone(),
             control_ops_inflight: shared.control_ops_inflight.clone(),
             control_ops_state_tx: shared.control_ops_state.clone(),
@@ -3113,6 +3286,30 @@ impl SinkWorkerClientHandle {
     #[cfg(test)]
     pub(crate) async fn worker_instance_id_for_tests(&self) -> u64 {
         self.shared_worker().await.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_owner_count_for_tests(&self) -> usize {
+        self._shared.active_owner_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_control_frame_pause_hook_for_envelopes_for_tests(
+        &self,
+        envelopes: &[ControlEnvelope],
+        hook: SinkWorkerControlFramePauseHook,
+    ) -> Result<()> {
+        let expected_summary =
+            summarize_sink_control_signals(&sink_control_signals_from_envelopes(envelopes)?);
+        let mut guard = match self._shared.control_frame_pause_hook.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(SinkWorkerLocalControlFramePauseHook {
+            expected_summary,
+            hook,
+        });
+        Ok(())
     }
 
     #[cfg(test)]
@@ -3568,10 +3765,11 @@ impl SinkWorkerClientHandle {
                     )));
                 }
             }
+            *self.applied_control_state.lock().await = AppliedSinkWorkerControlState::default();
+            self.control_state_replay_required
+                .store(1, Ordering::Release);
             *guard = replacement;
         }
-        self.control_state_replay_required
-            .store(1, Ordering::Release);
         Ok(())
     }
 
@@ -3650,21 +3848,61 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    async fn retain_control_signals(&self, signals: &[SinkControlSignal]) -> Result<()> {
+    async fn retain_control_signals(
+        &self,
+        signals: &[SinkControlSignal],
+        worker_client: &TypedWorkerClient<SinkWorkerRpc>,
+    ) -> Result<()> {
+        let current_worker = self.worker.lock().await;
+        let current_worker_client = current_worker.client.existing_client().await?;
+        let ack_is_from_current_worker = current_worker_client
+            .as_ref()
+            .is_some_and(|current| current.is_same_worker_transport(worker_client));
         let (schedule_evidence, retained_replay_current) = {
             let mut retained = self.retained_control_state.lock().await;
-            let retained_replay_current =
-                control_frame_covers_retained_sink_state_after_apply(&retained, signals);
-            *retained = retained_sink_state_after_signals(&retained, signals);
+            let retained_after_apply = retained_sink_state_after_signals(&retained, signals);
+            let mut applied = self.applied_control_state.lock().await;
+            let applied_is_for_current_worker =
+                current_worker_client.as_ref().is_some_and(|current| {
+                    applied
+                        .worker_client
+                        .as_ref()
+                        .is_some_and(|applied| applied.is_same_worker_transport(current))
+                });
+            if ack_is_from_current_worker && !applied_is_for_current_worker {
+                *applied = AppliedSinkWorkerControlState {
+                    worker_client: current_worker_client.clone(),
+                    state: RetainedSinkWorkerControlState::default(),
+                };
+            }
+            if ack_is_from_current_worker {
+                applied.state = retained_sink_state_after_signals(&applied.state, signals);
+            }
+            let applied_is_for_current_worker =
+                current_worker_client.as_ref().is_some_and(|current| {
+                    applied
+                        .worker_client
+                        .as_ref()
+                        .is_some_and(|applied| applied.is_same_worker_transport(current))
+                });
+            let retained_replay_current = applied_is_for_current_worker
+                && applied_sink_state_covers_retained_sink_state(
+                    &retained_after_apply,
+                    &applied.state,
+                );
+            *retained = retained_after_apply;
+            self.retained_materialized_replay_routes_complete.store(
+                retained_sink_state_has_complete_materialized_replay_routes(&retained),
+                Ordering::Release,
+            );
             (
                 retained_sink_schedule_evidence(&retained, &self.node_id),
                 retained_replay_current,
             )
         };
-        if retained_replay_current {
-            self.control_state_replay_required
-                .store(0, Ordering::Release);
-        }
+        self.control_state_replay_required
+            .store(usize::from(!retained_replay_current), Ordering::Release);
+        drop(current_worker);
         self.replace_cached_schedule_evidence(schedule_evidence)
     }
 
@@ -4389,7 +4627,7 @@ impl SinkWorkerClientHandle {
         live_snapshot: &SinkStatusSnapshot,
         raw_live_snapshot: &SinkStatusSnapshot,
         cached_snapshot: &SinkStatusSnapshot,
-        _recovered_after_retry_reset: bool,
+        recovered_after_retry_reset: bool,
     ) -> SinkStatusSnapshotOutcome {
         let current_groups = self.current_logical_root_group_ids().unwrap_or_default();
         let raw_scheduled_groups = raw_live_snapshot.scheduled_groups();
@@ -4417,6 +4655,8 @@ impl SinkWorkerClientHandle {
             && !current_groups.is_empty()
             && !raw_scheduled_groups.is_empty()
             && raw_scheduled_groups != current_groups;
+        let raw_schedule_mismatch_after_retry_reset =
+            recovered_after_retry_reset && raw_schedule_mismatch_after_root_reconfigure;
         let live_projection = live_snapshot.concern_projection();
         let cached_projection = cached_snapshot.concern_projection();
         let cached_ready_for_current_groups = !current_groups.is_empty()
@@ -4440,6 +4680,7 @@ impl SinkWorkerClientHandle {
             SinkStatusOutcomeKind::ReturnLive | SinkStatusOutcomeKind::ReturnCached
         ) && (raw_control_signal_mismatch_after_root_reconfigure
             || (retained_schedule_mismatch_after_root_reconfigure && live_ready_for_current_groups)
+            || raw_schedule_mismatch_after_retry_reset
             || (raw_schedule_mismatch_after_root_reconfigure && !live_ready_for_current_groups)
             || (live_pending_without_truth
                 && self.root_reconfigured_pending_snapshot_needs_replay(cached_snapshot)))
@@ -4516,7 +4757,7 @@ impl SinkWorkerClientHandle {
             &cached_snapshot,
             probe_outcome.recovered_after_retry_reset,
         );
-        apply_live_sink_status_snapshot_outcome_side_effects(self, &live_snapshot, &outcome, false)
+        apply_live_sink_status_snapshot_outcome_side_effects(self, &live_snapshot, &outcome)
             .map_err(SinkFailure::from)?;
         match outcome.kind {
             SinkStatusOutcomeKind::ReturnLive => {
@@ -4680,13 +4921,8 @@ impl SinkWorkerClientHandle {
             None,
             SinkStatusAccessPath::Blocking,
         );
-        apply_live_sink_status_snapshot_outcome_side_effects(
-            self,
-            &snapshot,
-            &outcome,
-            replay_required,
-        )
-        .map_err(SinkFailure::from)?;
+        apply_live_sink_status_snapshot_outcome_side_effects(self, &snapshot, &outcome)
+            .map_err(SinkFailure::from)?;
         match outcome.kind {
             SinkStatusOutcomeKind::ReturnLive => Ok(snapshot),
             SinkStatusOutcomeKind::FailClosed => {
@@ -4757,6 +4993,30 @@ impl SinkWorkerClientHandle {
             .map_err(SinkFailure::from)
     }
 
+    pub(crate) async fn live_status_snapshot_for_recovery_with_failure(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        if self.control_state_replay_required.load(Ordering::Acquire) > 0 {
+            return Err(SinkFailure::from_cause(CnxError::NotReady(
+                "sink worker retained control replay is still pending".into(),
+            )));
+        }
+        if self.control_op_inflight() {
+            return Err(SinkFailure::from_cause(CnxError::NotReady(
+                "sink worker control apply is still in flight".into(),
+            )));
+        }
+        let snapshot = self
+            .status_route_existing_client_probe_once(timeout)
+            .await?
+            .snapshot;
+        let snapshot = self.prepare_status_snapshot_for_evaluation_with_failure(snapshot)?;
+        self.update_cached_status_snapshot(snapshot.clone())
+            .map_err(SinkFailure::from)?;
+        Ok(snapshot)
+    }
+
     async fn status_snapshot_nonblocking_with_access_path(
         &self,
     ) -> std::result::Result<(SinkStatusSnapshot, bool), SinkFailure> {
@@ -4825,6 +5085,9 @@ impl SinkWorkerClientHandle {
                     }
                 }
                 Err(err) => {
+                    if let Some(fail_closed) = last_fail_closed.take() {
+                        return Err(fail_closed);
+                    }
                     let access_path = plan.err_access_path();
                     return self
                         .finalize_nonblocking_cached_status_snapshot(
@@ -4859,6 +5122,16 @@ impl SinkWorkerClientHandle {
     pub(crate) fn cached_status_snapshot_for_tests(&self) -> Result<SinkStatusSnapshot> {
         self.cached_status_snapshot_with_failure()
             .map_err(SinkFailure::into_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_cached_materialization_status_for_tests(&self) -> Result<()> {
+        let mut guard = self
+            .status_cache
+            .lock()
+            .map_err(|_| CnxError::Internal("sink worker status cache lock poisoned".into()))?;
+        *guard = SinkStatusSnapshot::default();
+        Ok(())
     }
 
     pub(crate) async fn status_snapshot_nonblocking_for_status_route(
@@ -5196,6 +5469,7 @@ impl SinkWorkerClientHandle {
         timeout: Duration,
     ) -> std::result::Result<SinkStatusSnapshotProbeOutcome, SinkFailure> {
         let mut machine = SinkStatusProbeMachine::new(std::time::Instant::now() + timeout);
+        let mut retried_stale_ack_after_completed_replay = false;
         let response = loop {
             let replay_required_for_attempt =
                 self.control_state_replay_required.load(Ordering::Acquire) > 0;
@@ -5271,16 +5545,20 @@ impl SinkWorkerClientHandle {
                 })
                 .await;
             match rpc_result {
+                Ok(SinkWorkerResponse::Ack) if retried_stale_ack_after_completed_replay => {
+                    break SinkWorkerResponse::Ack;
+                }
+                Ok(SinkWorkerResponse::Ack)
+                    if replay_required_for_attempt
+                        && self.control_state_replay_required.load(Ordering::Acquire) == 0 =>
+                {
+                    // The retained replay RPC may leave one delayed Ack ahead of the
+                    // requested status response. Retry the status request once on the
+                    // same live client; a second Ack falls through as a protocol error.
+                    retried_stale_ack_after_completed_replay = true;
+                    tokio::task::yield_now().await;
+                }
                 Ok(SinkWorkerResponse::Ack) if replay_required_for_attempt => {
-                    if self.control_state_replay_required.load(Ordering::Acquire) == 0 {
-                        if debug_control_scope_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_sink_worker_client: status_snapshot ignored stale ack after retained replay cleared node={}",
-                                self.node_id.0
-                            );
-                        }
-                        continue;
-                    }
                     machine = machine.phase_after_retry_reset();
                     self.control_state_replay_required
                         .store(1, Ordering::Release);
@@ -5741,10 +6019,11 @@ impl SinkWorkerClientHandle {
     ) -> std::result::Result<(), SinkFailure> {
         let _inflight = self.begin_control_op();
         let decoded_signals = sink_control_signals_from_envelopes(&envelopes).ok();
-        let inflight_summary = decoded_signals
+        let control_frame_summary = decoded_signals
             .as_ref()
             .map(|signals| summarize_sink_control_signals(signals));
-        let _inflight_summary_guard = self.begin_control_frame_summary_tracking(inflight_summary);
+        let _inflight_summary_guard =
+            self.begin_control_frame_summary_tracking(control_frame_summary.clone());
         eprintln!(
             "fs_meta_sink_worker_client: on_control_frame begin node={} envelopes={}",
             self.node_id.0,
@@ -5792,28 +6071,40 @@ impl SinkWorkerClientHandle {
             let attempt_timeout = machine.attempt_timeout(rpc_timeout)?;
             #[cfg(test)]
             let current_worker_instance_id = self.worker_instance_id_for_tests().await;
+            #[cfg(test)]
+            let local_control_frame_pause_hook = Arc::clone(&self._shared.control_frame_pause_hook);
             let attempt = if retained_replay_fail_closed {
                 tokio::time::timeout(
                     attempt_timeout,
                     self.with_started_retry_with_failure(|client| {
                         let envelopes = envelopes.clone();
+                        #[cfg(test)]
+                        let local_control_frame_pause_hook =
+                            Arc::clone(&local_control_frame_pause_hook);
+                        #[cfg(test)]
+                        let control_frame_summary = control_frame_summary.clone();
                         async move {
                             #[cfg(test)]
-                            maybe_pause_before_on_control_frame_rpc().await;
+                            maybe_pause_before_on_control_frame_rpc(
+                                local_control_frame_pause_hook,
+                                control_frame_summary,
+                            )
+                            .await;
                             #[cfg(test)]
                             if let Some(err) = take_sink_worker_control_frame_error_hook(
                                 current_worker_instance_id,
                             ) {
                                 return Err(SinkFailure::from(err));
                             }
-                            Self::call_worker_with_failure(
+                            let response = Self::call_worker_with_failure(
                                 &client,
                                 SinkWorkerRequest::OnControlFrame {
                                     envelopes: envelopes.clone(),
                                 },
                                 attempt_timeout,
                             )
-                            .await
+                            .await?;
+                            Ok((response, client))
                         }
                     }),
                 )
@@ -5823,23 +6114,33 @@ impl SinkWorkerClientHandle {
                     attempt_timeout,
                     self.with_started_once_with_failure(|client| {
                         let envelopes = envelopes.clone();
+                        #[cfg(test)]
+                        let local_control_frame_pause_hook =
+                            Arc::clone(&local_control_frame_pause_hook);
+                        #[cfg(test)]
+                        let control_frame_summary = control_frame_summary.clone();
                         async move {
                             #[cfg(test)]
-                            maybe_pause_before_on_control_frame_rpc().await;
+                            maybe_pause_before_on_control_frame_rpc(
+                                local_control_frame_pause_hook,
+                                control_frame_summary,
+                            )
+                            .await;
                             #[cfg(test)]
                             if let Some(err) = take_sink_worker_control_frame_error_hook(
                                 current_worker_instance_id,
                             ) {
                                 return Err(SinkFailure::from(err));
                             }
-                            Self::call_worker_with_failure(
+                            let response = Self::call_worker_with_failure(
                                 &client,
                                 SinkWorkerRequest::OnControlFrame {
                                     envelopes: envelopes.clone(),
                                 },
                                 attempt_timeout,
                             )
-                            .await
+                            .await?;
+                            Ok((response, client))
                         }
                     }),
                 )
@@ -5850,9 +6151,9 @@ impl SinkWorkerClientHandle {
                 SinkRetryBudgetExhaustionKind::ControlFrameAttempt,
             );
             match rpc_result {
-                Ok(SinkWorkerResponse::Ack) => {
+                Ok((SinkWorkerResponse::Ack, worker_client)) => {
                     if let Some(signals) = decoded_signals.as_ref() {
-                        self.retain_control_signals(signals).await?;
+                        self.retain_control_signals(signals, &worker_client).await?;
                     }
                     eprintln!(
                         "fs_meta_sink_worker_client: on_control_frame done node={} ok=true",
@@ -5860,7 +6161,7 @@ impl SinkWorkerClientHandle {
                     );
                     return Ok(());
                 }
-                Ok(other) => {
+                Ok((other, _worker_client)) => {
                     eprintln!(
                         "fs_meta_sink_worker_client: on_control_frame done node={} ok=false err=unexpected_response:{:?}",
                         self.node_id.0, other
@@ -5933,7 +6234,7 @@ impl SinkWorkerClientHandle {
         notify_sink_worker_close_started();
         self.wait_for_control_ops_to_drain(SINK_WORKER_CLOSE_DRAIN_TIMEOUT)
             .await;
-        if Arc::strong_count(&self._shared) > 1 {
+        if !self.owner_lease.release() {
             return Ok(());
         }
         self.worker_client()
@@ -5941,6 +6242,10 @@ impl SinkWorkerClientHandle {
             .shutdown(Duration::from_secs(2))
             .await
             .map_err(SinkFailure::from)
+    }
+
+    fn release_owner_on_app_drop(&self) {
+        let _ = self.owner_lease.release();
     }
 
     #[cfg(test)]
@@ -5990,12 +6295,12 @@ impl SinkFileMeta {
         .map_err(SinkFailure::from)
     }
 
-    pub(crate) fn start_runtime_endpoints_with_failure(
+    pub(crate) fn start_external_worker_runtime_endpoints_with_failure(
         &self,
         io_boundary: Arc<dyn ChannelIoSubset>,
         node_id: NodeId,
     ) -> std::result::Result<(), SinkFailure> {
-        self.start_runtime_endpoints_on_boundary(io_boundary, node_id)
+        self.start_external_worker_runtime_endpoints_on_boundary(io_boundary, node_id)
             .map_err(SinkFailure::from)
     }
 
@@ -6033,14 +6338,14 @@ impl SinkFileMeta {
     pub(crate) fn status_snapshot_with_failure(
         &self,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
-        self.status_snapshot().map_err(SinkFailure::from)
+        self.build_status_snapshot().map_err(SinkFailure::from)
     }
 
     pub(crate) fn status_snapshot_for_route_with_failure(
         &self,
         route_key: &str,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
-        self.status_snapshot_for_route(route_key)
+        self.build_cached_status_snapshot_for_route(route_key)
             .map_err(SinkFailure::from)
     }
 
@@ -6054,7 +6359,8 @@ impl SinkFileMeta {
     pub(crate) fn status_snapshot_nonblocking_with_failure(
         &self,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
-        self.status_snapshot().map_err(SinkFailure::from)
+        self.build_cached_status_snapshot()
+            .map_err(SinkFailure::from)
     }
 
     pub(crate) fn scheduled_group_ids_snapshot_with_failure(
@@ -6262,6 +6568,20 @@ impl SinkFacade {
         match self {
             Self::Local(sink) => sink.status_snapshot_with_failure(),
             Self::Worker(client) => client.status_snapshot_with_failure().await,
+        }
+    }
+
+    pub(crate) async fn live_status_snapshot_for_recovery_with_failure(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        match self {
+            Self::Local(sink) => sink.status_snapshot_with_failure(),
+            Self::Worker(client) => {
+                client
+                    .live_status_snapshot_for_recovery_with_failure(timeout)
+                    .await
+            }
         }
     }
 
@@ -6590,6 +6910,13 @@ impl SinkFacade {
         }
     }
 
+    pub(crate) fn request_shutdown_on_owner_drop(&self) {
+        match self {
+            Self::Local(sink) => sink.request_shutdown_on_owner_drop(),
+            Self::Worker(client) => client.release_owner_on_app_drop(),
+        }
+    }
+
     #[cfg(test)]
     pub async fn close(&self) -> Result<()> {
         self.close_with_failure()
@@ -6672,6 +6999,122 @@ mod schedule_evidence_unit_tests {
             bound_scopes: scopes,
             envelope,
         }
+    }
+
+    #[test]
+    fn owner_scoped_sink_routes_complete_retained_materialized_replay_without_facade_query() {
+        let owner = "node-a-29936883602883535712550913";
+        let scopes = vec![RuntimeBoundScope {
+            scope_id: "nfs-144".to_string(),
+            resource_ids: vec![format!("{owner}::nfs-144")],
+        }];
+        let route_keys = [
+            crate::runtime::routes::events_stream_route_for_scope(owner).0,
+            crate::runtime::routes::sink_query_request_route_for(owner).0,
+            crate::runtime::routes::sink_roots_control_stream_route_for(owner).0,
+        ];
+        let retained = route_keys.into_iter().fold(
+            RetainedSinkWorkerControlState::default(),
+            |mut retained, route_key| {
+                retained.active_by_route.insert(
+                    (
+                        execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                        route_key.clone(),
+                    ),
+                    activate_signal_for_route(route_key, scopes.clone()),
+                );
+                retained
+            },
+        );
+
+        assert!(
+            retained_sink_state_has_complete_materialized_replay_routes(&retained),
+            "a non-facade sink owner must not re-arm an accepted full replay only because it owns the scoped materialized-query route instead of the facade-only generic query route"
+        );
+        assert!(
+            !retained
+                .active_by_route
+                .keys()
+                .any(|(_, route_key)| route_key == ROUTE_KEY_QUERY),
+            "fixture must prove completeness without the facade-only generic query route"
+        );
+
+        let replay_pending = SinkStatusSnapshotOutcome {
+            kind: SinkStatusOutcomeKind::FailClosed,
+            concern: Some(SinkStatusConcern::ReplayPending),
+            should_mark_replay_required: true,
+            should_republish_zero_row_summary: false,
+        };
+        assert!(
+            !sink_status_outcome_should_rearm_retained_control(&retained, &replay_pending),
+            "pending materialization after a complete owner-scoped control ACK is data catch-up, not authority to replay the same control state"
+        );
+        let coverage_gap = SinkStatusSnapshotOutcome {
+            kind: SinkStatusOutcomeKind::FailClosed,
+            concern: Some(SinkStatusConcern::CoverageGap),
+            should_mark_replay_required: true,
+            should_republish_zero_row_summary: false,
+        };
+        assert!(
+            !sink_status_outcome_should_rearm_retained_control(&retained, &coverage_gap),
+            "missing materialization rows after a complete owner-scoped control ACK cannot be repaired by replaying the identical local routes"
+        );
+
+        let mut missing_events_route = retained.clone();
+        missing_events_route
+            .active_by_route
+            .retain(|(_, route_key), _| {
+                !crate::runtime::routes::is_events_stream_route_key(route_key)
+            });
+        assert!(
+            sink_status_outcome_should_rearm_retained_control(
+                &missing_events_route,
+                &replay_pending
+            ),
+            "a retained state that truly lacks data-ingress route authority must remain repairable"
+        );
+        assert!(
+            sink_status_outcome_should_rearm_retained_control(&missing_events_route, &coverage_gap),
+            "coverage gaps remain control-repairable while the retained data-ingress route set is incomplete"
+        );
+    }
+
+    #[test]
+    fn route_cache_republish_keeps_schedule_only_evidence_out_of_materialized_group_rows() {
+        let evidence = CachedSinkScheduleEvidence {
+            scheduled_groups: std::collections::BTreeSet::from([String::from("root-b")]),
+            scheduled_groups_by_node: std::collections::BTreeMap::from([(
+                String::from("node-b"),
+                vec![String::from("root-b")],
+            )]),
+            primary_host_ref_by_group: std::collections::BTreeMap::from([(
+                String::from("root-b"),
+                String::from("node-b"),
+            )]),
+        };
+        let mut snapshot = SinkStatusSnapshot::default();
+
+        SinkWorkerClientHandle::republish_route_scoped_schedule_evidence_into_status_summary(
+            &mut snapshot,
+            &evidence,
+        );
+
+        assert_eq!(
+            snapshot.owner_scoped_scheduled_groups_by_node,
+            std::collections::BTreeMap::from([(
+                String::from("node-b"),
+                vec![String::from("root-b")]
+            )])
+        );
+        assert!(
+            snapshot.groups.is_empty(),
+            "schedule-only evidence must not synthesize materialization rows"
+        );
+        assert_eq!(
+            snapshot.readiness_summary().missing_scheduled_groups,
+            std::collections::BTreeSet::from([String::from("root-b")]),
+            "schedule-only evidence must remain explicitly not ready until sink-owned materialization evidence arrives"
+        );
     }
 
     #[test]

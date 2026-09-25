@@ -452,7 +452,7 @@ async fn wait_for_fixture_query_ready(app: &FSMetaApp) -> Result<(), Box<dyn std
                 false
             }
         };
-        if iteration % 10 == 0 && source_ready && !sink_ready {
+        if iteration.is_multiple_of(10) && source_ready && !sink_ready {
             let _ = app.trigger_rescan_when_ready_epoch().await;
         }
         if source_ready && sink_ready && query_ready {

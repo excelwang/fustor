@@ -241,9 +241,7 @@ fn fixture_binary_is_fresh(bin: &Path, workspace_root: &Path) -> Result<bool, St
     let mut latest_src_mtime =
         latest_mtime_recursive(&src_root).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     if let Ok(mtime) = std::fs::metadata(&manifest).and_then(|m| m.modified()) {
-        if mtime > latest_src_mtime {
-            latest_src_mtime = mtime;
-        }
+        latest_src_mtime = latest_src_mtime.max(mtime);
     }
     Ok(bin_mtime >= latest_src_mtime)
 }
@@ -260,9 +258,7 @@ fn latest_mtime_recursive(path: &Path) -> Option<SystemTime> {
     let entries = std::fs::read_dir(path).ok()?;
     for entry in entries.flatten() {
         if let Some(child_mtime) = latest_mtime_recursive(&entry.path()) {
-            if child_mtime > latest {
-                latest = child_mtime;
-            }
+            latest = latest.max(child_mtime);
         }
     }
     Some(latest)

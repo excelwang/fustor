@@ -214,7 +214,7 @@ async fn fixed_bind_cold_start_publishes_same_frame_facade_dependent_routes() {
             .expect("query route state"),
         "same-frame query route must not be suppressed by a stale pending fixed-bind snapshot after cold-start publication"
     );
-    let claims = app.shared_sink_route_claims.lock().await;
+    let claims = lock_shared_route_claims(&app.shared_sink_route_claims);
     assert!(
         claims.contains_key(&(
             execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
@@ -341,7 +341,7 @@ async fn fixed_bind_publication_replay_uses_fresh_session_for_sink_owned_routes(
     .await
     .expect("replay suppressed routes after publication");
 
-    let claims = app.shared_sink_route_claims.lock().await;
+    let claims = lock_shared_route_claims(&app.shared_sink_route_claims);
     assert!(
         claims.contains_key(&(
             execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
@@ -360,10 +360,10 @@ async fn fixed_bind_publication_replay_uses_fresh_session_for_sink_owned_routes(
         "fixed-bind publication replay must restore retained materialized query proxy"
     );
     assert!(
-        app.facade_gate
+        !app.facade_gate
             .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &sink_status_route)
             .expect("sink-status route state after publication replay"),
-        "fixed-bind publication replay must restore retained sink-status"
+        "fixed-bind business-route publication replay must not fabricate sink-owner status observation ownership"
     );
     assert!(
         !app.pending_fixed_bind_has_suppressed_dependent_routes

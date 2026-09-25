@@ -1,0 +1,29 @@
+[package]
+name = "data-view-normalizers"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Fustor-owned source payload normalizers for DataView v0.4"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+csv-source = { workspace = true }
+data-view = { workspace = true }
+es-source = { workspace = true }
+fs-meta = { workspace = true }
+jsonl-source = { workspace = true }
+local-fs-source = { workspace = true }
+mysql-source = { workspace = true }
+pg-source = { workspace = true }
+rmp-serde = { workspace = true }
+ring = "0.17"
+s3-source = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+source-kit = { workspace = true }
+graph-source = { workspace = true }
+
+[dev-dependencies]
+capanix-host-fs-types = { workspace = true }

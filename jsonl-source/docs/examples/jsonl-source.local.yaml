@@ -1,0 +1,20 @@
+default_page_size: 1000
+max_page_size: 10000
+field_sample_limit: 1000
+endpoints:
+  - object_ref: jsonl-prod
+    root_path: /data/fustor
+    path_scopes:
+      - datasets/*.jsonl
+    active: true
+__cnx_runtime:
+  local_host_ref: jsonl-source-node-a
+  resource_grants:
+    - resource_kind: jsonl
+      object_ref: jsonl-prod
+      grant_state: active
+      grant_epoch: 1
+      interfaces:
+        - read
+      path_scopes:
+        - datasets/*.jsonl

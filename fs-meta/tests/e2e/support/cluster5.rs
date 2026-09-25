@@ -15,7 +15,10 @@ use fs_meta::{
     api::config::{ApiAuthConfig, BootstrapAdminConfig},
     RootSpec,
 };
-use fs_meta_deploy::{build_release_doc_value, write_startup_manifest, FsMetaReleaseSpec};
+use fs_meta_deploy::{
+    build_app_scopes_json_for_roots, build_release_doc_value,
+    scope_only_followup_logical_roots_pending, write_startup_manifest, FsMetaReleaseSpec,
+};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
@@ -23,7 +26,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::UdpSocket;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -58,6 +61,8 @@ const FULL_NODE_DELEGATION_SCOPES: &[&str] = &[
 ];
 const NODE_NAMES: &[&str] = &["node-a", "node-b", "node-c", "node-d", "node-e"];
 const FULL_REAL_NFS_MAX_CHANNELS: u32 = 1024;
+const SCOPE_ONLY_FOLLOWUP_MAX_ATTEMPTS: usize = 3;
+const SCOPE_ONLY_FOLLOWUP_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 fn configure_test_child_runtime(cmd: &mut Command) {
     unsafe {
@@ -102,12 +107,12 @@ fn socket_accepts_probe_connection(socket_path: &Path) -> bool {
     UnixStream::connect(socket_path).is_ok()
 }
 
-fn reserved_bind_addr_registry() -> &'static Mutex<BTreeMap<String, TcpListener>> {
-    static REGISTRY: OnceLock<Mutex<BTreeMap<String, TcpListener>>> = OnceLock::new();
+fn reserved_bind_addr_registry() -> &'static Mutex<BTreeMap<String, UdpSocket>> {
+    static REGISTRY: OnceLock<Mutex<BTreeMap<String, UdpSocket>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn lock_reserved_bind_addr_registry() -> MutexGuard<'static, BTreeMap<String, TcpListener>> {
+fn lock_reserved_bind_addr_registry() -> MutexGuard<'static, BTreeMap<String, UdpSocket>> {
     match reserved_bind_addr_registry().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -128,6 +133,8 @@ fn clear_reserved_bind_addrs(bind_addrs: &[String]) {
 fn is_retryable_startup_bind_transport_failure(err: &str) -> bool {
     err.contains("exited before socket ready")
         && err.contains("failed to bind transport 127.0.0.1:")
+        && err.contains("QUIC UDP bind 127.0.0.1:")
+        && (err.contains("Address already in use") || err.contains("os error 98"))
 }
 
 fn retry_cluster_start_after_bind_transport_conflict<T, F>(mut start_once: F) -> Result<T, String>
@@ -183,6 +190,34 @@ fn release_target_generation(release: &Value) -> Option<i64> {
                 .and_then(Value::as_u64)
                 .and_then(|value| i64::try_from(value).ok())
         })
+}
+
+fn build_scope_only_app_scopes_followup(
+    current_intent: &Value,
+    facade_resource_id: &str,
+    roots: &[RootSpec],
+) -> Result<Value, String> {
+    let mut followup = current_intent.clone();
+    let worker = followup
+        .get_mut("workers")
+        .and_then(Value::as_array_mut)
+        .and_then(|workers| workers.first_mut())
+        .ok_or_else(|| "current relation target intent missing first worker".to_string())?;
+    let runtime = worker
+        .get_mut("runtime")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "current relation target worker missing runtime object".to_string())?;
+    runtime.insert(
+        "app_scopes".to_string(),
+        Value::Array(build_app_scopes_json_for_roots(facade_resource_id, roots)),
+    );
+
+    if followup.pointer("/workers/0/config/roots")
+        != current_intent.pointer("/workers/0/config/roots")
+    {
+        return Err("scope-only followup changed static fs-meta roots config".to_string());
+    }
+    Ok(followup)
 }
 
 #[derive(Clone)]
@@ -559,6 +594,33 @@ impl Cluster5 {
         result
     }
 
+    pub fn apply_scope_only_followup(
+        &self,
+        node_name: &str,
+        intent: Value,
+    ) -> Result<Value, String> {
+        for attempt in 1..=SCOPE_ONLY_FOLLOWUP_MAX_ATTEMPTS {
+            match self.apply_release(node_name, intent.clone()) {
+                Ok(result) => return Ok(result),
+                Err(err) if scope_only_followup_logical_roots_pending(&err) => {
+                    if attempt == SCOPE_ONLY_FOLLOWUP_MAX_ATTEMPTS {
+                        return Err(format!(
+                            "scope-only accepted-scope followup exhausted {} bounded attempts: {err}",
+                            SCOPE_ONLY_FOLLOWUP_MAX_ATTEMPTS
+                        ));
+                    }
+                    eprintln!(
+                        "cluster5: scope-only followup retry node={} attempt={} reason=logical_roots_follower_pending",
+                        node_name, attempt
+                    );
+                    thread::sleep(SCOPE_ONLY_FOLLOWUP_RETRY_BACKOFF);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("scope-only followup bounded attempt loop must return")
+    }
+
     pub fn clear_release(&self, node_name: &str, app_id: &str) -> Result<Value, String> {
         let node = self.node(node_name)?;
         let cnxctl_bin = try_find_cnxctl_bin().ok_or_else(|| {
@@ -784,6 +846,15 @@ impl Cluster5 {
         value["units"][0]["policy"]["generation"] = json!(generation);
         value["units"][0]["policy"]["replicas"] = json!(1_i64);
         scope_unit_intent_to_scope_worker_intent(&value)
+    }
+
+    pub fn build_fs_meta_scope_only_followup(
+        &self,
+        current_intent: &Value,
+        facade_resource_id: &str,
+        roots: &[RootSpec],
+    ) -> Result<Value, String> {
+        build_scope_only_app_scopes_followup(current_intent, facade_resource_id, roots)
     }
 
     pub fn wait_http_login_ready(
@@ -1141,7 +1212,7 @@ fn reserve_distinct_bind_addrs(count: usize) -> Result<Vec<String>, String> {
     let mut used = BTreeSet::new();
     while addrs.len() < count {
         let socket =
-            TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind tcp probe failed: {e}"))?;
+            UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind udp probe failed: {e}"))?;
         let port = socket
             .local_addr()
             .map_err(|e| format!("probe addr failed: {e}"))?
@@ -2316,7 +2387,7 @@ fn signed_auth_for_command(
     nonce: &str,
     key_id: &str,
 ) -> Value {
-    let command_bytes = canonical_ctl_command_value_bytes(&command)
+    let command_bytes = canonical_ctl_command_value_bytes(command)
         .expect("serialize canonicalized control command");
     signed_auth_for_payload_bytes(command_bytes, scopes, seq, nonce, key_id)
 }
@@ -2631,10 +2702,67 @@ mod tests {
     }
 
     #[test]
+    fn scope_only_roots_followup_changes_only_runtime_app_scopes() {
+        let current = json!({
+            "schema_version": "scope-worker-declaration-v1",
+            "target_id": "fs-meta-test",
+            "target_generation": 7,
+            "route_plans": [{"route_key": "source-status:v1.req", "mode": "fan_out"}],
+            "workers": [{
+                "worker_id": "fs-meta-test",
+                "startup": {"path": "/tmp/libfs_meta_runtime.so"},
+                "config": {"roots": [], "static_marker": "preserve"},
+                "runtime": {
+                    "app_scopes": [{
+                        "scope_id": "__fsmeta_empty_roots_bootstrap",
+                        "resource_ids": [],
+                        "unit_scopes": []
+                    }],
+                    "route_units": {"source-status:v1.req": {"recv": ["runtime.exec.source"]}}
+                },
+                "policy": {"generation": 7},
+                "restart_policy": "Never"
+            }]
+        });
+        let roots = vec![RootSpec {
+            id: "nfs-144".to_string(),
+            selector: fs_meta::RootSelector {
+                mount_point: None,
+                fs_source: Some("nfs://server/nfs-144".to_string()),
+                fs_type: None,
+                host_ip: None,
+                host_ref: None,
+            },
+            subpath_scope: PathBuf::from("/"),
+            watch: true,
+            scan: true,
+            audit_interval_ms: None,
+        }];
+
+        let followup =
+            build_scope_only_app_scopes_followup(&current, "fs-meta-facade-test", &roots)
+                .expect("build scope-only followup");
+        let mut expected = current.clone();
+        *expected
+            .pointer_mut("/workers/0/runtime/app_scopes")
+            .expect("expected app scopes") = Value::Array(build_app_scopes_json_for_roots(
+            "fs-meta-facade-test",
+            &roots,
+        ));
+
+        assert_eq!(followup, expected);
+        assert_eq!(
+            followup.pointer("/workers/0/config/roots"),
+            Some(&json!([]))
+        );
+        assert_eq!(followup.get("target_generation"), Some(&json!(7)));
+    }
+
+    #[test]
     fn reserve_distinct_bind_addrs_keeps_reserved_ports_unavailable_until_use() {
         let addrs = reserve_distinct_bind_addrs(3).expect("reserve bind addrs");
 
-        let bind_result = TcpListener::bind(&addrs[0]);
+        let bind_result = UdpSocket::bind(&addrs[0]);
         clear_reserved_bind_addrs(&addrs);
 
         bind_result.expect_err(
@@ -2647,10 +2775,10 @@ mod tests {
         let addrs = reserve_distinct_bind_addrs(2).expect("reserve bind addrs");
 
         release_reserved_bind_addr(&addrs[0]);
-        let listener = TcpListener::bind(&addrs[0])
+        let socket = UdpSocket::bind(&addrs[0])
             .expect("released bind addr must become bindable for the child daemon");
 
-        drop(listener);
+        drop(socket);
         clear_reserved_bind_addrs(&addrs);
     }
 
@@ -2662,7 +2790,7 @@ mod tests {
             attempts += 1;
             if attempts == 1 {
                 Err(
-                    "node node-a-123 exited before socket ready (exit status: 1); stderr:\nfailed to bind transport 127.0.0.1:45527"
+                    "node node-a-123 exited before socket ready (exit status: 1); stderr:\nfailed to bind transport 127.0.0.1:45527: not supported: QUIC UDP bind 127.0.0.1:45527: Address already in use (os error 98)"
                         .to_string(),
                 )
             } else {
@@ -2692,6 +2820,23 @@ mod tests {
 
         assert!(err.contains("config parse failed"));
         assert_eq!(attempts, 1, "non-bind startup failure must not be retried");
+    }
+
+    #[test]
+    fn retry_cluster_start_does_not_mask_quic_socket_capacity_failure() {
+        let mut attempts = 0;
+
+        let err = retry_cluster_start_after_bind_transport_conflict::<(), _>(|| {
+            attempts += 1;
+            Err(
+                "node node-a exited before socket ready (exit status: 1); stderr:\nfailed to bind transport 127.0.0.1:45527: resource exhausted: QUIC UDP receive buffer below required capacity"
+                    .to_string(),
+            )
+        })
+        .expect_err("QUIC socket capacity failure must surface without retry masking");
+
+        assert!(err.contains("receive buffer below required capacity"));
+        assert_eq!(attempts, 1, "socket capacity failure is not a port race");
     }
 
     #[test]

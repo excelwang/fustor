@@ -8,9 +8,10 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+RESOURCE_GUARD="${FUSTOR_RESOURCE_GUARD:-${SCRIPT_DIR}/resource-guard.sh}"
 
 cd "${ROOT_DIR}"
 
-cargo test -q --test specs_fs_meta_domain -- --skip common::runtime_admin::tests::runtime_admin_request_roundtrip_preserves_worker_intent_payload_shape
-cargo test -q -p fs-meta --test app_specs
-cargo test -q -p fs-meta --test cli_specs
+"${RESOURCE_GUARD}" cargo test -q --test specs_fs_meta_domain -- --skip common::runtime_admin::tests::runtime_admin_request_roundtrip_preserves_worker_intent_payload_shape
+"${RESOURCE_GUARD}" cargo test -q -p fs-meta --test app_specs
+"${RESOURCE_GUARD}" cargo test -q -p fs-meta --test cli_specs

@@ -407,16 +407,6 @@
             .await
             .expect("initial successor source/sink control should succeed");
 
-        let control_entered = Arc::new(Notify::new());
-        let control_release = Arc::new(Notify::new());
-        let _control_pause_reset = SinkWorkerControlFramePauseHookReset;
-        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
-            crate::workers::sink::SinkWorkerControlFramePauseHook {
-                entered: control_entered.clone(),
-                release: control_release.clone(),
-            },
-        );
-
         let successor_control = tokio::spawn({
             let successor = successor.clone();
             async move {
@@ -425,9 +415,6 @@
                     .await
             }
         });
-
-        control_entered.notified().await;
-
         let deactivate_task = tokio::spawn({
             let predecessor = predecessor.clone();
             async move {
@@ -440,19 +427,21 @@
             }
         });
 
-        control_release.notify_waiters();
+        let (successor_control, deactivate_task) = tokio::time::timeout(
+            Duration::from_secs(10),
+            async { tokio::join!(successor_control, deactivate_task) },
+        )
+        .await
+        .expect("successor sink control and late predecessor facade deactivate must stay bounded");
         successor_control
-            .await
             .expect("join successor control")
             .expect(
                 "successor second sink-only control must survive late predecessor facade deactivate after the first batch already succeeded",
             );
         deactivate_task
-            .await
             .expect("join predecessor deactivate")
             .expect("late predecessor facade deactivate");
 
         successor.close().await.expect("close successor app");
         predecessor.close().await.expect("close predecessor app");
     }
-

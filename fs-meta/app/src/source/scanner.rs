@@ -427,6 +427,77 @@ mod tests {
             "bulk catch-up metadata must use the host-fs op pool concurrently"
         );
     }
+
+    #[test]
+    fn scanners_can_share_one_host_fs_worker_group() {
+        let pool = HostFsOpPool::new(2, Duration::from_secs(2));
+        let scanner_a = ParallelScanner::with_host_fs_ops(
+            PathBuf::from("/root-a"),
+            PathBuf::new(),
+            1,
+            16,
+            1024,
+            NodeId("node-a::root-a".to_string()),
+            Arc::new(MetadataErrorHostFs {
+                kind: io::ErrorKind::NotFound,
+                message: "not found",
+            }),
+            pool.clone(),
+        );
+        let scanner_b = ParallelScanner::with_host_fs_ops(
+            PathBuf::from("/root-b"),
+            PathBuf::new(),
+            1,
+            16,
+            1024,
+            NodeId("node-a::root-b".to_string()),
+            Arc::new(MetadataErrorHostFs {
+                kind: io::ErrorKind::NotFound,
+                message: "not found",
+            }),
+            pool,
+        );
+
+        assert_eq!(
+            scanner_a.host_fs_worker_group_id_for_tests(),
+            scanner_b.host_fs_worker_group_id_for_tests(),
+            "concrete-root scanners in one source must reuse a single bounded host-fs worker group"
+        );
+    }
+
+    #[test]
+    fn explicitly_closing_host_fs_pool_disconnects_retained_clones() {
+        let pool = HostFsOpPool::new(2, Duration::from_secs(2));
+        let retained = pool.clone();
+        assert_eq!(pool.worker_count_for_tests(), 2);
+
+        pool.close();
+
+        assert_eq!(retained.worker_count_for_tests(), 0);
+        let error = retained
+            .run("metadata", Path::new("/root/file"), || {
+                Ok::<_, io::Error>(())
+            })
+            .expect_err("closed host-fs pool must reject new work through retained clones");
+        assert!(error.to_string().contains("worker pool disconnected"));
+    }
+
+    #[test]
+    fn source_instances_share_process_host_fs_workers_but_close_independently() {
+        let source_a = HostFsOpPool::for_scan_workers(1);
+        let source_b = HostFsOpPool::for_scan_workers(1);
+        assert_eq!(source_a.worker_group_id(), source_b.worker_group_id());
+
+        source_a.close();
+
+        assert!(source_a.closed_for_tests());
+        assert!(!source_b.closed_for_tests());
+        source_b
+            .run("metadata", Path::new("/root/file"), || {
+                Ok::<_, io::Error>(())
+            })
+            .expect("closing one source admission must not stop the process executor");
+    }
 }
 
 fn derived_ino_for_path(path: &Path) -> u64 {
@@ -628,24 +699,151 @@ fn host_fs_timeout_error(op: &str, path: &Path) -> io::Error {
 
 type HostFsJob = Box<dyn FnOnce() + Send + 'static>;
 
+struct HostFsOpPoolState {
+    tx: Option<cb::Sender<HostFsJob>>,
+    joins: Vec<std::thread::JoinHandle<()>>,
+}
+
+struct HostFsOpPoolInner {
+    state: Mutex<HostFsOpPoolState>,
+}
+
+impl HostFsOpPoolInner {
+    fn new(worker_count: usize) -> Arc<Self> {
+        let (tx, rx) = cb::bounded::<HostFsJob>(worker_count.saturating_mul(2).max(1));
+        let mut joins = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let rx = rx.clone();
+            joins.push(
+                std::thread::Builder::new()
+                    .name(format!("fs-meta-host-fs-op-{worker_index}"))
+                    .spawn(move || {
+                        while let Ok(job) = rx.recv() {
+                            job();
+                        }
+                    })
+                    .expect("spawn host-fs operation worker"),
+            );
+        }
+        Arc::new(Self {
+            state: Mutex::new(HostFsOpPoolState {
+                tx: Some(tx),
+                joins,
+            }),
+        })
+    }
+
+    fn shutdown(&self, timeout: Duration) {
+        let (tx, joins) = {
+            let mut state = lock_or_recover(&self.state, "scanner.host_fs_ops.shutdown");
+            (state.tx.take(), std::mem::take(&mut state.joins))
+        };
+        let Some(tx) = tx else {
+            return;
+        };
+        drop(tx);
+        let deadline = Instant::now() + timeout;
+        for join in joins {
+            if join.thread().id() == std::thread::current().id() {
+                log::warn!("host-fs operation pool dropped on one of its own worker threads");
+                continue;
+            }
+            while !join.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if join.is_finished() {
+                let _ = join.join();
+            } else {
+                log::warn!(
+                    "host-fs operation worker did not exit within {:?} during pool drop",
+                    timeout
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        lock_or_recover(&self.state, "scanner.host_fs_ops.worker_count")
+            .joins
+            .len()
+    }
+}
+
+impl Drop for HostFsOpPoolInner {
+    fn drop(&mut self) {
+        self.shutdown(Duration::from_secs(2));
+    }
+}
+
 #[derive(Clone)]
-struct HostFsOpPool {
-    tx: cb::Sender<HostFsJob>,
+pub(super) struct HostFsOpPool {
+    inner: Arc<HostFsOpPoolInner>,
+    closed: Arc<AtomicBool>,
+    shutdown_on_close: bool,
     timeout: Duration,
 }
 
 impl HostFsOpPool {
+    #[cfg(test)]
     fn new(worker_count: usize, timeout: Duration) -> Self {
-        let (tx, rx) = cb::bounded::<HostFsJob>(worker_count.saturating_mul(2).max(1));
-        for _ in 0..worker_count {
-            let rx = rx.clone();
-            std::thread::spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    job();
-                }
-            });
+        Self {
+            inner: HostFsOpPoolInner::new(worker_count),
+            closed: Arc::new(AtomicBool::new(false)),
+            shutdown_on_close: true,
+            timeout,
         }
-        Self { tx, timeout }
+    }
+
+    pub(super) fn for_scan_workers(scan_workers: usize) -> Self {
+        let worker_count = host_fs_op_workers(scan_workers);
+        static REGISTRY: std::sync::OnceLock<
+            Mutex<HashMap<usize, std::sync::Weak<HostFsOpPoolInner>>>,
+        > = std::sync::OnceLock::new();
+        let inner = {
+            let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut registry = lock_or_recover(registry, "scanner.host_fs_ops.registry");
+            if let Some(inner) = registry
+                .get(&worker_count)
+                .and_then(std::sync::Weak::upgrade)
+            {
+                inner
+            } else {
+                let inner = HostFsOpPoolInner::new(worker_count);
+                registry.insert(worker_count, Arc::downgrade(&inner));
+                inner
+            }
+        };
+        Self {
+            inner,
+            closed: Arc::new(AtomicBool::new(false)),
+            shutdown_on_close: false,
+            timeout: host_fs_op_timeout(),
+        }
+    }
+
+    pub(super) fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if self.shutdown_on_close {
+            self.inner.shutdown(Duration::from_secs(2));
+        }
+    }
+
+    #[cfg(test)]
+    fn worker_group_id(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
+    #[cfg(test)]
+    pub(super) fn worker_count_for_tests(&self) -> usize {
+        self.inner.worker_count()
+    }
+
+    #[cfg(test)]
+    pub(super) fn closed_for_tests(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     fn run<T, F>(&self, op: &str, path: &Path, f: F) -> io::Result<T>
@@ -654,9 +852,24 @@ impl HostFsOpPool {
         F: FnOnce() -> io::Result<T> + Send + 'static,
     {
         let display_path = path.to_path_buf();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(io::Error::other(format!(
+                "{op} worker pool disconnected for {}",
+                display_path.display()
+            )));
+        }
         let (tx, rx) = cb::bounded(1);
         let enqueue_started = Instant::now();
-        self.tx
+        let worker_tx = lock_or_recover(&self.inner.state, "scanner.host_fs_ops.run")
+            .tx
+            .clone()
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "{op} worker pool disconnected for {}",
+                    display_path.display()
+                ))
+            })?;
+        worker_tx
             .send_timeout(
                 Box::new(move || {
                     let _ = tx.send(f());
@@ -749,12 +962,42 @@ fn metadata_many_with_retry(
     if paths.is_empty() {
         return Vec::new();
     }
+    if host_fs_ops.closed.load(Ordering::Acquire) {
+        return paths
+            .into_iter()
+            .map(|path| {
+                let error = io::Error::other(format!(
+                    "metadata worker pool disconnected for {}",
+                    path.display()
+                ));
+                (path, Err(error))
+            })
+            .collect();
+    }
 
     let started = Instant::now();
     let deadline = started + host_fs_ops.timeout;
     let (tx, rx) = cb::bounded(paths.len());
     let mut scheduled = HashSet::<PathBuf>::new();
     let mut output = Vec::with_capacity(paths.len());
+    let worker_tx = lock_or_recover(
+        &host_fs_ops.inner.state,
+        "scanner.host_fs_ops.metadata_many",
+    )
+    .tx
+    .clone();
+    let Some(worker_tx) = worker_tx else {
+        return paths
+            .into_iter()
+            .map(|path| {
+                let error = io::Error::other(format!(
+                    "metadata worker pool disconnected for {}",
+                    path.display()
+                ));
+                (path, Err(error))
+            })
+            .collect();
+    };
 
     for path in paths {
         let remaining = deadline.checked_duration_since(Instant::now());
@@ -765,7 +1008,7 @@ fn metadata_many_with_retry(
         let tx = tx.clone();
         let job_path = path.clone();
         let job_host_fs = Arc::clone(&host_fs);
-        match host_fs_ops.tx.send_timeout(
+        match worker_tx.send_timeout(
             Box::new(move || {
                 let result = metadata_direct_with_retry(job_host_fs, &job_path);
                 let _ = tx.send((job_path, result));
@@ -880,6 +1123,7 @@ pub struct ParallelScanner {
 }
 
 impl ParallelScanner {
+    #[cfg(test)]
     pub fn new(
         root_path: PathBuf,
         emit_prefix: PathBuf,
@@ -889,6 +1133,29 @@ impl ParallelScanner {
         node_id: NodeId,
         host_fs: Arc<dyn HostFs>,
     ) -> Self {
+        let host_fs_ops = HostFsOpPool::for_scan_workers(scan_workers);
+        Self::with_host_fs_ops(
+            root_path,
+            emit_prefix,
+            scan_workers,
+            batch_size,
+            max_scan_events,
+            node_id,
+            host_fs,
+            host_fs_ops,
+        )
+    }
+
+    pub(super) fn with_host_fs_ops(
+        root_path: PathBuf,
+        emit_prefix: PathBuf,
+        scan_workers: usize,
+        batch_size: usize,
+        max_scan_events: usize,
+        node_id: NodeId,
+        host_fs: Arc<dyn HostFs>,
+        host_fs_ops: HostFsOpPool,
+    ) -> Self {
         Self {
             root_path,
             emit_prefix,
@@ -897,11 +1164,16 @@ impl ParallelScanner {
             max_scan_events,
             node_id,
             host_fs,
-            host_fs_ops: HostFsOpPool::new(host_fs_op_workers(scan_workers), host_fs_op_timeout()),
+            host_fs_ops,
             dir_state_cache: Arc::new(Mutex::new(HashMap::new())),
             audit_round: Arc::new(AtomicU64::new(0)),
             deep_scan_interval_rounds: deep_interval_rounds_from_env(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn host_fs_worker_group_id_for_tests(&self) -> usize {
+        self.host_fs_ops.worker_group_id()
     }
 
     /// Run a full audit scan. Returns batched events including EpochStart/End.
@@ -1353,6 +1625,8 @@ impl ParallelScanner {
                                         if stop_requested.load(Ordering::SeqCst) {
                                             break;
                                         }
+                                        // ALWAYS_RECURSE: still descend into subdirectories
+                                        // even when file-level stat is skipped for a quiet dir.
                                         if entry.is_dir {
                                             child_dirs.push(entry.path);
                                             continue;
@@ -1671,6 +1945,8 @@ impl ParallelScanner {
                 let parent_mtime_us = (current_mtime * 1_000_000.0) as u64;
 
                 for entry in entries {
+                    // ALWAYS_RECURSE: still descend into subdirectories even
+                    // when file-level stat is skipped for a quiet dir.
                     if entry.is_dir {
                         pending.push(entry.path);
                         continue;

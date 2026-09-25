@@ -1,11 +1,16 @@
 use capanix_app_sdk::runtime::RouteKey;
 
 pub const ROUTE_TOKEN_UNION_GRAPH_INTERNAL: &str = "union-graph.internal";
+pub const ROUTE_TOKEN_DATA_VIEW_INTERNAL: &str = "fustor.data-view.internal";
 pub const METHOD_QUERY: &str = "query";
 pub const METHOD_INGEST: &str = "ingest";
+pub const METHOD_DATA_VIEW_QUERY: &str = "data-view-query";
+pub const METHOD_DATA_VIEW_COMMAND: &str = "data-view-command";
 
 pub const ROUTE_KEY_QUERY_INTERNAL: &str = "union-graph.query:v1";
 pub const ROUTE_KEY_INGEST_INTERNAL: &str = "union-graph.ingest:v1";
+pub const ROUTE_KEY_DATA_VIEW_QUERY_INTERNAL: &str = "fustor.data-view.query:v1";
+pub const ROUTE_KEY_DATA_VIEW_COMMAND_INTERNAL: &str = "fustor.data-view.command:v1";
 
 fn request_reply_route_key(base: &str) -> RouteKey {
     RouteKey(format!("{base}.req"))
@@ -44,6 +49,22 @@ pub fn ingest_request_route_for(node_id: &str) -> RouteKey {
     request_reply_route_key(&ingest_route_key_for(node_id))
 }
 
+pub fn data_view_query_route_key_for(node_id: &str) -> String {
+    scoped_internal_route_key(ROUTE_KEY_DATA_VIEW_QUERY_INTERNAL, node_id)
+}
+
+pub fn data_view_query_request_route_for(node_id: &str) -> RouteKey {
+    request_reply_route_key(&data_view_query_route_key_for(node_id))
+}
+
+pub fn data_view_command_route_key_for(node_id: &str) -> String {
+    scoped_internal_route_key(ROUTE_KEY_DATA_VIEW_COMMAND_INTERNAL, node_id)
+}
+
+pub fn data_view_command_request_route_for(node_id: &str) -> RouteKey {
+    request_reply_route_key(&data_view_command_route_key_for(node_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,6 +74,14 @@ mod tests {
         assert_eq!(
             query_request_route_for("Node-A/1").0,
             "union-graph.query.node_a_1:v1.req"
+        );
+        assert_eq!(
+            data_view_query_request_route_for("Node-A/1").0,
+            "fustor.data-view.query.node_a_1:v1.req"
+        );
+        assert_eq!(
+            data_view_command_request_route_for("Node-A/1").0,
+            "fustor.data-view.command.node_a_1:v1.req"
         );
     }
 }

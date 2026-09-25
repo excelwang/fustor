@@ -1,3 +1,4 @@
+#[cfg(not(feature = "embedded-inspection"))]
 use capanix_runtime_entry_sdk::entry::capanix_unit_entry;
 
 pub mod driver;
@@ -13,4 +14,5 @@ pub use es_source::{
 pub use runtime_app::EsSourceRuntimeApp;
 pub use service::EsSourceService;
 
+#[cfg(not(feature = "embedded-inspection"))]
 capanix_unit_entry!(EsSourceRuntimeApp);

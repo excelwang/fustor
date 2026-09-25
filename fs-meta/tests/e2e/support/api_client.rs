@@ -622,6 +622,7 @@ impl OperatorSession {
         let mut last_err = None::<String>;
         loop {
             let mut saw_reauthable_error = false;
+            let mut needs_login_recovery = false;
             for base_url in self.prioritized_base_urls() {
                 let client = self.client.with_base_url(base_url.clone());
                 match op(&client, &self.management_token) {
@@ -631,6 +632,7 @@ impl OperatorSession {
                     }
                     Err(err) if is_invalid_session_error(&err) => {
                         saw_reauthable_error = true;
+                        needs_login_recovery = true;
                         last_err = Some(format!("{base_url}: {err}"));
                     }
                     Err(err)
@@ -648,7 +650,9 @@ impl OperatorSession {
                     "management operation failed without a recoverable candidate".to_string()
                 }));
             }
-            self.reconnect_and_login()?;
+            if needs_login_recovery {
+                self.reconnect_and_login()?;
+            }
             std::thread::sleep(RECONNECT_RETRY_INTERVAL);
         }
     }
@@ -674,6 +678,7 @@ impl OperatorSession {
         let mut last_err = None::<String>;
         loop {
             let mut saw_reauthable_error = false;
+            let mut needs_login_recovery = false;
             for base_url in self.prioritized_base_urls() {
                 let client = self.client.with_base_url(base_url.clone());
                 match op(&client, &self.query_api_key) {
@@ -683,6 +688,7 @@ impl OperatorSession {
                     }
                     Err(err) if is_invalid_query_api_key_error(&err) => {
                         saw_reauthable_error = true;
+                        needs_login_recovery = true;
                         last_err = Some(format!("{base_url}: {err}"));
                     }
                     Err(err)
@@ -700,7 +706,9 @@ impl OperatorSession {
                     "query operation failed without a recoverable candidate".to_string()
                 }));
             }
-            self.reconnect_and_login()?;
+            if needs_login_recovery {
+                self.reconnect_and_login()?;
+            }
             std::thread::sleep(RECONNECT_RETRY_INTERVAL);
         }
     }

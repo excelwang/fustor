@@ -2,7 +2,7 @@ use fs_meta::{RootSelector, RootSpec};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const FULL_NFS_ROOTS_FILE_ENV: &str = "FSMETA_FULL_NFS_ROOTS_FILE";
 #[derive(Clone, Debug)]
@@ -50,7 +50,7 @@ pub fn logical_roots_from_env(logical_ids: &[&str]) -> Result<Option<Vec<FullDem
     Ok(Some(
         logical_ids
             .iter()
-            .zip(roots.into_iter())
+            .zip(roots)
             .map(|(logical_id, root)| {
                 let source = root_source(&root);
                 FullDemoRoot {
@@ -77,7 +77,7 @@ fn roots_file_from_env() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn load_roots_file(path: &PathBuf) -> Result<Vec<RootSpec>, String> {
+fn load_roots_file(path: &Path) -> Result<Vec<RootSpec>, String> {
     let bytes = fs::read(path)
         .map_err(|e| format!("read full demo roots {} failed: {e}", path.display()))?;
     let value = serde_json::from_slice::<Value>(&bytes)
@@ -87,7 +87,7 @@ fn load_roots_file(path: &PathBuf) -> Result<Vec<RootSpec>, String> {
         .map_err(|e| format!("decode full demo roots {} failed: {e}", path.display()))
 }
 
-fn validate_demo_mounts(roots: &[RootSpec], roots_file: &PathBuf) -> Result<(), String> {
+fn validate_demo_mounts(roots: &[RootSpec], roots_file: &Path) -> Result<(), String> {
     let mounted_paths = mounted_paths()?;
     for root in roots {
         let host_ip = root
@@ -148,7 +148,7 @@ fn validate_demo_mounts(roots: &[RootSpec], roots_file: &PathBuf) -> Result<(), 
                 roots_file.display()
             ));
         }
-        let scoped_path = if root.subpath_scope == PathBuf::from("/") {
+        let scoped_path = if root.subpath_scope == Path::new("/") {
             mount_point.clone()
         } else {
             let relative_scope = root
@@ -255,7 +255,7 @@ mod tests {
                 {
                   "id": "nfs-144-smoke",
                   "selector": {
-                    "host_ip": "10.0.82.144",
+                    "host_ip": "198.51.100.144",
                     "mount_point": "/mnt/fustor-peers/nfs144"
                   },
                   "subpath_scope": "/fsmeta-smoke",

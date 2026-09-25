@@ -1,0 +1,36 @@
+[package]
+name = "fustor-source-inspect"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+portable-tls = ["dep:native-tls", "native-tls/vendored"]
+
+[dependencies]
+native-tls = { workspace = true, optional = true }
+capanix-app-sdk = { workspace = true }
+jsonl-source = { workspace = true }
+jsonl-source-runtime = { workspace = true, features = ["embedded-inspection"] }
+pg-source = { workspace = true }
+pg-source-runtime = { workspace = true, features = ["embedded-inspection"] }
+mysql-source = { workspace = true }
+mysql-source-runtime = { workspace = true, features = ["embedded-inspection"] }
+es-source = { workspace = true }
+es-source-runtime = { workspace = true, features = ["embedded-inspection"] }
+local-fs-source = { workspace = true }
+local-fs-source-runtime = { workspace = true, features = ["embedded-inspection"] }
+s3-source = { workspace = true }
+s3-source-runtime = { workspace = true, features = ["embedded-inspection"] }
+csv-source = { workspace = true }
+csv-source-runtime = { workspace = true, features = ["embedded-inspection"] }
+source-kit = { workspace = true }
+graph-source = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+rmp-serde = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -7,6 +7,8 @@ pub enum S3SourceOperation {
     PollSince,
     DiscoverFields,
     ProbeConnection,
+    SampleJsonl,
+    SampleCsv,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,4 +55,6 @@ pub struct S3SnapshotCursor {
 pub struct S3PollCursor {
     pub last_modified_unix_ms: u64,
     pub last_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
 }

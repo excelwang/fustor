@@ -1,0 +1,23 @@
+[package]
+name = "fustor-data-view-inspect"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+portable-tls = ["dep:native-tls", "native-tls/vendored"]
+
+[dependencies]
+native-tls = { workspace = true, optional = true }
+data-view = { workspace = true }
+data-view-normalizers = { workspace = true }
+base64 = "0.22"
+private-discovery = { workspace = true }
+union-graph-runtime = { workspace = true, features = ["embedded-inspection"] }
+source-kit = { workspace = true }
+capanix-app-sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

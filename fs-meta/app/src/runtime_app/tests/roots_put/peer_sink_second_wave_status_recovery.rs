@@ -1,5 +1,5 @@
     #[tokio::test]
-    async fn peer_sink_status_fails_closed_while_successor_second_exact_shaped_wave_sink_apply_is_pending()
+    async fn peer_sink_status_serves_nonready_cache_while_successor_second_exact_shaped_wave_sink_apply_is_pending()
      {
         struct SinkControlErrorHookReset;
 
@@ -264,16 +264,31 @@
 
         entered.notified().await;
 
-        let request_result = internal_sink_status_request_with_timeout(
+        let pending_events = internal_sink_status_request_with_timeout(
             boundary.clone(),
             NodeId("node-d".into()),
             Duration::from_millis(250),
             Duration::from_millis(50),
         )
-        .await;
+        .await
+        .expect("peer-facing sink-status must return bounded cached ownership evidence while sink.apply is pending");
+        let pending_snapshots = pending_events
+            .iter()
+            .map(|event| {
+                rmp_serde::from_slice::<crate::sink::SinkStatusSnapshot>(event.payload_bytes())
+                    .expect("decode apply-pending peer sink-status snapshot")
+            })
+            .collect::<Vec<_>>();
         assert!(
-            request_result.is_err(),
-            "peer-facing sink-status must fail closed while the successor exact-shaped second wave is still paused in sink.apply"
+            pending_snapshots.iter().any(|snapshot| {
+                snapshot
+                    .scheduled_groups_by_node
+                    .get("node-a")
+                    .is_some_and(|groups| {
+                        groups == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                    }) && !snapshot.has_ready_scheduled_groups()
+            }),
+            "peer-facing sink-status must preserve scheduled ownership without claiming materialized readiness while sink.apply is pending: {pending_snapshots:?}"
         );
 
         release.notify_waiters();
@@ -696,4 +711,3 @@
         successor.close().await.expect("close successor app");
         predecessor.close().await.expect("close predecessor app");
     }
-

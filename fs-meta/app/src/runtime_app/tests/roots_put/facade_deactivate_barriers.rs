@@ -425,15 +425,8 @@
     }
 
     #[tokio::test]
-    async fn initialized_inflight_internal_sink_status_timeout_returns_explicit_empty_reply() {
-        struct SinkWorkerControlFramePauseHookReset;
+    async fn initialized_inflight_internal_sink_status_timeout_returns_cached_schedule_reply() {
         struct SinkWorkerStatusErrorHookReset;
-
-        impl Drop for SinkWorkerControlFramePauseHookReset {
-            fn drop(&mut self) {
-                crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
-            }
-        }
 
         impl Drop for SinkWorkerStatusErrorHookReset {
             fn drop(&mut self) {
@@ -568,36 +561,41 @@
 
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let _pause_reset = SinkWorkerControlFramePauseHookReset;
-        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
-            crate::workers::sink::SinkWorkerControlFramePauseHook {
-                entered: entered.clone(),
-                release: release.clone(),
-            },
-        );
+        let sink_followup_envelopes = vec![activate_envelope_with_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            3,
+        )];
+        let sink_worker = match &*app.sink {
+            SinkFacade::Worker(client) => client.clone(),
+            SinkFacade::Local(_) => panic!("expected external sink worker client"),
+        };
+        sink_worker
+            .install_control_frame_pause_hook_for_envelopes_for_tests(
+                &sink_followup_envelopes,
+                crate::workers::sink::SinkWorkerControlFramePauseHook {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                },
+            )
+            .expect("install generation-3 sink followup pause hook");
 
+        let sink_followup_envelopes_for_task = sink_followup_envelopes.clone();
         let _status_error_reset = SinkWorkerStatusErrorHookReset;
-        crate::workers::sink::install_sink_worker_status_error_hook(
-            crate::workers::sink::SinkWorkerStatusErrorHook {
-                err: CnxError::Timeout,
-            },
-        );
-
         let sink_followup = tokio::spawn({
             let app = app.clone();
-            async move {
-                app.on_control_frame(&[activate_envelope_with_scope_rows(
-                    execution_units::SINK_RUNTIME_UNIT_ID,
-                    &[("test-root", &["single-app-node::root-1"])],
-                    3,
-                )])
-                .await
-            }
+            async move { app.on_control_frame(&sink_followup_envelopes_for_task).await }
         });
 
         tokio::time::timeout(Duration::from_secs(5), entered.notified())
             .await
             .expect("sink followup should pause in sink.apply before probing internal sink-status");
+        crate::workers::sink::install_sink_worker_status_error_hook_for_worker_instance(
+            sink_worker.worker_instance_id_for_tests().await,
+            crate::workers::sink::SinkWorkerStatusErrorHook {
+                err: CnxError::Timeout,
+            },
+        );
 
         let request_result = internal_sink_status_request_with_timeout(
             boundary.clone(),
@@ -614,7 +612,7 @@
             .expect("sink followup should settle after releasing sink.apply pause");
 
         let events = request_result.expect(
-            "initialized internal sink-status timeout while sink control is inflight must fail closed with an explicit empty reply instead of caller timeout",
+            "initialized internal sink-status timeout while sink control is inflight must return bounded cached schedule evidence instead of caller timeout",
         );
         let snapshots = events
             .into_iter()
@@ -625,19 +623,13 @@
             .collect::<Vec<_>>();
         assert!(
             snapshots.iter().any(|snapshot| {
-                snapshot.scheduled_groups_by_node.is_empty()
-                    && snapshot.last_control_frame_signals_by_node.is_empty()
-                    && (snapshot.groups.is_empty()
-                        || snapshot.groups.iter().all(|group| {
-                            group.total_nodes == 0
-                                && group.live_nodes == 0
-                                && !matches!(
-                                    group.normalized_readiness(),
-                                    crate::sink::GroupReadinessState::Ready
-                                )
-                        }))
+                snapshot
+                    .scheduled_groups_by_node
+                    .get("single-app-node")
+                    .is_some_and(|groups| groups.iter().any(|group| group == "test-root"))
+                    && snapshot.groups.is_empty()
             }),
-            "initialized inflight internal sink-status timeout must emit an explicit empty reply: {snapshots:?}"
+            "initialized inflight internal sink-status timeout must preserve accepted schedule evidence without fabricating materialization rows: {snapshots:?}"
         );
 
         app.close().await.expect("close app");

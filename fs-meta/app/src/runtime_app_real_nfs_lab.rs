@@ -7,6 +7,9 @@ use tempfile::TempDir;
 const E2E_TMP_ROOT_ENV: &str = "DATANIX_E2E_TMP_ROOT";
 const LEGACY_E2E_TMP_ROOT_ENV: &str = "CAPANIX_E2E_TMP_ROOT";
 const REAL_NFS_LAB_COMPONENT: &str = "runtime-app-real-nfs";
+const NFS_LAB_V4_PSEUDOROOT_ENV: &str = "FSMETA_NFS_LAB_V4_PSEUDOROOT";
+const DISPOSABLE_NFS_MOUNT_OPTIONS: &str =
+    "vers=4,tcp,soft,timeo=50,retrans=1,retry=0,noac,actimeo=0,lookupcache=none,nordirplus";
 
 fn e2e_tmp_root() -> PathBuf {
     if let Ok(raw) = std::env::var(E2E_TMP_ROOT_ENV)
@@ -29,6 +32,10 @@ fn real_nfs_lab_parent_dir() -> PathBuf {
     let dir = e2e_tmp_root().join(REAL_NFS_LAB_COMPONENT);
     fs::create_dir_all(&dir).expect("create runtime app real nfs parent dir");
     dir
+}
+
+fn use_v4_pseudoroot() -> bool {
+    std::env::var(NFS_LAB_V4_PSEUDOROOT_ENV).ok().as_deref() == Some("1")
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +147,7 @@ impl NfsLab {
             mounted_nfsd: false,
         };
         lab.ensure_nfs_stack()?;
+        lab.export_pseudoroot_if_enabled()?;
         for export in ["nfs1", "nfs2", "nfs3"] {
             lab.create_export(export)?;
         }
@@ -199,13 +207,13 @@ impl NfsLab {
         let mount_dir = self.mounts_dir.join(node_name).join(export_name);
         fs::create_dir_all(&mount_dir)
             .map_err(|e| format!("create mount dir {} failed: {e}", mount_dir.display()))?;
-        let source = format!("127.0.0.1:{}", export_dir.display());
+        let source = self.export_source(export_name);
         let status = sudo_status([
             "mount",
             "-t",
             "nfs",
             "-o",
-            "vers=4,tcp,timeo=50,retrans=1,noac,actimeo=0,lookupcache=none,nordirplus",
+            DISPOSABLE_NFS_MOUNT_OPTIONS,
             source.as_str(),
             mount_dir.to_string_lossy().as_ref(),
         ])?;
@@ -222,6 +230,34 @@ impl NfsLab {
             mount_dir.clone(),
         );
         Ok(mount_dir)
+    }
+
+    pub fn export_source(&self, export_name: &str) -> String {
+        if use_v4_pseudoroot() {
+            return format!("127.0.0.1:/{export_name}");
+        }
+        format!("127.0.0.1:{}", self.exports_dir.join(export_name).display())
+    }
+
+    fn export_pseudoroot_if_enabled(&self) -> Result<(), String> {
+        if !use_v4_pseudoroot() {
+            return Ok(());
+        }
+        let status = sudo_status([
+            "exportfs",
+            "-i",
+            "-o",
+            "rw,no_subtree_check,no_root_squash,fsid=0",
+            &format!("127.0.0.1:{}", self.exports_dir.display()),
+        ])?;
+        if !status.success() {
+            return Err(format!(
+                "exportfs pseudoroot {} failed with status {}",
+                self.exports_dir.display(),
+                status
+            ));
+        }
+        Ok(())
     }
 
     fn unmount_export(&mut self, node_name: &str, export_name: &str) -> Result<(), String> {
@@ -357,15 +393,19 @@ impl Drop for NfsLab {
         for dir in exports {
             let _ = self.unexport_dir(&dir);
         }
+        if use_v4_pseudoroot() {
+            let _ = self.unexport_dir(&self.exports_dir);
+        }
         if let Some(child) = &mut self.started_mountd {
             let _ = child.kill();
             let _ = child.wait();
         }
+        if self.mounted_nfsd {
+            let _ = sudo_status(["rpc.nfsd", "0"]);
+            let _ = sudo_status(["umount", "/proc/fs/nfsd"]);
+        }
         if self.started_rpcbind {
             let _ = sudo_status(["pkill", "-x", "rpcbind"]);
-        }
-        if self.mounted_nfsd {
-            let _ = sudo_status(["umount", "/proc/fs/nfsd"]);
         }
     }
 }
@@ -484,7 +524,18 @@ fn decode_mountinfo_path(raw: &str) -> PathBuf {
 mod tests {
     use std::path::{Component, Path};
 
-    use super::{decode_mountinfo_path, exportfs_paths_under_parent, real_nfs_lab_parent_dir};
+    use super::{
+        decode_mountinfo_path, exportfs_paths_under_parent, real_nfs_lab_parent_dir,
+        DISPOSABLE_NFS_MOUNT_OPTIONS,
+    };
+
+    #[test]
+    fn disposable_nfs_mounts_use_bounded_retry_semantics() {
+        let options = DISPOSABLE_NFS_MOUNT_OPTIONS.split(',').collect::<Vec<_>>();
+        for required in ["soft", "timeo=50", "retrans=1", "retry=0"] {
+            assert!(options.contains(&required), "missing NFS mount option: {required}");
+        }
+    }
 
     #[test]
     fn real_nfs_lab_parent_dir_is_canonical_for_nfs_export_identity() {

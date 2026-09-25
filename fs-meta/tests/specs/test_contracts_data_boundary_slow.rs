@@ -300,12 +300,30 @@ async fn make_app(dir: &TempDir, node_id: &str) -> FSMetaApp {
     app.start().await.expect("start fs-meta app");
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
-        match app.recv(RecvOpts::default()).await {
-            Ok(events) if !events.is_empty() => break,
-            _ => {}
+        let source_ready = app.source_status_snapshot().await.is_ok_and(|status| {
+            let active_scan_roots = status
+                .concrete_roots
+                .iter()
+                .filter(|root| root.active && root.scan_enabled)
+                .collect::<Vec<_>>();
+            !active_scan_roots.is_empty()
+                && active_scan_roots
+                    .iter()
+                    .all(|root| root.last_audit_completed_at_us.is_some())
+        });
+        let sink_ready = app.sink_status_snapshot().await.is_ok_and(|status| {
+            status.groups.iter().any(|group| {
+                group.group_id == DATA_BOUNDARY_SCOPE_ID
+                    && group.readiness == fs_meta_runtime::sink::GroupReadinessState::Ready
+            })
+        });
+        if source_ready && sink_ready {
+            break;
         }
         if Instant::now() >= deadline {
-            break;
+            panic!(
+                "timed out waiting for source audit and sink materialization before data-boundary assertions: source_ready={source_ready} sink_ready={sink_ready}"
+            );
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

@@ -53,8 +53,8 @@ use crate::runtime::seam::resolve_host_fs_facade;
 
 use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNITS};
 use crate::runtime::orchestration::{
-    MANUAL_RESCAN_CONTROL_FRAME_KIND, ManualRescanControlPayload, SourceControlSignal,
-    SourceRuntimeUnit, decode_logical_roots_control_payload,
+    EventRouteScopeProjection, MANUAL_RESCAN_CONTROL_FRAME_KIND, ManualRescanControlPayload,
+    SourceControlSignal, SourceRuntimeUnit, decode_logical_roots_control_payload,
     manual_rescan_scoped_target_acceptance_timeout_from_payload,
     source_control_signals_from_envelopes,
 };
@@ -68,7 +68,7 @@ use crate::runtime::routes::{
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
 use crate::source::drift::DriftEstimator;
-use crate::source::scanner::{AuditScanResult, ParallelScanner};
+use crate::source::scanner::{AuditScanResult, HostFsOpPool, ParallelScanner};
 use crate::source::sentinel::{HealthSignal, Sentinel, SentinelAction, SentinelConfig};
 use crate::source::watcher::WatchManager;
 use crate::state::cell::{AuthorityJournal, HostObjectGrantsCell, LogicalRootsCell, SignalCell};
@@ -80,6 +80,7 @@ use crate::{ControlEvent, EpochType, FileMetaRecord};
 use crate::runtime::routes::ROUTE_KEY_QUERY;
 
 const MANUAL_RESCAN_SEEN_REQUEST_IDS_LIMIT: usize = 256;
+const EMPTY_ROOTS_BOOTSTRAP_SCOPE_ID: &str = "__fsmeta_empty_roots_bootstrap";
 
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -185,6 +186,12 @@ fn debug_stream_path_capture_target() -> Option<Vec<u8>> {
         Ok(value) => Some(value.into_bytes()),
         Err(_) => None,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn debug_stream_path_capture_env_serial_guard() -> &'static std::sync::Mutex<()> {
+    static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GUARD.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 fn count_events_under_query_path(events: &[Event], query_path: &[u8]) -> u64 {
@@ -517,6 +524,8 @@ pub struct SourceConcreteRootHealthSnapshot {
     pub rescan_pending: bool,
     #[serde(default)]
     pub last_rescan_requested_at_us: Option<u64>,
+    #[serde(default)]
+    pub last_manual_rescan_accepted_at_us: Option<u64>,
     pub last_rescan_reason: Option<String>,
     pub last_error: Option<String>,
     pub last_audit_started_at_us: Option<u64>,
@@ -713,10 +722,18 @@ pub enum LifecycleState {
     Closed,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SourceEventRouteState {
+    by_group: BTreeMap<String, SourceEventRouteEntry>,
+}
+
+type SourceEventRouteEntry = EventRouteScopeProjection;
+
 /// File metadata source app.
 #[derive(Clone)]
 pub struct FSMetaSource {
     config: SourceConfig,
+    host_fs_ops: HostFsOpPool,
     node_id: NodeId,
     boundary: Option<Arc<dyn ChannelIoSubset>>,
     drift_estimator: Arc<Mutex<DriftEstimator>>,
@@ -751,6 +768,8 @@ pub struct FSMetaSource {
     manual_rescan_control_high_watermark_us: Arc<AtomicU64>,
     /// Recently accepted manual-rescan request identities.
     manual_rescan_control_seen_request_ids: Arc<Mutex<VecDeque<String>>>,
+    /// Fustor-resolved opaque output route scopes, fenced independently per logical group.
+    event_route_state: Arc<Mutex<SourceEventRouteState>>,
     /// Canonical retained source control state for local/runtime replay.
     control_state: Arc<tokio::sync::Mutex<SourceControlState>>,
     /// Coalesced runtime-topology refresh trigger.
@@ -775,14 +794,15 @@ pub(crate) enum SourceEndpointRuntime {
 
 impl SourceEndpointRuntime {
     fn owns_external_scoped_rescan_routes(self) -> bool {
-        matches!(self, Self::Local | Self::Worker)
+        matches!(self, Self::Local)
     }
 
-    fn owns_source_status_route(self, route_key: &str, local_node_id: &str) -> bool {
-        match self {
-            Self::Local => true,
-            Self::Worker => route_key == source_status_request_route_for(local_node_id).0,
-        }
+    fn owns_external_roots_control_routes(self) -> bool {
+        matches!(self, Self::Local)
+    }
+
+    fn owns_source_status_route(self, _route_key: &str, _local_node_id: &str) -> bool {
+        matches!(self, Self::Local)
     }
 }
 
@@ -866,6 +886,32 @@ impl RootTaskHandle {
     }
 }
 
+impl Drop for RootTaskHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        if join.thread().id() == std::thread::current().id() {
+            log::warn!("source root task handle dropped on its own thread");
+            return;
+        }
+        let timeout = Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + timeout;
+        while !join.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if join.is_finished() {
+            let _ = join.join();
+        } else {
+            log::warn!(
+                "source root task did not exit within {:?} during drop",
+                timeout
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RootTaskSignature {
     logical_root_id: String,
@@ -894,6 +940,11 @@ struct RootTaskSlot {
 struct RootTaskEntry {
     active: RootTaskSlot,
     candidate: Option<RootTaskSlot>,
+}
+
+struct SourceCloseWork {
+    root_tasks: HashMap<String, RootTaskEntry>,
+    endpoint_tasks: Vec<ManagedEndpointTask>,
 }
 
 #[derive(Clone)]
@@ -941,6 +992,7 @@ struct ConcreteRootHealthEntry {
     overflow_pending: bool,
     rescan_pending: bool,
     last_rescan_requested_at_us: Option<u64>,
+    last_manual_rescan_accepted_at_us: Option<u64>,
     last_rescan_reason: Option<String>,
     last_error: Option<String>,
     last_audit_started_at_us: Option<u64>,
@@ -997,6 +1049,7 @@ impl ConcreteRootHealthEntry {
             overflow_pending: false,
             rescan_pending: false,
             last_rescan_requested_at_us: None,
+            last_manual_rescan_accepted_at_us: None,
             last_rescan_reason: None,
             last_error: None,
             last_audit_started_at_us: None,
@@ -1056,6 +1109,7 @@ impl ConcreteRootHealthEntry {
             overflow_pending: false,
             rescan_pending: false,
             last_rescan_requested_at_us: None,
+            last_manual_rescan_accepted_at_us: None,
             last_rescan_reason: None,
             last_error: None,
             last_audit_started_at_us: None,
@@ -1143,6 +1197,9 @@ struct SourceStateCell {
     rescan_request_last_audit_completed_at_us: Arc<AtomicU64>,
     rescan_observed_epoch: Arc<AtomicU64>,
     published_group_epoch: Arc<Mutex<BTreeMap<String, u64>>>,
+    downstream_accepted_batch_count: Arc<AtomicU64>,
+    downstream_accepted_control_event_count: Arc<AtomicU64>,
+    downstream_accepted_data_event_count: Arc<AtomicU64>,
     scan_audit_admission_open: Arc<AtomicBool>,
     commit_boundary: CommitBoundary,
 }
@@ -1178,6 +1235,9 @@ impl SourceStateCell {
             rescan_request_last_audit_completed_at_us: Arc::new(AtomicU64::new(0)),
             rescan_observed_epoch: Arc::new(AtomicU64::new(0)),
             published_group_epoch: Arc::new(Mutex::new(BTreeMap::new())),
+            downstream_accepted_batch_count: Arc::new(AtomicU64::new(0)),
+            downstream_accepted_control_event_count: Arc::new(AtomicU64::new(0)),
+            downstream_accepted_data_event_count: Arc::new(AtomicU64::new(0)),
             scan_audit_admission_open: Arc::new(AtomicBool::new(true)),
             commit_boundary,
         };
@@ -1219,7 +1279,6 @@ impl SourceStateCell {
     }
 
     pub(crate) fn current_logical_roots_generation(&self) -> u64 {
-        let _ = self.logical_roots_cell.refresh_from_boundary_blocking();
         self.logical_roots_cell.current_seq()
     }
 
@@ -2037,6 +2096,7 @@ impl FSMetaSource {
         };
         let desired = Self::build_root_runtimes(
             &self.config,
+            &self.host_fs_ops,
             &self.node_id,
             self.boundary.clone(),
             &root_specs,
@@ -2092,6 +2152,7 @@ impl FSMetaSource {
 
     fn build_root_runtimes(
         config: &SourceConfig,
+        host_fs_ops: &HostFsOpPool,
         node_id: &NodeId,
         boundary: Option<Arc<dyn ChannelIoSubset>>,
         roots: &[RootSpec],
@@ -2171,7 +2232,7 @@ impl FSMetaSource {
                     }
                 };
                 let scanner_host_fs: Arc<dyn HostFs> = host_fs.clone();
-                let scanner = Arc::new(ParallelScanner::new(
+                let scanner = Arc::new(ParallelScanner::with_host_fs_ops(
                     monitor_path.clone(),
                     emit_prefix.clone(),
                     config.scan_workers,
@@ -2179,6 +2240,7 @@ impl FSMetaSource {
                     config.max_scan_events,
                     NodeId(member.object_ref.clone()),
                     scanner_host_fs,
+                    host_fs_ops.clone(),
                 ));
                 let (rescan_tx, _) = tokio::sync::broadcast::channel(16);
                 runtimes.push(RootRuntime {
@@ -2868,6 +2930,21 @@ impl FSMetaSource {
             return;
         }
 
+        let control_event_count = events
+            .iter()
+            .filter(|event| rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok())
+            .count() as u64;
+        let data_event_count = (events.len() as u64).saturating_sub(control_event_count);
+        state_cell
+            .downstream_accepted_batch_count
+            .fetch_add(1, Ordering::Relaxed);
+        state_cell
+            .downstream_accepted_control_event_count
+            .fetch_add(control_event_count, Ordering::Relaxed);
+        state_cell
+            .downstream_accepted_data_event_count
+            .fetch_add(data_event_count, Ordering::Relaxed);
+
         let roots = lock_or_recover(roots_handle, "source.pub.yielded.roots").clone();
         let mut roots_by_object_ref = BTreeMap::<String, Vec<(String, String)>>::new();
         for root in roots.iter().filter(|root| root.active) {
@@ -2945,6 +3022,20 @@ impl FSMetaSource {
         );
     }
 
+    pub(crate) fn downstream_accepted_publication_counts(&self) -> (u64, u64, u64) {
+        (
+            self.state_cell
+                .downstream_accepted_batch_count
+                .load(Ordering::Relaxed),
+            self.state_cell
+                .downstream_accepted_control_event_count
+                .load(Ordering::Relaxed),
+            self.state_cell
+                .downstream_accepted_data_event_count
+                .load(Ordering::Relaxed),
+        )
+    }
+
     fn set_object_last_error(
         fanout_health: &Arc<Mutex<FanoutHealthState>>,
         root_key: &str,
@@ -2975,6 +3066,17 @@ impl FSMetaSource {
             detail.last_audit_completed_at_us = None;
             detail.last_audit_duration_ms = None;
         }
+    }
+
+    fn mark_root_manual_rescan_accepted(
+        fanout_health: &Arc<Mutex<FanoutHealthState>>,
+        root_key: &str,
+    ) {
+        lock_or_recover(fanout_health, "source.object_health.manual_rescan_accepted")
+            .object_ref_detail
+            .entry(root_key.to_string())
+            .or_default()
+            .last_manual_rescan_accepted_at_us = Some(now_us());
     }
 
     fn mark_root_rescan_requested_if_not_pending(
@@ -3325,6 +3427,7 @@ impl FSMetaSource {
                 entry.requested = entry.requested.saturating_add(1);
                 signal_root_keys.insert(Self::root_runtime_key(root));
                 if let Some(health) = fanout_health {
+                    Self::mark_root_manual_rescan_accepted(health, &root_key);
                     Self::mark_root_rescan_requested_if_not_pending(health, &root_key, reason);
                 }
             } else {
@@ -3357,6 +3460,7 @@ impl FSMetaSource {
                 entry.requested = entry.requested.saturating_add(1);
                 signal_root_keys.insert(Self::root_runtime_key(root));
                 if let Some(health) = fanout_health {
+                    Self::mark_root_manual_rescan_accepted(health, &root_key);
                     Self::mark_root_rescan_requested_if_not_pending(health, &root_key, reason);
                 }
             } else {
@@ -3586,8 +3690,10 @@ impl FSMetaSource {
             config.drift_max_jump_us,
         )));
         let logical_clock = Arc::new(LogicalClock::new());
+        let host_fs_ops = HostFsOpPool::for_scan_workers(config.scan_workers);
         let roots: Vec<RootRuntime> = Self::build_root_runtimes(
             &config,
+            &host_fs_ops,
             &node_id,
             boundary.clone(),
             &root_specs,
@@ -3624,6 +3730,7 @@ impl FSMetaSource {
 
         let source = Self {
             config,
+            host_fs_ops,
             node_id: node_id.clone(),
             boundary: boundary.clone(),
             drift_estimator: drift_estimator.clone(),
@@ -3655,6 +3762,7 @@ impl FSMetaSource {
             last_control_frame_signals: Arc::new(Mutex::new(Vec::new())),
             manual_rescan_control_high_watermark_us: Arc::new(AtomicU64::new(0)),
             manual_rescan_control_seen_request_ids: Arc::new(Mutex::new(VecDeque::new())),
+            event_route_state: Arc::new(Mutex::new(SourceEventRouteState::default())),
             control_state: Arc::new(tokio::sync::Mutex::new(SourceControlState::default())),
             runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
             runtime_refresh_rescan: Arc::new(AtomicBool::new(false)),
@@ -4232,6 +4340,53 @@ impl FSMetaSource {
         Ok(())
     }
 
+    fn scan_audit_release_event_route_scopes_for_requests(
+        requests: &[Event],
+    ) -> Result<Option<BTreeMap<String, EventRouteScopeProjection>>> {
+        let mut release_seen = false;
+        let mut merged = BTreeMap::<String, EventRouteScopeProjection>::new();
+        for request in requests {
+            if !crate::query::api::source_status_request_requires_scan_audit_admission_release(
+                request.payload_bytes(),
+            ) {
+                continue;
+            }
+            release_seen = true;
+            let route_scopes =
+                crate::query::api::source_status_request_scan_audit_release_event_route_scopes(
+                    request.payload_bytes(),
+                )
+                .ok_or_else(|| {
+                    CnxError::InvalidInput(
+                        "scan/audit admission release is missing its event route projection".into(),
+                    )
+                })?;
+            if route_scopes.is_empty() {
+                return Err(CnxError::InvalidInput(
+                    "scan/audit admission release requires a non-empty event route projection"
+                        .into(),
+                ));
+            }
+            for (group_id, projection) in route_scopes {
+                if let Some(current) = merged.get(&group_id) {
+                    if current.generation == projection.generation
+                        && current.route_scope != projection.route_scope
+                    {
+                        return Err(CnxError::ProtocolViolation(format!(
+                            "scan/audit admission release has conflicting event route scopes at generation {} for group '{group_id}'",
+                            projection.generation
+                        )));
+                    }
+                    if current.generation >= projection.generation {
+                        continue;
+                    }
+                }
+                merged.insert(group_id, projection);
+            }
+        }
+        Ok(release_seen.then_some(merged))
+    }
+
     fn start_source_status_endpoint_on_route(
         &self,
         boundary: Arc<dyn ChannelIoSubset>,
@@ -4265,11 +4420,20 @@ impl FSMetaSource {
                             req.payload_bytes(),
                         )
                     });
-                    let scan_audit_admission_release = requests.iter().any(|req| {
-                        crate::query::api::source_status_request_requires_scan_audit_admission_release(
-                            req.payload_bytes(),
-                        )
-                    });
+                    let scan_audit_release_event_route_scopes =
+                        match FSMetaSource::scan_audit_release_event_route_scopes_for_requests(
+                            &requests,
+                        ) {
+                            Ok(route_scopes) => route_scopes,
+                            Err(err) => {
+                                log::warn!(
+                                    "source status scan/audit admission release projection rejected route={}: {:?}",
+                                    status_route_key,
+                                    err
+                                );
+                                return Vec::new();
+                            }
+                        };
                     let generic_source_status_route =
                         format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
                     let generic_non_target_status = match status_source
@@ -4330,12 +4494,21 @@ impl FSMetaSource {
                             );
                         }
                         snapshot
-                    } else if scan_audit_admission_release {
-                        let epoch = if status_source.open_scan_audit_admission_if_closed() {
-                            status_source.submit_rescan_request_epoch()
-                        } else {
-                            0
-                        };
+                    } else if let Some(event_route_scopes_by_group) =
+                        scan_audit_release_event_route_scopes
+                    {
+                        if let Err(err) = status_source
+                            .update_event_route_scopes_with_failure(event_route_scopes_by_group)
+                        {
+                            log::warn!(
+                                "source status scan/audit admission release projection apply failed route={}: {:?}",
+                                status_route_key,
+                                err
+                            );
+                            return Vec::new();
+                        }
+                        let epoch = status_source
+                            .open_scan_audit_admission_and_submit_rescan_request_epoch();
                         eprintln!(
                             "fs_meta_source: release_source_scan_audit_after_sink_scope_ready_if_needed source-status ok node={} route={} epoch={}",
                             status_node_id.0, status_route_key, epoch
@@ -4703,19 +4876,13 @@ impl FSMetaSource {
                                     );
                                     continue;
                                 }
-                                let apply_result = if payload.defer_scan_audit {
-                                    source
-                                        .apply_logical_roots_update_defer_scan_audit(payload.roots)
-                                        .await
-                                } else {
-                                    source
-                                        .apply_logical_roots_snapshot(
-                                            payload.roots,
-                                            true,
-                                            "source.roots_control_stream",
-                                        )
-                                        .await
-                                };
+                                let apply_result = source
+                                    .apply_propagated_logical_roots_declaration(
+                                        payload.roots,
+                                        payload.generation,
+                                        payload.defer_scan_audit,
+                                    )
+                                    .await;
                                 match apply_result {
                                     Ok(()) => source
                                         .mark_logical_roots_control_generation(payload.generation),
@@ -4742,10 +4909,11 @@ impl FSMetaSource {
             .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_ROOTS_CONTROL)
         {
             Ok(route)
-                if !self.endpoint_task_route_present(
-                    &route.0,
-                    "source.start_runtime_endpoints.route_present.roots_control_default",
-                ) =>
+                if self.endpoint_runtime.owns_external_roots_control_routes()
+                    && !self.endpoint_task_route_present(
+                        &route.0,
+                        "source.start_runtime_endpoints.route_present.roots_control_default",
+                    ) =>
             {
                 spawn_roots_control_stream(
                     route,
@@ -4767,10 +4935,12 @@ impl FSMetaSource {
         }
 
         let scoped_roots_route = source_roots_control_stream_route_for(&self.node_id.0);
-        if !self.endpoint_task_route_present(
-            &scoped_roots_route.0,
-            "source.start_runtime_endpoints.route_present.roots_control_scoped",
-        ) {
+        if self.endpoint_runtime.owns_external_roots_control_routes()
+            && !self.endpoint_task_route_present(
+                &scoped_roots_route.0,
+                "source.start_runtime_endpoints.route_present.roots_control_scoped",
+            )
+        {
             spawn_roots_control_stream(scoped_roots_route.clone(), scoped_roots_route.0);
         }
 
@@ -5150,10 +5320,16 @@ impl FSMetaSource {
                 resource_ids: Vec::new(),
             })
             .collect::<Vec<_>>();
-        self.unit_control
-            .sync_active_scopes(SourceRuntimeUnit::Source.unit_id(), &bound_scopes)?;
-        self.unit_control
-            .sync_active_scopes(SourceRuntimeUnit::Scan.unit_id(), &bound_scopes)?;
+        self.unit_control.sync_active_scopes_with_replacements(
+            SourceRuntimeUnit::Source.unit_id(),
+            &bound_scopes,
+            &[EMPTY_ROOTS_BOOTSTRAP_SCOPE_ID],
+        )?;
+        self.unit_control.sync_active_scopes_with_replacements(
+            SourceRuntimeUnit::Scan.unit_id(),
+            &bound_scopes,
+            &[EMPTY_ROOTS_BOOTSTRAP_SCOPE_ID],
+        )?;
 
         *lock_or_recover(
             &self.state_cell.logical_roots,
@@ -5187,7 +5363,7 @@ impl FSMetaSource {
     pub(crate) async fn sync_logical_roots_from_authoritative_cell_if_changed(
         &self,
     ) -> Result<bool> {
-        let Some(authoritative_roots) = self.authoritative_logical_roots_if_changed()? else {
+        let Some(authoritative_roots) = self.authoritative_logical_roots_if_changed().await? else {
             return Ok(false);
         };
         eprintln!(
@@ -5209,11 +5385,14 @@ impl FSMetaSource {
         Ok(true)
     }
 
-    pub(crate) fn authoritative_logical_roots_if_changed(&self) -> Result<Option<Vec<RootSpec>>> {
+    pub(crate) async fn authoritative_logical_roots_if_changed(
+        &self,
+    ) -> Result<Option<Vec<RootSpec>>> {
         let authoritative_roots = self
             .state_cell
             .logical_roots_cell
-            .refresh_from_boundary_blocking()?;
+            .refresh_from_boundary()
+            .await?;
         if root_specs_signature(&authoritative_roots)
             == root_specs_signature(&self.logical_roots_snapshot())
         {
@@ -5242,6 +5421,91 @@ impl FSMetaSource {
                 .any(|member| member.object_ref == object_ref)
                 .then(|| group_id.clone())
         })
+    }
+
+    pub(crate) fn update_event_route_scopes_with_failure(
+        &self,
+        route_scopes_by_group: BTreeMap<String, EventRouteScopeProjection>,
+    ) -> Result<bool> {
+        if route_scopes_by_group.is_empty() {
+            return Ok(false);
+        }
+
+        let known_groups = self
+            .logical_roots_snapshot()
+            .into_iter()
+            .map(|root| root.id)
+            .collect::<BTreeSet<_>>();
+        let mut normalized = BTreeMap::new();
+        for (group_id, projection) in route_scopes_by_group {
+            let group_id = group_id.trim();
+            let route_scope = projection.route_scope.trim();
+            if group_id.is_empty() || route_scope.is_empty() {
+                return Err(CnxError::InvalidInput(
+                    "source event route-scope update contains an empty group or route scope".into(),
+                ));
+            }
+            if !known_groups.contains(group_id) {
+                return Err(CnxError::InvalidInput(format!(
+                    "source event route-scope update names unknown logical group '{group_id}'"
+                )));
+            }
+            if projection.generation == 0 {
+                return Err(CnxError::InvalidInput(format!(
+                    "source event route-scope update requires a non-zero generation for group '{group_id}'"
+                )));
+            }
+            normalized.insert(
+                group_id.to_string(),
+                SourceEventRouteEntry {
+                    generation: projection.generation,
+                    route_scope: route_scope.to_string(),
+                },
+            );
+        }
+
+        let mut state = lock_or_recover(&self.event_route_state, "source.event_route_state.update");
+        for (group_id, projection) in &normalized {
+            if let Some(current) = state.by_group.get(group_id)
+                && current.generation == projection.generation
+                && current.route_scope != projection.route_scope
+            {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "source event route-scope update conflicts at generation {} for group '{group_id}'",
+                    projection.generation
+                )));
+            }
+        }
+
+        let mut changed = false;
+        for (group_id, projection) in normalized {
+            let should_replace = state
+                .by_group
+                .get(&group_id)
+                .is_none_or(|current| projection.generation > current.generation);
+            if should_replace {
+                state.by_group.insert(group_id, projection);
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn event_route_scope_for_object_ref(&self, object_ref: &str) -> Option<String> {
+        let group_id = self.snapshot_group_id_for_object_ref(object_ref)?;
+        lock_or_recover(&self.event_route_state, "source.event_route_state.lookup")
+            .by_group
+            .get(&group_id)
+            .map(|entry| entry.route_scope.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn event_route_scopes_snapshot(&self) -> BTreeMap<String, (u64, String)> {
+        lock_or_recover(&self.event_route_state, "source.event_route_state.snapshot")
+            .by_group
+            .iter()
+            .map(|(group, entry)| (group.clone(), (entry.generation, entry.route_scope.clone())))
+            .collect()
     }
 
     pub(crate) fn current_logical_roots_generation(&self) -> u64 {
@@ -5332,6 +5596,7 @@ impl FSMetaSource {
                 overflow_pending: entry.overflow_pending,
                 rescan_pending: entry.rescan_pending,
                 last_rescan_requested_at_us: entry.last_rescan_requested_at_us,
+                last_manual_rescan_accepted_at_us: entry.last_manual_rescan_accepted_at_us,
                 last_rescan_reason: entry.last_rescan_reason.clone(),
                 last_error: entry.last_error.clone(),
                 last_audit_started_at_us: entry.last_audit_started_at_us,
@@ -5594,6 +5859,7 @@ impl FSMetaSource {
                 ));
             }
         };
+        self.update_event_route_scopes_with_failure(payload.event_route_scopes_by_group.clone())?;
         let request_id = payload.request_id.trim();
         if !request_id.is_empty() {
             let mut seen = lock_or_recover(
@@ -5703,8 +5969,48 @@ impl FSMetaSource {
         self.apply_logical_roots_update(roots).await
     }
 
+    pub(crate) async fn apply_propagated_logical_roots_declaration(
+        &self,
+        roots: Vec<RootSpec>,
+        generation: u64,
+        defer_scan_audit: bool,
+    ) -> Result<()> {
+        if generation == 0 {
+            return Err(CnxError::InvalidInput(
+                "propagated logical-roots generation must be positive".to_string(),
+            ));
+        }
+        let current_generation = self.current_logical_roots_generation();
+        if generation < current_generation {
+            return Ok(());
+        }
+        if generation == current_generation
+            && root_specs_signature(&roots)
+                != root_specs_signature(&self.state_cell.logical_roots_cell.snapshot())
+        {
+            return Err(CnxError::ProtocolViolation(format!(
+                "conflicting propagated logical-roots declaration for generation {generation}"
+            )));
+        }
+        if defer_scan_audit {
+            self.state_cell.close_scan_audit_admission();
+        }
+        self.apply_logical_roots_snapshot(roots, false, "source.apply_propagated_logical_roots")
+            .await?;
+        self.state_cell
+            .logical_roots_cell
+            .accept_propagated(generation, self.snapshot_logical_roots())?;
+        self.mark_logical_roots_control_generation(generation);
+        Ok(())
+    }
+
     pub(crate) fn open_scan_audit_admission_if_closed(&self) -> bool {
         self.state_cell.open_scan_audit_admission_if_closed()
+    }
+
+    pub(crate) fn open_scan_audit_admission_and_submit_rescan_request_epoch(&self) -> u64 {
+        let _ = self.open_scan_audit_admission_if_closed();
+        self.submit_rescan_request_epoch()
     }
 
     /// Update logical roots online and reconcile concrete-root tasks without restart.
@@ -7264,6 +7570,16 @@ impl FSMetaSource {
                                         completion.started_at_us,
                                         now_us(),
                                     );
+                                    let actions = sentinel.handle_signal(HealthSignal::AuditDrift {
+                                        root_key: root_key.clone(),
+                                        corrections: 0,
+                                    });
+                                    Self::execute_sentinel_actions(
+                                        &actions,
+                                        &root_key,
+                                        Some(&root.rescan_tx),
+                                        Some(&fanout_health),
+                                    );
                                     if debug_root_task || matches!(completion.kind, RootAuditKind::Rescan) {
                                         eprintln!(
                                             "fs_meta_source: {} completed batches={} root_key={} records={}",
@@ -7684,13 +8000,77 @@ impl FSMetaSource {
         self.apply_control_frame_signals(&signals).await
     }
 
-    pub(crate) async fn perform_close(&self) -> Result<()> {
+    fn begin_close(&self) -> SourceCloseWork {
         self.shutdown.cancel();
-        let mut tasks = std::mem::take(&mut *lock_or_recover(
+        let tasks = std::mem::take(&mut *lock_or_recover(
             &self.state_cell.root_tasks,
             "source.close.root_tasks",
         ));
-        for (_key, entry) in tasks.drain() {
+        for entry in tasks.values() {
+            entry.active.handle.cancel();
+            if let Some(candidate) = entry.candidate.as_ref() {
+                candidate.handle.cancel();
+            }
+        }
+        *lock_or_recover(
+            &self.state_cell.stream_binding,
+            "source.close.stream_binding",
+        ) = None;
+        let endpoint_tasks = std::mem::take(&mut *lock_or_recover(
+            &self.endpoint_tasks,
+            "source.close.endpoints",
+        ));
+        for task in &endpoint_tasks {
+            task.request_shutdown_and_close();
+        }
+        if let Some(task) = lock_or_recover(
+            &self.manual_rescan_watch_task,
+            "source.close.manual_rescan_watch",
+        )
+        .take()
+        {
+            task.abort();
+        }
+        self.host_fs_ops.close();
+        *lock_or_recover(&self.state, "source.close.state") = LifecycleState::Closed;
+        SourceCloseWork {
+            root_tasks: tasks,
+            endpoint_tasks,
+        }
+    }
+
+    pub(crate) fn request_shutdown_on_owner_drop(&self) {
+        drop(self.begin_close());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_work_is_shutdown_for_tests(&self) -> bool {
+        self.shutdown.is_cancelled()
+            && lock_or_recover(
+                &self.state_cell.root_tasks,
+                "source.test.background_work.root_tasks",
+            )
+            .is_empty()
+            && lock_or_recover(
+                &self.endpoint_tasks,
+                "source.test.background_work.endpoints",
+            )
+            .is_empty()
+            && lock_or_recover(
+                &self.manual_rescan_watch_task,
+                "source.test.background_work.manual_rescan_watch",
+            )
+            .is_none()
+            && *lock_or_recover(&self.state, "source.test.background_work.state")
+                == LifecycleState::Closed
+    }
+
+    pub(crate) async fn perform_close(&self) -> Result<()> {
+        let SourceCloseWork {
+            mut root_tasks,
+            mut endpoint_tasks,
+        } = self.begin_close();
+        for (_key, entry) in root_tasks.drain() {
             entry
                 .active
                 .handle
@@ -7703,26 +8083,9 @@ impl FSMetaSource {
                     .await;
             }
         }
-        *lock_or_recover(
-            &self.state_cell.stream_binding,
-            "source.close.stream_binding",
-        ) = None;
-        let mut endpoint_tasks = std::mem::take(&mut *lock_or_recover(
-            &self.endpoint_tasks,
-            "source.close.endpoints",
-        ));
         for task in &mut endpoint_tasks {
             task.shutdown(Duration::from_secs(2)).await;
         }
-        if let Some(task) = lock_or_recover(
-            &self.manual_rescan_watch_task,
-            "source.close.manual_rescan_watch",
-        )
-        .take()
-        {
-            task.abort();
-        }
-        *lock_or_recover(&self.state, "source.close.state") = LifecycleState::Closed;
         Ok(())
     }
 

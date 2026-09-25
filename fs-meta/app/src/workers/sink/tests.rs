@@ -12,7 +12,8 @@ use capanix_app_sdk::worker::WorkerMode;
 use capanix_host_fs_types::UnixStat;
 use capanix_runtime_entry_sdk::control::{
     RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
-    RuntimeUnitTick, encode_runtime_exec_control, encode_runtime_unit_tick,
+    RuntimeHostGrantChange, RuntimeUnitTick, encode_runtime_exec_control,
+    encode_runtime_host_grant_change, encode_runtime_unit_tick,
 };
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -25,9 +26,7 @@ use tempfile::tempdir;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::Duration;
 
-use crate::runtime::orchestration::{
-    SinkRuntimeUnit, encode_logical_roots_control_payload_with_generation_and_sink_replay,
-};
+use crate::runtime::orchestration::SinkRuntimeUnit;
 use crate::runtime::routes::{
     METHOD_SINK_QUERY, ROUTE_KEY_EVENTS, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_ROOTS_CONTROL,
     ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, events_stream_route_for_scope,
@@ -74,6 +73,19 @@ impl LoopbackWorkerBoundary {
             .expect("loopback recv batches lock")
             .get(channel)
             .unwrap_or(&0)
+    }
+
+    fn transport_batch_counts(&self) -> (HashMap<String, usize>, HashMap<String, usize>) {
+        (
+            self.send_batches_by_channel
+                .lock()
+                .expect("loopback send batches lock")
+                .clone(),
+            self.recv_batches_by_channel
+                .lock()
+                .expect("loopback recv batches lock")
+                .clone(),
+        )
     }
 }
 
@@ -146,6 +158,8 @@ impl ChannelIoSubset for LoopbackWorkerBoundary {
             .map(Duration::from_millis)
             .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
             {
                 let mut channels = self.channels.lock().await;
                 if let Some(events) = channels.remove(&request.channel_key.0)
@@ -167,7 +181,6 @@ impl ChannelIoSubset for LoopbackWorkerBoundary {
                     return Err(CnxError::ChannelClosed);
                 }
             }
-            let notified = self.changed.notified();
             if let Some(deadline) = deadline {
                 match tokio::time::timeout_at(deadline, notified).await {
                     Ok(()) => {}
@@ -669,10 +682,10 @@ fn sink_local_runtime_bootstrap_and_roots_typed_helpers_do_not_bounce_through_ra
         "Self::with_boundaries_and_state_internal(",
         "false,\n        )\n        .map_err(SinkFailure::from)",
         "true,\n        )\n        .map_err(SinkFailure::from)",
-        "self.start_runtime_endpoints_on_boundary(io_boundary, node_id)\n            .map_err(SinkFailure::from)",
+        "self.start_external_worker_runtime_endpoints_on_boundary(io_boundary, node_id)\n            .map_err(SinkFailure::from)",
         "self.perform_update_logical_roots(roots, host_object_grants)\n            .map_err(SinkFailure::from)",
         "self.snapshot_scheduled_group_ids()\n            .map_err(SinkFailure::from)",
-        "pub(crate) fn start_runtime_endpoints_on_boundary(",
+        "pub(crate) fn start_external_worker_runtime_endpoints_on_boundary(",
         "pub(crate) fn perform_update_logical_roots(",
         "pub(crate) fn snapshot_scheduled_group_ids(&self) -> Result<Option<BTreeSet<String>>> {",
     ] {
@@ -1051,7 +1064,7 @@ fn sink_worker_cached_scheduled_groups_access_stays_on_typed_helper() {
     );
     assert!(
         sink_impl.contains(
-            "self.scheduled_groups_cache\n            .lock()\n            .map(|guard| guard.clone())",
+            "self.scheduled_groups_cache\n            .lock()\n            .map(|guard| {\n                guard\n                    .as_ref()\n                    .map(|evidence| evidence.scheduled_groups.clone())\n            })",
         ),
         "workers/sink hard cut regressed; sink worker typed cached scheduled-groups helper should read the cache directly",
     );
@@ -1446,7 +1459,10 @@ async fn external_sink_worker_materializes_each_local_primary_root_from_source_b
         )
         .expect("decode nfs1 final")
         .is_some(),
-        "nfs1 should materialize its post-rescan file",
+        "nfs1 should materialize its post-rescan file; transport_counts={:?} bound_route_metrics={:?} worker_logs={}",
+        boundary.transport_batch_counts(),
+        capanix_app_sdk::bound_route_metrics_snapshot(),
+        worker_stderr_excerpt(worker_socket_dir.path()),
     );
     assert!(
         decode_exact_query_node(
@@ -1460,7 +1476,10 @@ async fn external_sink_worker_materializes_each_local_primary_root_from_source_b
         )
         .expect("decode nfs2 final")
         .is_some(),
-        "nfs2 should materialize its post-rescan file",
+        "nfs2 should materialize its post-rescan file; transport_counts={:?} bound_route_metrics={:?} worker_logs={}",
+        boundary.transport_batch_counts(),
+        capanix_app_sdk::bound_route_metrics_snapshot(),
+        worker_stderr_excerpt(worker_socket_dir.path()),
     );
 
     source.close().await.expect("close source");
@@ -1653,7 +1672,7 @@ async fn external_sink_worker_stream_endpoint_materializes_split_primary_mixed_c
         .expect("sink worker start timed out")
         .expect("start sink worker");
 
-    let events_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+    let events_route = events_stream_route_for_scope("node-b").0;
     sink.on_control_frame(vec![
         encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
             route_key: events_route.clone(),
@@ -1844,7 +1863,7 @@ async fn external_sink_worker_stream_endpoint_materializes_split_primary_mixed_c
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn external_sink_worker_owner_scoped_roots_control_replay_arms_events_stream_and_ingests_owner_events()
+async fn external_sink_worker_owner_scoped_control_frame_arms_events_stream_and_ingests_owner_events()
  {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
@@ -1881,70 +1900,46 @@ async fn external_sink_worker_owner_scoped_roots_control_replay_arms_events_stre
     let events_route = events_stream_route_for_scope("node-b").0;
     let roots_control_route = sink_roots_control_stream_route_for("node-b").0;
     let owner_scope = vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])];
-    let payload = encode_logical_roots_control_payload_with_generation_and_sink_replay(
-        &cfg.roots,
-        3,
-        vec![
-            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
-                route_key: events_route.clone(),
-                unit_id: "runtime.exec.sink".to_string(),
-                lease: None,
-                generation: 3,
-                expires_at_ms: 1,
-                bound_scopes: owner_scope.clone(),
-            }))
-            .expect("encode owner events activate"),
-            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
-                route_key: sink_query_request_route_for("node-b").0,
-                unit_id: "runtime.exec.sink".to_string(),
-                lease: None,
-                generation: 3,
-                expires_at_ms: 1,
-                bound_scopes: owner_scope.clone(),
-            }))
-            .expect("encode owner query activate"),
-            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
-                route_key: sink_status_request_route_for("node-b").0,
-                unit_id: "runtime.exec.sink".to_string(),
-                lease: None,
-                generation: 3,
-                expires_at_ms: 1,
-                bound_scopes: owner_scope.clone(),
-            }))
-            .expect("encode owner status activate"),
-            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
-                route_key: roots_control_route.clone(),
-                unit_id: "runtime.exec.sink".to_string(),
-                lease: None,
-                generation: 3,
-                expires_at_ms: 1,
-                bound_scopes: owner_scope,
-            }))
-            .expect("encode owner roots-control activate"),
-        ],
-    )
-    .expect("encode roots-control payload");
-    boundary
-        .channel_send(
-            BoundaryContext::default(),
-            ChannelSendRequest {
-                channel_key: ChannelKey(roots_control_route.clone()),
-                events: vec![Event::new(
-                    EventMetadata {
-                        origin_id: NodeId("node-a".to_string()),
-                        timestamp_us: 1,
-                        logical_ts: None,
-                        correlation_id: None,
-                        ingress_auth: None,
-                        trace: None,
-                    },
-                    Bytes::from(payload),
-                )],
-                timeout_ms: Some(100),
-            },
-        )
-        .await
-        .expect("send owner roots-control replay to worker boundary");
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: events_route.clone(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 1,
+            bound_scopes: owner_scope.clone(),
+        }))
+        .expect("encode owner events activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: sink_query_request_route_for("node-b").0,
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 1,
+            bound_scopes: owner_scope.clone(),
+        }))
+        .expect("encode owner query activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: sink_status_request_route_for("node-b").0,
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 1,
+            bound_scopes: owner_scope.clone(),
+        }))
+        .expect("encode owner status activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: roots_control_route.clone(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 1,
+            bound_scopes: owner_scope,
+        }))
+        .expect("encode owner roots-control activate"),
+    ])
+    .await
+    .expect("apply owner-scoped sink control frame");
 
     let route_apply_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1958,7 +1953,7 @@ async fn external_sink_worker_owner_scoped_roots_control_replay_arms_events_stre
         }
         assert!(
             tokio::time::Instant::now() < route_apply_deadline,
-            "owner-scoped roots-control replay should apply the worker sink schedule; roots_recv={} groups={groups:?} worker_logs={}",
+            "owner-scoped control frame should apply the worker sink schedule without direct app roots-control ownership; roots_recv={} groups={groups:?} worker_logs={}",
             boundary.recv_batch_count(&roots_control_route),
             worker_stderr_excerpt(worker_socket_dir.path())
         );
@@ -1982,10 +1977,21 @@ async fn external_sink_worker_owner_scoped_roots_control_replay_arms_events_stre
 
     let recv_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let snapshot = sink
-            .status_snapshot_with_failure()
-            .await
-            .expect("sink worker status snapshot after owner event send");
+        let snapshot = match sink.status_snapshot_with_failure().await {
+            Ok(snapshot) => snapshot,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => {
+                assert!(
+                    tokio::time::Instant::now() < recv_deadline,
+                    "owner-scoped events stream status remained unavailable within the receive budget; roots_recv={} events_recv={} worker_logs={}",
+                    boundary.recv_batch_count(&roots_control_route),
+                    boundary.recv_batch_count(&events_route),
+                    worker_stderr_excerpt(worker_socket_dir.path())
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            Err(err) => panic!("sink worker status snapshot after owner event send: {err:?}"),
+        };
         if boundary.recv_batch_count(&events_route) > 0
             && snapshot
                 .stream_received_events_by_node
@@ -1998,7 +2004,7 @@ async fn external_sink_worker_owner_scoped_roots_control_replay_arms_events_stre
         }
         assert!(
             tokio::time::Instant::now() < recv_deadline,
-            "owner-scoped roots-control replay must arm the worker-backed events stream; roots_recv={} events_recv={} snapshot={snapshot:?} worker_logs={}",
+            "owner-scoped control frame must arm the worker-backed events stream; roots_recv={} events_recv={} snapshot={snapshot:?} worker_logs={}",
             boundary.recv_batch_count(&roots_control_route),
             boundary.recv_batch_count(&events_route),
             worker_stderr_excerpt(worker_socket_dir.path())
@@ -3081,7 +3087,7 @@ async fn status_snapshot_stale_ack_after_retained_replay_does_not_rearm_replay()
         host_object_grants: vec![sink_worker_export(
             "node-b::nfs-145",
             "node-b",
-            "10.0.82.145",
+            "198.51.100.145",
             nfs145.clone(),
         )],
         ..SourceConfig::default()
@@ -3118,7 +3124,8 @@ async fn status_snapshot_stale_ack_after_retained_replay_does_not_rearm_replay()
     let retained_signals =
         sink_control_signals_from_envelopes(std::slice::from_ref(&retained_envelope))
             .expect("decode retained sink activate");
-    sink.retain_control_signals(&retained_signals)
+    let worker_client = sink.client().await.expect("typed sink worker client");
+    sink.retain_control_signals(&retained_signals, &worker_client)
         .await
         .expect("retain sink control state");
     sink.control_state_replay_required
@@ -4103,7 +4110,7 @@ async fn status_route_cache_fallback_preserves_owner_scoped_sink_schedule_and_pr
         host_object_grants: vec![sink_worker_export(
             "node-a::nfs-144",
             "node-a",
-            "10.0.82.144",
+            "198.51.100.144",
             nfs144.clone(),
         )],
         ..SourceConfig::default()
@@ -4185,8 +4192,8 @@ async fn owner_status_route_uses_matching_roots_control_scope_instead_of_facade_
     let cfg = SourceConfig {
         roots: vec![sink_worker_root("nfs-144", &nfs144)],
         host_object_grants: vec![
-            sink_worker_export("node-a::nfs-144", "node-a", "10.0.82.144", nfs144.clone()),
-            sink_worker_export("node-b::nfs-144", "node-b", "10.0.82.145", nfs144.clone()),
+            sink_worker_export("node-a::nfs-144", "node-a", "198.51.100.144", nfs144.clone()),
+            sink_worker_export("node-b::nfs-144", "node-b", "198.51.100.145", nfs144.clone()),
         ],
         ..SourceConfig::default()
     };
@@ -4220,7 +4227,8 @@ async fn owner_status_route_uses_matching_roots_control_scope_instead_of_facade_
         .expect("encode retained owner-scoped sink roots-control activate");
     let signals =
         sink_control_signals_from_envelopes(&[envelope]).expect("decode retained activate");
-    sink.retain_control_signals(&signals)
+    let worker_client = sink.client().await.expect("typed sink worker client");
+    sink.retain_control_signals(&signals, &worker_client)
         .await
         .expect("retain owner-scoped sink roots-control route evidence");
     sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
@@ -4260,7 +4268,7 @@ async fn owner_status_route_uses_matching_events_scope_when_status_route_is_boot
         host_object_grants: vec![sink_worker_export(
             "node-b::nfs-145",
             "node-b",
-            "10.0.82.145",
+            "198.51.100.145",
             nfs145.clone(),
         )],
         ..SourceConfig::default()
@@ -4305,7 +4313,8 @@ async fn owner_status_route_uses_matching_events_scope_when_status_route_is_boot
     ];
     let signals = sink_control_signals_from_envelopes(&envelopes)
         .expect("decode retained owner route activates");
-    sink.retain_control_signals(&signals)
+    let worker_client = sink.client().await.expect("typed sink worker client");
+    sink.retain_control_signals(&signals, &worker_client)
         .await
         .expect("retain owner events route evidence");
     sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
@@ -4351,9 +4360,9 @@ async fn external_sink_worker_status_route_snapshot_uses_owner_route_scope_not_g
             sink_worker_root("nfs-146", &nfs146),
         ],
         host_object_grants: vec![
-            sink_worker_export("node-a::nfs-144", "node-a", "10.0.82.144", nfs144.clone()),
-            sink_worker_export("node-b::nfs-145", "node-b", "10.0.82.145", nfs145.clone()),
-            sink_worker_export("node-c::nfs-146", "node-c", "10.0.82.146", nfs146.clone()),
+            sink_worker_export("node-a::nfs-144", "node-a", "198.51.100.144", nfs144.clone()),
+            sink_worker_export("node-b::nfs-145", "node-b", "198.51.100.145", nfs145.clone()),
+            sink_worker_export("node-c::nfs-146", "node-c", "198.51.100.146", nfs146.clone()),
         ],
         ..SourceConfig::default()
     };
@@ -4446,7 +4455,7 @@ async fn external_sink_worker_owner_status_route_live_reply_republishes_retained
         host_object_grants: vec![sink_worker_export(
             "node-c::nfs-146",
             "node-c",
-            "10.0.82.146",
+            "198.51.100.146",
             nfs146.clone(),
         )],
         ..SourceConfig::default()
@@ -4482,7 +4491,8 @@ async fn external_sink_worker_owner_status_route_live_reply_republishes_retained
         .expect("encode retained owner-scoped sink status activate");
     let signals =
         sink_control_signals_from_envelopes(&[envelope]).expect("decode retained activate");
-    sink.retain_control_signals(&signals)
+    let worker_client = sink.client().await.expect("typed sink worker client");
+    sink.retain_control_signals(&signals, &worker_client)
         .await
         .expect("retain owner-scoped sink status route evidence");
 
@@ -4521,7 +4531,7 @@ async fn owner_status_route_cache_fallback_preserves_live_stream_receive_readine
         host_object_grants: vec![sink_worker_export(
             "node-b::nfs-145",
             "node-b",
-            "10.0.82.145",
+            "198.51.100.145",
             nfs145.clone(),
         )],
         ..SourceConfig::default()
@@ -4638,7 +4648,7 @@ async fn owner_status_route_cache_fallback_uses_cached_owner_evidence_after_reta
         host_object_grants: vec![sink_worker_export(
             "node-c::nfs-146",
             "node-c",
-            "10.0.82.146",
+            "198.51.100.146",
             nfs146.clone(),
         )],
         ..SourceConfig::default()
@@ -4711,7 +4721,7 @@ async fn owner_status_route_control_inflight_probes_existing_worker_when_cache_l
         host_object_grants: vec![sink_worker_export(
             "node-b::nfs-145",
             "node-b",
-            "10.0.82.145",
+            "198.51.100.145",
             nfs145.clone(),
         )],
         ..SourceConfig::default()
@@ -4809,7 +4819,7 @@ async fn owner_status_route_control_inflight_probes_existing_worker_when_route_c
         host_object_grants: vec![sink_worker_export(
             "node-b::nfs-145",
             "node-b",
-            "10.0.82.145",
+            "198.51.100.145",
             nfs145.clone(),
         )],
         ..SourceConfig::default()
@@ -4902,9 +4912,9 @@ async fn logical_roots_replay_does_not_project_all_roots_into_sink_status_schedu
         sink_worker_root("nfs-146", &nfs146),
     ];
     let grants = vec![
-        sink_worker_export("node-a::nfs-144", "node-a", "10.0.82.144", nfs144.clone()),
-        sink_worker_export("node-b::nfs-145", "node-b", "10.0.82.145", nfs145.clone()),
-        sink_worker_export("node-c::nfs-146", "node-c", "10.0.82.146", nfs146.clone()),
+        sink_worker_export("node-a::nfs-144", "node-a", "198.51.100.144", nfs144.clone()),
+        sink_worker_export("node-b::nfs-145", "node-b", "198.51.100.145", nfs145.clone()),
+        sink_worker_export("node-c::nfs-146", "node-c", "198.51.100.146", nfs146.clone()),
     ];
     let cfg = SourceConfig {
         roots: roots.clone(),
@@ -5495,7 +5505,10 @@ async fn second_on_control_frame_reacquires_worker_client_after_first_wave_succe
     std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
 
     let cfg = SourceConfig {
-        roots: vec![sink_worker_root("nfs1", &nfs1)],
+        roots: vec![
+            sink_worker_root("nfs1", &nfs1),
+            sink_worker_root("nfs2", &nfs2),
+        ],
         host_object_grants: vec![
             sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
             sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),

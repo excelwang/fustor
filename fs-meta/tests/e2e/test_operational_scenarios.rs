@@ -1809,7 +1809,7 @@ fn scenario_facade_failover_and_resource_switch(
     };
 
     cluster.withdraw_resources_clusterwide(
-        &cluster.node_id(&holder_node)?,
+        &cluster.node_id(holder_node)?,
         vec![facade_resource_id.to_string()],
     )?;
     wait_until(

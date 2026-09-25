@@ -1,0 +1,20 @@
+default_page_size: 1000
+max_page_size: 10000
+endpoints:
+  - object_ref: local-prod
+    root_path: /data/fustor
+    path_scopes:
+      - datasets
+      - datasets/*
+    active: true
+__cnx_runtime:
+  local_host_ref: local-fs-source-node-a
+  resource_grants:
+    - resource_kind: local-fs
+      object_ref: local-prod
+      grant_state: active
+      grant_epoch: 1
+      interfaces:
+        - read
+      path_scopes:
+        - datasets/*

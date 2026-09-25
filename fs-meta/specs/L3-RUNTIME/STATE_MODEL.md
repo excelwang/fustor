@@ -1,5 +1,5 @@
 ---
-version: 3.0.0
+version: 3.1.0
 ---
 
 # L3 Runtime: fs-meta Domain State Model
@@ -205,6 +205,8 @@ RecoveryLaneState =
 1. For a given diagnostic signature, `scheduled` and `inflight` are single-flight ownership states.
 2. A status-observation wake that encounters the same lane signature already `scheduled` or `inflight` MUST observe that lane instead of starting another execution turn.
 3. New work for the same lane requires a new Authority Epoch, generation, trigger, diagnostic signature, or an explicit retry transition from `failed`/`timed-out`/`blocked`/`completed`.
+4. `status-triggered-sink-observation-repair` is additionally single-flight across diagnostic signatures because every turn shares one sink replay transaction. A new signature observed while another signature is `scheduled` or `inflight` transitions to blocked observation evidence without entering execution or mutating the pending targeted-repair request. The app runtime owns the detached task, and completion, cancellation, runtime shutdown, or unwind releases the execution lease; a wake cannot create an untracked OS thread/runtime that survives its app lifecycle.
+5. Contention with a shared replay transaction owned by another recovery lane is `blocked` ownership evidence, not terminal `failed` evidence. The pending status-observation republish request remains retained for a later eligible turn.
 
 **User Question This Answers**
 
@@ -212,6 +214,33 @@ RecoveryLaneState =
 2. Which recovery owner owns the work?
 3. Did this `/status` request block on recovery, merely observe it, or skip it?
 4. Which generation/signature should be used to correlate repeated observations?
+
+## [state-machine] ScanAuditAdmissionReleaseState
+
+**Rationale**
+
+Source publication must not race an accepted sink owner that is still applying
+its current control scope, and an earlier open admission bit must not suppress
+the catch-up publication required after the sink becomes receivable.
+
+**Type Signature**
+
+```text
+ScanAuditAdmissionReleaseState =
+  | source-owner-unproven
+  | sink-receive-unproven
+  | admitted
+  | rescan-intent-recorded
+  | completed
+```
+
+**State Rules**
+
+1. `source-owner-unproven` accepts only a live concrete group-primary or, before first audit, an explicit source-primary covered by current source and scan runtime scope. Unique schedule membership is insufficient.
+2. `sink-receive-unproven` requires exactly one accepted sink owner plus its current receive-armed marker. Schedule, historical ingress, and replay/apply-pending cache evidence cannot make this transition.
+3. `admitted` opens the source scan/audit admission bit if closed, but an already-open bit remains `admitted`; it does not skip the next transition.
+4. `rescan-intent-recorded` requires a positive bounded intent epoch from the named source owner for every group assigned to that route. Zero/no-op, timeout, failure, unrelated ownership, or partial ownership remains retryable pending evidence.
+5. `completed` is cached per stable source/sink scope signature and completed source-owner set. A changed authority/scope signature or a newly receive-ready owner creates a new admitted turn; repeated identical observations do not create duplicate intents.
 
 ## [decision] MaterializedReadinessEvidenceEpochMonotonicity
 
@@ -235,7 +264,7 @@ RecoveryLaneState =
 1. host-fs facade scan, stat, list, and watch setup operations MUST be bounded by an explicit latency/cancellation policy.
 2. timeout and backpressure are observation evidence and MUST be visible as degraded, partial, or not-ready status.
 3. repeated timeout for a root or group MUST produce degraded reason `HOST_FS_TIMEOUT`; repeated backpressure MUST produce degraded reason `HOST_FS_BACKPRESSURE`.
-4. unbounded thread spawning is not an acceptable routine policy for handling slow host-fs operations.
+4. unbounded thread spawning is not an acceptable routine policy for handling slow host-fs operations; all concrete-root scanners and source instances in one source process share one bounded host-fs operation executor whose worker count is independent of root/app/source-instance count. Each source owns separate admission state: source close rejects new work through retained clones, while the process executor remains available to other live sources and retires only when its final owner disappears.
 5. scan/audit publication backpressure is valid flow-control evidence: source MUST bound scan/audit read-ahead and let downstream sink/channel pressure throttle scan/audit concurrency/admission state instead of hiding it in unbounded source-side buffers.
 6. source MUST NOT advance scan/audit progress or release source-side scan/audit concurrency as if a batch were downstream-accepted while that batch is only waiting in an unbounded or fairness-only publication buffer.
 7. realtime watch ingestion is a separate evidence lane. Backpressure from the scan/audit publication lane MUST NOT block host watch event ingestion or force realtime events to wait behind scan/audit backlog.

@@ -16,6 +16,10 @@ path = "../tests/app_specs.rs"
 name = "cli_specs"
 path = "../tests/cli_specs.rs"
 
+[[test]]
+name = "fustor_integration"
+path = "../tests/specs/test_contracts_fustor_integration.rs"
+
 [dependencies]
 capanix-app-sdk = { workspace = true }
 capanix-host-adapter-fs = { workspace = true }

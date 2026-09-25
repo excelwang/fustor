@@ -107,15 +107,15 @@ index 0000000..f165c62
 +
 +虽然 5 节点底座正常，且多个节点本地 `resource announce` 已成功，但当前 `FSMETA_DEMO_ENTRY_HOST` 上运行中的 `fs-meta` 所看到的 `/runtime/grants` 仍然只有本机资源：
 +
-+- `panda145::panda145-...` 对应 `/mnt/fustor-peers/nfs146`
-+- `panda145::fs-meta-tcp-listener`
++- `example-node-145::example-node-145-...` 对应 `/mnt/fustor-peers/nfs146`
++- `example-node-145::fs-meta-tcp-listener`
 +
 +当前缺失的目标资源包括：
 +
-+- `panda144` 的 NFS 资源
-+- `panda146` 的 NFS 资源
-+- `panda147` 的 NFS 资源
-+- `panda148` 的 NFS 资源
++- `example-node-144` 的 NFS 资源
++- `example-node-146` 的 NFS 资源
++- `example-node-147` 的 NFS 资源
++- `example-node-148` 的 NFS 资源
 +
 +### 4.2 monitoring roots 无法按 5 组写入
 +

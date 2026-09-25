@@ -9,6 +9,10 @@ description = "S3-compatible source deployable runtime artifact package"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
+[features]
+# One-shot tools embed services, not the shared-library plugin entry symbol.
+embedded-inspection = []
+
 [dependencies]
 async-trait = { workspace = true }
 aws-config = { workspace = true }
@@ -23,3 +27,6 @@ serde_json = "1"
 source-kit = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+source-test-kit = { workspace = true }

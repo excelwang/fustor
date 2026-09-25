@@ -1,3 +1,8 @@
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use capanix_app_sdk::runtime::{ControlEnvelope, ControlFrame};
 use capanix_app_sdk::{CnxError, Result};
 use capanix_runtime_entry_sdk::control::{
@@ -14,6 +19,12 @@ use crate::source::config::RootSpec;
 
 pub(crate) const MANUAL_RESCAN_CONTROL_FRAME_KIND: &str = "fs-meta.manual-rescan-control:v1";
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EventRouteScopeProjection {
+    pub route_scope: String,
+    pub generation: u64,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ManualRescanControlPayload {
     pub requested_at_us: u64,
@@ -21,6 +32,9 @@ pub(crate) struct ManualRescanControlPayload {
     pub request_id: String,
     #[serde(default)]
     pub scoped_target_acceptance_timeout_ms: Option<u64>,
+    /// Fustor-resolved opaque output route scopes for the named logical groups.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub event_route_scopes_by_group: BTreeMap<String, EventRouteScopeProjection>,
 }
 
 #[cfg(test)]
@@ -45,6 +59,20 @@ pub(crate) fn encode_manual_rescan_envelope_with_request_id_and_scoped_target_ac
     requested_at_us: u64,
     scoped_target_acceptance_timeout: Option<std::time::Duration>,
 ) -> Result<ControlEnvelope> {
+    encode_manual_rescan_envelope_with_event_route_scopes(
+        request_id,
+        requested_at_us,
+        scoped_target_acceptance_timeout,
+        BTreeMap::new(),
+    )
+}
+
+pub(crate) fn encode_manual_rescan_envelope_with_event_route_scopes(
+    request_id: String,
+    requested_at_us: u64,
+    scoped_target_acceptance_timeout: Option<std::time::Duration>,
+    event_route_scopes_by_group: BTreeMap<String, EventRouteScopeProjection>,
+) -> Result<ControlEnvelope> {
     Ok(ControlEnvelope::Frame(ControlFrame {
         kind: MANUAL_RESCAN_CONTROL_FRAME_KIND.to_string(),
         payload: rmp_serde::to_vec_named(&ManualRescanControlPayload {
@@ -52,6 +80,7 @@ pub(crate) fn encode_manual_rescan_envelope_with_request_id_and_scoped_target_ac
             request_id,
             scoped_target_acceptance_timeout_ms: scoped_target_acceptance_timeout
                 .map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64),
+            event_route_scopes_by_group,
         })
         .map_err(|err| {
             CnxError::Internal(format!(
@@ -61,20 +90,161 @@ pub(crate) fn encode_manual_rescan_envelope_with_request_id_and_scoped_target_ac
     }))
 }
 
+pub(crate) fn decode_manual_rescan_control_payload_from_event_payload(
+    payload: &[u8],
+) -> Result<Option<ManualRescanControlPayload>> {
+    if payload == b"manual-rescan" {
+        return Ok(None);
+    }
+    let envelope = rmp_serde::from_slice::<ControlEnvelope>(payload).map_err(|err| {
+        CnxError::InvalidInput(format!(
+            "decode manual rescan control envelope failed: {err}"
+        ))
+    })?;
+    let ControlEnvelope::Frame(frame) = envelope else {
+        return Ok(None);
+    };
+    if frame.kind != MANUAL_RESCAN_CONTROL_FRAME_KIND {
+        return Ok(None);
+    }
+    rmp_serde::from_slice::<ManualRescanControlPayload>(&frame.payload)
+        .map(Some)
+        .map_err(|err| {
+            CnxError::InvalidInput(format!(
+                "decode manual rescan control payload failed: {err}"
+            ))
+        })
+}
+
 pub(crate) fn manual_rescan_scoped_target_acceptance_timeout_from_payload(
     payload: &[u8],
 ) -> Option<std::time::Duration> {
-    let envelope = rmp_serde::from_slice::<ControlEnvelope>(payload).ok()?;
-    let ControlEnvelope::Frame(frame) = envelope else {
-        return None;
-    };
-    if frame.kind != MANUAL_RESCAN_CONTROL_FRAME_KIND {
-        return None;
-    }
-    rmp_serde::from_slice::<ManualRescanControlPayload>(&frame.payload)
+    decode_manual_rescan_control_payload_from_event_payload(payload)
         .ok()
+        .flatten()
         .and_then(|payload| payload.scoped_target_acceptance_timeout_ms)
         .map(std::time::Duration::from_millis)
+}
+
+#[cfg(test)]
+mod manual_rescan_control_payload_tests {
+    use super::*;
+
+    #[derive(serde::Serialize)]
+    struct LegacyManualRescanControlPayload {
+        requested_at_us: u64,
+        request_id: String,
+        scoped_target_acceptance_timeout_ms: Option<u64>,
+    }
+
+    fn encode_event_payload(envelope: &ControlEnvelope) -> Vec<u8> {
+        rmp_serde::to_vec_named(envelope).expect("encode manual-rescan event payload")
+    }
+
+    #[test]
+    fn manual_rescan_event_route_projection_round_trips_and_legacy_payload_defaults_empty() {
+        let envelope = encode_manual_rescan_envelope_with_event_route_scopes(
+            "repair-7".to_string(),
+            700,
+            Some(std::time::Duration::from_millis(250)),
+            BTreeMap::from([
+                (
+                    "nfs1".to_string(),
+                    EventRouteScopeProjection {
+                        route_scope: "node-b".to_string(),
+                        generation: 7,
+                    },
+                ),
+                (
+                    "nfs2".to_string(),
+                    EventRouteScopeProjection {
+                        route_scope: "node-c".to_string(),
+                        generation: 6,
+                    },
+                ),
+            ]),
+        )
+        .expect("encode current manual-rescan envelope");
+        let decoded = decode_manual_rescan_control_payload_from_event_payload(
+            &encode_event_payload(&envelope),
+        )
+        .expect("decode current manual-rescan event payload")
+        .expect("manual-rescan frame");
+        assert_eq!(decoded.requested_at_us, 700);
+        assert_eq!(decoded.request_id, "repair-7");
+        assert_eq!(decoded.scoped_target_acceptance_timeout_ms, Some(250));
+        assert_eq!(
+            decoded.event_route_scopes_by_group,
+            BTreeMap::from([
+                (
+                    "nfs1".to_string(),
+                    EventRouteScopeProjection {
+                        route_scope: "node-b".to_string(),
+                        generation: 7,
+                    },
+                ),
+                (
+                    "nfs2".to_string(),
+                    EventRouteScopeProjection {
+                        route_scope: "node-c".to_string(),
+                        generation: 6,
+                    },
+                ),
+            ])
+        );
+
+        let legacy = ControlEnvelope::Frame(ControlFrame {
+            kind: MANUAL_RESCAN_CONTROL_FRAME_KIND.to_string(),
+            payload: rmp_serde::to_vec_named(&LegacyManualRescanControlPayload {
+                requested_at_us: 600,
+                request_id: "legacy".to_string(),
+                scoped_target_acceptance_timeout_ms: Some(125),
+            })
+            .expect("encode legacy manual-rescan payload"),
+        });
+        let decoded_legacy =
+            decode_manual_rescan_control_payload_from_event_payload(&encode_event_payload(&legacy))
+                .expect("decode legacy manual-rescan event payload")
+                .expect("legacy manual-rescan frame");
+        assert_eq!(decoded_legacy.requested_at_us, 600);
+        assert!(decoded_legacy.event_route_scopes_by_group.is_empty());
+
+        assert!(
+            decode_manual_rescan_control_payload_from_event_payload(b"manual-rescan")
+                .expect("accept legacy raw manual-rescan token")
+                .is_none()
+        );
+        assert!(
+            decode_manual_rescan_control_payload_from_event_payload(b"corrupt-control-payload")
+                .is_err(),
+            "unknown malformed payloads must not bypass projection validation"
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RootsControlApplicationAttemptId {
+    pub producer_process_id: u32,
+    pub producer_epoch_us: u64,
+    pub sequence: u64,
+}
+
+fn next_roots_control_application_attempt_id() -> RootsControlApplicationAttemptId {
+    static PRODUCER_EPOCH_US: OnceLock<u64> = OnceLock::new();
+    static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    let producer_epoch_us = *PRODUCER_EPOCH_US.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64
+    });
+    RootsControlApplicationAttemptId {
+        producer_process_id: std::process::id(),
+        producer_epoch_us,
+        sequence: NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -82,6 +252,8 @@ pub(crate) struct LogicalRootsControlPayload {
     pub roots: Vec<RootSpec>,
     #[serde(default)]
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_attempt_id: Option<RootsControlApplicationAttemptId>,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub defer_scan_audit: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -143,6 +315,7 @@ fn encode_logical_roots_control_payload_with_generation_sink_replay_and_defer_sc
     rmp_serde::to_vec_named(&LogicalRootsControlPayload {
         roots: roots.to_vec(),
         generation,
+        application_attempt_id: Some(next_roots_control_application_attempt_id()),
         defer_scan_audit,
         sink_replay_envelopes,
     })
@@ -161,6 +334,56 @@ pub(crate) fn decode_logical_roots_control_payload(
             "decode logical roots control payload failed: {err}"
         ))
     })
+}
+
+#[cfg(test)]
+mod logical_roots_control_payload_tests {
+    use super::*;
+
+    #[derive(serde::Serialize)]
+    struct LegacyLogicalRootsControlPayload {
+        roots: Vec<RootSpec>,
+        generation: u64,
+        defer_scan_audit: bool,
+        sink_replay_envelopes: Vec<ControlEnvelope>,
+    }
+
+    #[test]
+    fn encoded_application_waves_have_stable_unique_ids_and_legacy_payloads_still_decode() {
+        let first_bytes = encode_logical_roots_control_payload_with_generation(&[], 7)
+            .expect("encode first roots-control application wave");
+        let first = decode_logical_roots_control_payload(&first_bytes)
+            .expect("decode first roots-control application wave");
+        let first_again = decode_logical_roots_control_payload(&first_bytes)
+            .expect("decode cloned route payload");
+        let second = decode_logical_roots_control_payload(
+            &encode_logical_roots_control_payload_with_generation(&[], 7)
+                .expect("encode explicit same-generation recovery wave"),
+        )
+        .expect("decode explicit same-generation recovery wave");
+
+        assert!(first.application_attempt_id.is_some());
+        assert_eq!(
+            first.application_attempt_id, first_again.application_attempt_id,
+            "route copies of one encoded payload must retain one application-wave identity"
+        );
+        assert_ne!(
+            first.application_attempt_id, second.application_attempt_id,
+            "an explicit same-generation recovery publication must create a new application wave"
+        );
+
+        let legacy_bytes = rmp_serde::to_vec_named(&LegacyLogicalRootsControlPayload {
+            roots: Vec::new(),
+            generation: 6,
+            defer_scan_audit: false,
+            sink_replay_envelopes: Vec::new(),
+        })
+        .expect("encode legacy roots-control payload");
+        let legacy = decode_logical_roots_control_payload(&legacy_bytes)
+            .expect("decode legacy roots-control payload without attempt id");
+        assert_eq!(legacy.generation, 6);
+        assert_eq!(legacy.application_attempt_id, None);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

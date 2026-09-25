@@ -37,6 +37,45 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tower::util::ServiceExt;
 
+#[test]
+fn scan_audit_release_source_status_payload_round_trips_event_route_projection() {
+    let expected = BTreeMap::from([(
+        "nfs1".to_string(),
+        EventRouteScopeProjection {
+            route_scope: "node-c".to_string(),
+            generation: 7,
+        },
+    )]);
+    let payload = release_scan_audit_source_status_request_payload_with_live_probe_timeout(
+        Duration::from_millis(750),
+        expected.clone(),
+    );
+
+    assert!(source_status_request_requires_scan_audit_admission_release(
+        &payload
+    ));
+    assert_eq!(
+        source_status_request_scan_audit_release_event_route_scopes(&payload),
+        Some(expected)
+    );
+
+    #[derive(serde::Serialize)]
+    struct LegacyReleaseRequest<'a> {
+        purpose: &'a str,
+        live_probe_timeout_ms: u64,
+    }
+    let legacy_payload = rmp_serde::to_vec_named(&LegacyReleaseRequest {
+        purpose: "release-scan-audit-after-sink-scope-ready",
+        live_probe_timeout_ms: 500,
+    })
+    .expect("encode legacy release source-status request");
+    assert_eq!(
+        source_status_request_scan_audit_release_event_route_scopes(&legacy_payload),
+        Some(BTreeMap::new()),
+        "legacy release payloads remain decodable but expose no route projection, so the runtime can fail closed"
+    );
+}
+
 fn source_section_between<'a>(
     source: &'a str,
     start_marker: &str,
@@ -79,6 +118,7 @@ fn repair_trigger_source_status_for_test(group_ids: &[&str]) -> SourceStatusSnap
                 overflow_pending: false,
                 rescan_pending: false,
                 last_rescan_requested_at_us: None,
+                last_manual_rescan_accepted_at_us: None,
                 last_rescan_reason: None,
                 last_error: None,
                 last_audit_started_at_us: Some(10),
@@ -899,6 +939,8 @@ impl ChannelIoSubset for LoopbackRouteBoundary {
             .map(Duration::from_millis)
             .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
             {
                 let mut channels = self.channels.lock().await;
                 if let Some(events) = channels.remove(&request.channel_key.0)
@@ -913,7 +955,6 @@ impl ChannelIoSubset for LoopbackRouteBoundary {
                     return Err(CnxError::ChannelClosed);
                 }
             }
-            let notified = self.changed.notified();
             if let Some(deadline) = deadline {
                 match tokio::time::timeout_at(deadline, notified).await {
                     Ok(()) => {}
@@ -1149,7 +1190,8 @@ impl ReusableObservedRouteBoundary {
 
     async fn wait_for_request_correlation(&self, channel: &str) -> u64 {
         loop {
-            let notified = self.changed.notified();
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
             {
                 let mut channels = self.channels.lock().await;
                 if let Some(events) = channels.remove(channel)
@@ -2036,7 +2078,8 @@ impl ChannelIoSubset for MaterializedRouteRaceBoundary {
         }
 
         let (delay, reply_kind, correlation) = loop {
-            let notified = self.changed.notified();
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
             let should_wait = {
                 let mut state = self.state.lock().expect("route race state lock");
                 if let Some(sent_call_channel) = state.sent_call_channel.clone() {
@@ -2132,6 +2175,8 @@ impl ChannelIoSubset for ReusableObservedRouteBoundary {
             .map(Duration::from_millis)
             .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
             {
                 let mut channels = self.channels.lock().await;
                 if let Some(events) = channels.remove(&request.channel_key.0)
@@ -2156,7 +2201,6 @@ impl ChannelIoSubset for ReusableObservedRouteBoundary {
                     return Err(CnxError::ChannelClosed);
                 }
             }
-            let notified = self.changed.notified();
             if let Some(deadline) = deadline {
                 match tokio::time::timeout_at(deadline, notified).await {
                     Ok(()) => {}
@@ -2922,6 +2966,8 @@ impl ChannelIoSubset for MaterializedRouteAccessDeniedThenProxyBoundary {
             .map(Duration::from_millis)
             .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
             {
                 let mut channels = self.channels.lock().await;
                 if let Some(events) = channels.remove(&request.channel_key.0)
@@ -2939,7 +2985,6 @@ impl ChannelIoSubset for MaterializedRouteAccessDeniedThenProxyBoundary {
                     return Err(CnxError::ChannelClosed);
                 }
             }
-            let notified = self.changed.notified();
             if let Some(deadline) = deadline {
                 match tokio::time::timeout_at(deadline, notified).await {
                     Ok(()) => {}
@@ -3051,6 +3096,8 @@ impl ChannelIoSubset for MaterializedRouteMissingRouteStateThenProxyBoundary {
             .map(Duration::from_millis)
             .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
             {
                 let mut channels = self.channels.lock().await;
                 if let Some(events) = channels.remove(&request.channel_key.0)
@@ -3068,7 +3115,6 @@ impl ChannelIoSubset for MaterializedRouteMissingRouteStateThenProxyBoundary {
                     return Err(CnxError::ChannelClosed);
                 }
             }
-            let notified = self.changed.notified();
             if let Some(deadline) = deadline {
                 match tokio::time::timeout_at(deadline, notified).await {
                     Ok(()) => {}
@@ -3957,6 +4003,8 @@ impl ChannelIoSubset for ForceFindScopedRouteRequiresCallerOriginBoundary {
             .map(Duration::from_millis)
             .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
             {
                 let mut replies = self.replies.lock().await;
                 if let Some(events) = replies.remove(&request.channel_key.0)
@@ -3965,7 +4013,6 @@ impl ChannelIoSubset for ForceFindScopedRouteRequiresCallerOriginBoundary {
                     return Ok(events);
                 }
             }
-            let notified = self.changed.notified();
             if let Some(deadline) = deadline {
                 if tokio::time::timeout_at(deadline, notified).await.is_err() {
                     return Err(CnxError::Timeout);
@@ -4179,6 +4226,8 @@ impl ChannelIoSubset for MaterializedSelectedGroupTreeStallBoundary {
         let source_status_reply_channel = format!("{}:reply", self.source_status_request_channel);
         let sink_status_reply_channel = format!("{}:reply", self.sink_status_request_channel);
         loop {
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
             let reply_kind = if request.channel_key.0 == reply_channel {
                 Some(("owner", self.owner_request_channel.as_str()))
             } else if request.channel_key.0 == source_status_reply_channel {
@@ -4284,7 +4333,6 @@ impl ChannelIoSubset for MaterializedSelectedGroupTreeStallBoundary {
                     }
                 }
             }
-            let notified = self.changed.notified();
             if let Some(timeout_ms) = request.timeout_ms {
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
                 match tokio::time::timeout_at(deadline, notified).await {
@@ -12028,6 +12076,7 @@ async fn materialized_untrusted_owner_collection_gap_retries_bound_primary_befor
             overflow_pending: false,
             rescan_pending: true,
             last_rescan_requested_at_us: Some(10),
+            last_manual_rescan_accepted_at_us: None,
             last_rescan_reason: Some("manual".to_string()),
             last_error: None,
             last_audit_started_at_us: None,

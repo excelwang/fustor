@@ -20,6 +20,9 @@ mkdir -p "${TMP_DIR}/tests_merged"
 rsync -a "${DOMAIN_DIR}/tests/specs/" "${TMP_DIR}/tests_merged/"
 rsync -a "${DOMAIN_DIR}/tests/app_specs/" "${TMP_DIR}/tests_merged/app_specs/"
 rsync -a "${DOMAIN_DIR}/tests/cli_specs/" "${TMP_DIR}/tests_merged/cli_specs/"
+mkdir -p "${TMP_DIR}/tests_merged/system"
+rsync -a "${DOMAIN_DIR}/tests/specs/test_contracts_fustor_integration.rs" \
+  "${TMP_DIR}/tests_merged/system/"
 
 echo "== repo-local specs precheck =="
 python3 "${PRECHECK}" "${DOMAIN_DIR}/specs"

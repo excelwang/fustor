@@ -1,0 +1,22 @@
+[package]
+name = "graph-source"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Passive configured-query graph source, independent of DataView and workflows"
+
+[dependencies]
+capanix-app-sdk = { workspace = true }
+source-kit = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "net", "io-util"] }
+native-tls = { workspace = true }
+tokio-native-tls = "0.3"
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

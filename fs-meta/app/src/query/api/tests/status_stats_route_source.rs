@@ -22,6 +22,7 @@ fn routed_source_concrete_root_for_test(
         overflow_pending: false,
         rescan_pending,
         last_rescan_requested_at_us,
+        last_manual_rescan_accepted_at_us: None,
         last_rescan_reason: None,
         last_error: None,
         last_audit_started_at_us,
@@ -749,7 +750,7 @@ async fn load_materialized_status_snapshots_queries_owner_when_generic_source_st
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn load_materialized_status_snapshots_refreshes_source_owner_before_empty_sink_recollect_when_runtime_scope_has_no_root_health()
+async fn load_materialized_status_snapshots_skips_source_owner_refresh_when_runtime_scope_has_no_root_health()
  {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_b_root = tmp.path().join("node-b");
@@ -1046,11 +1047,8 @@ async fn load_materialized_status_snapshots_refreshes_source_owner_before_empty_
         .expect("load materialized status snapshots");
 
     assert!(
-        source_status
-            .logical_roots
-            .iter()
-            .any(|root| root.root_id == "nfs1"),
-        "runtime-scope-only source status must be refreshed from current-owner health before sink readiness gates: {source_status:?}"
+        source_status.logical_roots.is_empty(),
+        "runtime-scope-only source status may locate an owner, but it must not be promoted to current owner-health evidence before sink readiness: {source_status:?}"
     );
     assert!(
         !sink_status_covers_ready_readiness_groups(
@@ -1061,16 +1059,15 @@ async fn load_materialized_status_snapshots_refreshes_source_owner_before_empty_
     );
     assert_eq!(
         boundary.send_batch_count(&node_b_source_status_route.0),
-        1,
-        "materialized status load must query source current-owner health before treating empty sink status as authoritative"
+        0,
+        "runtime-scope-only scheduling must not trigger a source current-owner live probe before sink readiness"
     );
-    assert_eq!(
+    assert!(
         node_b_request_purposes
             .lock()
             .expect("node-b request purposes lock")
-            .as_slice(),
-        &[Some("current-owner-health".to_string())],
-        "source current-owner refresh must use current-owner-health request purpose"
+            .is_empty(),
+        "skipped source current-owner refresh must not emit a live-probe request"
     );
 
     generic_source_status_endpoint

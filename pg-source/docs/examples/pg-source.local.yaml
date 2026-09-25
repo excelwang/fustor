@@ -1,0 +1,31 @@
+default_page_size: 500
+max_page_size: 5000
+snapshot_ttl_ms: 60000
+endpoints:
+  - object_ref: pg-prod
+    endpoint_uri: pg://postgres.internal:5432/app
+    credential_ref: pg-prod-reader
+    schema_scopes:
+      - public
+    table_scopes:
+      - "*"
+    primary_key: id
+    active: true
+credentials:
+  - credential_ref: pg-prod-reader
+    auth_type: basic_env
+    username_env: PG_PROD_READER_USERNAME
+    password_env: PG_PROD_READER_PASSWORD
+__cnx_runtime:
+  local_host_ref: pg-source-node-a
+  resource_grants:
+    - resource_kind: pg
+      object_ref: pg-prod
+      grant_state: active
+      grant_epoch: 1
+      interfaces:
+        - read
+      schema_scopes:
+        - public
+      table_scopes:
+        - "*"

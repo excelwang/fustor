@@ -622,6 +622,7 @@ mod tests {
             overflow_pending: false,
             rescan_pending: false,
             last_rescan_requested_at_us: None,
+            last_manual_rescan_accepted_at_us: None,
             last_rescan_reason: None,
             last_error: None,
             last_audit_started_at_us: Some(10),

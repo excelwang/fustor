@@ -492,6 +492,7 @@ async fn future_generation_facade_deactivate_without_successor_activate_keeps_ac
     )
     .await
     .expect("same-resource generation refresh should succeed");
+    set_control_initialized_for_tests(&app, true);
 
     let shutdown_started = Arc::new(Notify::new());
     let _shutdown_reset = FacadeShutdownStartHookReset;
@@ -609,6 +610,7 @@ async fn future_generation_facade_deactivate_without_successor_activate_keeps_qu
     )
     .await
     .expect("same-resource generation refresh should succeed");
+    set_control_initialized_for_tests(&app, true);
 
     let shutdown_started = Arc::new(Notify::new());
     let _shutdown_reset = FacadeShutdownStartHookReset;
@@ -775,7 +777,7 @@ async fn pending_successor_facade_cleanup_deactivate_keeps_active_listener_until
 }
 
 #[tokio::test]
-async fn uninitialized_same_generation_facade_deactivate_keeps_listener_available() {
+async fn uninitialized_same_generation_facade_deactivate_retires_non_failed_listener() {
     let tmp = tempdir().expect("create temp dir");
     let bind_addr = reserve_bind_addr();
     let root = tmp.path().join("root-a");
@@ -857,27 +859,12 @@ async fn uninitialized_same_generation_facade_deactivate_keeps_listener_availabl
         .await
         .expect("same-generation facade deactivate should not error");
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), shutdown_wait)
-            .await
-            .is_err(),
-        "uninitialized same-generation facade deactivate must not tear down the active listener before replacement continuity is recovered"
-    );
-    assert!(
-        app.api_task.lock().await.is_some(),
-        "uninitialized same-generation facade deactivate must retain the active facade handle"
-    );
-
-    let login = Client::new()
-        .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
-        .json(&json!({"username":"admin","password":"admin"}))
-        .send()
+    tokio::time::timeout(Duration::from_secs(2), shutdown_wait)
         .await
-        .expect("login request");
+        .expect("uninitialized non-failed facade deactivate should start listener retirement");
     assert!(
-        login.status().is_success(),
-        "uninitialized same-generation facade deactivate must keep login available: status={}",
-        login.status()
+        app.api_task.lock().await.is_none(),
+        "uninitialized same-generation facade deactivate must retire a stale listener when no failed-owner or pending-successor continuity lane exists"
     );
 
     app.close().await.expect("close app");

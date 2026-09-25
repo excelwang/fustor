@@ -9,6 +9,10 @@ description = "Elasticsearch source deployable runtime artifact package"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
+[features]
+# One-shot tools embed services, not the shared-library plugin entry symbol.
+embedded-inspection = []
+
 [dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }
@@ -19,5 +23,10 @@ reqwest = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1"
+source-kit = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 tokio-util = { workspace = true, features = ["rt"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+source-test-kit = { workspace = true }

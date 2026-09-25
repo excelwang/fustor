@@ -5,7 +5,9 @@ use capanix_app_sdk::{CnxError, Result};
 use source_kit::{
     SourceCredentialConfig, bool_value, effective_limit, get_int, get_map, get_str,
     normalize_page_size, optional_nonempty_str, parse_credential_config, pattern_allowed,
-    reject_secret_material, required_str, resolve_credential, string_array,
+    pattern_allowed_by_product_and_grant, reject_duplicate_refs, reject_secret_material,
+    require_grant_interface, required_str, resolve_credential, string_array,
+    validate_grants_match_product_endpoints, validate_secret_free_endpoint_uri,
 };
 
 pub const DEFAULT_PAGE_SIZE: usize = 1_000;
@@ -83,10 +85,10 @@ impl Default for S3SourceConfig {
 
 impl S3SourceRuntimeConfig {
     pub fn from_manifest_config(cfg: &HashMap<String, ConfigValue>) -> Result<Self> {
-        Ok(Self {
-            product: S3SourceConfig::from_product_manifest_config(cfg)?,
-            runtime: S3SourceRuntimeInputs::from_runtime_manifest_config(cfg)?,
-        })
+        let product = S3SourceConfig::from_product_manifest_config(cfg)?;
+        let runtime = S3SourceRuntimeInputs::from_runtime_manifest_config(cfg)?;
+        validate_runtime_grants_match_product_endpoints(&product, &runtime)?;
+        Ok(Self { product, runtime })
     }
 
     pub fn endpoint_for(
@@ -123,6 +125,7 @@ impl S3SourceRuntimeConfig {
                 "runtime grant for s3 endpoint '{object_ref}' is inactive"
             )));
         }
+        require_grant_interface(&grant.interfaces, "read", "s3 endpoint")?;
         let resolved_bucket = bucket
             .map(str::to_string)
             .or_else(|| grant.bucket.clone())
@@ -130,22 +133,20 @@ impl S3SourceRuntimeConfig {
         let resolved_prefix = prefix
             .map(str::to_string)
             .unwrap_or_else(|| product.prefix.clone());
-        let bucket_scopes = if grant.bucket_scopes.is_empty() {
-            product.bucket_scopes.clone()
-        } else {
-            grant.bucket_scopes.clone()
-        };
-        let prefix_scopes = if grant.prefix_scopes.is_empty() {
-            product.prefix_scopes.clone()
-        } else {
-            grant.prefix_scopes.clone()
-        };
-        if !pattern_allowed(&resolved_bucket, &bucket_scopes) {
+        if !pattern_allowed_by_product_and_grant(
+            &resolved_bucket,
+            &product.bucket_scopes,
+            &grant.bucket_scopes,
+        ) {
             return Err(CnxError::ScopeDenied(format!(
                 "bucket '{resolved_bucket}' is outside runtime scope for s3 endpoint '{object_ref}'"
             )));
         }
-        if !pattern_allowed(&resolved_prefix, &prefix_scopes) {
+        if !pattern_allowed_by_product_and_grant(
+            &resolved_prefix,
+            &product.prefix_scopes,
+            &grant.prefix_scopes,
+        ) {
             return Err(CnxError::ScopeDenied(format!(
                 "prefix '{resolved_prefix}' is outside runtime scope for s3 endpoint '{object_ref}'"
             )));
@@ -163,8 +164,8 @@ impl S3SourceRuntimeConfig {
                 .credential_ref
                 .clone()
                 .or_else(|| product.credential_ref.clone()),
-            bucket_scopes,
-            prefix_scopes,
+            bucket_scopes: effective_scopes(&product.bucket_scopes, &grant.bucket_scopes),
+            prefix_scopes: effective_scopes(&product.prefix_scopes, &grant.prefix_scopes),
             grant_epoch: grant.grant_epoch,
         })
     }
@@ -219,6 +220,18 @@ impl S3SourceConfig {
                 out.credentials.push(parse_credential_config(row)?);
             }
         }
+        reject_duplicate_refs(
+            out.endpoints
+                .iter()
+                .map(|endpoint| endpoint.object_ref.as_str()),
+            "s3 endpoints[].object_ref",
+        )?;
+        reject_duplicate_refs(
+            out.credentials
+                .iter()
+                .map(|credential| credential.credential_ref.as_str()),
+            "s3 credentials[].credential_ref",
+        )?;
         Ok(out)
     }
 }
@@ -252,9 +265,11 @@ impl S3SourceRuntimeInputs {
 
 fn parse_endpoint_config(row: &HashMap<String, ConfigValue>) -> Result<S3EndpointConfig> {
     reject_secret_material(row, "endpoints[]")?;
+    let endpoint_uri = required_str(row, "endpoint_uri")?;
+    validate_secret_free_endpoint_uri(&endpoint_uri, "s3 endpoints[].endpoint_uri")?;
     Ok(S3EndpointConfig {
         object_ref: required_str(row, "object_ref")?,
-        endpoint_uri: required_str(row, "endpoint_uri")?,
+        endpoint_uri,
         bucket: required_str(row, "bucket")?,
         region: optional_nonempty_str(row, "region"),
         prefix: optional_nonempty_str(row, "prefix").unwrap_or_default(),
@@ -266,10 +281,17 @@ fn parse_endpoint_config(row: &HashMap<String, ConfigValue>) -> Result<S3Endpoin
 }
 
 fn parse_runtime_grant(row: &HashMap<String, ConfigValue>) -> Result<GrantedS3Endpoint> {
+    let endpoint_uri = optional_nonempty_str(row, "endpoint_uri");
+    if let Some(endpoint_uri) = endpoint_uri.as_deref() {
+        validate_secret_free_endpoint_uri(
+            endpoint_uri,
+            "s3 __cnx_runtime.resource_grants[].endpoint_uri",
+        )?;
+    }
     Ok(GrantedS3Endpoint {
         object_ref: required_str(row, "object_ref")?,
         endpoint_ref: optional_nonempty_str(row, "endpoint_ref"),
-        endpoint_uri: optional_nonempty_str(row, "endpoint_uri"),
+        endpoint_uri,
         bucket: optional_nonempty_str(row, "bucket"),
         credential_ref: optional_nonempty_str(row, "credential_ref"),
         bucket_scopes: string_array(row, "bucket_scopes").unwrap_or_default(),
@@ -283,6 +305,79 @@ fn parse_runtime_grant(row: &HashMap<String, ConfigValue>) -> Result<GrantedS3En
         },
         grant_epoch: get_int(row, "grant_epoch").and_then(|v| u64::try_from(v).ok()),
     })
+}
+
+fn validate_runtime_grants_match_product_endpoints(
+    product: &S3SourceConfig,
+    runtime: &S3SourceRuntimeInputs,
+) -> Result<()> {
+    reject_duplicate_refs(
+        runtime
+            .endpoint_grants
+            .iter()
+            .map(|grant| grant.object_ref.as_str()),
+        "s3 __cnx_runtime.resource_grants[].object_ref",
+    )?;
+    validate_grants_match_product_endpoints(
+        product
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.object_ref.as_str()),
+        runtime
+            .endpoint_grants
+            .iter()
+            .map(|grant| grant.object_ref.as_str()),
+        "s3",
+    )?;
+    for grant in &runtime.endpoint_grants {
+        let endpoint = product
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.object_ref == grant.object_ref)
+            .ok_or_else(|| {
+                CnxError::InvalidInput(format!(
+                    "s3 grants unknown endpoint_ref '{}'",
+                    grant.object_ref
+                ))
+            })?;
+        validate_grant_scopes_within_product(
+            &grant.bucket_scopes,
+            &endpoint.bucket_scopes,
+            "bucket",
+            &grant.object_ref,
+        )?;
+        validate_grant_scopes_within_product(
+            &grant.prefix_scopes,
+            &endpoint.prefix_scopes,
+            "prefix",
+            &grant.object_ref,
+        )?;
+    }
+    Ok(())
+}
+
+fn effective_scopes(product_scopes: &[String], grant_scopes: &[String]) -> Vec<String> {
+    if grant_scopes.is_empty() {
+        product_scopes.to_vec()
+    } else {
+        grant_scopes.to_vec()
+    }
+}
+
+fn validate_grant_scopes_within_product(
+    grant_scopes: &[String],
+    product_scopes: &[String],
+    label: &str,
+    object_ref: &str,
+) -> Result<()> {
+    for scope in grant_scopes {
+        if !pattern_allowed(scope, product_scopes) {
+            return Err(CnxError::InvalidInput(format!(
+                "s3 runtime grant scope '{scope}' widens product {label} scope for endpoint '{object_ref}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -311,6 +406,25 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_uri_rejects_embedded_credentials_and_presigned_secrets() {
+        for endpoint_uri in [
+            "https://key:secret@s3.local",
+            "https://s3.local?X-Amz-Credential=key&X-Amz-Signature=secret",
+        ] {
+            let cfg = HashMap::from([(
+                "endpoints".to_string(),
+                ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                    ("object_ref".to_string(), string("s3-prod")),
+                    ("endpoint_uri".to_string(), string(endpoint_uri)),
+                    ("bucket".to_string(), string("logs")),
+                ]))]),
+            )]);
+
+            assert!(S3SourceConfig::from_product_manifest_config(&cfg).is_err());
+        }
+    }
+
+    #[test]
     fn endpoint_resolution_applies_bucket_and_prefix_scope() {
         let cfg = HashMap::from([
             (
@@ -329,6 +443,10 @@ mod tests {
                     ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
                         ("resource_kind".to_string(), string("s3")),
                         ("object_ref".to_string(), string("s3-prod")),
+                        (
+                            "interfaces".to_string(),
+                            ConfigValue::Array(vec![string("read")]),
+                        ),
                         (
                             "bucket_scopes".to_string(),
                             ConfigValue::Array(vec![string("logs")]),
@@ -358,5 +476,195 @@ mod tests {
                 .endpoint_for("s3-prod", Some("logs"), Some("2025/"))
                 .is_err()
         );
+        let mut missing_read = config.clone();
+        missing_read.runtime.endpoint_grants[0].interfaces.clear();
+        assert!(matches!(
+            missing_read.endpoint_for("s3-prod", Some("logs"), Some("2026/06/")),
+            Err(CnxError::AccessDenied(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_endpoint_object_refs_fail_closed() {
+        let cfg = HashMap::from([(
+            "endpoints".to_string(),
+            ConfigValue::Array(vec![
+                ConfigValue::Map(HashMap::from([
+                    ("object_ref".to_string(), string("s3-prod")),
+                    ("endpoint_uri".to_string(), string("https://s3-a.local")),
+                    ("bucket".to_string(), string("logs")),
+                ])),
+                ConfigValue::Map(HashMap::from([
+                    ("object_ref".to_string(), string("s3-prod")),
+                    ("endpoint_uri".to_string(), string("https://s3-b.local")),
+                    ("bucket".to_string(), string("logs")),
+                ])),
+            ]),
+        )]);
+
+        let err = S3SourceConfig::from_product_manifest_config(&cfg).unwrap_err();
+
+        assert!(err.to_string().contains("duplicate s3 endpoints"));
+    }
+
+    #[test]
+    fn duplicate_runtime_endpoint_grants_fail_closed() {
+        let cfg = HashMap::from([
+            (
+                "endpoints".to_string(),
+                ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                    ("object_ref".to_string(), string("s3-prod")),
+                    ("endpoint_uri".to_string(), string("https://s3.local")),
+                    ("bucket".to_string(), string("logs")),
+                ]))]),
+            ),
+            (
+                "__cnx_runtime".to_string(),
+                ConfigValue::Map(HashMap::from([(
+                    "resource_grants".to_string(),
+                    ConfigValue::Array(vec![
+                        ConfigValue::Map(HashMap::from([
+                            ("resource_kind".to_string(), string("s3")),
+                            ("object_ref".to_string(), string("s3-prod")),
+                        ])),
+                        ConfigValue::Map(HashMap::from([
+                            ("resource_kind".to_string(), string("s3")),
+                            ("object_ref".to_string(), string("s3-prod")),
+                        ])),
+                    ]),
+                )])),
+            ),
+        ]);
+
+        let err = S3SourceRuntimeConfig::from_manifest_config(&cfg).unwrap_err();
+
+        assert!(err.to_string().contains("duplicate s3 __cnx_runtime"));
+    }
+
+    #[test]
+    fn runtime_grant_to_unknown_endpoint_fails_closed() {
+        let cfg = HashMap::from([
+            (
+                "endpoints".to_string(),
+                ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                    ("object_ref".to_string(), string("s3-prod")),
+                    ("endpoint_uri".to_string(), string("https://s3.local")),
+                    ("bucket".to_string(), string("logs")),
+                ]))]),
+            ),
+            (
+                "__cnx_runtime".to_string(),
+                ConfigValue::Map(HashMap::from([(
+                    "resource_grants".to_string(),
+                    ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                        ("resource_kind".to_string(), string("s3")),
+                        ("object_ref".to_string(), string("s3-shadow")),
+                    ]))]),
+                )])),
+            ),
+        ]);
+
+        let err = S3SourceRuntimeConfig::from_manifest_config(&cfg).unwrap_err();
+
+        assert!(err.to_string().contains("unknown endpoint_ref 's3-shadow'"));
+    }
+
+    #[test]
+    fn runtime_grant_may_narrow_product_scope() {
+        let cfg = HashMap::from([
+            (
+                "endpoints".to_string(),
+                ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                    ("object_ref".to_string(), string("s3-prod")),
+                    ("endpoint_uri".to_string(), string("https://s3.local")),
+                    ("bucket".to_string(), string("logs")),
+                    (
+                        "bucket_scopes".to_string(),
+                        ConfigValue::Array(vec![string("logs")]),
+                    ),
+                    (
+                        "prefix_scopes".to_string(),
+                        ConfigValue::Array(vec![string("logs/*")]),
+                    ),
+                ]))]),
+            ),
+            (
+                "__cnx_runtime".to_string(),
+                ConfigValue::Map(HashMap::from([(
+                    "resource_grants".to_string(),
+                    ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                        ("resource_kind".to_string(), string("s3")),
+                        ("object_ref".to_string(), string("s3-prod")),
+                        (
+                            "interfaces".to_string(),
+                            ConfigValue::Array(vec![string("read")]),
+                        ),
+                        (
+                            "bucket_scopes".to_string(),
+                            ConfigValue::Array(vec![string("logs")]),
+                        ),
+                        (
+                            "prefix_scopes".to_string(),
+                            ConfigValue::Array(vec![string("logs/2026/*")]),
+                        ),
+                    ]))]),
+                )])),
+            ),
+        ]);
+        let config = S3SourceRuntimeConfig::from_manifest_config(&cfg).expect("config");
+
+        assert!(
+            config
+                .endpoint_for("s3-prod", Some("logs"), Some("logs/2026/06/"))
+                .is_ok()
+        );
+        assert!(
+            config
+                .endpoint_for("s3-prod", Some("logs"), Some("logs/2025/"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_grant_cannot_widen_product_scope() {
+        let cfg = HashMap::from([
+            (
+                "endpoints".to_string(),
+                ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                    ("object_ref".to_string(), string("s3-prod")),
+                    ("endpoint_uri".to_string(), string("https://s3.local")),
+                    ("bucket".to_string(), string("logs")),
+                    (
+                        "bucket_scopes".to_string(),
+                        ConfigValue::Array(vec![string("logs")]),
+                    ),
+                    (
+                        "prefix_scopes".to_string(),
+                        ConfigValue::Array(vec![string("2026/*")]),
+                    ),
+                ]))]),
+            ),
+            (
+                "__cnx_runtime".to_string(),
+                ConfigValue::Map(HashMap::from([(
+                    "resource_grants".to_string(),
+                    ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                        ("resource_kind".to_string(), string("s3")),
+                        ("object_ref".to_string(), string("s3-prod")),
+                        (
+                            "bucket_scopes".to_string(),
+                            ConfigValue::Array(vec![string("*")]),
+                        ),
+                        (
+                            "prefix_scopes".to_string(),
+                            ConfigValue::Array(vec![string("*")]),
+                        ),
+                    ]))]),
+                )])),
+            ),
+        ]);
+        let err = S3SourceRuntimeConfig::from_manifest_config(&cfg).unwrap_err();
+
+        assert!(err.to_string().contains("widens product bucket scope"));
     }
 }

@@ -378,7 +378,7 @@ impl FsTreeOracle {
         Ok(json!({
             "status": "ok",
             "data": {
-                "total_nodes": (total_files + total_dirs) as u64,
+                "total_nodes": total_files + total_dirs,
                 "total_files": total_files,
                 "total_dirs": total_dirs,
                 "total_size": total_size,

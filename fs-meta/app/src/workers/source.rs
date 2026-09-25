@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,8 @@ use tokio_util::sync::CancellationToken;
 use crate::query::request::InternalQueryRequest;
 use crate::runtime::execution_units;
 use crate::runtime::orchestration::{
-    SourceControlSignal, SourceRuntimeUnit, source_control_signals_from_envelopes,
+    EventRouteScopeProjection, SourceControlSignal, SourceRuntimeUnit,
+    source_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{events_stream_route_for_scope, source_rescan_route_key_for};
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
@@ -596,6 +597,7 @@ impl SourceControlFramePostAckRefreshRequirement {
     fn replay_required_refresh_expectation(
         self,
         primed_local_schedule: Option<PrimedLocalScheduleSummary>,
+        replay_required_for_current_wave: bool,
     ) -> Option<SourceScheduledGroupsExpectation> {
         match primed_local_schedule {
             None => matches!(self, Self::Required)
@@ -611,7 +613,9 @@ impl SourceControlFramePostAckRefreshRequirement {
                 };
                 let should_refresh_cached_schedule = matches!(self, Self::Required)
                     && !(primed_local_schedule.saw_activate_with_bound_scopes
-                        && !primed_local_schedule.has_local_runnable_groups);
+                        && !primed_local_schedule.has_local_runnable_groups)
+                    && (primed_local_schedule.local_schedule_changed
+                        || replay_required_for_current_wave);
                 should_refresh_cached_schedule.then_some(scheduled_groups_expectation)
             }
         }
@@ -930,7 +934,10 @@ impl SourceControlFrameMachine {
             return None;
         }
         self.post_ack_refresh_requirement
-            .replay_required_refresh_expectation(self.primed_local_schedule)
+            .replay_required_refresh_expectation(
+                self.primed_local_schedule,
+                self.replay_required_for_current_wave,
+            )
     }
 
     fn step_after_ack_success(
@@ -2407,7 +2414,7 @@ impl SourceScheduledGroupsRefreshMachine {
                 SourceScheduledGroupsRefreshEffect::AcquireClient
             }
             SourceScheduledGroupsRefreshEvent::ReplayRetainedControlStateCompleted(Err(err)) => {
-                SourceScheduledGroupsRefreshEffect::Fail(err)
+                self.fail(err.into_error())
             }
             SourceScheduledGroupsRefreshEvent::ClientAcquired {
                 result: Ok(client), ..
@@ -2839,6 +2846,7 @@ struct PrimedLocalScheduleSummary {
     saw_activate_with_bound_scopes: bool,
     has_local_runnable_groups: bool,
     saw_runtime_host_grant_change: bool,
+    local_schedule_changed: bool,
 }
 
 fn prime_cached_schedule_from_control_signals(
@@ -2848,6 +2856,8 @@ fn prime_cached_schedule_from_control_signals(
     fallback_roots: &[RootSpec],
     fallback_grants: &[GrantedMountRoot],
 ) -> PrimedLocalScheduleSummary {
+    let scheduled_source_before = cache.scheduled_source_groups_by_node.clone();
+    let scheduled_scan_before = cache.scheduled_scan_groups_by_node.clone();
     let changed_grants = signals.iter().rev().find_map(|signal| match signal {
         SourceControlSignal::RuntimeHostGrantChange { changed, .. } => Some((
             changed.version,
@@ -2976,6 +2986,8 @@ fn prime_cached_schedule_from_control_signals(
         saw_activate_with_bound_scopes: saw_source_activate || saw_scan_activate,
         has_local_runnable_groups,
         saw_runtime_host_grant_change,
+        local_schedule_changed: cache.scheduled_source_groups_by_node != scheduled_source_before
+            || cache.scheduled_scan_groups_by_node != scheduled_scan_before,
     }
 }
 
@@ -4198,6 +4210,7 @@ pub struct SourceWorkerClientHandle {
     config: SourceConfig,
     worker_factory: RuntimeWorkerClientFactory,
     worker_binding: RuntimeWorkerBinding,
+    owner_lease: Arc<SourceWorkerOwnerLease>,
     _shared: Arc<SharedSourceWorkerHandleState>,
     cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
     control_state: Arc<tokio::sync::Mutex<SourceControlState>>,
@@ -4228,6 +4241,7 @@ impl Drop for InflightControlOpGuard {
 }
 
 struct SharedSourceWorkerHandleState {
+    lifecycle: Mutex<SharedSourceWorkerHandleLifecycle>,
     worker: tokio::sync::Mutex<SharedSourceWorkerClient>,
     cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
     control_state: Arc<tokio::sync::Mutex<SourceControlState>>,
@@ -4238,6 +4252,18 @@ struct SharedSourceWorkerHandleState {
     source_progress_state: tokio::sync::watch::Sender<SourceProgressState>,
     control_ops_serial: Arc<tokio::sync::Mutex<()>>,
     observability_read_serial: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct SharedSourceWorkerHandleLifecycle {
+    active_owners: usize,
+    retiring: bool,
+}
+
+struct SourceWorkerOwnerLease {
+    registry_key: String,
+    shared: Weak<SharedSourceWorkerHandleState>,
+    released: AtomicBool,
+    shutdown_owner: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4597,12 +4623,22 @@ fn source_worker_handle_registry_key(
         Arc::as_ptr(&io_boundary) as *const () as usize
     };
     format!(
-        "{}|{}|{:?}|{:?}|{}",
+        "{}|{}|{:?}|{:?}|{}|{}|{}",
         node_id.0,
         worker_binding.role_id,
         worker_binding.mode,
         worker_binding.launcher_kind,
-        runtime_boundary_id
+        runtime_boundary_id,
+        worker_binding
+            .module_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        worker_binding
+            .socket_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default()
     )
 }
 
@@ -4626,6 +4662,74 @@ fn lock_source_worker_handle_registry() -> std::sync::MutexGuard<
             );
             poisoned.into_inner()
         }
+    }
+}
+
+impl SharedSourceWorkerHandleState {
+    fn try_acquire_owner(&self) -> bool {
+        let mut lifecycle = match self.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(poisoned) => {
+                log::warn!(
+                    "source worker handle lifecycle lock poisoned; recovering shared owner state"
+                );
+                poisoned.into_inner()
+            }
+        };
+        if lifecycle.retiring {
+            return false;
+        }
+        lifecycle.active_owners = lifecycle.active_owners.saturating_add(1);
+        true
+    }
+
+    #[cfg(test)]
+    fn active_owner_count(&self) -> usize {
+        match self.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle.active_owners,
+            Err(poisoned) => poisoned.into_inner().active_owners,
+        }
+    }
+}
+
+impl SourceWorkerOwnerLease {
+    fn release(&self) -> bool {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return self.shutdown_owner.load(Ordering::Acquire);
+        }
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        let mut registry = lock_source_worker_handle_registry();
+        let mut lifecycle = match shared.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(poisoned) => {
+                log::warn!(
+                    "source worker handle lifecycle lock poisoned; recovering shared owner state"
+                );
+                poisoned.into_inner()
+            }
+        };
+        debug_assert!(lifecycle.active_owners > 0);
+        lifecycle.active_owners = lifecycle.active_owners.saturating_sub(1);
+        let shutdown_owner = lifecycle.active_owners == 0;
+        if shutdown_owner {
+            lifecycle.retiring = true;
+            let registered_here = registry
+                .get(&self.registry_key)
+                .is_some_and(|registered| std::ptr::eq(registered.as_ptr(), Arc::as_ptr(&shared)));
+            if registered_here {
+                registry.remove(&self.registry_key);
+            }
+        }
+        self.shutdown_owner.store(shutdown_owner, Ordering::Release);
+        shutdown_owner
+    }
+}
+
+impl Drop for SourceWorkerOwnerLease {
+    fn drop(&mut self) {
+        let _ = self.release();
     }
 }
 
@@ -5636,8 +5740,14 @@ async fn shutdown_stale_source_worker_client_for_replacement(
         };
         guard.clone()
     } {
-        hook.entered.notify_waiters();
-        hook.release.notified().await;
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        hook.entered.notify_one();
+        release.await;
     }
 
     stale_client.shutdown(timeout).await
@@ -5664,11 +5774,19 @@ fn source_worker_logical_roots_snapshot_hook() -> Option<SourceWorkerLogicalRoot
 #[cfg(test)]
 async fn maybe_pause_before_logical_roots_snapshot_rpc() -> Option<Vec<RootSpec>> {
     let hook = source_worker_logical_roots_snapshot_hook()?;
-    if let Some(entered) = hook.entered.as_ref() {
-        entered.notify_waiters();
-    }
     if let Some(release) = hook.release.as_ref() {
-        release.notified().await;
+        let mut release_wait = std::pin::pin!(release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release_wait.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        if let Some(entered) = hook.entered.as_ref() {
+            entered.notify_one();
+        }
+        release_wait.await;
+    } else if let Some(entered) = hook.entered.as_ref() {
+        entered.notify_one();
     }
     hook.roots
 }
@@ -5929,7 +6047,7 @@ fn notify_source_worker_control_frame_started() {
         guard.clone()
     };
     if let Some(hook) = hook {
-        hook.entered.notify_waiters();
+        hook.entered.notify_one();
     }
 }
 
@@ -5949,7 +6067,7 @@ async fn maybe_pause_before_status_retained_replay() {
             std::task::Poll::Ready(())
         })
         .await;
-        hook.entered.notify_waiters();
+        hook.entered.notify_one();
         release.await;
     }
 }
@@ -5970,7 +6088,7 @@ async fn maybe_pause_before_on_control_frame_rpc() {
             std::task::Poll::Ready(())
         })
         .await;
-        hook.entered.notify_waiters();
+        hook.entered.notify_one();
         release.await;
     }
 }
@@ -5991,7 +6109,7 @@ async fn maybe_pause_before_ensure_started() {
             std::task::Poll::Ready(())
         })
         .await;
-        hook.entered.notify_waiters();
+        hook.entered.notify_one();
         release.await;
     }
 }
@@ -6006,7 +6124,7 @@ fn notify_source_worker_close_started() {
         guard.clone()
     };
     if let Some(hook) = hook {
-        hook.entered.notify_waiters();
+        hook.entered.notify_one();
     }
 }
 
@@ -6026,7 +6144,7 @@ async fn maybe_pause_before_update_logical_roots_rpc() {
             std::task::Poll::Ready(())
         })
         .await;
-        hook.entered.notify_waiters();
+        hook.entered.notify_one();
         release.await;
     }
 }
@@ -6088,7 +6206,11 @@ impl SourceWorkerClientHandle {
         let key = source_worker_handle_registry_key(&node_id, &worker_binding, &worker_factory);
         let shared = {
             let mut registry = lock_source_worker_handle_registry();
-            if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            if let Some(existing) = registry
+                .get(&key)
+                .and_then(Weak::upgrade)
+                .filter(|existing| existing.try_acquire_owner())
+            {
                 existing
             } else {
                 let (control_ops_state, _control_ops_state_rx) = tokio::sync::watch::channel(0);
@@ -6096,6 +6218,10 @@ impl SourceWorkerClientHandle {
                 let (source_progress_state, _source_progress_state_rx) =
                     tokio::sync::watch::channel(initial_progress_state);
                 let shared = Arc::new(SharedSourceWorkerHandleState {
+                    lifecycle: Mutex::new(SharedSourceWorkerHandleLifecycle {
+                        active_owners: 1,
+                        retiring: false,
+                    }),
                     worker: tokio::sync::Mutex::new(SharedSourceWorkerClient {
                         instance_id: next_shared_source_worker_instance_id(),
                         client: Arc::new(worker_factory.connect(
@@ -6119,11 +6245,17 @@ impl SourceWorkerClientHandle {
                     control_ops_serial: Arc::new(tokio::sync::Mutex::new(())),
                     observability_read_serial: Arc::new(tokio::sync::Mutex::new(())),
                 });
-                registry.insert(key, Arc::downgrade(&shared));
+                registry.insert(key.clone(), Arc::downgrade(&shared));
                 shared
             }
         };
         Ok(Self {
+            owner_lease: Arc::new(SourceWorkerOwnerLease {
+                registry_key: key,
+                shared: Arc::downgrade(&shared),
+                released: AtomicBool::new(false),
+                shutdown_owner: AtomicBool::new(false),
+            }),
             _shared: shared.clone(),
             node_id,
             worker_factory,
@@ -6160,6 +6292,11 @@ impl SourceWorkerClientHandle {
     #[cfg(test)]
     pub(crate) async fn worker_instance_id_for_tests(&self) -> u64 {
         self.shared_worker().await.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_owner_count_for_tests(&self) -> usize {
+        self._shared.active_owner_count()
     }
 
     fn build_shared_worker_client_replacement(&self) -> Result<SharedSourceWorkerClient> {
@@ -7368,7 +7505,7 @@ impl SourceWorkerClientHandle {
         &self,
         roots: Vec<RootSpec>,
     ) -> std::result::Result<(), SourceFailure> {
-        self.update_logical_roots_with_scan_audit_policy(roots, false)
+        self.update_logical_roots_with_scan_audit_policy(roots, false, None)
             .await
     }
 
@@ -7376,7 +7513,17 @@ impl SourceWorkerClientHandle {
         &self,
         roots: Vec<RootSpec>,
     ) -> std::result::Result<(), SourceFailure> {
-        self.update_logical_roots_with_scan_audit_policy(roots, true)
+        self.update_logical_roots_with_scan_audit_policy(roots, true, None)
+            .await
+    }
+
+    pub(crate) async fn apply_propagated_logical_roots_with_failure(
+        &self,
+        roots: Vec<RootSpec>,
+        generation: u64,
+        defer_scan_audit: bool,
+    ) -> std::result::Result<(), SourceFailure> {
+        self.update_logical_roots_with_scan_audit_policy(roots, defer_scan_audit, Some(generation))
             .await
     }
 
@@ -7384,14 +7531,16 @@ impl SourceWorkerClientHandle {
         &self,
         roots: Vec<RootSpec>,
         defer_scan_audit: bool,
+        propagated_generation: Option<u64>,
     ) -> std::result::Result<(), SourceFailure> {
         let _inflight = self.begin_control_op();
         let _serial = self.control_ops_serial.lock().await;
         eprintln!(
-            "fs_meta_source_worker_client: update_logical_roots begin node={} roots={} defer_scan_audit={}",
+            "fs_meta_source_worker_client: update_logical_roots begin node={} roots={} defer_scan_audit={} propagated_generation={:?}",
             self.node_id.0,
             roots.len(),
             defer_scan_audit,
+            propagated_generation,
         );
         let deadline = clip_retry_deadline(
             std::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT,
@@ -7410,6 +7559,7 @@ impl SourceWorkerClientHandle {
                                         &roots,
                                         timeout,
                                         defer_scan_audit,
+                                        propagated_generation,
                                     )
                                     .await,
                                 after: self.current_source_progress_state(),
@@ -7433,8 +7583,11 @@ impl SourceWorkerClientHandle {
                     SourceUpdateLogicalRootsEffect::Complete => {
                         self.with_cache_mut(|cache| {
                             cache.logical_roots = Some(roots.clone());
-                            cache.logical_roots_generation =
-                                cache.logical_roots_generation.saturating_add(1);
+                            cache.logical_roots_generation = propagated_generation
+                                .map(|generation| cache.logical_roots_generation.max(generation))
+                                .unwrap_or_else(|| {
+                                    cache.logical_roots_generation.saturating_add(1)
+                                });
                             cache.runtime_scope_control_cache_bootstrap_served = false;
                         });
                         self.bump_source_progress(SourceProgressReason::LogicalRootsUpdated);
@@ -7812,7 +7965,6 @@ impl SourceWorkerClientHandle {
         .await
     }
 
-    #[cfg(test)]
     async fn source_primary_by_group_snapshot_with_failure(
         &self,
     ) -> std::result::Result<std::collections::BTreeMap<String, String>, SourceFailure> {
@@ -7836,13 +7988,34 @@ impl SourceWorkerClientHandle {
     async fn last_force_find_runner_by_group_snapshot_with_failure(
         &self,
     ) -> std::result::Result<std::collections::BTreeMap<String, String>, SourceFailure> {
-        match Self::call_worker_with_failure(
-            &self.client_with_failure().await?,
-            SourceWorkerRequest::LastForceFindRunnerByGroupSnapshot,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )
-        .await?
-        {
+        let response = async {
+            Self::call_worker_with_failure(
+                &self.client_with_failure().await?,
+                SourceWorkerRequest::LastForceFindRunnerByGroupSnapshot,
+                SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+            )
+            .await
+        }
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(err)
+                if matches!(
+                    err.reason,
+                    SourceFailureReason::ControlReset(_)
+                        | SourceFailureReason::RetryBudgetExhausted(_)
+                ) =>
+            {
+                if let Some(cached) =
+                    self.with_cache_mut(|cache| cache.last_force_find_runner_by_group.clone())
+                {
+                    return Ok(cached);
+                }
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
+        match response {
             SourceWorkerResponse::LastForceFindRunnerByGroup(groups) => {
                 self.with_cache_mut(|cache| {
                     cache.last_force_find_runner_by_group = Some(groups.clone());
@@ -7851,6 +8024,29 @@ impl SourceWorkerClientHandle {
             }
             other => unexpected_source_worker_response_result("for last force-find runner", other),
         }
+    }
+
+    fn remember_force_find_runner_from_events(
+        &self,
+        params: &InternalQueryRequest,
+        events: &[Event],
+    ) {
+        let Some(group_id) = params.scope.selected_group.as_deref() else {
+            return;
+        };
+        let Some(runner) = events
+            .iter()
+            .map(|event| event.metadata().origin_id.0.trim())
+            .find(|origin| !origin.is_empty())
+        else {
+            return;
+        };
+        self.with_cache_mut(|cache| {
+            cache
+                .last_force_find_runner_by_group
+                .get_or_insert_with(Default::default)
+                .insert(group_id.to_string(), runner.to_string());
+        });
     }
 
     async fn force_find_inflight_groups_snapshot_with_failure(
@@ -7890,6 +8086,33 @@ impl SourceWorkerClientHandle {
         {
             SourceWorkerResponse::ResolveGroupIdForObjectRef(group) => Ok(group),
             other => unexpected_source_worker_response_result("for resolve group", other),
+        }
+    }
+
+    async fn update_event_route_scopes_with_failure(
+        &self,
+        route_scopes_by_group: std::collections::BTreeMap<String, EventRouteScopeProjection>,
+    ) -> std::result::Result<(), SourceFailure> {
+        match self
+            .with_started_retry_with_failure(|client| {
+                let route_scopes_by_group = route_scopes_by_group.clone();
+                async move {
+                    Self::call_worker_with_failure(
+                        &client,
+                        SourceWorkerRequest::UpdateEventRouteScopes {
+                            route_scopes_by_group,
+                        },
+                        SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                    )
+                    .await
+                }
+            })
+            .await?
+        {
+            SourceWorkerResponse::Ack => Ok(()),
+            other => {
+                unexpected_source_worker_response_result("for event route-scope update", other)
+            }
         }
     }
 
@@ -8161,6 +8384,7 @@ impl SourceWorkerClientHandle {
         roots: &[RootSpec],
         timeout: Duration,
         defer_scan_audit: bool,
+        propagated_generation: Option<u64>,
     ) -> std::result::Result<SourceWorkerResponse, CnxError> {
         self.with_started_retry_with_failure(|client| {
             let roots = roots.to_vec();
@@ -8171,7 +8395,13 @@ impl SourceWorkerClientHandle {
                 if let Some(err) = take_update_logical_roots_error_hook() {
                     return Err(SourceFailure::from(err));
                 }
-                let request = if defer_scan_audit {
+                let request = if let Some(generation) = propagated_generation {
+                    SourceWorkerRequest::ApplyPropagatedLogicalRoots {
+                        roots,
+                        generation,
+                        defer_scan_audit,
+                    }
+                } else if defer_scan_audit {
                     SourceWorkerRequest::UpdateLogicalRootsDeferScanAudit { roots }
                 } else {
                     SourceWorkerRequest::UpdateLogicalRoots { roots }
@@ -8222,6 +8452,7 @@ impl SourceWorkerClientHandle {
                         SourceOperationLoopStep::Event(SourceForceFindEvent::WaitCompleted)
                     }
                     SourceForceFindEffect::Complete(events) => {
+                        self.remember_force_find_runner_from_events(&params, &events);
                         let _ = self
                             .last_force_find_runner_by_group_snapshot_with_failure()
                             .await;
@@ -8617,12 +8848,6 @@ impl SourceWorkerClientHandle {
         let deadline = clip_retry_deadline(Instant::now() + acceptance_timeout, acceptance_timeout);
         let mut last_pending_err: Option<SourceFailure> = None;
         loop {
-            if self.retained_replay_required_for_status().await {
-                return Err(SourceFailure::from(CnxError::NotReady(
-                    "source worker targeted rescan delivery acceptance is pending while retained control state replays"
-                        .to_string(),
-                )));
-            }
             if self.control_op_inflight() {
                 let err = SourceFailure::from(CnxError::NotReady(
                     "source worker targeted rescan delivery acceptance is pending while control state is applying"
@@ -8638,6 +8863,12 @@ impl SourceWorkerClientHandle {
                 )
                 .await;
                 continue;
+            }
+            if self.retained_replay_required_for_status().await {
+                return Err(SourceFailure::from(CnxError::NotReady(
+                    "source worker targeted rescan delivery acceptance is pending while retained control state replays"
+                        .to_string(),
+                )));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -8913,7 +9144,7 @@ impl SourceWorkerClientHandle {
         notify_source_worker_close_started();
         self.wait_for_control_ops_to_drain(SOURCE_WORKER_CLOSE_DRAIN_TIMEOUT)
             .await;
-        if Arc::strong_count(&self._shared) > 1 {
+        if !self.owner_lease.release() {
             return Ok(());
         }
         self.worker_client()
@@ -8925,6 +9156,10 @@ impl SourceWorkerClientHandle {
             cache.lifecycle_state = Some("closed".to_string());
         });
         Ok(())
+    }
+
+    fn release_owner_on_app_drop(&self) {
+        let _ = self.owner_lease.release();
     }
 
     #[cfg(test)]
@@ -8953,6 +9188,8 @@ impl SourceWorkerClientHandle {
         live_probe_timeout: Duration,
         read_mode: SourceObservabilityStatusReadMode,
     ) -> std::result::Result<(SourceObservabilitySnapshot, bool), SourceFailure> {
+        let live_snapshot_at_entry =
+            self.with_cache_mut(|cache| cache.last_live_observability_snapshot_at);
         if self.control_op_inflight() {
             if let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot() {
                 self.log_observability_cache_fallback(
@@ -9052,6 +9289,14 @@ impl SourceWorkerClientHandle {
             }
             return Ok((snapshot, true));
         }
+        if matches!(
+            read_mode,
+            SourceObservabilityStatusReadMode::CurrentOwnerHealth
+        ) && let Some(snapshot) =
+            self.fresh_live_observability_cache_snapshot_after(live_snapshot_at_entry)
+        {
+            return Ok((snapshot, false));
+        }
         if read_mode.can_use_recent_live_cache_before_live_probe()
             && let Some(snapshot) = self.recent_nonblocking_observability_cache_snapshot()
         {
@@ -9139,6 +9384,25 @@ impl SourceWorkerClientHandle {
                 .last_live_observability_snapshot_at
                 .filter(|last| last.elapsed() < SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL)
                 .and_then(|_| build_cached_worker_observability_snapshot(cache))
+        })?;
+        (!recent_cached_source_observability_snapshot_is_incomplete(&snapshot)).then_some(snapshot)
+    }
+
+    fn fresh_live_observability_cache_snapshot_after(
+        &self,
+        previous_live_snapshot_at: Option<Instant>,
+    ) -> Option<SourceObservabilitySnapshot> {
+        let snapshot = self.with_cache_mut(|cache| {
+            let completed_at = cache.last_live_observability_snapshot_at?;
+            if previous_live_snapshot_at.is_some_and(|previous| completed_at <= previous) {
+                return None;
+            }
+            let snapshot = build_source_observability_snapshot_from_cache(
+                cache,
+                cache.lifecycle_state.clone()?,
+                cache.status.clone().unwrap_or_default(),
+            );
+            Some(snapshot)
         })?;
         (!recent_cached_source_observability_snapshot_is_incomplete(&snapshot)).then_some(snapshot)
     }
@@ -10199,13 +10463,18 @@ fn recovered_published_observability_from_active_status(
 
 fn build_local_source_observability_snapshot(source: &FSMetaSource) -> SourceObservabilitySnapshot {
     let context = build_source_observability_live_source_context(source);
-    build_live_source_observability_snapshot(
-        source,
-        recovered_published_observability_from_active_status(
-            &context.recovery.stable_host_ref,
-            &context.status,
-        ),
-    )
+    let mut publication = recovered_published_observability_from_active_status(
+        &context.recovery.stable_host_ref,
+        &context.status,
+    );
+    let (published_batch_count, published_control_event_count, published_data_event_count) =
+        source.downstream_accepted_publication_counts();
+    publication.published_batch_count = published_batch_count;
+    publication.published_event_count =
+        published_control_event_count.saturating_add(published_data_event_count);
+    publication.published_control_event_count = published_control_event_count;
+    publication.published_data_event_count = published_data_event_count;
+    build_live_source_observability_snapshot(source, publication)
 }
 
 fn build_cached_worker_observability_snapshot(
@@ -10448,6 +10717,7 @@ fn manual_rescan_delivery_status_from_cache(
                 overflow_pending: false,
                 rescan_pending: false,
                 last_rescan_requested_at_us: None,
+                last_manual_rescan_accepted_at_us: None,
                 last_rescan_reason: None,
                 last_error: None,
                 last_audit_started_at_us: None,
@@ -11108,13 +11378,34 @@ pub struct SourcePumpHandle {
 }
 
 impl SourcePumpHandle {
-    pub(crate) fn abort(mut self) {
+    fn cancel_and_join_blocking(&mut self, timeout: Duration) {
         self.shutdown.cancel();
-        if let Some(join) = self.join.take()
-            && join.is_finished()
-        {
-            let _ = join.join();
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        if join.thread().id() == std::thread::current().id() {
+            log::warn!("source pump handle dropped on its own thread");
+            return;
         }
+        let deadline = Instant::now() + timeout;
+        while !join.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if join.is_finished() {
+            let _ = join.join();
+        } else {
+            log::warn!("source pump did not exit within {:?}", timeout);
+        }
+    }
+
+    pub(crate) fn abort(mut self) {
+        self.cancel_and_join_blocking(Duration::from_secs(2));
+    }
+}
+
+impl Drop for SourcePumpHandle {
+    fn drop(&mut self) {
+        self.cancel_and_join_blocking(Duration::from_secs(2));
     }
 }
 
@@ -11559,6 +11850,29 @@ impl SourceFacade {
         }
     }
 
+    pub(crate) async fn apply_propagated_logical_roots_with_failure(
+        &self,
+        roots: Vec<RootSpec>,
+        generation: u64,
+        defer_scan_audit: bool,
+    ) -> std::result::Result<(), SourceFailure> {
+        match self {
+            Self::Local(source) => source
+                .apply_propagated_logical_roots_declaration(roots, generation, defer_scan_audit)
+                .await
+                .map_err(SourceFailure::from),
+            Self::Worker(client) => {
+                client
+                    .apply_propagated_logical_roots_with_failure(
+                        roots,
+                        generation,
+                        defer_scan_audit,
+                    )
+                    .await
+            }
+        }
+    }
+
     pub(crate) fn cached_logical_roots_snapshot_with_failure(
         &self,
     ) -> std::result::Result<Vec<RootSpec>, SourceFailure> {
@@ -11676,7 +11990,6 @@ impl SourceFacade {
             .map_err(SourceFailure::into_error)
     }
 
-    #[cfg(test)]
     pub(crate) async fn source_primary_by_group_snapshot_with_failure(
         &self,
     ) -> std::result::Result<std::collections::BTreeMap<String, String>, SourceFailure> {
@@ -11721,6 +12034,23 @@ impl SourceFacade {
             Self::Worker(client) => {
                 client
                     .resolve_group_id_for_object_ref_with_failure(object_ref)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn update_event_route_scopes_with_failure(
+        &self,
+        route_scopes_by_group: std::collections::BTreeMap<String, EventRouteScopeProjection>,
+    ) -> std::result::Result<(), SourceFailure> {
+        match self {
+            Self::Local(source) => source
+                .update_event_route_scopes_with_failure(route_scopes_by_group)
+                .map(|_| ())
+                .map_err(SourceFailure::from),
+            Self::Worker(client) => {
+                client
+                    .update_event_route_scopes_with_failure(route_scopes_by_group)
                     .await
             }
         }
@@ -11861,11 +12191,7 @@ impl SourceFacade {
         maybe_delay_source_scan_audit_admission_release_attempt().await;
         match self {
             Self::Local(source) => {
-                if source.open_scan_audit_admission_if_closed() {
-                    Ok(source.submit_rescan_request_epoch())
-                } else {
-                    Ok(0)
-                }
+                Ok(source.open_scan_audit_admission_and_submit_rescan_request_epoch())
             }
             Self::Worker(client) => {
                 client
@@ -11925,6 +12251,13 @@ impl SourceFacade {
         match self {
             Self::Local(source) => source.close_with_failure().await,
             Self::Worker(client) => client.close_with_failure().await,
+        }
+    }
+
+    pub(crate) fn request_shutdown_on_owner_drop(&self) {
+        match self {
+            Self::Local(source) => source.request_shutdown_on_owner_drop(),
+            Self::Worker(client) => client.release_owner_on_app_drop(),
         }
     }
 
@@ -12143,23 +12476,41 @@ async fn run_local_source_pump(
 ) {
     if let Some(boundary) = boundary {
         tokio::pin!(stream);
-        while let Some(batch) = stream.next().await {
+        'publish: while let Some(batch) = stream.next().await {
             let origin = batch
                 .first()
                 .map(|event| event.metadata().origin_id.0.clone())
                 .unwrap_or_else(|| "__empty__".to_string());
             let accepted_batch = batch.clone();
-            if let Err(err) =
-                publish_local_source_boundary_batch(&boundary, &batch, &origin, &event_route_scope)
-                    .await
-            {
-                log::error!(
-                    "fs-meta app pump failed to publish source batch on stream route origin={}: {:?}",
-                    origin,
-                    err
-                );
-                source.mark_publication_output_closed(err.to_string());
-                break;
+            let mut by_route_scope = std::collections::BTreeMap::<String, Vec<Event>>::new();
+            for event in batch {
+                let event_origin = event.metadata().origin_id.0.as_str();
+                let route_scope = source
+                    .event_route_scope_for_object_ref(event_origin)
+                    .unwrap_or_else(|| event_route_scope.clone());
+                by_route_scope.entry(route_scope).or_default().push(event);
+            }
+            for (route_scope, route_batch) in by_route_scope {
+                let route_origin = route_batch
+                    .first()
+                    .map(|event| event.metadata().origin_id.0.as_str())
+                    .unwrap_or(origin.as_str());
+                if let Err(err) = publish_local_source_boundary_batch(
+                    &boundary,
+                    &route_batch,
+                    route_origin,
+                    &route_scope,
+                )
+                .await
+                {
+                    log::error!(
+                        "fs-meta app pump failed to publish source batch on stream route origin={}: {:?}",
+                        route_origin,
+                        err
+                    );
+                    source.mark_publication_output_closed(err.to_string());
+                    break 'publish;
+                }
             }
             source.record_batch_downstream_accepted(&accepted_batch);
         }

@@ -61,6 +61,51 @@ fn control_frame_lease_path_is_stable_per_node_and_binding_even_across_socket_ro
 }
 
 #[test]
+fn shared_route_claims_are_isolated_by_concrete_worker_binding() {
+    let worker_socket_root_a = worker_socket_tempdir();
+    let source_socket_dir_a = worker_role_socket_dir(worker_socket_root_a.path(), "source");
+    let sink_socket_dir_a = worker_role_socket_dir(worker_socket_root_a.path(), "sink");
+    let source_binding_a = external_runtime_worker_binding("source", &source_socket_dir_a);
+    let sink_binding_a = external_runtime_worker_binding("sink", &sink_socket_dir_a);
+
+    let worker_socket_root_b = worker_socket_tempdir();
+    let source_socket_dir_b = worker_role_socket_dir(worker_socket_root_b.path(), "source");
+    let sink_socket_dir_b = worker_role_socket_dir(worker_socket_root_b.path(), "sink");
+    let source_binding_b = external_runtime_worker_binding("source", &source_socket_dir_b);
+    let sink_binding_b = external_runtime_worker_binding("sink", &sink_socket_dir_b);
+
+    let source_claims_a = shared_source_route_claims_for_runtime(
+        &NodeId("node-a".into()),
+        &source_binding_a,
+        &sink_binding_a,
+    );
+    let source_claims_a_again = shared_source_route_claims_for_runtime(
+        &NodeId("node-a".into()),
+        &source_binding_a,
+        &sink_binding_a,
+    );
+    let source_claims_b = shared_source_route_claims_for_runtime(
+        &NodeId("node-a".into()),
+        &source_binding_b,
+        &sink_binding_b,
+    );
+    let sink_claims_a = shared_sink_route_claims_for_runtime(
+        &NodeId("node-a".into()),
+        &source_binding_a,
+        &sink_binding_a,
+    );
+    let sink_claims_b = shared_sink_route_claims_for_runtime(
+        &NodeId("node-a".into()),
+        &source_binding_b,
+        &sink_binding_b,
+    );
+
+    assert!(Arc::ptr_eq(&source_claims_a, &source_claims_a_again));
+    assert!(!Arc::ptr_eq(&source_claims_a, &source_claims_b));
+    assert!(!Arc::ptr_eq(&sink_claims_a, &sink_claims_b));
+}
+
+#[test]
 fn control_frame_lease_guard_is_exclusive_for_same_runtime_path() {
     let worker_socket_root = worker_socket_tempdir();
     let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");

@@ -1,0 +1,17 @@
+[package]
+name = "data-view"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Fustor DataView v0.4 public contracts and bounded registries"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ring = "0.17"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,3 +1,4 @@
+#[cfg(not(feature = "embedded-inspection"))]
 use capanix_runtime_entry_sdk::entry::capanix_unit_entry;
 
 pub mod driver;
@@ -16,4 +17,5 @@ pub use mysql_source::{
 pub use runtime_app::MysqlSourceRuntimeApp;
 pub use service::MysqlSourceService;
 
+#[cfg(not(feature = "embedded-inspection"))]
 capanix_unit_entry!(MysqlSourceRuntimeApp);

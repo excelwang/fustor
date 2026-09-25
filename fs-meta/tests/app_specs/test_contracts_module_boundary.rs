@@ -707,6 +707,49 @@ fn real_nfs_e2e_entrypoint_stays_aligned_with_support_preflight() {
 }
 
 #[test]
+fn real_nfs_cleanup_stops_nfsd_before_rpcbind() {
+    let support = read_app_spec("tests/e2e/support/nfs_lab.rs");
+    let support_cleanup_start = support
+        .find("fn cleanup(&mut self)")
+        .expect("NFS support cleanup function");
+    let support_cleanup_end = support[support_cleanup_start..]
+        .find("fn seed_export_tree")
+        .map(|offset| support_cleanup_start + offset)
+        .expect("NFS support cleanup end");
+    let support_cleanup = &support[support_cleanup_start..support_cleanup_end];
+
+    let runtime_lab = read_app_spec("app/src/runtime_app_real_nfs_lab.rs");
+    let runtime_cleanup_start = runtime_lab
+        .find("impl Drop for NfsLab")
+        .expect("runtime-app NFS Drop");
+    let runtime_cleanup_end = runtime_lab[runtime_cleanup_start..]
+        .find("fn normalize_relative")
+        .map(|offset| runtime_cleanup_start + offset)
+        .expect("runtime-app NFS Drop end");
+    let runtime_cleanup = &runtime_lab[runtime_cleanup_start..runtime_cleanup_end];
+
+    let container_cleanup = read_app_spec("docs/examples/container-staging-nfs-cleanup.sh");
+    for (label, cleanup) in [
+        ("e2e support", support_cleanup),
+        ("runtime-app lab", runtime_cleanup),
+        ("container hook", container_cleanup.as_str()),
+    ] {
+        let nfsd_stop = cleanup
+            .find("rpc.nfsd")
+            .unwrap_or_else(|| panic!("{label} cleanup must stop rpc.nfsd"));
+        let rpcbind_stop = cleanup
+            .rfind("rpcbind")
+            .unwrap_or_else(|| panic!("{label} cleanup must stop rpcbind"));
+        assert!(
+            nfsd_stop < rpcbind_stop,
+            "{label} cleanup must stop rpc.nfsd before rpcbind"
+        );
+    }
+    assert!(container_cleanup.contains("FSMETA_CONTAINER_STAGING_INSIDE"));
+    assert!(container_cleanup.contains("outside-disposable-container"));
+}
+
+#[test]
 fn e2e_apply_release_harness_stays_blackbox() {
     let cluster = read_app_spec("tests/e2e/support/cluster5.rs");
     let start = cluster

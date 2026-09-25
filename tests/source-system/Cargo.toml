@@ -1,0 +1,39 @@
+[package]
+name = "source-system-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+aws-credential-types = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+capanix-app-sdk = { workspace = true }
+csv-source = { workspace = true }
+csv-source-runtime = { workspace = true }
+data-view = { workspace = true }
+data-view-normalizers = { workspace = true }
+es-source = { workspace = true }
+es-source-runtime = { workspace = true }
+jsonl-source = { workspace = true }
+jsonl-source-runtime = { workspace = true }
+local-fs-source = { workspace = true }
+local-fs-source-runtime = { workspace = true }
+mysql-source = { workspace = true }
+mysql-source-runtime = { workspace = true }
+mysql = { workspace = true }
+pg-source = { workspace = true }
+pg-source-runtime = { workspace = true }
+postgres = { workspace = true }
+reqwest = { workspace = true }
+s3-source = { workspace = true }
+s3-source-runtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+source-kit = { workspace = true }
+source-test-kit = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { workspace = true }

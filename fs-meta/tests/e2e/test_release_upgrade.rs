@@ -983,7 +983,8 @@ fn wait_for_node_d_facade_claim_convergence(
                 })
             {
                 last_management_probe_at = Some(Instant::now());
-                last_management_probe_result = Some(probe_management_status(&[node_d_url.clone()]));
+                last_management_probe_result =
+                    Some(probe_management_status(std::slice::from_ref(&node_d_url)));
             }
             let source_status_active =
                 activation_route_has_active_pids(&node_status, "source-status:v1.req");
@@ -1308,10 +1309,10 @@ fn source_runtime_scope_route_owner_nodes_by_group(
 
     for route in routes {
         if route.get("state").and_then(Value::as_str) != Some("activated")
-            || !route
+            || route
                 .get("active_pids")
                 .and_then(Value::as_array)
-                .is_some_and(|pids| !pids.is_empty())
+                .is_none_or(|pids| pids.is_empty())
         {
             continue;
         }

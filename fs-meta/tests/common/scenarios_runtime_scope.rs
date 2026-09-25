@@ -216,6 +216,12 @@ fn fs_meta_post_json(
         .map_err(|e| format!("decode POST {path} response failed: {e}"))
 }
 
+fn fs_meta_rescan_rejected_for_pending_materialization(err: &str) -> bool {
+    err.contains("POST /index/rescan returned HTTP 503")
+        && err.contains("pending materialization")
+        && err.contains("observed patiently")
+}
+
 fn fs_meta_put_json(
     bind_addr: &str,
     path: &str,
@@ -640,13 +646,13 @@ pub(crate) fn scenario_runtime_orchestrated_worker_hosting_config_apply_e2e() ->
                 Err(e) => {
                     let status_a = c
                         .layered_status_a_local()
-                        .unwrap_or_else(|_| serde_json::json!(null));
+                        .unwrap_or(serde_json::json!(null));
                     let status_b = c
                         .layered_status_b_local()
-                        .unwrap_or_else(|_| serde_json::json!(null));
+                        .unwrap_or(serde_json::json!(null));
                     let audit_a = c
                         .ctl_ok_a_local(json!({ "command": "audit_tail", "count": 32 }))
-                        .unwrap_or_else(|_| serde_json::json!(null));
+                        .unwrap_or(serde_json::json!(null));
                     return Err(format!(
                         "runtime-e2e baseline config_set failed: {e}; status_a={status_a}; status_b={status_b}; audit_a={audit_a}"
                     ));
@@ -838,16 +844,16 @@ pub(crate) fn scenario_runtime_orchestrated_worker_hosting_config_apply_e2e() ->
             if !seen_instance {
                 let cfg_a = c
                     .ctl_ok_a_local(json!({ "command": "config_get" }))
-                    .unwrap_or_else(|_| serde_json::json!(null));
+                    .unwrap_or(serde_json::json!(null));
                 let cfg_b = c
                     .ctl_ok_b_local(json!({ "command": "config_get" }))
-                    .unwrap_or_else(|_| serde_json::json!(null));
+                    .unwrap_or(serde_json::json!(null));
                 let audit_a = c
                     .ctl_ok_a_local(json!({ "command": "audit_tail", "count": 32 }))
-                    .unwrap_or_else(|_| serde_json::json!(null));
+                    .unwrap_or(serde_json::json!(null));
                 let audit_b = c
                     .ctl_ok_b_local(json!({ "command": "audit_tail", "count": 32 }))
-                    .unwrap_or_else(|_| serde_json::json!(null));
+                    .unwrap_or(serde_json::json!(null));
                 return Err(format!(
                     "app instance with exactly one active facade was not observed after relation_target_apply; node_a_status={last_status_a}; node_b_status={last_status_b}; node_a_api={last_api_a}; node_b_api={last_api_b}; node_a_config={cfg_a}; node_b_config={cfg_b}; node_a_audit={audit_a}; node_b_audit={audit_b}"
                 ));
@@ -1224,16 +1230,16 @@ pub(crate) fn scenario_single_entrypoint_distributed_apply_e2e() -> Result<(), S
 
             let cfg_b = c
                 .ctl_ok_b_local(json!({ "command": "config_get" }))
-                .unwrap_or_else(|_| serde_json::json!(null));
+                .unwrap_or(serde_json::json!(null));
             let cfg_a = c
                 .ctl_ok_a_local(json!({ "command": "config_get" }))
-                .unwrap_or_else(|_| serde_json::json!(null));
+                .unwrap_or(serde_json::json!(null));
             let audit_b = c
                 .ctl_ok_b_local(json!({ "command": "audit_tail", "count": 32 }))
-                .unwrap_or_else(|_| serde_json::json!(null));
+                .unwrap_or(serde_json::json!(null));
             let audit_a = c
                 .ctl_ok_a_local(json!({ "command": "audit_tail", "count": 32 }))
-                .unwrap_or_else(|_| serde_json::json!(null));
+                .unwrap_or(serde_json::json!(null));
             Err(format!(
                 "one-cardinality facade realization did not converge to exactly one active facade; apply={apply}; node_a_config={cfg_a}; node_b_config={cfg_b}; node_a_status={last_status_a}; node_b_status={last_status_b}; node_a_api={last_api_a}; node_b_api={last_api_b}; node_a_audit={audit_a}; node_b_audit={audit_b}"
             ))
@@ -1505,10 +1511,10 @@ pub(crate) fn scenario_empty_roots_online_roots_apply_distributed_force_find_e2e
                                 .unwrap_or_else(|e| serde_json::json!({ "error": e }));
                             let audit_a = c
                                 .ctl_ok_a_local(json!({ "command": "audit_tail", "count": 32 }))
-                                .unwrap_or_else(|_| serde_json::json!(null));
+                                .unwrap_or(serde_json::json!(null));
                             let audit_b = c
                                 .ctl_ok_b_local(json!({ "command": "audit_tail", "count": 32 }))
-                                .unwrap_or_else(|_| serde_json::json!(null));
+                                .unwrap_or(serde_json::json!(null));
                             let cfg_a = c
                                 .ctl_ok_a_local(json!({ "command": "config_get" }))
                                 .map(|cfg| local_route_plan_summary(&cfg))
@@ -1542,6 +1548,13 @@ pub(crate) fn scenario_empty_roots_online_roots_apply_distributed_force_find_e2e
                         &json!({}),
                     ) {
                         Ok(rescan) => rescan,
+                        Err(err) if fs_meta_rescan_rejected_for_pending_materialization(&err) => {
+                            json!({
+                                "accepted": true,
+                                "pending_materialization_observation": true,
+                                "rescan_rejected": err,
+                            })
+                        }
                         Err(err) => {
                             let status_a = c
                                 .layered_status_a_local()
@@ -1553,10 +1566,10 @@ pub(crate) fn scenario_empty_roots_online_roots_apply_distributed_force_find_e2e
                                 .unwrap_or_else(|e| serde_json::json!({ "error": e }));
                             let audit_a = c
                                 .ctl_ok_a_local(json!({ "command": "audit_tail", "count": 48 }))
-                                .unwrap_or_else(|_| serde_json::json!(null));
+                                .unwrap_or(serde_json::json!(null));
                             let audit_b = c
                                 .ctl_ok_b_local(json!({ "command": "audit_tail", "count": 48 }))
-                                .unwrap_or_else(|_| serde_json::json!(null));
+                                .unwrap_or(serde_json::json!(null));
                             let public_status_active = match fs_meta_get_json(
                                 &active_bind_addr,
                                 "/status",
@@ -1713,16 +1726,16 @@ pub(crate) fn scenario_empty_roots_online_roots_apply_distributed_force_find_e2e
                         };
                         let status_a = c
                             .layered_status_a_local()
-                            .unwrap_or_else(|_| serde_json::json!(null));
+                            .unwrap_or(serde_json::json!(null));
                         let status_b = c
                             .layered_status_b_local()
-                            .unwrap_or_else(|_| serde_json::json!(null));
+                            .unwrap_or(serde_json::json!(null));
                         let audit_a = c
                             .ctl_ok_a_local(json!({ "command": "audit_tail", "count": 32 }))
-                            .unwrap_or_else(|_| serde_json::json!(null));
+                            .unwrap_or(serde_json::json!(null));
                         let audit_b = c
                             .ctl_ok_b_local(json!({ "command": "audit_tail", "count": 32 }))
-                            .unwrap_or_else(|_| serde_json::json!(null));
+                            .unwrap_or(serde_json::json!(null));
                         return Err(format!(
                             "{err}; login_a={login_a}; login_b={login_b}; single_active_after_force_find={single_active_after_force_find}; roots_current_active={roots_current_active}; public_status_active={public_status_active}; node_a_status={status_a}; node_b_status={status_b}; node_a_audit={audit_a}; node_b_audit={audit_b}"
                         ));

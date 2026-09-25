@@ -7,12 +7,17 @@ use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 const LAB_MARKER_FILENAME: &str = ".fs_meta_nfs_lab";
 const E2E_TMP_ROOT_ENV: &str = "DATANIX_E2E_TMP_ROOT";
 const LEGACY_E2E_TMP_ROOT_ENV: &str = "CAPANIX_E2E_TMP_ROOT";
 const NFS_LAB_COMPONENT: &str = "nfs-lab";
+const NFS_LAB_V4_PSEUDOROOT_ENV: &str = "FSMETA_NFS_LAB_V4_PSEUDOROOT";
+const PRIVILEGED_COMMAND_TIMEOUT_ENV: &str = "DATANIX_TEST_PRIVILEGED_COMMAND_TIMEOUT_SECS";
+const DEFAULT_PRIVILEGED_COMMAND_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StaleLabCleanupPlan {
@@ -44,6 +49,10 @@ fn nfs_lab_parent_dir() -> PathBuf {
     let dir = e2e_tmp_root().join(NFS_LAB_COMPONENT);
     fs::create_dir_all(&dir).expect("create nfs lab parent dir");
     dir
+}
+
+fn use_v4_pseudoroot() -> bool {
+    std::env::var(NFS_LAB_V4_PSEUDOROOT_ENV).ok().as_deref() == Some("1")
 }
 
 fn decode_mountinfo_path(raw: &str) -> PathBuf {
@@ -382,17 +391,16 @@ fn interpret_umount_outputs_with_mountinfo(
     fallback: Option<&std::process::Output>,
     mountinfo: &str,
 ) -> Result<(), String> {
-    if primary.status.success() || output_indicates_absent_mount(primary) {
-        if !mountinfo_lists_target(mountinfo, path) {
-            return Ok(());
-        }
+    if (primary.status.success() || output_indicates_absent_mount(primary))
+        && !mountinfo_lists_target(mountinfo, path)
+    {
+        return Ok(());
     }
-    if let Some(fallback) = fallback {
-        if fallback.status.success() || output_indicates_absent_mount(fallback) {
-            if !mountinfo_lists_target(mountinfo, path) {
-                return Ok(());
-            }
-        }
+    if fallback.is_some_and(|fallback| {
+        (fallback.status.success() || output_indicates_absent_mount(fallback))
+            && !mountinfo_lists_target(mountinfo, path)
+    }) {
+        return Ok(());
     }
     if mountinfo_lists_target(mountinfo, path) {
         return Err(format!(
@@ -475,6 +483,7 @@ impl RealNfsPreflight {
             "umount",
             "pgrep",
             "pkill",
+            "timeout",
         ] {
             let ok = Command::new("sh")
                 .arg("-lc")
@@ -544,6 +553,7 @@ impl NfsLab {
             mounted_nfsd: false,
         };
         lab.ensure_nfs_stack()?;
+        lab.export_pseudoroot_if_enabled()?;
         for export in exports {
             lab.create_export(export.as_ref())?;
         }
@@ -655,6 +665,9 @@ impl NfsLab {
     }
 
     pub fn export_source(&self, export_name: &str) -> String {
+        if use_v4_pseudoroot() {
+            return format!("127.0.0.1:/{export_name}");
+        }
         format!("127.0.0.1:{}", self.exports_dir.join(export_name).display())
     }
 
@@ -674,6 +687,7 @@ impl NfsLab {
     }
 
     pub fn mount_export(&mut self, node_name: &str, export_name: &str) -> Result<PathBuf, String> {
+        self.ensure_mountd_alive()?;
         let export_dir = self.exports_dir.join(export_name);
         if !export_dir.exists() {
             return Err(format!("export {export_name} does not exist"));
@@ -681,13 +695,13 @@ impl NfsLab {
         let mount_dir = self.mounts_dir.join(node_name).join(export_name);
         fs::create_dir_all(&mount_dir)
             .map_err(|e| format!("create mount dir {} failed: {e}", mount_dir.display()))?;
-        let source = format!("127.0.0.1:{}", export_dir.display());
+        let source = self.export_source(export_name);
         let status = sudo_status([
             "mount",
             "-t",
             "nfs",
             "-o",
-            "vers=4,tcp,timeo=50,retrans=1,noac,actimeo=0,lookupcache=none,nordirplus",
+            "vers=4,tcp,soft,timeo=50,retrans=1,retry=0,noac,actimeo=0,lookupcache=none,nordirplus",
             source.as_str(),
             mount_dir.to_string_lossy().as_ref(),
         ])?;
@@ -727,6 +741,27 @@ impl NfsLab {
             .cloned()
     }
 
+    fn export_pseudoroot_if_enabled(&self) -> Result<(), String> {
+        if !use_v4_pseudoroot() {
+            return Ok(());
+        }
+        let status = sudo_status([
+            "exportfs",
+            "-i",
+            "-o",
+            "rw,no_subtree_check,no_root_squash,fsid=0",
+            &format!("127.0.0.1:{}", self.exports_dir.display()),
+        ])?;
+        if !status.success() {
+            return Err(format!(
+                "exportfs pseudoroot {} failed with status {}",
+                self.exports_dir.display(),
+                status
+            ));
+        }
+        Ok(())
+    }
+
     fn cleanup(&mut self) -> Result<(), String> {
         let mut errors = Vec::new();
         let mounts = self.mounted.keys().cloned().collect::<Vec<_>>();
@@ -746,6 +781,11 @@ impl NfsLab {
                 errors.push(err);
             }
         }
+        if use_v4_pseudoroot() {
+            if let Err(err) = self.unexport_dir(&self.exports_dir) {
+                errors.push(err);
+            }
+        }
         if let Some(child) = &mut self.started_mountd {
             if let Err(err) = child.kill() {
                 errors.push(format!("kill rpc.mountd failed: {err}"));
@@ -754,20 +794,25 @@ impl NfsLab {
                 errors.push(format!("wait rpc.mountd failed: {err}"));
             }
         }
-        if self.started_rpcbind {
-            match sudo_status(["pkill", "-x", "rpcbind"]) {
+        if self.mounted_nfsd {
+            match sudo_status(["rpc.nfsd", "0"]) {
                 Ok(status) if status.success() => {}
-                Ok(status) => errors.push(format!("pkill rpcbind failed with status {}", status)),
+                Ok(status) => errors.push(format!("rpc.nfsd 0 failed with status {}", status)),
                 Err(err) => errors.push(err),
             }
-        }
-        if self.mounted_nfsd {
             match sudo_status(["umount", "/proc/fs/nfsd"]) {
                 Ok(status) if status.success() => {}
                 Ok(status) => errors.push(format!(
                     "umount /proc/fs/nfsd failed with status {}",
                     status
                 )),
+                Err(err) => errors.push(err),
+            }
+        }
+        if self.started_rpcbind {
+            match sudo_status(["pkill", "-x", "rpcbind"]) {
+                Ok(status) if status.success() => {}
+                Ok(status) => errors.push(format!("pkill rpcbind failed with status {}", status)),
                 Err(err) => errors.push(err),
             }
         }
@@ -835,15 +880,42 @@ impl NfsLab {
             .map(|s| s.success())
             .map_err(|e| format!("check rpc.mountd failed: {e}"))?;
         if !mountd_running {
+            let mountd_log_path = self.temp.path().join("rpc.mountd.log");
+            let mountd_log = fs::File::create(&mountd_log_path)
+                .map_err(|e| format!("create {} failed: {e}", mountd_log_path.display()))?;
+            let mountd_stdout = mountd_log
+                .try_clone()
+                .map_err(|e| format!("clone {} failed: {e}", mountd_log_path.display()))?;
             let child = Command::new("sudo")
                 .args(["-n", "rpc.mountd", "--foreground"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(Stdio::from(mountd_stdout))
+                .stderr(Stdio::from(mountd_log))
                 .spawn()
                 .map_err(|e| format!("spawn rpc.mountd failed: {e}"))?;
             self.started_mountd = Some(child);
+            thread::sleep(Duration::from_millis(200));
+            self.ensure_mountd_alive()?;
         }
         Ok(())
+    }
+
+    fn ensure_mountd_alive(&mut self) -> Result<(), String> {
+        let Some(child) = self.started_mountd.as_mut() else {
+            return Ok(());
+        };
+        let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("check rpc.mountd process failed: {e}"))?
+        else {
+            return Ok(());
+        };
+        let log_path = self.temp.path().join("rpc.mountd.log");
+        let detail = fs::read_to_string(&log_path)
+            .unwrap_or_else(|e| format!("unable to read {}: {e}", log_path.display()));
+        Err(format!(
+            "rpc.mountd exited before NFS mount with status {status}: {}",
+            detail.trim()
+        ))
     }
 
     fn export_dir(&self, dir: &Path) -> Result<(), String> {
@@ -893,12 +965,47 @@ fn normalize_relative(relative: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(normalized))
 }
 
-fn sudo_status<const N: usize>(args: [&str; N]) -> Result<ExitStatus, String> {
-    Command::new("sudo")
+fn privileged_command_timeout_secs() -> u64 {
+    std::env::var(PRIVILEGED_COMMAND_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_PRIVILEGED_COMMAND_TIMEOUT_SECS)
+}
+
+fn bounded_sudo_command<I, S>(args: I) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = Command::new("timeout");
+    command
+        .arg("--foreground")
+        .arg("--signal=TERM")
+        .arg("--kill-after=5s")
+        .arg(format!("{}s", privileged_command_timeout_secs()))
+        .arg("sudo")
         .arg("-n")
-        .args(args)
+        .args(args);
+    command
+}
+
+fn command_timed_out(status: ExitStatus) -> bool {
+    matches!(status.code(), Some(124 | 137))
+}
+
+fn sudo_status<const N: usize>(args: [&str; N]) -> Result<ExitStatus, String> {
+    let display = format!("{:?}", args.as_slice());
+    let status = bounded_sudo_command(args)
         .status()
-        .map_err(|e| format!("sudo {:?} failed to start: {e}", args.as_slice()))
+        .map_err(|e| format!("bounded sudo {display} failed to start: {e}"))?;
+    if command_timed_out(status) {
+        return Err(format!(
+            "bounded sudo {display} timed out after {}s",
+            privileged_command_timeout_secs()
+        ));
+    }
+    Ok(status)
 }
 
 #[allow(dead_code)]
@@ -907,17 +1014,46 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new("sudo")
-        .arg("-n")
-        .args(args)
+    let args = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect::<Vec<_>>();
+    let output = bounded_sudo_command(&args)
         .output()
-        .map_err(|e| format!("sudo output failed: {e}"))
+        .map_err(|e| format!("bounded sudo {args:?} failed to start: {e}"))?;
+    if command_timed_out(output.status) {
+        return Err(format!(
+            "bounded sudo {args:?} timed out after {}s",
+            privileged_command_timeout_secs()
+        ));
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn privileged_command_timeout_is_positive_and_bounded_by_default() {
+        std::env::remove_var(PRIVILEGED_COMMAND_TIMEOUT_ENV);
+        assert_eq!(
+            privileged_command_timeout_secs(),
+            DEFAULT_PRIVILEGED_COMMAND_TIMEOUT_SECS
+        );
+
+        std::env::set_var(PRIVILEGED_COMMAND_TIMEOUT_ENV, "7");
+        assert_eq!(privileged_command_timeout_secs(), 7);
+        std::env::remove_var(PRIVILEGED_COMMAND_TIMEOUT_ENV);
+    }
+
+    #[test]
+    fn timeout_exit_codes_are_classified() {
+        assert!(command_timed_out(ExitStatus::from_raw(124 << 8)));
+        assert!(command_timed_out(ExitStatus::from_raw(137 << 8)));
+        assert!(!command_timed_out(ExitStatus::from_raw(1 << 8)));
+    }
 
     #[test]
     fn nfs_lab_root_for_mount_target_finds_structured_root_under_any_base() {
@@ -1023,10 +1159,10 @@ mod tests {
     fn stale_lab_cleanup_plans_merge_workspace_alias_roots_into_one_plan() {
         let workspace_root = crate::path_support::workspace_root();
         let workspace_root_str = workspace_root.display().to_string();
-        let alias_root_str = if let Some(rest) = workspace_root_str.strip_prefix("/root/repo/") {
+        let alias_root_str = if let Some(rest) = workspace_root_str.strip_prefix("/opt/fusiongraph/src/") {
             format!("/data/repo/{rest}")
         } else if let Some(rest) = workspace_root_str.strip_prefix("/data/repo/") {
-            format!("/root/repo/{rest}")
+            format!("/opt/fusiongraph/src/{rest}")
         } else {
             format!("/data/repo-alias{}", workspace_root_str)
         };
@@ -1046,7 +1182,8 @@ mod tests {
             real_root.display(),
         );
 
-        let plans = stale_lab_cleanup_plans_from_mountinfo(&mountinfo, &[alias_root.clone()]);
+        let plans =
+            stale_lab_cleanup_plans_from_mountinfo(&mountinfo, std::slice::from_ref(&alias_root));
         assert_eq!(
             plans.len(),
             1,
@@ -1114,7 +1251,7 @@ mod tests {
             stale_lab_cleanup_plans_from_mountinfo(&mountinfo, std::slice::from_ref(&alias_root));
         let plan = plans.first().expect("cleanup plan");
 
-        let mut export_dirs = stale_lab_export_dirs_for_cleanup(&plan);
+        let mut export_dirs = stale_lab_export_dirs_for_cleanup(plan);
         export_dirs.sort();
         let mut expected = vec![
             alias_root.join("exports/nfs1"),

@@ -10,6 +10,11 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
+resource_guard="${FUSTOR_RESOURCE_GUARD:-${repo_root}/scripts/resource-guard.sh}"
+
+guarded_cargo() {
+  "${resource_guard}" cargo "$@"
+}
 
 resolve_worker_host_binary() {
   local bin_name="capanix_worker_host"
@@ -143,7 +148,7 @@ run_real_nfs_api_filter() {
   echo "[fs-meta-test-matrix] filter=${filter}"
   CAPANIX_REAL_NFS_E2E=1 \
     CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fustor-specs-root --test fs_meta_api_e2e \
+    guarded_cargo test -p fustor-specs-root --test fs_meta_api_e2e \
       "$filter" -- --ignored --nocapture --test-threads=1
 }
 
@@ -154,7 +159,7 @@ run_real_nfs_runtime_filter() {
   echo "[fs-meta-test-matrix] filter=${filter}"
   CAPANIX_REAL_NFS_E2E=1 \
     CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime "$filter" \
+    guarded_cargo test -p fs-meta-runtime "$filter" \
       -- --ignored --nocapture --test-threads=1
 }
 
@@ -198,47 +203,47 @@ run_l5_runtime_case() {
 }
 
 contract_fast() {
-  cargo test -p fustor-specs-root --test app_specs
-  cargo test -p fustor-specs-root --test cli_specs
-  cargo test -p fustor-specs-root --test specs_fs_meta_contract_fast
+  guarded_cargo test -p fustor-specs-root --test app_specs
+  guarded_cargo test -p fustor-specs-root --test cli_specs
+  guarded_cargo test -p fustor-specs-root --test specs_fs_meta_contract_fast
 }
 
 root_namespace_contracts() {
   contract_fast
-  cargo test -p fs-meta-runtime subpath_scope_materializes_root_relative_paths \
+  guarded_cargo test -p fs-meta-runtime subpath_scope_materializes_root_relative_paths \
     -- --nocapture --test-threads=1
-  cargo test -p fs-meta-runtime update_logical_roots_resets_materialized_group_when_covered_scope_changes \
+  guarded_cargo test -p fs-meta-runtime update_logical_roots_resets_materialized_group_when_covered_scope_changes \
     -- --nocapture --test-threads=1
 }
 
 single_process_closed_loop_core() {
-  cargo test -p fs-meta-runtime slow_watch_setup_does_not_block_initial_scan_stream \
+  guarded_cargo test -p fs-meta-runtime slow_watch_setup_does_not_block_initial_scan_stream \
     -- --nocapture --test-threads=1
   CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime selected_group -- --nocapture --test-threads=1
+    guarded_cargo test -p fs-meta-runtime selected_group -- --nocapture --test-threads=1
   CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime force_find -- --nocapture --test-threads=1
-  cargo test -p fs-meta-runtime status_stats -- --nocapture --test-threads=1
+    guarded_cargo test -p fs-meta-runtime force_find -- --nocapture --test-threads=1
+  guarded_cargo test -p fs-meta-runtime status_stats -- --nocapture --test-threads=1
   CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime roots_put -- --nocapture --test-threads=1
+    guarded_cargo test -p fs-meta-runtime roots_put -- --nocapture --test-threads=1
 }
 
 runtime_local_multinode_core() {
   CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime --lib workers::source::tests::source_control \
+    guarded_cargo test -p fs-meta-runtime --lib workers::source::tests::source_control \
       -- --nocapture --test-threads=1
   CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime --lib workers::source::tests::external_source_worker_force_find \
+    guarded_cargo test -p fs-meta-runtime --lib workers::source::tests::external_source_worker_force_find \
       -- --nocapture --test-threads=1
   CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime --lib workers::sink::tests::sink_control_frame_machine \
+    guarded_cargo test -p fs-meta-runtime --lib workers::sink::tests::sink_control_frame_machine \
       -- --nocapture --test-threads=1
   CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime --lib workers::sink::tests::status_snapshot_nonblocking \
+    guarded_cargo test -p fs-meta-runtime --lib workers::sink::tests::status_snapshot_nonblocking \
       -- --nocapture --test-threads=1
   CAPANIX_RUNTIME_SCOPE_E2E=1 \
     CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fustor-specs-root --test runtime_scope_e2e -- --nocapture --test-threads=1
+    guarded_cargo test -p fustor-specs-root --test runtime_scope_e2e -- --nocapture --test-threads=1
 }
 
 contracts_fast() {
@@ -270,7 +275,7 @@ business_mini_nfs() {
   ensure_worker_host_binary
   CAPANIX_REAL_NFS_E2E=1 \
     CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fustor-specs-root --test fs_meta_api_e2e \
+    guarded_cargo test -p fustor-specs-root --test fs_meta_api_e2e \
       fs_meta_business_mini_real_nfs -- --ignored --nocapture --test-threads=1
 }
 
@@ -280,16 +285,16 @@ environment_full_nfs() {
   require_full_demo_assets
   CAPANIX_REAL_NFS_E2E=1 \
     CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fustor-specs-root --test fs_meta_api_e2e \
+    guarded_cargo test -p fustor-specs-root --test fs_meta_api_e2e \
       fs_meta_business_query_real_nfs -- --ignored --nocapture --test-threads=1
   CAPANIX_REAL_NFS_E2E=1 \
     CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fustor-specs-root --test fs_meta_api_e2e \
+    guarded_cargo test -p fustor-specs-root --test fs_meta_api_e2e \
       fs_meta_environment_full_real_nfs -- --ignored --nocapture --test-threads=1
   FSMETA_FULL_NFS_ROOTS_FILE= \
     CAPANIX_REAL_NFS_E2E=1 \
     CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fustor-specs-root --test fs_meta_api_e2e \
+    guarded_cargo test -p fustor-specs-root --test fs_meta_api_e2e \
       fs_meta_environment_live_only_rescan_real_nfs -- --ignored --nocapture --test-threads=1
 }
 

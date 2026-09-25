@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 
 use capanix_app_sdk::runtime::ConfigValue;
 use capanix_app_sdk::{CnxError, Result};
+use source_kit::{require_grant_interface, validate_secret_free_endpoint_uri};
 
 const DEFAULT_TIMESTAMP_FIELD: &str = "@timestamp";
 const DEFAULT_TIE_BREAKER_FIELD: &str = "_id";
@@ -19,6 +20,11 @@ const FORBIDDEN_RUNTIME_SECRET_KEYS: &[&str] = &[
     "token",
     "secret",
     "secret_value",
+    "access_key",
+    "access_key_id",
+    "secret_access_key",
+    "client_secret",
+    "private_key",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,10 +122,10 @@ impl Default for EsSourceConfig {
 
 impl EsSourceRuntimeConfig {
     pub fn from_manifest_config(cfg: &HashMap<String, ConfigValue>) -> Result<Self> {
-        Ok(Self {
-            product: EsSourceConfig::from_product_manifest_config(cfg)?,
-            runtime: EsSourceRuntimeInputs::from_runtime_manifest_config(cfg)?,
-        })
+        let product = EsSourceConfig::from_product_manifest_config(cfg)?;
+        let runtime = EsSourceRuntimeInputs::from_runtime_manifest_config(cfg)?;
+        validate_runtime_grants_match_product_endpoints(&product, &runtime)?;
+        Ok(Self { product, runtime })
     }
 
     pub fn endpoint_for(&self, object_ref: &str, index: &str) -> Result<ResolvedEsEndpoint> {
@@ -152,13 +158,9 @@ impl EsSourceRuntimeConfig {
                 "runtime grant for es endpoint '{object_ref}' is inactive"
             )));
         }
+        require_grant_interface(&grant.interfaces, "read", "es endpoint")?;
 
-        let index_scopes = if grant.index_scopes.is_empty() {
-            product.index_scopes.clone()
-        } else {
-            grant.index_scopes.clone()
-        };
-        if !index_allowed(index, &index_scopes) {
+        if !index_allowed_by_product_and_grant(index, &product.index_scopes, &grant.index_scopes) {
             return Err(CnxError::ScopeDenied(format!(
                 "index '{index}' is outside runtime scope for es endpoint '{object_ref}'"
             )));
@@ -174,7 +176,7 @@ impl EsSourceRuntimeConfig {
                 .credential_ref
                 .clone()
                 .or_else(|| product.credential_ref.clone()),
-            index_scopes,
+            index_scopes: effective_index_scopes(&product.index_scopes, &grant.index_scopes),
             timestamp_field: product.timestamp_field.clone(),
             tie_breaker_field: product.tie_breaker_field.clone(),
             grant_epoch: grant.grant_epoch,
@@ -238,6 +240,18 @@ impl EsSourceConfig {
                 out.credentials.push(parse_credential_config(row)?);
             }
         }
+        reject_duplicate_refs(
+            out.endpoints
+                .iter()
+                .map(|endpoint| endpoint.object_ref.as_str()),
+            "endpoints[].object_ref",
+        )?;
+        reject_duplicate_refs(
+            out.credentials
+                .iter()
+                .map(|credential| credential.credential_ref.as_str()),
+            "credentials[].credential_ref",
+        )?;
         Ok(out)
     }
 }
@@ -298,6 +312,7 @@ fn parse_endpoint_config(row: &HashMap<String, ConfigValue>) -> Result<EsEndpoin
     }
     let object_ref = required_str(row, "object_ref")?;
     let endpoint_uri = required_str(row, "endpoint_uri")?;
+    validate_secret_free_endpoint_uri(&endpoint_uri, "es endpoints[].endpoint_uri")?;
     Ok(EsEndpointConfig {
         object_ref,
         endpoint_uri,
@@ -345,10 +360,17 @@ fn parse_credential_config(row: &HashMap<String, ConfigValue>) -> Result<EsCrede
 
 fn parse_runtime_grant(row: &HashMap<String, ConfigValue>) -> Result<GrantedEsEndpoint> {
     let object_ref = required_str(row, "object_ref")?;
+    let endpoint_uri = optional_nonempty_str(row, "endpoint_uri");
+    if let Some(endpoint_uri) = endpoint_uri.as_deref() {
+        validate_secret_free_endpoint_uri(
+            endpoint_uri,
+            "es __cnx_runtime.resource_grants[].endpoint_uri",
+        )?;
+    }
     Ok(GrantedEsEndpoint {
         object_ref,
         endpoint_ref: optional_nonempty_str(row, "endpoint_ref"),
-        endpoint_uri: optional_nonempty_str(row, "endpoint_uri"),
+        endpoint_uri,
         credential_ref: optional_nonempty_str(row, "credential_ref"),
         index_scopes: string_array(row, "index_scopes").unwrap_or_default(),
         interfaces: string_array(row, "interfaces").unwrap_or_default(),
@@ -360,6 +382,75 @@ fn parse_runtime_grant(row: &HashMap<String, ConfigValue>) -> Result<GrantedEsEn
         },
         grant_epoch: get_int(row, "grant_epoch").and_then(|v| u64::try_from(v).ok()),
     })
+}
+
+fn validate_runtime_grants_match_product_endpoints(
+    product: &EsSourceConfig,
+    runtime: &EsSourceRuntimeInputs,
+) -> Result<()> {
+    reject_duplicate_refs(
+        runtime
+            .endpoint_grants
+            .iter()
+            .map(|grant| grant.object_ref.as_str()),
+        "__cnx_runtime.resource_grants[].object_ref",
+    )?;
+    let endpoint_refs = product
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.object_ref.as_str())
+        .collect::<HashSet<_>>();
+    for grant in &runtime.endpoint_grants {
+        if !endpoint_refs.contains(grant.object_ref.as_str()) {
+            return Err(CnxError::AccessDenied(format!(
+                "runtime grant references unknown es endpoint object_ref '{}'",
+                grant.object_ref
+            )));
+        }
+        let endpoint = product
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.object_ref == grant.object_ref)
+            .ok_or_else(|| {
+                CnxError::InvalidInput(format!(
+                    "runtime grant references unknown es endpoint object_ref '{}'",
+                    grant.object_ref
+                ))
+            })?;
+        validate_grant_scopes_within_product(
+            &grant.index_scopes,
+            &endpoint.index_scopes,
+            &grant.object_ref,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_grant_scopes_within_product(
+    grant_scopes: &[String],
+    product_scopes: &[String],
+    object_ref: &str,
+) -> Result<()> {
+    for scope in grant_scopes {
+        if !index_allowed(scope, product_scopes) {
+            return Err(CnxError::InvalidInput(format!(
+                "es runtime grant scope '{scope}' widens product index scope for endpoint '{object_ref}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_duplicate_refs<'a>(refs: impl IntoIterator<Item = &'a str>, field: &str) -> Result<()> {
+    let mut seen = HashSet::new();
+    for item in refs {
+        if !seen.insert(item) {
+            return Err(CnxError::InvalidInput(format!(
+                "duplicate {field} '{item}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn reject_secret_material(row: &HashMap<String, ConfigValue>, context: &str) -> Result<()> {
@@ -394,6 +485,23 @@ fn contains_forbidden_secret_key(row: &HashMap<String, ConfigValue>) -> bool {
 
 fn index_allowed(index: &str, scopes: &[String]) -> bool {
     scopes.iter().any(|scope| pattern_matches(scope, index))
+}
+
+fn index_allowed_by_product_and_grant(
+    index: &str,
+    product_scopes: &[String],
+    grant_scopes: &[String],
+) -> bool {
+    index_allowed(index, product_scopes)
+        && (grant_scopes.is_empty() || index_allowed(index, grant_scopes))
+}
+
+fn effective_index_scopes(product_scopes: &[String], grant_scopes: &[String]) -> Vec<String> {
+    if grant_scopes.is_empty() {
+        product_scopes.to_vec()
+    } else {
+        grant_scopes.to_vec()
+    }
 }
 
 fn pattern_matches(scope: &str, index: &str) -> bool {
@@ -510,6 +618,22 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_uri_rejects_embedded_credentials() {
+        let cfg = HashMap::from([(
+            "endpoints".to_string(),
+            ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                ("object_ref".to_string(), string("es-prod")),
+                (
+                    "endpoint_uri".to_string(),
+                    string("https://user:secret@es.internal"),
+                ),
+            ]))]),
+        )]);
+
+        assert!(EsSourceConfig::from_product_manifest_config(&cfg).is_err());
+    }
+
+    #[test]
     fn resolves_endpoint_from_runtime_grant_without_secret_bytes() {
         let cfg = HashMap::from([
             (
@@ -531,6 +655,10 @@ mod tests {
                     ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
                         ("resource_kind".to_string(), string("elasticsearch")),
                         ("object_ref".to_string(), string("es-prod")),
+                        (
+                            "interfaces".to_string(),
+                            ConfigValue::Array(vec![string("read")]),
+                        ),
                         ("grant_state".to_string(), string("active")),
                         ("grant_epoch".to_string(), ConfigValue::Int(11)),
                         (
@@ -551,6 +679,124 @@ mod tests {
         assert_eq!(endpoint.credential_ref.as_deref(), Some("prod-es"));
         assert_eq!(endpoint.grant_epoch, Some(11));
         assert!(config.endpoint_for("es-prod", "logs-2025-01").is_err());
+        let mut missing_read = config.clone();
+        missing_read.runtime.endpoint_grants[0].interfaces.clear();
+        assert!(matches!(
+            missing_read.endpoint_for("es-prod", "logs-2026-05"),
+            Err(CnxError::AccessDenied(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_endpoint_object_refs_fail_closed() {
+        let cfg = HashMap::from([(
+            "endpoints".to_string(),
+            ConfigValue::Array(vec![
+                ConfigValue::Map(HashMap::from([
+                    ("object_ref".to_string(), string("es-prod")),
+                    ("endpoint_uri".to_string(), string("https://es-a.internal")),
+                ])),
+                ConfigValue::Map(HashMap::from([
+                    ("object_ref".to_string(), string("es-prod")),
+                    ("endpoint_uri".to_string(), string("https://es-b.internal")),
+                ])),
+            ]),
+        )]);
+
+        let err = EsSourceConfig::from_product_manifest_config(&cfg).unwrap_err();
+
+        assert!(err.to_string().contains("duplicate endpoints[].object_ref"));
+    }
+
+    #[test]
+    fn duplicate_credential_refs_fail_closed() {
+        let cfg = HashMap::from([(
+            "credentials".to_string(),
+            ConfigValue::Array(vec![
+                ConfigValue::Map(HashMap::from([
+                    ("credential_ref".to_string(), string("prod-es")),
+                    ("auth_type".to_string(), string("none")),
+                ])),
+                ConfigValue::Map(HashMap::from([
+                    ("credential_ref".to_string(), string("prod-es")),
+                    ("auth_type".to_string(), string("none")),
+                ])),
+            ]),
+        )]);
+
+        let err = EsSourceConfig::from_product_manifest_config(&cfg).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("duplicate credentials[].credential_ref")
+        );
+    }
+
+    #[test]
+    fn runtime_grant_to_unknown_endpoint_fails_closed() {
+        let cfg = HashMap::from([
+            (
+                "endpoints".to_string(),
+                ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                    ("object_ref".to_string(), string("es-prod")),
+                    ("endpoint_uri".to_string(), string("https://es.internal")),
+                ]))]),
+            ),
+            (
+                "__cnx_runtime".to_string(),
+                ConfigValue::Map(HashMap::from([(
+                    "resource_grants".to_string(),
+                    ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                        ("resource_kind".to_string(), string("elasticsearch")),
+                        ("object_ref".to_string(), string("es-shadow")),
+                    ]))]),
+                )])),
+            ),
+        ]);
+
+        let err = EsSourceRuntimeConfig::from_manifest_config(&cfg).unwrap_err();
+
+        assert!(err.to_string().contains("unknown es endpoint object_ref"));
+    }
+
+    #[test]
+    fn duplicate_runtime_endpoint_grants_fail_closed() {
+        let cfg = HashMap::from([
+            (
+                "endpoints".to_string(),
+                ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                    ("object_ref".to_string(), string("es-prod")),
+                    ("endpoint_uri".to_string(), string("https://es.internal")),
+                ]))]),
+            ),
+            (
+                "__cnx_runtime".to_string(),
+                ConfigValue::Map(HashMap::from([(
+                    "resource_grants".to_string(),
+                    ConfigValue::Array(vec![
+                        ConfigValue::Map(HashMap::from([
+                            ("resource_kind".to_string(), string("elasticsearch")),
+                            ("object_ref".to_string(), string("es-prod")),
+                        ])),
+                        ConfigValue::Map(HashMap::from([
+                            ("resource_kind".to_string(), string("elasticsearch")),
+                            ("object_ref".to_string(), string("es-prod")),
+                            (
+                                "index_scopes".to_string(),
+                                ConfigValue::Array(vec![string("logs-*")]),
+                            ),
+                        ])),
+                    ]),
+                )])),
+            ),
+        ]);
+
+        let err = EsSourceRuntimeConfig::from_manifest_config(&cfg).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("duplicate __cnx_runtime.resource_grants[].object_ref")
+        );
     }
 
     #[test]
@@ -572,6 +818,40 @@ mod tests {
         };
 
         assert!(config.endpoint_for("es-prod", "logs").is_err());
+    }
+
+    #[test]
+    fn runtime_grant_cannot_widen_product_scope() {
+        let cfg = HashMap::from([
+            (
+                "endpoints".to_string(),
+                ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                    ("object_ref".to_string(), string("es-prod")),
+                    ("endpoint_uri".to_string(), string("https://es.internal")),
+                    (
+                        "index_scopes".to_string(),
+                        ConfigValue::Array(vec![string("logs-*")]),
+                    ),
+                ]))]),
+            ),
+            (
+                "__cnx_runtime".to_string(),
+                ConfigValue::Map(HashMap::from([(
+                    "resource_grants".to_string(),
+                    ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                        ("resource_kind".to_string(), string("elasticsearch")),
+                        ("object_ref".to_string(), string("es-prod")),
+                        (
+                            "index_scopes".to_string(),
+                            ConfigValue::Array(vec![string("*")]),
+                        ),
+                    ]))]),
+                )])),
+            ),
+        ]);
+        let err = EsSourceRuntimeConfig::from_manifest_config(&cfg).unwrap_err();
+
+        assert!(err.to_string().contains("widens product index scope"));
     }
 
     #[test]

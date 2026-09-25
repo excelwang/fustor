@@ -9,7 +9,7 @@ pub mod shared_types;
 
 pub use config::{
     GrantedMysqlEndpoint, MysqlEndpointConfig, MysqlSourceConfig, MysqlSourceRuntimeConfig,
-    MysqlSourceRuntimeInputs, ResolvedMysqlEndpoint,
+    MysqlSourceRuntimeInputs, MysqlTlsConfig, ResolvedMysqlEndpoint,
 };
 pub use shared_types::{
     MysqlFieldCatalog, MysqlFieldDescriptor, MysqlProbeStatus, MysqlRowBatch, MysqlRowEvent,
@@ -18,7 +18,7 @@ pub use shared_types::{
 };
 pub use source_kit::{
     CredentialSource, ResolvedCredential, SourceCredentialConfig, SourceErrorPayload,
-    decode_msgpack, encode_msgpack,
+    SourceRuntimeStatus, decode_msgpack, encode_msgpack,
 };
 
 pub fn from_manifest_config(

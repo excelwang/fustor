@@ -5,6 +5,7 @@ use serde_json::Value;
 #[serde(rename_all = "kebab-case")]
 pub enum EsSourceOperation {
     SnapshotPage,
+    SnapshotClose,
     PollSince,
     DiscoverFields,
     ProbeConnection,
@@ -44,6 +45,18 @@ impl EsSourceRequest {
     pub fn poll_since(object_ref: impl Into<String>, index: impl Into<String>) -> Self {
         Self {
             operation: EsSourceOperation::PollSince,
+            ..Self::snapshot_page(object_ref, index)
+        }
+    }
+
+    pub fn snapshot_close(
+        object_ref: impl Into<String>,
+        index: impl Into<String>,
+        cursor: EsSnapshotCursor,
+    ) -> Self {
+        Self {
+            operation: EsSourceOperation::SnapshotClose,
+            cursor: Some(EsSourceCursor::Snapshot(cursor)),
             ..Self::snapshot_page(object_ref, index)
         }
     }

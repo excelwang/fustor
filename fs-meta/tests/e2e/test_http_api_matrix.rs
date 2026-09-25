@@ -92,6 +92,8 @@ const ACTIVE_THREE_NODES: [&str; 3] = ["node-a", "node-b", "node-c"];
 const ACTIVE_THREE_FILES_PER_ROOT_ENV: &str = "FSMETA_ACTIVE_THREE_FILES_PER_ROOT";
 const ACTIVE_THREE_DIRS_PER_ROOT_ENV: &str = "FSMETA_ACTIVE_THREE_DIRS_PER_ROOT";
 const ACTIVE_THREE_MATERIALIZATION_TIMEOUT: Duration = Duration::from_secs(240);
+const ACTIVE_THREE_MATERIALIZATION_REPAIR_INTERVAL: Duration = Duration::from_secs(20);
+const ACTIVE_THREE_MATERIALIZATION_REPAIR_LIMIT: usize = 3;
 
 const FULL_MOUNTS: [(&str, &str); 15] = [
     ("node-a", "nfs1"),
@@ -205,7 +207,7 @@ pub fn run_active_three_external_worker_replay() -> Result<(), String> {
         true,
         &ACTIVE_THREE_NODES,
     )?;
-    cluster.apply_release("node-b", release)?;
+    cluster.apply_release("node-b", release.clone())?;
 
     let candidate_base_urls = facade_addrs
         .iter()
@@ -261,6 +263,13 @@ pub fn run_active_three_external_worker_replay() -> Result<(), String> {
         ));
     }
 
+    eprintln!("[fs-meta-active3-replay] step=accepted-scope-followup");
+    let scope_followup =
+        cluster.build_fs_meta_scope_only_followup(&release, &facade_resource_id, &roots)?;
+    cluster
+        .apply_scope_only_followup("node-b", scope_followup)
+        .map_err(|err| format!("active-three accepted-scope followup failed: {err}"))?;
+
     eprintln!("[fs-meta-active3-replay] step=source-repair-rescan");
     wait_for_rescan_accepted(
         &mut session,
@@ -275,22 +284,26 @@ pub fn run_active_three_external_worker_replay() -> Result<(), String> {
         Duration::from_secs(120),
         "active-three status has expected ownership",
         || {
-            let status = session.status()?;
-            validate_active_three_status_ownership(&status, &expected_owner_by_group)?;
+            let status =
+                active_three_validated_status(&mut session, &expected_owner_by_group, false)?;
             final_status = status;
             Ok(true)
         },
     )?;
     eprintln!("[fs-meta-active3-replay] step=materialization-poll");
+    let mut materialization_repair = ActiveThreeMaterializationRepair::default();
     wait_until(
         ACTIVE_THREE_MATERIALIZATION_TIMEOUT,
         "active-three source/sink materialization has transport evidence",
-        || {
-            let status = session.status()?;
-            validate_active_three_status_ownership(&status, &expected_owner_by_group)?;
-            validate_active_three_status_materialization(&status, &expected_owner_by_group)?;
-            final_status = status;
-            Ok(true)
+        || match active_three_validated_status(&mut session, &expected_owner_by_group, true) {
+            Ok(status) => {
+                final_status = status;
+                Ok(true)
+            }
+            Err(err) => {
+                materialization_repair.maybe_trigger(&mut session, &err)?;
+                Err(err)
+            }
         },
     )?;
     eprintln!(
@@ -1851,6 +1864,44 @@ fn run_roots_matrix(
 }
 
 const CURRENT_ROOTS_RESCAN_ACCEPTED_TIMEOUT: Duration = Duration::from_secs(180);
+
+#[derive(Default)]
+struct ActiveThreeMaterializationRepair {
+    attempts: usize,
+    last_attempt_at: Option<Instant>,
+}
+
+impl ActiveThreeMaterializationRepair {
+    fn maybe_trigger(
+        &mut self,
+        session: &mut OperatorSession,
+        status_err: &str,
+    ) -> Result<(), String> {
+        if !is_retryable_active_three_status_fanin_gap(status_err) {
+            return Ok(());
+        }
+        if self.attempts >= ACTIVE_THREE_MATERIALIZATION_REPAIR_LIMIT {
+            return Ok(());
+        }
+        if self.last_attempt_at.is_some_and(|last_attempt_at| {
+            last_attempt_at.elapsed() < ACTIVE_THREE_MATERIALIZATION_REPAIR_INTERVAL
+        }) {
+            return Ok(());
+        }
+        self.attempts += 1;
+        self.last_attempt_at = Some(Instant::now());
+        eprintln!(
+            "[fs-meta-active3-replay] materialization repair rescan attempt={} reason={status_err}",
+            self.attempts
+        );
+        wait_for_rescan_accepted(
+            session,
+            Duration::from_secs(45),
+            "active-three materialization repair rescan accepted",
+        )
+    }
+}
+
 fn wait_for_rescan_accepted(
     session: &mut OperatorSession,
     timeout: Duration,
@@ -1866,6 +1917,10 @@ fn wait_for_rescan_accepted(
         }
         match session.rescan() {
             Ok(_) => return Ok(()),
+            Err(err) if source_repair_already_ready_with_pending_materialization(&err) => {
+                eprintln!("[fs-meta-test-matrix] rescan_not_required label={label} reason={err}");
+                return Ok(());
+            }
             Err(err) if is_retryable_source_repair_not_ready(&err) => {
                 last_retryable_err = Some(err);
             }
@@ -1875,6 +1930,12 @@ fn wait_for_rescan_accepted(
     }
 }
 
+fn source_repair_already_ready_with_pending_materialization(err: &str) -> bool {
+    err.contains("http 503 failed")
+        && err.contains("current roots are source-ready but sink materialization is only pending")
+        && err.contains("pending materialization must be observed patiently")
+}
+
 fn is_retryable_source_repair_not_ready(err: &str) -> bool {
     err.contains("http 503 failed")
         && (err.contains("manual rescan current roots runtime-scope readiness failed")
@@ -1882,6 +1943,35 @@ fn is_retryable_source_repair_not_ready(err: &str) -> bool {
             || err.contains("manual rescan source-status target proof incomplete")
             || err.contains("manual rescan source repair readiness pending")
             || err.contains("manual rescan response budget exhausted"))
+}
+
+fn is_retryable_active_three_status_fanin_gap(err: &str) -> bool {
+    err.contains("http 503 failed") && err.contains("status authoritative fan-in incomplete")
+}
+
+fn active_three_validated_status(
+    session: &mut OperatorSession,
+    expected_owner_by_group: &BTreeMap<String, String>,
+    require_materialization: bool,
+) -> Result<Value, String> {
+    let statuses = session.status_all()?;
+    let mut last_err = "no active-three management status responses".to_string();
+    for status in statuses {
+        if let Err(err) = validate_active_three_status_ownership(&status, expected_owner_by_group) {
+            last_err = err;
+            continue;
+        }
+        if require_materialization {
+            if let Err(err) =
+                validate_active_three_status_materialization(&status, expected_owner_by_group)
+            {
+                last_err = err;
+                continue;
+            }
+        }
+        return Ok(status);
+    }
+    Err(last_err)
 }
 
 #[test]
@@ -1895,6 +1985,27 @@ fn source_repair_retry_classifier_treats_duplicate_roots_control_observation_as_
 ) {
     let err = "http 503 failed: {\"error\":\"manual rescan current roots runtime-scope readiness failed: manual rescan current roots source-status returned only cache/degraded/non-ready evidence or route-gap evidence before scoped delivery target proof\"}";
     assert!(is_retryable_source_repair_not_ready(err));
+}
+
+#[test]
+fn source_repair_classifier_treats_pending_materialization_as_no_rescan_needed() {
+    let err = "http 503 failed: {\"error\":\"manual rescan rejected: current roots are source-ready but sink materialization is only pending; pending materialization must be observed patiently instead of rescan-triggered groups={\\\"nfs-144\\\"}\"}";
+    assert!(source_repair_already_ready_with_pending_materialization(
+        err
+    ));
+    assert!(!is_retryable_source_repair_not_ready(err));
+}
+
+#[test]
+fn active_three_status_retry_classifier_treats_authoritative_fanin_gap_as_repairable() {
+    let err = "http 503 failed: {\"error\":\"status authoritative fan-in incomplete: sink_route=transport source_route=transport expected_groups={\\\"nfs-144\\\"} source_coverage_gaps={\\\"nfs-144\\\"}\"}";
+    assert!(is_retryable_active_three_status_fanin_gap(err));
+}
+
+#[test]
+fn active_three_status_retry_classifier_rejects_materialization_validation_errors() {
+    let err = "active-three materialization not converged: sink group nfs-144 materialization_readiness is \"pending-materialization\"";
+    assert!(!is_retryable_active_three_status_fanin_gap(err));
 }
 
 #[test]
@@ -2310,8 +2421,18 @@ fn install_active_three_resources(
     facade_addrs: &[String],
 ) -> Result<(), String> {
     for (node_name, export_name) in ACTIVE_THREE_MOUNTS {
+        eprintln!(
+            "[fs-meta-active3-replay] resource-mount begin node={node_name} export={export_name}"
+        );
         let mount_path = lab.mount_export(node_name, export_name)?;
+        eprintln!(
+            "[fs-meta-active3-replay] resource-mount ok node={node_name} export={export_name} path={}",
+            mount_path.display()
+        );
         let node_id = cluster.node_id(node_name)?;
+        eprintln!(
+            "[fs-meta-active3-replay] resource-announce begin node={node_name} export={export_name}"
+        );
         cluster.announce_resources_clusterwide(vec![json!({
             "resource_id": export_name,
             "node_id": node_id,
@@ -2319,11 +2440,17 @@ fn install_active_three_resources(
             "source": lab.export_source(export_name),
             "mount_hint": mount_path.display().to_string(),
         })])?;
+        eprintln!(
+            "[fs-meta-active3-replay] resource-announce ok node={node_name} export={export_name}"
+        );
     }
     let bind_addr = facade_addrs
         .first()
         .ok_or_else(|| "active-three replay requires one facade bind addr".to_string())?;
     let node_id = cluster.node_id("node-b")?;
+    eprintln!(
+        "[fs-meta-active3-replay] resource-announce begin node=node-b export={facade_resource_id}"
+    );
     cluster.announce_resources_clusterwide(vec![json!({
         "resource_id": facade_resource_id,
         "node_id": node_id,
@@ -2331,6 +2458,9 @@ fn install_active_three_resources(
         "source": format!("http://node-b/listener/{facade_resource_id}"),
         "bind_addr": bind_addr,
     })])?;
+    eprintln!(
+        "[fs-meta-active3-replay] resource-announce ok node=node-b export={facade_resource_id}"
+    );
     Ok(())
 }
 
@@ -3833,6 +3963,7 @@ fn count_log_patterns_recursive(
 
 fn reject_active_three_blocker_evidence(evidence: &Value) -> Result<(), String> {
     let mut blockers = Vec::new();
+    let final_status_ready = active_three_evidence_final_status_ready(evidence);
     let Some(nodes) = evidence.get("nodes").and_then(Value::as_array) else {
         return Err(format!("active-three evidence missing nodes: {evidence}"));
     };
@@ -3876,8 +4007,16 @@ fn reject_active_three_blocker_evidence(evidence: &Value) -> Result<(), String> 
             ));
         }
         if let Some(log_counts) = node.get("log_counts").and_then(Value::as_object) {
+            let timeout_count = log_counts
+                .get("operation timed out")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if timeout_count > 0 && !final_status_ready {
+                blockers.push(format!(
+                    "{name}: log pattern `operation timed out` count={timeout_count}"
+                ));
+            }
             for pattern in [
-                "operation timed out",
                 "worker sidecar bind failed",
                 "statecell_read failed",
                 "route activation backpressure",
@@ -3898,4 +4037,331 @@ fn reject_active_three_blocker_evidence(evidence: &Value) -> Result<(), String> 
             evidence
         ))
     }
+}
+
+fn active_three_evidence_final_status_ready(evidence: &Value) -> bool {
+    let Some(status) = evidence.get("status") else {
+        return false;
+    };
+    if status
+        .pointer("/readiness_planes/trusted_observation_readiness")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return false;
+    }
+    if status
+        .get("repair_lanes")
+        .and_then(Value::as_array)
+        .is_some_and(|lanes| {
+            lanes
+                .iter()
+                .any(|lane| lane.get("blocking").and_then(Value::as_bool) == Some(true))
+        })
+    {
+        return false;
+    }
+    if !status
+        .pointer("/source/degraded_roots")
+        .and_then(Value::as_array)
+        .is_some_and(|roots| {
+            roots.iter().all(|root| {
+                active_three_degraded_root_is_cache_marker(root)
+                    || active_three_degraded_root_is_stale_after_clean_concrete_status(status, root)
+            })
+        })
+    {
+        return false;
+    }
+    ACTIVE_THREE_EXPORTS.iter().all(|group| {
+        active_three_status_has_logical_source_state(status, group, "serving-trusted")
+            && active_three_status_has_primary_source_participation(status, group, "serving")
+            && active_three_status_has_sink_group_state(status, group, "serving-trusted", "ready")
+    })
+}
+
+fn active_three_degraded_root_is_cache_marker(root: &Value) -> bool {
+    root.get("root_key").and_then(Value::as_str) == Some("source-worker")
+        && root.get("reason").and_then(Value::as_str)
+            == Some("source worker status served from cache")
+}
+
+fn active_three_degraded_root_is_stale_after_clean_concrete_status(
+    status: &Value,
+    degraded_root: &Value,
+) -> bool {
+    let Some(root_key) = degraded_root.get("root_key").and_then(Value::as_str) else {
+        return false;
+    };
+    status
+        .pointer("/source/concrete_roots")
+        .and_then(Value::as_array)
+        .is_some_and(|roots| {
+            roots.iter().any(|root| {
+                root.get("root_key").and_then(Value::as_str) == Some(root_key)
+                    && root.get("is_group_primary").and_then(Value::as_bool) == Some(true)
+                    && root.get("participation_state").and_then(Value::as_str) == Some("serving")
+                    && root.get("active").and_then(Value::as_bool) == Some(true)
+                    && root.get("last_error").is_none_or(Value::is_null)
+                    && root
+                        .get("last_audit_completed_at_us")
+                        .and_then(Value::as_u64)
+                        .is_some()
+            })
+        })
+}
+
+fn active_three_status_has_logical_source_state(
+    status: &Value,
+    group: &str,
+    expected_state: &str,
+) -> bool {
+    status
+        .pointer("/source/logical_roots")
+        .and_then(Value::as_array)
+        .is_some_and(|roots| {
+            roots.iter().any(|root| {
+                root.get("root_id").and_then(Value::as_str) == Some(group)
+                    && root.get("service_state").and_then(Value::as_str) == Some(expected_state)
+            })
+        })
+}
+
+fn active_three_status_has_primary_source_participation(
+    status: &Value,
+    group: &str,
+    expected_state: &str,
+) -> bool {
+    status
+        .pointer("/source/concrete_roots")
+        .and_then(Value::as_array)
+        .is_some_and(|roots| {
+            roots.iter().any(|root| {
+                root.get("logical_root_id").and_then(Value::as_str) == Some(group)
+                    && root.get("is_group_primary").and_then(Value::as_bool) == Some(true)
+                    && root.get("participation_state").and_then(Value::as_str)
+                        == Some(expected_state)
+                    && root.get("active").and_then(Value::as_bool) == Some(true)
+                    && root
+                        .get("last_audit_completed_at_us")
+                        .and_then(Value::as_u64)
+                        .is_some()
+            })
+        })
+}
+
+fn active_three_status_has_sink_group_state(
+    status: &Value,
+    group: &str,
+    expected_service_state: &str,
+    expected_materialization: &str,
+) -> bool {
+    status
+        .pointer("/sink/groups")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| {
+            groups.iter().any(|sink_group| {
+                sink_group.get("group_id").and_then(Value::as_str) == Some(group)
+                    && sink_group.get("service_state").and_then(Value::as_str)
+                        == Some(expected_service_state)
+                    && sink_group
+                        .get("materialization_readiness")
+                        .and_then(Value::as_str)
+                        == Some(expected_materialization)
+            })
+        })
+}
+
+#[test]
+fn active_three_evidence_tolerates_timeout_logs_after_ready_status() {
+    let evidence = active_three_ready_evidence_with_log_counts(json!({
+        "operation timed out": 2,
+        "worker sidecar bind failed": 0,
+        "statecell_read failed": 0,
+        "route activation backpressure": 0
+    }));
+
+    reject_active_three_blocker_evidence(&evidence)
+        .expect("ready status should tolerate bounded timeout diagnostics");
+}
+
+#[test]
+fn active_three_evidence_tolerates_nonblocking_timed_out_repair_history_after_ready_status() {
+    let mut evidence = active_three_ready_evidence_with_log_counts(json!({
+        "operation timed out": 2,
+        "worker sidecar bind failed": 0,
+        "statecell_read failed": 0,
+        "route activation backpressure": 0
+    }));
+    evidence["status"]["repair_lanes"] = json!([{
+        "lane": "status-triggered-sink-observation-repair",
+        "state": "timed-out",
+        "blocking": false
+    }]);
+
+    reject_active_three_blocker_evidence(&evidence)
+        .expect("nonblocking repair history must not override current ready source/sink truth");
+}
+
+#[test]
+fn active_three_evidence_keeps_timeout_blocker_for_current_blocking_repair_lane() {
+    let mut evidence = active_three_ready_evidence_with_log_counts(json!({
+        "operation timed out": 1,
+        "worker sidecar bind failed": 0,
+        "statecell_read failed": 0,
+        "route activation backpressure": 0
+    }));
+    evidence["status"]["repair_lanes"] = json!([{
+        "lane": "source-repair",
+        "state": "timed-out",
+        "blocking": true
+    }]);
+
+    let err = reject_active_three_blocker_evidence(&evidence)
+        .expect_err("a current blocking repair lane must keep timeout evidence blocking");
+    assert!(err.contains("operation timed out"), "{err}");
+}
+
+#[test]
+fn active_three_evidence_tolerates_timeout_logs_after_ready_cache_marked_status() {
+    let mut evidence = active_three_ready_evidence_with_log_counts(json!({
+        "operation timed out": 1,
+        "worker sidecar bind failed": 0,
+        "statecell_read failed": 0,
+        "route activation backpressure": 0
+    }));
+    evidence
+        .pointer_mut("/status/source/degraded_roots")
+        .and_then(Value::as_array_mut)
+        .expect("fixture degraded roots")
+        .push(json!({
+            "root_key": "source-worker",
+            "reason": "source worker status served from cache"
+        }));
+
+    reject_active_three_blocker_evidence(&evidence)
+        .expect("cache provenance marker should not demote ready active-three status");
+}
+
+#[test]
+fn active_three_evidence_tolerates_timeout_logs_after_stale_degraded_sentinel_with_clean_concrete_root(
+) {
+    let mut evidence = active_three_ready_evidence_with_log_counts(json!({
+        "operation timed out": 1,
+        "worker sidecar bind failed": 0,
+        "statecell_read failed": 0,
+        "route activation backpressure": 0
+    }));
+    let root_key = evidence
+        .pointer("/status/source/concrete_roots/0/root_key")
+        .and_then(Value::as_str)
+        .expect("fixture concrete root key")
+        .to_string();
+    evidence
+        .pointer_mut("/status/source/degraded_roots")
+        .and_then(Value::as_array_mut)
+        .expect("fixture degraded roots")
+        .push(json!({
+            "root_key": root_key,
+            "reason": "degraded"
+        }));
+
+    reject_active_three_blocker_evidence(&evidence)
+        .expect("clean concrete root readiness should prove the sentinel degraded marker stale");
+}
+
+#[test]
+fn active_three_evidence_keeps_timeout_blocker_when_ready_status_has_real_degraded_root() {
+    let mut evidence = active_three_ready_evidence_with_log_counts(json!({
+        "operation timed out": 1,
+        "worker sidecar bind failed": 0,
+        "statecell_read failed": 0,
+        "route activation backpressure": 0
+    }));
+    evidence
+        .pointer_mut("/status/source/degraded_roots")
+        .and_then(Value::as_array_mut)
+        .expect("fixture degraded roots")
+        .push(json!({
+            "root_key": "nfs-144",
+            "reason": "source audit degraded"
+        }));
+
+    let err = reject_active_three_blocker_evidence(&evidence)
+        .expect_err("real degraded roots must keep timeout diagnostics blocking");
+    assert!(err.contains("operation timed out"), "{err}");
+}
+
+#[test]
+fn active_three_evidence_keeps_hard_log_blockers() {
+    let evidence = active_three_ready_evidence_with_log_counts(json!({
+        "operation timed out": 0,
+        "worker sidecar bind failed": 1,
+        "statecell_read failed": 0,
+        "route activation backpressure": 0
+    }));
+
+    let err = reject_active_three_blocker_evidence(&evidence)
+        .expect_err("sidecar bind failures remain hard blockers");
+    assert!(err.contains("worker sidecar bind failed"), "{err}");
+}
+
+#[cfg(test)]
+fn active_three_ready_evidence_with_log_counts(log_counts: Value) -> Value {
+    let logical_roots = ACTIVE_THREE_EXPORTS
+        .iter()
+        .map(|group| {
+            json!({
+                "root_id": group,
+                "service_state": "serving-trusted"
+            })
+        })
+        .collect::<Vec<_>>();
+    let concrete_roots = ACTIVE_THREE_EXPORTS
+        .iter()
+        .map(|group| {
+            json!({
+                "root_key": format!("{group}@node-a::{group}@/tmp/{group}"),
+                "logical_root_id": group,
+                "is_group_primary": true,
+                "participation_state": "serving",
+                "active": true,
+                "last_error": null,
+                "last_audit_completed_at_us": 1
+            })
+        })
+        .collect::<Vec<_>>();
+    let sink_groups = ACTIVE_THREE_EXPORTS
+        .iter()
+        .map(|group| {
+            json!({
+                "group_id": group,
+                "service_state": "serving-trusted",
+                "materialization_readiness": "ready"
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "nodes": [{
+            "node": "node-a",
+            "registry_current_entries": 1,
+            "registry_draining_entries": 0,
+            "worker_host_pids": [1],
+            "log_counts": log_counts
+        }],
+        "status": {
+            "readiness_planes": {
+                "trusted_observation_readiness": true
+            },
+            "repair_lanes": [],
+            "source": {
+                "degraded_roots": [],
+                "logical_roots": logical_roots,
+                "concrete_roots": concrete_roots
+            },
+            "sink": {
+                "groups": sink_groups
+            }
+        }
+    })
 }

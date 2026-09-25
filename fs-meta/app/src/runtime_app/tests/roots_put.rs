@@ -517,34 +517,39 @@
             .await
             .expect("initial successor sink events wave should succeed");
 
-        successor.shared_sink_route_claims.lock().await.clear();
+        lock_shared_route_claims(&successor.shared_sink_route_claims).clear();
 
+        let successor_sink_only_envelopes = vec![
+            deactivate_envelope_with_route_key_reason_and_lease(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                sink_events_route.1.clone(),
+                3,
+                "restart_deferred_retire_pending",
+                7,
+                11,
+                22,
+            ),
+        ];
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let _pause_reset = SinkWorkerControlFramePauseHookReset;
-        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
-            crate::workers::sink::SinkWorkerControlFramePauseHook {
-                entered: entered.clone(),
-                release: release.clone(),
-            },
-        );
+        match &*successor.sink {
+            SinkFacade::Worker(client) => client
+                .install_control_frame_pause_hook_for_envelopes_for_tests(
+                    &successor_sink_only_envelopes,
+                    crate::workers::sink::SinkWorkerControlFramePauseHook {
+                        entered: entered.clone(),
+                        release: release.clone(),
+                    },
+                )
+                .expect("install targeted sink control pause hook"),
+            SinkFacade::Local(_) => panic!("expected external sink worker client"),
+        }
+        ;
 
         let successor_sink_only = tokio::spawn({
             let successor = successor.clone();
-            let sink_events_route_key = sink_events_route.1.clone();
-            async move {
-                successor
-                    .on_control_frame(&[deactivate_envelope_with_route_key_reason_and_lease(
-                        execution_units::SINK_RUNTIME_UNIT_ID,
-                        sink_events_route_key,
-                        3,
-                        "restart_deferred_retire_pending",
-                        7,
-                        11,
-                        22,
-                    )])
-                    .await
-            }
+            async move { successor.on_control_frame(&successor_sink_only_envelopes).await }
         });
 
         tokio::time::timeout(Duration::from_secs(5), entered.notified())
@@ -698,34 +703,39 @@
             .await
             .expect("initial successor sink events wave should succeed");
 
-        successor.shared_sink_route_claims.lock().await.clear();
+        lock_shared_route_claims(&successor.shared_sink_route_claims).clear();
 
+        let successor_sink_only_envelopes = vec![
+            deactivate_envelope_with_route_key_reason_and_lease(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                sink_events_route.1.clone(),
+                3,
+                "restart_deferred_retire_pending",
+                7,
+                11,
+                22,
+            ),
+        ];
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let _pause_reset = SinkWorkerControlFramePauseHookReset;
-        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
-            crate::workers::sink::SinkWorkerControlFramePauseHook {
-                entered: entered.clone(),
-                release: release.clone(),
-            },
-        );
+        match &*successor.sink {
+            SinkFacade::Worker(client) => client
+                .install_control_frame_pause_hook_for_envelopes_for_tests(
+                    &successor_sink_only_envelopes,
+                    crate::workers::sink::SinkWorkerControlFramePauseHook {
+                        entered: entered.clone(),
+                        release: release.clone(),
+                    },
+                )
+                .expect("install targeted sink control pause hook"),
+            SinkFacade::Local(_) => panic!("expected external sink worker client"),
+        }
+        ;
 
         let successor_sink_only = tokio::spawn({
             let successor = successor.clone();
-            let sink_events_route_key = sink_events_route.1.clone();
-            async move {
-                successor
-                    .on_control_frame(&[deactivate_envelope_with_route_key_reason_and_lease(
-                        execution_units::SINK_RUNTIME_UNIT_ID,
-                        sink_events_route_key,
-                        3,
-                        "restart_deferred_retire_pending",
-                        7,
-                        11,
-                        22,
-                    )])
-                    .await
-            }
+            async move { successor.on_control_frame(&successor_sink_only_envelopes).await }
         });
 
         tokio::time::timeout(Duration::from_secs(5), entered.notified())
@@ -1189,8 +1199,28 @@
         "/src/runtime_app/tests/roots_put/fail_closed_sink_recovery_reactivation.rs"
     ));
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn first_uninitialized_materialized_find_node_a_deactivate_stays_cleanup_only_after_fail_closed_cutover_source_failure_and_proxy_cleanup()
+    #[test]
+    fn first_uninitialized_materialized_find_node_a_deactivate_stays_cleanup_only_after_fail_closed_cutover_source_failure_and_proxy_cleanup()
+    {
+        std::thread::Builder::new()
+            .name("fs-meta-fail-closed-cleanup-test".to_string())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .enable_all()
+                    .build()
+                    .expect("build fail-closed cleanup test runtime")
+                    .block_on(
+                        first_uninitialized_materialized_find_node_a_deactivate_stays_cleanup_only_after_fail_closed_cutover_source_failure_and_proxy_cleanup_body(),
+                    );
+            })
+            .expect("spawn fail-closed cleanup test thread")
+            .join()
+            .expect("join fail-closed cleanup test thread");
+    }
+
+    async fn first_uninitialized_materialized_find_node_a_deactivate_stays_cleanup_only_after_fail_closed_cutover_source_failure_and_proxy_cleanup_body()
      {
         struct SinkWorkerControlFramePauseHookReset;
         struct SourceControlErrorHookReset;

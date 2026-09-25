@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RESOURCE_GUARD="${FUSTOR_RESOURCE_GUARD:-$ROOT/scripts/resource-guard.sh}"
 CAPANIX_ROOT="${CAPANIX_ROOT:-$(cd "$ROOT/../capanix" && pwd)}"
 WORKDIR="${WORKDIR:-/tmp/capanix-5node}"
 KEEP="${KEEP:-0}"
@@ -75,7 +76,6 @@ cnxctl_cluster() {
     --domain-id local \
     --key-id "${CAPANIX_CTL_KEY_ID:-local-admin-ed25519-1}" \
     --admin-sk-b64 "$CAPANIX_CTL_SK_B64" \
-    --target-scope cluster \
     "$@"
 }
 
@@ -121,7 +121,7 @@ start_node_direct() {
   CAPANIX_HOME="$CAPANIX_HOME" \
     CAPANIX_NODE_SK_B64="$CAPANIX_NODE_SK_B64" \
     CAPANIX_ADMIN_SK_B64="$CAPANIX_ADMIN_SK_B64" \
-    /usr/bin/setsid "$CAPANIXD_BIN" \
+    "$RESOURCE_GUARD" /usr/bin/setsid "$CAPANIXD_BIN" \
     -c "$CAPANIX_CONFIG" \
     -b "$CAPANIX_BIND_ADDR" \
     >>"$CAPANIX_LOG" 2>&1 </dev/null &
@@ -194,6 +194,7 @@ write_compose_file() {
 services:
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    cpus: "${LOCAL_ES_CPUS:-1.50}"
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
@@ -208,6 +209,7 @@ services:
 
   mysql:
     image: mysql:8.4
+    cpus: "${LOCAL_MYSQL_CPUS:-0.75}"
     environment:
       MYSQL_ROOT_PASSWORD: rootpass
       MYSQL_DATABASE: fustor_demo
@@ -223,6 +225,7 @@ services:
 
   minio:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    cpus: "${LOCAL_MINIO_CPUS:-0.50}"
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${S3_LOCAL_ACCESS_KEY_ID}
@@ -238,6 +241,7 @@ services:
 
   minio-mc:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    cpus: "${LOCAL_MINIO_MC_CPUS:-0.25}"
     depends_on:
       minio:
         condition: service_healthy
@@ -354,20 +358,20 @@ write_union_graph_manifest() {
   suffix="$(printf '%s' "$host_ref" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]/_/g')"
   cat >"$MANIFEST_DIR/union-graph.${host_ref}.yaml" <<YAML
 ports:
-  - route_token: union-graph.internal
-    use_port: query
-    dispatch_tag: query
+  - route_token: fustor.data-view.internal
+    use_port: data-view-query
+    dispatch_tag: data-view-query
     pattern: request_reply
-    route_key: union-graph.query.${suffix}:v1
+    route_key: fustor.data-view.query.${suffix}:v1
     visibility: internal
     roles:
       - serve
       - use
-  - route_token: union-graph.internal
-    use_port: ingest
-    dispatch_tag: ingest
+  - route_token: fustor.data-view.internal
+    use_port: data-view-command
+    dispatch_tag: data-view-command
     pattern: request_reply
-    route_key: union-graph.ingest.${suffix}:v1
+    route_key: fustor.data-view.command.${suffix}:v1
     visibility: internal
     roles:
       - serve
@@ -531,12 +535,8 @@ workers:
       path: ${UNION_GRAPH_LIB}
       manifest: ${MANIFEST_DIR}/union-graph.${host_ref}.yaml
     config:
-      bio_pipeline_mock:
-        enabled: true
-        schema_path: ${ROOT}/union-graph/fixtures/bio-mock/PPG_Schema.json
-        union_schema_path: ${ROOT}/union-graph/fixtures/bio-mock/PPG_Union_Schema.json
-        ppg_status_json_path: ${ROOT}/union-graph/fixtures/bio-mock/ppg-status.json
-        observed_at: 1779984000000000
+      data_view_id: global
+      data_view_state_path: ${WORKDIR}/data-view/global.json
     runtime:
       local_host_ref: ${host_ref}
     policy:
@@ -562,16 +562,16 @@ YAML
 
 build_binaries() {
   log "building Capanix CLI/daemon"
-  cargo build --manifest-path "$CAPANIX_ROOT/Cargo.toml" -p capanix-cli -p capanix-daemon
+  "$RESOURCE_GUARD" cargo build --manifest-path "$CAPANIX_ROOT/Cargo.toml" -p capanix-cli -p capanix-daemon
   log "building fustor runtime libraries and tooling"
-  cargo build --manifest-path "$ROOT/Cargo.toml" \
+  "$RESOURCE_GUARD" cargo build --manifest-path "$ROOT/Cargo.toml" \
     -p fs-meta-runtime \
     -p es-source-runtime \
     -p mysql-source-runtime \
     -p s3-source-runtime \
     -p union-graph-runtime \
     --lib
-  cargo build --manifest-path "$ROOT/Cargo.toml" -p fs-meta-tooling --bin fsmeta
+  "$RESOURCE_GUARD" cargo build --manifest-path "$ROOT/Cargo.toml" -p fs-meta-tooling --bin fsmeta
   [ -x "$CNXCTL_BIN" ] || die "cnxctl binary not found at $CNXCTL_BIN"
   [ -x "$CAPANIXD_BIN" ] || die "capanixd binary not found at $CAPANIXD_BIN"
   [ -x "$FSMETA_BIN" ] || die "fsmeta binary not found at $FSMETA_BIN"
@@ -656,6 +656,8 @@ main() {
   need_cmd cargo
   need_cmd curl
   need_cmd docker
+  need_cmd taskset
+  [[ -x "$RESOURCE_GUARD" ]] || die "resource guard is not executable: $RESOURCE_GUARD"
 
   if [ "$KEEP" != "1" ]; then
     cleanup_workdir

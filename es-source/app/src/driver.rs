@@ -10,6 +10,7 @@ use es_source::shared_types::{
 use es_source::{ResolvedCredential, ResolvedEsEndpoint};
 use reqwest::blocking::{Client, RequestBuilder};
 use serde_json::{Map, Value, json};
+use source_kit::{SourceOperationBudget, source_native_revision_digest};
 
 pub trait EsSourceDriver: Send + Sync {
     fn execute(
@@ -19,21 +20,93 @@ pub trait EsSourceDriver: Send + Sync {
         request: &EsSourceRequest,
         limit: usize,
     ) -> Result<EsSourcePayload>;
+
+    fn execute_with_timeout(
+        &self,
+        endpoint: &ResolvedEsEndpoint,
+        credential: &ResolvedCredential,
+        request: &EsSourceRequest,
+        limit: usize,
+        timeout: Option<Duration>,
+    ) -> Result<EsSourcePayload> {
+        let _ = timeout;
+        self.execute(endpoint, credential, request, limit)
+    }
+
+    fn execute_with_budget(
+        &self,
+        endpoint: &ResolvedEsEndpoint,
+        credential: &ResolvedCredential,
+        request: &EsSourceRequest,
+        limit: usize,
+        budget: &mut SourceOperationBudget,
+    ) -> Result<EsSourcePayload> {
+        budget.observe_fanout(1)?;
+        budget.consume_call(1)?;
+        self.execute_with_timeout(
+            endpoint,
+            credential,
+            request,
+            limit,
+            budget.remaining_timeout()?,
+        )
+    }
+
+    fn close_snapshot(
+        &self,
+        endpoint: &ResolvedEsEndpoint,
+        credential: &ResolvedCredential,
+        pit_id: &str,
+    ) -> Result<()> {
+        let _ = (endpoint, credential, pit_id);
+        Err(CnxError::NotSupported(
+            "elasticsearch snapshot close is not supported by this driver".into(),
+        ))
+    }
+
+    fn close_snapshot_with_timeout(
+        &self,
+        endpoint: &ResolvedEsEndpoint,
+        credential: &ResolvedCredential,
+        pit_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        let _ = timeout;
+        self.close_snapshot(endpoint, credential, pit_id)
+    }
+
+    fn close_snapshot_with_budget(
+        &self,
+        endpoint: &ResolvedEsEndpoint,
+        credential: &ResolvedCredential,
+        pit_id: &str,
+        budget: &mut SourceOperationBudget,
+    ) -> Result<()> {
+        budget.observe_fanout(1)?;
+        budget.consume_call(1)?;
+        self.close_snapshot_with_timeout(endpoint, credential, pit_id, budget.remaining_timeout()?)
+    }
 }
 
-#[derive(Clone)]
 pub struct HttpEsSourceDriver {
-    client: Client,
+    client: Option<Client>,
     pit_keep_alive: String,
 }
 
 impl Default for HttpEsSourceDriver {
     fn default() -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
+            client: Some(
+                run_es_thread("build Elasticsearch HTTP client", || {
+                    Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .build()
+                        .map_err(|err| {
+                            CnxError::Internal(format!("build Elasticsearch HTTP client: {err}"))
+                        })
+                })
                 .expect("build reqwest blocking client"),
+            ),
             pit_keep_alive: "1m".into(),
         }
     }
@@ -47,28 +120,116 @@ impl EsSourceDriver for HttpEsSourceDriver {
         request: &EsSourceRequest,
         limit: usize,
     ) -> Result<EsSourcePayload> {
-        match request.operation {
-            EsSourceOperation::ProbeConnection => self.probe(endpoint, credential),
-            EsSourceOperation::DiscoverFields => {
-                self.discover_fields(endpoint, credential, request)
+        self.execute_with_timeout(endpoint, credential, request, limit, None)
+    }
+
+    fn execute_with_timeout(
+        &self,
+        endpoint: &ResolvedEsEndpoint,
+        credential: &ResolvedCredential,
+        request: &EsSourceRequest,
+        limit: usize,
+        timeout: Option<Duration>,
+    ) -> Result<EsSourcePayload> {
+        let mut budget = SourceOperationBudget::new(timeout, None);
+        budget.observe_fanout(1)?;
+        self.execute_with_budget(endpoint, credential, request, limit, &mut budget)
+    }
+
+    fn execute_with_budget(
+        &self,
+        endpoint: &ResolvedEsEndpoint,
+        credential: &ResolvedCredential,
+        request: &EsSourceRequest,
+        limit: usize,
+        budget: &mut SourceOperationBudget,
+    ) -> Result<EsSourcePayload> {
+        budget.observe_fanout(1)?;
+        run_es_thread("execute Elasticsearch source request", || {
+            validate_driver_request(request)?;
+            match request.operation {
+                EsSourceOperation::ProbeConnection => self.probe(endpoint, credential, budget),
+                EsSourceOperation::DiscoverFields => {
+                    self.discover_fields(endpoint, credential, request, budget)
+                }
+                EsSourceOperation::SnapshotPage => {
+                    self.snapshot_page(endpoint, credential, request, limit, budget)
+                }
+                EsSourceOperation::SnapshotClose => Err(CnxError::InvalidInput(
+                    "snapshot close must be handled by the source session boundary".into(),
+                )),
+                EsSourceOperation::PollSince => {
+                    self.poll_since(endpoint, credential, request, limit, budget)
+                }
             }
-            EsSourceOperation::SnapshotPage => {
-                self.snapshot_page(endpoint, credential, request, limit)
-            }
-            EsSourceOperation::PollSince => self.poll_since(endpoint, credential, request, limit),
+        })
+    }
+
+    fn close_snapshot(
+        &self,
+        endpoint: &ResolvedEsEndpoint,
+        credential: &ResolvedCredential,
+        pit_id: &str,
+    ) -> Result<()> {
+        self.close_snapshot_with_timeout(endpoint, credential, pit_id, None)
+    }
+
+    fn close_snapshot_with_timeout(
+        &self,
+        endpoint: &ResolvedEsEndpoint,
+        credential: &ResolvedCredential,
+        pit_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        let mut budget = SourceOperationBudget::new(timeout, None);
+        budget.observe_fanout(1)?;
+        self.close_snapshot_with_budget(endpoint, credential, pit_id, &mut budget)
+    }
+
+    fn close_snapshot_with_budget(
+        &self,
+        endpoint: &ResolvedEsEndpoint,
+        credential: &ResolvedCredential,
+        pit_id: &str,
+        budget: &mut SourceOperationBudget,
+    ) -> Result<()> {
+        budget.observe_fanout(1)?;
+        budget.ensure_call_capacity(1, 1)?;
+        run_es_thread("close Elasticsearch snapshot", || {
+            self.close_pit(endpoint, credential, pit_id, budget)
+        })
+    }
+}
+
+impl Drop for HttpEsSourceDriver {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            let _ = run_es_thread("drop Elasticsearch HTTP client", || {
+                drop(client);
+                Ok(())
+            });
         }
     }
 }
 
 impl HttpEsSourceDriver {
+    fn client(&self) -> &Client {
+        self.client
+            .as_ref()
+            .expect("Elasticsearch HTTP client is available")
+    }
+
     fn probe(
         &self,
         endpoint: &ResolvedEsEndpoint,
         credential: &ResolvedCredential,
+        budget: &mut SourceOperationBudget,
     ) -> Result<EsSourcePayload> {
+        budget.ensure_call_capacity(1, 1)?;
         let value = self.request_json(
-            self.apply_auth(self.client.get(base_url(endpoint)), credential),
+            self.apply_auth(self.client().get(base_url(endpoint)), credential),
             "probe es endpoint",
+            budget,
         )?;
         Ok(EsSourcePayload::Probe(EsProbeStatus {
             object_ref: endpoint.object_ref.clone(),
@@ -91,15 +252,18 @@ impl HttpEsSourceDriver {
         endpoint: &ResolvedEsEndpoint,
         credential: &ResolvedCredential,
         request: &EsSourceRequest,
+        budget: &mut SourceOperationBudget,
     ) -> Result<EsSourcePayload> {
+        budget.ensure_call_capacity(1, 1)?;
         let url = format!(
             "{}/{}/_mapping",
             base_url(endpoint),
             clean_index(&request.index)
         );
         let mapping = self.request_json(
-            self.apply_auth(self.client.get(url), credential),
+            self.apply_auth(self.client().get(url), credential),
             "discover es fields",
+            budget,
         )?;
         let mut fields = Vec::new();
         collect_mapping_fields(&mapping, &mut fields);
@@ -126,7 +290,11 @@ impl HttpEsSourceDriver {
         credential: &ResolvedCredential,
         request: &EsSourceRequest,
         limit: usize,
+        budget: &mut SourceOperationBudget,
     ) -> Result<EsSourcePayload> {
+        let opened_pit = request.cursor.is_none();
+        let maximum_calls = if opened_pit { 3 } else { 2 };
+        budget.ensure_call_capacity(maximum_calls, maximum_calls)?;
         let (pit_id, search_after) = match request.cursor.as_ref() {
             Some(EsSourceCursor::Snapshot(cursor)) => {
                 (cursor.pit_id.clone(), cursor.search_after.clone())
@@ -137,13 +305,14 @@ impl HttpEsSourceDriver {
                 ));
             }
             None => (
-                self.open_pit(endpoint, credential, &request.index)?,
+                self.open_pit(endpoint, credential, &request.index, budget)?,
                 Vec::new(),
             ),
         };
 
         let mut body = json!({
             "size": limit,
+            "seq_no_primary_term": true,
             "pit": {
                 "id": pit_id,
                 "keep_alive": self.pit_keep_alive.clone(),
@@ -159,22 +328,40 @@ impl HttpEsSourceDriver {
             body["search_after"] = Value::Array(search_after);
         }
 
-        let search = self.request_json(
+        let search = match self.request_json(
             self.apply_auth(
-                self.client
+                self.client()
                     .post(format!("{}/_search", base_url(endpoint)))
                     .json(&body),
                 credential,
             ),
             "snapshot es page",
-        )?;
-        let hits = extract_hits(&search)?;
+            budget,
+        ) {
+            Ok(search) => search,
+            Err(err) => {
+                if opened_pit {
+                    let _ = self.close_pit(endpoint, credential, &pit_id, budget);
+                }
+                return Err(err);
+            }
+        };
+        let hits = match extract_hits(&search) {
+            Ok(hits) => hits,
+            Err(err) => {
+                if opened_pit {
+                    let _ = self.close_pit(endpoint, credential, &pit_id, budget);
+                }
+                return Err(err);
+            }
+        };
         let documents = hits_to_events(
             &hits,
             EsDocumentEventKind::SnapshotInsert,
             &endpoint.timestamp_field,
         );
         let has_more = documents.len() == limit && !documents.is_empty();
+        let mut diagnostics = None;
         let next_cursor = if has_more {
             documents.last().map(|last| {
                 EsSourceCursor::Snapshot(EsSnapshotCursor {
@@ -184,18 +371,21 @@ impl HttpEsSourceDriver {
                 })
             })
         } else {
-            let _ = self.close_pit(endpoint, credential, &pit_id);
+            if let Err(err) = self.close_pit(endpoint, credential, &pit_id, budget) {
+                diagnostics = Some(format!("close PIT failed: {err}"));
+            }
             None
         };
 
         Ok(EsSourcePayload::Batch(EsSourceBatch {
             object_ref: endpoint.object_ref.clone(),
             index: request.index.clone(),
+            source_revision: source_native_revision_digest("es-pit", &[pit_id.as_bytes()]),
             documents,
             next_cursor,
             has_more,
             grant_epoch: endpoint.grant_epoch,
-            diagnostics: None,
+            diagnostics,
         }))
     }
 
@@ -205,7 +395,9 @@ impl HttpEsSourceDriver {
         credential: &ResolvedCredential,
         request: &EsSourceRequest,
         limit: usize,
+        budget: &mut SourceOperationBudget,
     ) -> Result<EsSourcePayload> {
+        budget.ensure_call_capacity(1, 1)?;
         let cursor = match request.cursor.as_ref() {
             Some(EsSourceCursor::Poll(cursor)) => Some(cursor),
             Some(_) => {
@@ -220,6 +412,7 @@ impl HttpEsSourceDriver {
             .or_else(|| request.timestamp_after.clone());
         let mut body = json!({
             "size": limit,
+            "seq_no_primary_term": true,
             "sort": [
                 sort_clause(&endpoint.timestamp_field),
                 sort_clause(&endpoint.tie_breaker_field)
@@ -235,7 +428,7 @@ impl HttpEsSourceDriver {
 
         let search = self.request_json(
             self.apply_auth(
-                self.client
+                self.client()
                     .post(format!(
                         "{}/{}/_search",
                         base_url(endpoint),
@@ -245,6 +438,7 @@ impl HttpEsSourceDriver {
                 credential,
             ),
             "poll es page",
+            budget,
         )?;
         let hits = extract_hits(&search)?;
         let documents = hits_to_events(
@@ -259,10 +453,12 @@ impl HttpEsSourceDriver {
                 search_after: last.sort.clone(),
             })
         });
+        let source_revision = es_poll_source_revision(&request.index, &documents)?;
 
         Ok(EsSourcePayload::Batch(EsSourceBatch {
             object_ref: endpoint.object_ref.clone(),
             index: request.index.clone(),
+            source_revision,
             documents,
             next_cursor,
             has_more,
@@ -276,6 +472,7 @@ impl HttpEsSourceDriver {
         endpoint: &ResolvedEsEndpoint,
         credential: &ResolvedCredential,
         index: &str,
+        budget: &mut SourceOperationBudget,
     ) -> Result<String> {
         let url = format!(
             "{}/{}/_pit?keep_alive={}",
@@ -284,8 +481,9 @@ impl HttpEsSourceDriver {
             self.pit_keep_alive
         );
         let value = self.request_json(
-            self.apply_auth(self.client.post(url), credential),
+            self.apply_auth(self.client().post(url), credential),
             "open es point-in-time",
+            budget,
         )?;
         value
             .get("id")
@@ -299,15 +497,17 @@ impl HttpEsSourceDriver {
         endpoint: &ResolvedEsEndpoint,
         credential: &ResolvedCredential,
         pit_id: &str,
+        budget: &mut SourceOperationBudget,
     ) -> Result<()> {
         let value = self.request_json(
             self.apply_auth(
-                self.client
+                self.client()
                     .delete(format!("{}/_pit", base_url(endpoint)))
                     .json(&json!({ "id": pit_id })),
                 credential,
             ),
             "close es point-in-time",
+            budget,
         )?;
         if value.get("succeeded").and_then(Value::as_bool) == Some(false) {
             return Err(CnxError::PeerError(
@@ -317,20 +517,22 @@ impl HttpEsSourceDriver {
         Ok(())
     }
 
-    fn request_json(&self, request: RequestBuilder, context: &str) -> Result<Value> {
+    fn request_json(
+        &self,
+        request: RequestBuilder,
+        context: &str,
+        budget: &mut SourceOperationBudget,
+    ) -> Result<Value> {
+        budget.consume_call(1)?;
+        let timeout = effective_timeout(budget.remaining_timeout()?);
         let response = request
+            .timeout(timeout)
             .send()
-            .map_err(|err| CnxError::LinkError(format!("{context}: {err}")))?;
+            .map_err(|err| reqwest_error(context, err))?;
         let status = response.status();
-        let text = response
-            .text()
-            .map_err(|err| CnxError::LinkError(format!("{context}: read response: {err}")))?;
+        let text = response.text().map_err(|err| reqwest_error(context, err))?;
         if !status.is_success() {
-            return Err(CnxError::PeerError(format!(
-                "{context}: status={} body={}",
-                status.as_u16(),
-                truncate(&text, 512)
-            )));
+            return Err(classify_http_status_error(context, status.as_u16(), &text));
         }
         if text.trim().is_empty() {
             return Ok(Value::Null);
@@ -361,12 +563,103 @@ impl HttpEsSourceDriver {
     }
 }
 
+fn es_poll_source_revision(index: &str, documents: &[EsDocumentEvent]) -> Result<String> {
+    let native_observations = documents
+        .iter()
+        .map(|document| {
+            json!({
+                "index": document.index,
+                "id": document.id,
+                "sort": document.sort,
+                "seq_no": document.seq_no,
+                "primary_term": document.primary_term,
+            })
+        })
+        .collect::<Vec<_>>();
+    let encoded = serde_json::to_vec(&native_observations).map_err(|error| {
+        CnxError::Internal(format!(
+            "encode Elasticsearch poll source-native observations: {error}"
+        ))
+    })?;
+    Ok(source_native_revision_digest(
+        "es-poll-observation",
+        &[index.as_bytes(), &encoded],
+    ))
+}
+
+fn effective_timeout(timeout: Option<Duration>) -> Duration {
+    timeout
+        .unwrap_or_else(|| Duration::from_secs(30))
+        .max(Duration::from_millis(1))
+}
+
+fn reqwest_error(context: &str, error: reqwest::Error) -> CnxError {
+    if error.is_timeout() {
+        CnxError::Timeout
+    } else {
+        CnxError::LinkError(format!("{context}: {error}"))
+    }
+}
+
 fn base_url(endpoint: &ResolvedEsEndpoint) -> String {
     endpoint.endpoint_uri.trim_end_matches('/').to_string()
 }
 
+fn run_es_thread<T, F>(context: &'static str, operation: F) -> Result<T>
+where
+    T: Send,
+    F: FnOnce() -> Result<T> + Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(operation)
+            .join()
+            .map_err(|_| CnxError::Internal(format!("{context}: HTTP thread panicked")))?
+    })
+}
+
 fn clean_index(index: &str) -> &str {
     index.trim().trim_start_matches('/')
+}
+
+fn validate_driver_request(request: &EsSourceRequest) -> Result<()> {
+    validate_index(&request.index)?;
+    if let Some(EsSourceCursor::Snapshot(cursor)) = &request.cursor
+        && cursor.pit_id.trim().is_empty()
+    {
+        return Err(CnxError::InvalidInput(
+            "snapshot cursor pit_id must be non-empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_index(index: &str) -> Result<()> {
+    let trimmed = index.trim();
+    if trimmed.is_empty() {
+        return Err(CnxError::InvalidInput("index must be non-empty".into()));
+    }
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+    {
+        return Err(CnxError::InvalidInput(format!(
+            "index '{index}' contains unsupported path or query characters"
+        )));
+    }
+    Ok(())
+}
+
+fn classify_http_status_error(context: &str, status: u16, text: &str) -> CnxError {
+    let message = format!("{context}: status={status} body={}", truncate(text, 512));
+    match status {
+        400 => CnxError::InvalidInput(message),
+        401 | 403 => CnxError::AccessDenied(message),
+        408 | 429 | 500..=599 => CnxError::LinkError(message),
+        404 => CnxError::PeerError(message),
+        _ => CnxError::PeerError(message),
+    }
 }
 
 fn apply_source_filter(body: &mut Value, request: &EsSourceRequest) {

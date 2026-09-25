@@ -2,12 +2,9 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::Duration;
-
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
 
 use capanix_app_sdk::runtime::RouteKey;
 use capanix_app_sdk::{CnxError, Event};
@@ -25,6 +22,7 @@ use crate::runtime::routes::sink_query_request_route_for;
 #[cfg(test)]
 const ENDPOINT_READY_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 const ENDPOINT_RETRY_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const ENDPOINT_DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT: usize = 12;
 const REQUEST_REPLY_SEND_RETRY_LIMIT: usize = 12;
 const REQUEST_REPLY_SEND_RETRY_DELAY: Duration = Duration::from_millis(50);
@@ -439,8 +437,7 @@ impl EndpointReceiveState {
     }
 
     fn is_receive_armed(&self) -> bool {
-        self.inflight_recv_count.load(Ordering::Acquire) > 0
-            && self.receivable_observation_count.load(Ordering::Acquire) > 0
+        self.receivable_observation_count.load(Ordering::Acquire) > 0
     }
 
     fn is_receive_polling(&self) -> bool {
@@ -494,6 +491,7 @@ pub(crate) struct ManagedEndpointTask {
     close_unit_ids: Vec<String>,
     unit_ids: Vec<String>,
     shutdown: CancellationToken,
+    channels_closed: AtomicBool,
     terminal_reason: Arc<StdMutex<Option<String>>>,
     receive_state: Arc<EndpointReceiveState>,
     join: Option<EndpointJoin>,
@@ -713,53 +711,6 @@ impl ManagedEndpointTask {
         )
     }
 
-    pub(crate) fn spawn_with_recv_units_and_task_units_wait_receive_poll<F, Fut, I, S, J, T>(
-        boundary: Arc<dyn ChannelIoSubset>,
-        route: RouteKey,
-        name: impl Into<String>,
-        recv_unit_ids: I,
-        task_unit_ids: J,
-        shutdown: CancellationToken,
-        handler: F,
-    ) -> Self
-    where
-        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-        J: IntoIterator<Item = T>,
-        T: Into<String>,
-    {
-        let contexts = recv_unit_ids
-            .into_iter()
-            .map(|unit_id| BoundaryContext::for_unit(unit_id.into()))
-            .collect::<Vec<_>>();
-        assert!(
-            !contexts.is_empty(),
-            "spawn_with_recv_units_and_task_units_wait_receive_poll requires at least one recv unit id"
-        );
-        let mut task = Self::spawn_with_contexts(
-            boundary,
-            route,
-            name,
-            contexts,
-            shutdown,
-            handler,
-            EndpointStartWait::UntilReady,
-        );
-        let task_unit_ids = task_unit_ids
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<_>>();
-        assert!(
-            !task_unit_ids.is_empty(),
-            "spawn_with_recv_units_and_task_units_wait_receive_poll requires at least one task unit id"
-        );
-        task.unit_ids = task_unit_ids;
-        task
-    }
-
-    #[cfg(test)]
     pub(crate) fn spawn_with_recv_units_and_task_units_without_ready_wait<F, Fut, I, S, J, T>(
         boundary: Arc<dyn ChannelIoSubset>,
         route: RouteKey,
@@ -879,7 +830,7 @@ impl ManagedEndpointTask {
         )
     }
 
-    pub(crate) fn spawn_with_unit_wait_receive_poll<F, Fut>(
+    pub(crate) fn spawn_with_unit_receivable_without_ready_wait<F, Fut>(
         boundary: Arc<dyn ChannelIoSubset>,
         route: RouteKey,
         name: impl Into<String>,
@@ -891,14 +842,15 @@ impl ManagedEndpointTask {
         F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
     {
-        Self::spawn_with_context(
+        Self::spawn_with_contexts_and_ready_mode(
             boundary,
             route,
             name,
-            BoundaryContext::for_unit(unit_id),
+            vec![BoundaryContext::for_unit(unit_id)],
             shutdown,
             handler,
-            EndpointStartWait::UntilReady,
+            EndpointReadyMode::FirstReceivable,
+            EndpointStartWait::Detached,
         )
     }
 
@@ -1005,6 +957,7 @@ impl ManagedEndpointTask {
             close_unit_ids,
             unit_ids,
             shutdown: task_shutdown,
+            channels_closed: AtomicBool::new(false),
             terminal_reason,
             receive_state,
             join: Some(join),
@@ -1123,6 +1076,7 @@ impl ManagedEndpointTask {
             close_unit_ids: vec![unit_id.clone()],
             unit_ids: vec![unit_id],
             shutdown: task_shutdown,
+            channels_closed: AtomicBool::new(false),
             terminal_reason,
             receive_state,
             join: Some(join),
@@ -1153,6 +1107,10 @@ impl ManagedEndpointTask {
 
     pub(crate) fn belongs_to_boundary(&self, boundary: &Arc<dyn ChannelIoSubset>) -> bool {
         self.boundary_id == Self::boundary_id_for(boundary)
+    }
+
+    pub(crate) fn boundary_handle(&self) -> Arc<dyn ChannelIoSubset> {
+        self.boundary.clone()
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -1189,6 +1147,9 @@ impl ManagedEndpointTask {
     }
 
     pub(crate) fn close_owned_channels_on(&self, boundary: &Arc<dyn ChannelIoSubset>) {
+        if self.channels_closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let mut contexts = self
             .close_unit_ids
             .iter()
@@ -1237,6 +1198,35 @@ impl ManagedEndpointTask {
                     log::warn!("endpoint task {} thread panicked: {:?}", self.name, err);
                 }
             }
+        }
+    }
+}
+
+impl Drop for ManagedEndpointTask {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.close_owned_channels_on(&self.boundary);
+        let Some(EndpointJoin::Thread(join)) = self.join.take() else {
+            return;
+        };
+        if join.thread().id() == std::thread::current().id() {
+            log::warn!("endpoint task {} dropped on its own thread", self.name);
+            return;
+        }
+        let deadline = std::time::Instant::now() + ENDPOINT_DROP_JOIN_TIMEOUT;
+        while !join.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if join.is_finished() {
+            if let Err(err) = join.join() {
+                log::warn!("endpoint task {} thread panicked: {:?}", self.name, err);
+            }
+        } else {
+            log::warn!(
+                "endpoint task {} did not exit within {:?} during drop",
+                self.name,
+                ENDPOINT_DROP_JOIN_TIMEOUT
+            );
         }
     }
 }
@@ -2813,6 +2803,23 @@ mod tests {
     }
 
     #[test]
+    fn receive_armed_state_remains_stable_between_recv_polls() {
+        let state = Arc::new(EndpointReceiveState::default());
+        {
+            let _recv = state.enter_recv();
+            assert!(!state.is_receive_armed());
+            state.mark_receivable();
+            assert!(state.is_receive_armed());
+            assert!(state.is_receive_polling());
+        }
+        assert!(
+            state.is_receive_armed(),
+            "a live endpoint must retain established receive readiness between retry-loop polls"
+        );
+        assert!(!state.is_receive_polling());
+    }
+
+    #[test]
     fn stream_endpoint_idle_receive_uses_quiet_cancellable_window() {
         let boundary = Arc::new(IdleTimeoutBoundary::new());
         let mut endpoint = ManagedEndpointTask::spawn_stream(
@@ -2863,6 +2870,13 @@ mod tests {
 
         crate::runtime_app::shared_tokio_runtime()
             .block_on(endpoint.shutdown(Duration::from_secs(1)));
+        drop(endpoint);
+        let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
+        assert_eq!(
+            close_keys,
+            vec!["source-status:v1.req".to_string()],
+            "shutdown and drop must not close a retired request route again after a successor may have attached"
+        );
     }
 
     #[test]
@@ -2939,6 +2953,7 @@ mod tests {
             close_unit_ids: Vec::new(),
             unit_ids: Vec::new(),
             shutdown: CancellationToken::new(),
+            channels_closed: AtomicBool::new(false),
             terminal_reason: Arc::new(StdMutex::new(None)),
             receive_state: Arc::new(EndpointReceiveState::default()),
             join: Some(EndpointJoin::Thread(join)),

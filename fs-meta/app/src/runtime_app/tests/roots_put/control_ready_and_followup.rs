@@ -130,7 +130,8 @@
     }
 
     #[tokio::test]
-    async fn status_request_waits_for_control_ready_before_remote_source_status_collection() {
+    async fn status_request_does_not_collect_remote_source_status_while_control_apply_is_inflight()
+    {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -182,41 +183,7 @@
             return;
         }
 
-        let active_facade = match api::spawn(
-            app.config
-                .api
-                .resolve_for_candidate_ids(&["listener-a".to_string()])
-                .expect("resolve facade config"),
-            app.node_id.clone(),
-            app.runtime_boundary.clone(),
-            app.source.clone(),
-            app.sink.clone(),
-            app.query_sink.clone(),
-            app.runtime_boundary.clone(),
-            app.facade_pending_status.clone(),
-            app.facade_service_state.clone(),
-            app.api_request_tracker.clone(),
-            app.api_control_gate.clone(),
-        )
-        .await
-        {
-            Ok(handle) => handle,
-            Err(CnxError::InvalidInput(msg))
-                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
-            {
-                app.close().await.expect("close app after bind restriction");
-                return;
-            }
-            Err(err) => panic!("spawn active facade: {err}"),
-        };
-        *app.api_task.lock().await = Some(FacadeActivation {
-            route_key: facade_control_stream_route(),
-            generation: 1,
-            resource_ids: vec!["listener-a".to_string()],
-            handle: active_facade,
-        });
-
-        app.on_control_frame(&[
+        let initial_control_result = app.on_control_frame(&[
             activate_envelope_with_scope_rows(
                 execution_units::SOURCE_RUNTIME_UNIT_ID,
                 &[("test-root", &["single-app-node::root-1"])],
@@ -225,6 +192,30 @@
             activate_envelope_with_scope_rows(
                 execution_units::SINK_RUNTIME_UNIT_ID,
                 &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("test-root", &["listener-a"])],
                 2,
             ),
             activate_envelope_with_route_key_and_scope_rows(
@@ -252,8 +243,27 @@
                 2,
             ),
         ])
+        .await;
+        match initial_control_result {
+            Ok(()) => {}
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("activate source/sink, facade, and internal status routes: {err}"),
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if app.current_facade_service_state().await == FacadeServiceState::Serving {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
-        .expect("activate source/sink and internal status routes");
+        .expect("complete facade route wave should publish the local listener as serving");
 
         let client = Client::new();
         let login = client
@@ -324,24 +334,21 @@
             tokio::time::timeout(Duration::from_millis(600), request_entered.notified())
                 .await
                 .is_err(),
-            "GET /status must wait for control readiness before issuing remote source-status collection"
+            "GET /status must not issue remote source-status collection while source control apply is in flight"
         );
 
         control_release.notify_waiters();
-
-        tokio::time::timeout(Duration::from_secs(5), request_entered.notified())
-            .await
-            .expect(
-                "status should issue remote source-status collection after control wave settles",
-            );
-        request_release.notify_waiters();
-
         control_task
             .await
             .expect("join control-frame task")
             .expect("handle control frame after status wait");
-        let response = status_request
+
+        // `/status` is a weak observation path. Once control settles it may either
+        // collect live source status or return bounded degraded/not-ready evidence.
+        request_release.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(5), status_request)
             .await
+            .expect("status request must settle inside its bounded observation window")
             .expect("join status request")
             .expect("status request should complete");
         assert!(

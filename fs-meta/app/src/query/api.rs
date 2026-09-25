@@ -21,6 +21,7 @@ use crate::query::tree::{
     ObservationState, ObservationStatus, PageOrder, ReadClass, StabilityState, TreeGroupPayload,
     TreePageEntry, TreePageRoot, TreeStability,
 };
+use crate::runtime::orchestration::EventRouteScopeProjection;
 use crate::runtime::routes::{
     METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
     METHOD_SOURCE_STATUS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
@@ -103,6 +104,7 @@ const TRUSTED_MATERIALIZED_READINESS_SETTLE_BACKOFF: Duration = Duration::from_m
 const TRUSTED_MATERIALIZED_OWNER_STATUS_LOAD_BUDGET: Duration = Duration::from_millis(500);
 const LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE: Duration = Duration::from_millis(250);
 const STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP: Duration = Duration::from_secs(5);
+pub(crate) const STATUS_ROUTE_RESULT_SETTLE_GRACE: Duration = Duration::from_millis(25);
 const STATUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(30);
 const SOURCE_STATUS_ROUTE_REPLY_HEADROOM: Duration = Duration::from_millis(250);
 const SELECTED_GROUP_PROXY_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(100);
@@ -1206,7 +1208,11 @@ pub(crate) fn internal_status_request_payload() -> Bytes {
 struct InternalSourceStatusRequest {
     purpose: Option<String>,
     live_probe_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    event_route_scopes_by_group: BTreeMap<String, EventRouteScopeProjection>,
 }
+
+const SINK_RECOVERY_OWNER_READINESS_PURPOSE: &str = "sink-recovery-owner-readiness";
 
 fn duration_ms_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
@@ -1228,15 +1234,38 @@ pub(crate) fn internal_status_request_payload_with_live_probe_timeout(
     rmp_serde::to_vec_named(&InternalSourceStatusRequest {
         purpose: None,
         live_probe_timeout_ms: Some(duration_ms_u64(live_probe_timeout)),
+        event_route_scopes_by_group: BTreeMap::new(),
     })
     .map(Bytes::from)
     .unwrap_or_else(|_| internal_status_request_payload())
+}
+
+pub(crate) fn sink_recovery_status_request_payload_with_live_probe_timeout(
+    collect_timeout: Duration,
+) -> Bytes {
+    let live_probe_timeout = source_status_live_probe_timeout_for_collect(collect_timeout);
+    rmp_serde::to_vec_named(&InternalSourceStatusRequest {
+        purpose: Some(SINK_RECOVERY_OWNER_READINESS_PURPOSE.to_string()),
+        live_probe_timeout_ms: Some(duration_ms_u64(live_probe_timeout)),
+        event_route_scopes_by_group: BTreeMap::new(),
+    })
+    .map(Bytes::from)
+    .unwrap_or_else(|_| internal_status_request_payload())
+}
+
+pub(crate) fn sink_recovery_status_request_live_probe_timeout(payload: &[u8]) -> Option<Duration> {
+    rmp_serde::from_slice::<InternalSourceStatusRequest>(payload)
+        .ok()
+        .filter(|request| request.purpose.as_deref() == Some(SINK_RECOVERY_OWNER_READINESS_PURPOSE))
+        .and_then(|request| request.live_probe_timeout_ms)
+        .map(Duration::from_millis)
 }
 
 pub(crate) fn manual_rescan_source_status_request_payload() -> Bytes {
     rmp_serde::to_vec_named(&InternalSourceStatusRequest {
         purpose: Some("manual-rescan-delivery".to_string()),
         live_probe_timeout_ms: None,
+        event_route_scopes_by_group: BTreeMap::new(),
     })
     .map(Bytes::from)
     .unwrap_or_else(|_| internal_status_request_payload())
@@ -1249,6 +1278,7 @@ pub(crate) fn manual_rescan_source_status_request_payload_with_live_probe_timeou
     rmp_serde::to_vec_named(&InternalSourceStatusRequest {
         purpose: Some("manual-rescan-delivery".to_string()),
         live_probe_timeout_ms: Some(duration_ms_u64(live_probe_timeout)),
+        event_route_scopes_by_group: BTreeMap::new(),
     })
     .map(Bytes::from)
     .unwrap_or_else(|_| manual_rescan_source_status_request_payload())
@@ -1261,6 +1291,7 @@ pub(crate) fn current_owner_health_source_status_request_payload_with_live_probe
     rmp_serde::to_vec_named(&InternalSourceStatusRequest {
         purpose: Some("current-owner-health".to_string()),
         live_probe_timeout_ms: Some(duration_ms_u64(live_probe_timeout)),
+        event_route_scopes_by_group: BTreeMap::new(),
     })
     .map(Bytes::from)
     .unwrap_or_else(|_| internal_status_request_payload_with_live_probe_timeout(collect_timeout))
@@ -1268,11 +1299,13 @@ pub(crate) fn current_owner_health_source_status_request_payload_with_live_probe
 
 pub(crate) fn release_scan_audit_source_status_request_payload_with_live_probe_timeout(
     collect_timeout: Duration,
+    event_route_scopes_by_group: BTreeMap<String, EventRouteScopeProjection>,
 ) -> Bytes {
     let live_probe_timeout = source_status_live_probe_timeout_for_collect(collect_timeout);
     rmp_serde::to_vec_named(&InternalSourceStatusRequest {
         purpose: Some("release-scan-audit-after-sink-scope-ready".to_string()),
         live_probe_timeout_ms: Some(duration_ms_u64(live_probe_timeout)),
+        event_route_scopes_by_group,
     })
     .map(Bytes::from)
     .unwrap_or_else(|_| internal_status_request_payload_with_live_probe_timeout(collect_timeout))
@@ -1306,6 +1339,17 @@ pub(crate) fn source_status_request_requires_scan_audit_admission_release(payloa
         .ok()
         .and_then(|request| request.purpose)
         .is_some_and(|purpose| purpose == "release-scan-audit-after-sink-scope-ready")
+}
+
+pub(crate) fn source_status_request_scan_audit_release_event_route_scopes(
+    payload: &[u8],
+) -> Option<BTreeMap<String, EventRouteScopeProjection>> {
+    rmp_serde::from_slice::<InternalSourceStatusRequest>(payload)
+        .ok()
+        .filter(|request| {
+            request.purpose.as_deref() == Some("release-scan-audit-after-sink-scope-ready")
+        })
+        .map(|request| request.event_route_scopes_by_group)
 }
 
 pub(crate) fn merge_source_status_snapshots(
@@ -1585,7 +1629,12 @@ struct StatusRouteAttemptRuntime {
 
 impl StatusRouteAttemptRuntime {
     fn outer_timeout(self) -> Duration {
+        // BoundRoute owns the transport deadline and may return collected
+        // evidence exactly when that deadline expires. Keep the cancellation
+        // watchdog slightly wider so it observes that terminal result instead
+        // of racing and dropping an already-collected reply batch.
         self.attempt_timeout
+            .saturating_add(STATUS_ROUTE_RESULT_SETTLE_GRACE)
     }
 }
 
@@ -1999,7 +2048,7 @@ pub(crate) async fn route_sink_status_snapshot(
     merge_sink_status_route_events(events)
 }
 
-async fn route_sink_status_snapshot_via_node(
+pub(crate) async fn route_sink_status_snapshot_via_node(
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     node_id: NodeId,
@@ -2014,6 +2063,30 @@ async fn route_sink_status_snapshot_via_node(
             METHOD_SINK_STATUS,
             route_bindings,
             is_retryable_sink_status_continuity_gap,
+        )
+        .await?;
+    merge_sink_status_route_events(events)
+}
+
+pub(crate) async fn route_sink_recovery_status_snapshot_via_node(
+    boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    node_id: NodeId,
+    plan: StatusRoutePlan,
+) -> Result<SinkStatusSnapshot, CnxError> {
+    let route_bindings = sink_status_route_bindings_for(&node_id.0);
+    let adapter = exchange_host_adapter(boundary, origin_id, route_bindings);
+    // This route names one concrete sink owner. A replay/apply-pending owner
+    // intentionally returns one cache reply without receive-armed proof so the
+    // outer recovery loop can back off and retry. Multi-reply collection would
+    // wait for unrelated reply-route peers and turn that useful pending reply
+    // into a full attempt timeout.
+    let events = adapter
+        .call(
+            ROUTE_TOKEN_FS_META_INTERNAL,
+            METHOD_SINK_STATUS,
+            sink_recovery_status_request_payload_with_live_probe_timeout(plan.route_timeout()),
+            plan.route_timeout(),
         )
         .await?;
     merge_sink_status_route_events(events)
@@ -2717,14 +2790,12 @@ fn source_status_should_refresh_current_owner_before_sink_readiness(
         .intersection(&source_reported_groups)
         .cloned()
         .collect::<BTreeSet<_>>();
-    let probe_groups = if groups_with_source_status_evidence.is_empty() {
-        &groups_needing_owner_evidence
-    } else {
-        &groups_with_source_status_evidence
-    };
+    if groups_with_source_status_evidence.is_empty() {
+        return false;
+    }
     !current_owner_candidate_nodes_from_source_observability(
         source_observability_snapshots,
-        probe_groups,
+        &groups_with_source_status_evidence,
     )
     .is_empty()
 }
@@ -8161,8 +8232,9 @@ fn sink_status_primary_host_node_for_group(
     group_id: &str,
 ) -> Option<NodeId> {
     sink_status
-        .primary_host_ref_by_group
+        .owner_scoped_primary_host_ref_by_group
         .get(group_id)
+        .or_else(|| sink_status.primary_host_ref_by_group.get(group_id))
         .map(|host_ref| host_ref.trim())
         .filter(|host_ref| !host_ref.is_empty())
         .map(|host_ref| NodeId(host_ref.to_string()))
@@ -8312,6 +8384,21 @@ fn sink_primary_owner_node_for_group_requires_explicit_primary_host_ref() {
         sink_primary_owner_node_for_group(Some(&explicit_host), "nfs2"),
         Some(NodeId("node-b".to_string())),
         "query routing must use explicit sink primary host evidence"
+    );
+
+    let owner_scoped_host = SinkStatusSnapshot {
+        primary_host_ref_by_group: BTreeMap::from([("nfs2".to_string(), "node-b".to_string())]),
+        owner_scoped_primary_host_ref_by_group: BTreeMap::from([(
+            "nfs2".to_string(),
+            "node-c".to_string(),
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    assert_eq!(
+        sink_primary_owner_node_for_group(Some(&owner_scoped_host), "nfs2"),
+        Some(NodeId("node-c".to_string())),
+        "query routing must prefer owner-scoped primary host evidence over stale aggregate evidence"
     );
 }
 
@@ -9420,6 +9507,48 @@ fn source_status_request_carries_live_probe_budget_inside_collect_attempt() {
 }
 
 #[test]
+fn sink_recovery_status_request_is_explicit_and_leaves_reply_headroom() {
+    let payload =
+        sink_recovery_status_request_payload_with_live_probe_timeout(Duration::from_secs(3));
+
+    assert_eq!(
+        sink_recovery_status_request_live_probe_timeout(&payload),
+        Some(Duration::from_millis(2750)),
+        "sink recovery live probe budget must leave route-reply headroom inside the collect attempt"
+    );
+    assert_eq!(
+        sink_recovery_status_request_live_probe_timeout(
+            &internal_status_request_payload_with_live_probe_timeout(Duration::from_secs(3)),
+        ),
+        None,
+        "ordinary status requests must not enter the recovery-only live sink probe"
+    );
+    assert_eq!(
+        sink_recovery_status_request_live_probe_timeout(&internal_status_request_payload()),
+        None,
+        "legacy generic status requests must remain observation-only"
+    );
+}
+
+#[test]
+fn sink_recovery_status_owner_route_uses_single_owner_reply_call() {
+    let source = include_str!("api.rs");
+    let start = source
+        .find("pub(crate) async fn route_sink_recovery_status_snapshot_via_node")
+        .expect("sink recovery route function");
+    let end = source[start..]
+        .find("\nfn merge_sink_status_route_events")
+        .expect("sink status merge function follows recovery route");
+    let body = &source[start..start + end];
+
+    assert!(body.contains(".call("));
+    assert!(
+        !body.contains(".call_collect("),
+        "one explicit sink owner pending reply must return to the outer recovery retry loop"
+    );
+}
+
+#[test]
 fn manual_rescan_source_status_request_carries_delivery_probe_budget_inside_collect_attempt() {
     let payload = manual_rescan_source_status_request_payload_with_live_probe_timeout(
         Duration::from_secs(20),
@@ -9449,6 +9578,14 @@ fn status_route_machine_owns_attempt_budget_and_retry_followup() {
             collect_idle_grace: STATUS_ROUTE_COLLECT_IDLE_GRACE,
         }),
         "routed status machine should own the canonical attempt budget instead of leaving helper loops to recompute remaining and attempt timeout inline",
+    );
+    let StatusRouteMachinePhase::Attempt(first_attempt) = machine.entry_phase_at(now) else {
+        panic!("status route machine must begin with an attempt");
+    };
+    assert_eq!(
+        first_attempt.outer_timeout(),
+        STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP + STATUS_ROUTE_RESULT_SETTLE_GRACE,
+        "the outer cancellation watchdog must leave bounded settlement grace beyond the adapter-owned transport deadline",
     );
     assert_eq!(
         machine.entry_phase_at(now + Duration::from_secs(29) + Duration::from_millis(980)),
@@ -14239,6 +14376,7 @@ fn materialized_target_groups_from_source_status_keeps_concrete_root_ids_when_lo
             overflow_pending: false,
             rescan_pending: false,
             last_rescan_requested_at_us: None,
+            last_manual_rescan_accepted_at_us: None,
             last_rescan_reason: None,
             last_error: None,
             last_audit_started_at_us: Some(10),
@@ -14410,6 +14548,7 @@ fn merge_source_status_snapshots_preserves_completed_audit_evidence_from_older_s
         overflow_pending: false,
         rescan_pending: false,
         last_rescan_requested_at_us: None,
+        last_manual_rescan_accepted_at_us: None,
         last_rescan_reason: Some("manual".to_string()),
         last_error: None,
         last_audit_started_at_us: Some(10),
@@ -14453,6 +14592,7 @@ fn merge_source_status_snapshots_preserves_completed_audit_evidence_from_older_s
         overflow_pending: audited_root.overflow_pending,
         rescan_pending: audited_root.rescan_pending,
         last_rescan_requested_at_us: audited_root.last_rescan_requested_at_us,
+        last_manual_rescan_accepted_at_us: None,
         last_rescan_reason: None,
         last_error: None,
         last_audit_started_at_us: None,

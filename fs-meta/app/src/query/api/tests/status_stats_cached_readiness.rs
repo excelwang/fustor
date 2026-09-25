@@ -50,6 +50,7 @@ fn source_status_for_cache_key(group_id: &str) -> SourceStatusSnapshot {
             overflow_pending: false,
             rescan_pending: false,
             last_rescan_requested_at_us: None,
+            last_manual_rescan_accepted_at_us: None,
             last_rescan_reason: None,
             last_error: None,
             last_audit_started_at_us: Some(10),
@@ -425,7 +426,7 @@ async fn repeated_materialized_status_load_reuses_same_epoch_readiness_cache_wit
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn trusted_fail_closed_status_load_reuses_same_epoch_audit_inflight_cache_without_route_fanin()
+async fn trusted_status_load_reuses_same_epoch_settled_publication_cache_during_next_audit()
 {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_root = tmp.path().join("node-a-nfs1");
@@ -479,12 +480,12 @@ async fn trusted_fail_closed_status_load_reuses_same_epoch_audit_inflight_cache_
 
     assert_eq!(
         observation_status.state,
-        ObservationState::MaterializedUntrusted
+        ObservationState::TrustedMaterialized
     );
     assert_eq!(
         boundary.send_batch_count(&sink_status_route.0),
         0,
-        "steady trusted polling during giant-NFS audit lag should fail closed from same-epoch cached evidence instead of re-running sink/source status fan-in"
+        "a later periodic audit must not invalidate same-epoch trusted readiness while source publication and sink materialization remain aligned"
     );
 }
 
@@ -919,6 +920,7 @@ fn materialized_query_readiness_preserves_retained_group_audit_across_root_set_c
             overflow_pending: false,
             rescan_pending: false,
             last_rescan_requested_at_us: None,
+            last_manual_rescan_accepted_at_us: None,
             last_rescan_reason: Some("manual".into()),
             last_error: None,
             last_audit_started_at_us: Some(10),

@@ -1,3 +1,4 @@
+#[cfg(not(feature = "embedded-inspection"))]
 use capanix_runtime_entry_sdk::entry::capanix_unit_entry;
 
 pub mod driver;
@@ -13,4 +14,5 @@ pub use s3_source::{
 };
 pub use service::S3SourceService;
 
+#[cfg(not(feature = "embedded-inspection"))]
 capanix_unit_entry!(S3SourceRuntimeApp);

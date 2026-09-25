@@ -1,0 +1,8 @@
+{
+  "name": "@fustor/source-config",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": { ".": "./index.mjs" },
+  "bin": { "fustor-source-config": "./cli.mjs" },
+  "scripts": { "test": "node --test tests/*.test.mjs" }
+}

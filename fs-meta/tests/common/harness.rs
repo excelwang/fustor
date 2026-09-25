@@ -347,16 +347,14 @@ fn resolve_test_app_cdylib() -> Option<PathBuf> {
         }
     }
 
-    let Some(output) = cargo_build_silent(
+    let output = cargo_build_silent(
         Command::new("cargo")
             .current_dir(&root)
             .arg("build")
             .arg("--manifest-path")
             .arg(fixture_manifest)
             .arg("--lib"),
-    ) else {
-        return None;
-    };
+    )?;
     if !output.status.success() {
         return None;
     }

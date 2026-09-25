@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use source_kit::SourceErrorPayload;
+use source_kit::{SourceErrorPayload, SourceRuntimeStatus};
 
 use super::MysqlSourceCursor;
 
@@ -10,6 +10,7 @@ pub enum MysqlSourcePayload {
     Rows(MysqlRowBatch),
     Fields(MysqlFieldCatalog),
     Probe(MysqlProbeStatus),
+    Status(SourceRuntimeStatus),
     Error(SourceErrorPayload),
 }
 
@@ -18,6 +19,8 @@ pub struct MysqlRowBatch {
     pub object_ref: String,
     pub schema: String,
     pub table: String,
+    #[serde(default)]
+    pub source_revision: String,
     #[serde(default)]
     pub fields: Vec<String>,
     #[serde(default)]

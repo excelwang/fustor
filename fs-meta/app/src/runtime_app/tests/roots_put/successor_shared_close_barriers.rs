@@ -218,6 +218,14 @@
             .expect("join successor app close")
             .expect("close successor app after roots_put");
         app_1.close().await.expect("close first app");
+        let active_source_owners = match &*app_1.source {
+            SourceFacade::Worker(client) => client.active_owner_count_for_tests(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+        assert_eq!(
+            active_source_owners, 0,
+            "closing every app owner must retire the shared source worker even while closed app objects remain alive"
+        );
     }
 
     #[tokio::test]
@@ -441,4 +449,12 @@
             .expect("join successor app close")
             .expect("close successor app after roots_put");
         app_1.close().await.expect("close first app");
+        let active_sink_owners = match &*app_1.sink {
+            SinkFacade::Worker(client) => client.active_owner_count_for_tests(),
+            SinkFacade::Local(_) => panic!("expected external sink worker client"),
+        };
+        assert_eq!(
+            active_sink_owners, 0,
+            "closing every app owner must retire the shared sink worker even while closed app objects remain alive"
+        );
     }

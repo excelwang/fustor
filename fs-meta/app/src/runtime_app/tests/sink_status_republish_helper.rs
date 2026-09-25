@@ -3,6 +3,19 @@ fn local_sink_status_republish_helper_test_serial() -> &'static tokio::sync::Mut
     CELL.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+fn worker_exports_for_node(
+    node_id: &str,
+    nfs1: &std::path::Path,
+    nfs2: &std::path::Path,
+) -> Vec<source::config::GrantedMountRoot> {
+    let nfs1_ref = format!("{node_id}::nfs1");
+    let nfs2_ref = format!("{node_id}::nfs2");
+    vec![
+        worker_export(&nfs1_ref, node_id, "10.0.0.11", nfs1.to_path_buf()),
+        worker_export(&nfs2_ref, node_id, "10.0.0.12", nfs2.to_path_buf()),
+    ]
+}
+
 #[test]
 fn sink_status_snapshot_ready_for_expected_groups_trusts_exported_readiness_over_stale_legacy_bit()
 {
@@ -100,7 +113,11 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
                         worker_watch_scan_root("nfs1", &nfs1),
                         worker_watch_scan_root("nfs2", &nfs2),
                     ],
-                    host_object_grants: Vec::new(),
+                    host_object_grants: worker_exports_for_node(
+                        "node-c-local-sink-status-helper",
+                        &nfs1,
+                        &nfs2,
+                    ),
                     ..SourceConfig::default()
                 },
                 api: api::ApiConfig {
@@ -727,7 +744,11 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                         worker_watch_scan_root("nfs1", &nfs1),
                         worker_watch_scan_root("nfs2", &nfs2),
                     ],
-                    host_object_grants: Vec::new(),
+                    host_object_grants: worker_exports_for_node(
+                        "node-c-local-sink-status-helper",
+                        &nfs1,
+                        &nfs2,
+                    ),
                     ..SourceConfig::default()
                 },
                 ..FSMetaConfig::default()
@@ -1486,7 +1507,11 @@ async fn wait_for_sink_status_republish_readiness_after_recovery_accepts_expecte
                         worker_watch_scan_root("nfs1", &nfs1),
                         worker_watch_scan_root("nfs2", &nfs2),
                     ],
-                    host_object_grants: Vec::new(),
+                    host_object_grants: worker_exports_for_node(
+                        "node-c-extra-ready-group",
+                        &nfs1,
+                        &nfs2,
+                    ),
                     ..SourceConfig::default()
                 },
                 ..FSMetaConfig::default()
@@ -1733,7 +1758,11 @@ async fn wait_for_sink_status_republish_readiness_after_recovery_defers_fast_pen
                         worker_watch_scan_root("nfs1", &nfs1),
                         worker_watch_scan_root("nfs2", &nfs2),
                     ],
-                    host_object_grants: Vec::new(),
+                    host_object_grants: worker_exports_for_node(
+                        "node-c-fast-pending-republish",
+                        &nfs1,
+                        &nfs2,
+                    ),
                     ..SourceConfig::default()
                 },
                 ..FSMetaConfig::default()
@@ -1965,7 +1994,11 @@ async fn wait_for_local_sink_status_republish_requiring_probe_checks_first_probe
                         worker_watch_scan_root("nfs1", &nfs1),
                         worker_watch_scan_root("nfs2", &nfs2),
                     ],
-                    host_object_grants: Vec::new(),
+                    host_object_grants: worker_exports_for_node(
+                        "node-c-require-probe-helper",
+                        &nfs1,
+                        &nfs2,
+                    ),
                     ..SourceConfig::default()
                 },
                 ..FSMetaConfig::default()
@@ -2239,7 +2272,11 @@ async fn wait_for_local_sink_status_republish_requiring_probe_replays_retained_s
                         worker_watch_scan_root("nfs1", &nfs1),
                         worker_watch_scan_root("nfs2", &nfs2),
                     ],
-                    host_object_grants: Vec::new(),
+                    host_object_grants: worker_exports_for_node(
+                        "node-c-require-probe-replay",
+                        &nfs1,
+                        &nfs2,
+                    ),
                     ..SourceConfig::default()
                 },
                 ..FSMetaConfig::default()
@@ -3556,6 +3593,15 @@ async fn ordinary_current_generation_source_sink_and_facade_ticks_do_not_reenter
         "ordinary current-generation mixed source/sink/facade ticks while runtime stays initialized and retained replay is disarmed must not re-enter runtime_app sink.apply",
     );
 
+    app.on_control_frame(&sink_wave(2))
+        .await
+        .expect("repeated identical current sink activation must remain a steady no-op");
+    assert_eq!(
+        sink_apply_entries.load(Ordering::Acquire),
+        0,
+        "an exact current-generation sink activation replay must not re-enter runtime_app sink.apply",
+    );
+
     assert!(
         app.control_initialized(),
         "ordinary steady mixed source/sink/facade ticks must keep runtime control initialized when replay is not required"
@@ -3941,6 +3987,23 @@ async fn replay_only_sink_followup_reenters_sink_apply_once_and_local_sink_statu
     install_sink_apply_entry_count_hook_for_app(app.instance_id, sink_apply_entries.clone());
     install_local_sink_status_republish_helper_entry_count_hook(helper_entries.clone());
 
+    app.on_control_frame(&[tick_envelope_with_route_key(
+        execution_units::SINK_RUNTIME_UNIT_ID,
+        format!("{}.stream", ROUTE_KEY_EVENTS),
+        2,
+    )])
+    .await
+    .expect("sink tick while app replay is pending should remain on the retained gate lane");
+    assert_eq!(
+        sink_apply_entries.load(Ordering::Acquire),
+        0,
+        "an ordinary sink tick must not enter runtime_app sink.apply while the repair lane owns app-level replay",
+    );
+    assert!(
+        app.sink_state_replay_required(),
+        "the gated sink tick must preserve replay for an explicit recovery entrypoint"
+    );
+
     app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
         execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
         format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
@@ -4065,7 +4128,20 @@ async fn source_led_uninitialized_mixed_recovery_keeps_control_gate_closed_until
                         worker_watch_scan_root("nfs1", &nfs1),
                         worker_watch_scan_root("nfs2", &nfs2),
                     ],
-                    host_object_grants: Vec::new(),
+                    host_object_grants: vec![
+                        worker_export(
+                            "node-c-mixed-recovery-gate::nfs1",
+                            "node-c-mixed-recovery-gate",
+                            "10.0.0.11",
+                            nfs1.clone(),
+                        ),
+                        worker_export(
+                            "node-c-mixed-recovery-gate::nfs2",
+                            "node-c-mixed-recovery-gate",
+                            "10.0.0.12",
+                            nfs2.clone(),
+                        ),
+                    ],
                     ..SourceConfig::default()
                 },
                 api: api::ApiConfig {
@@ -4449,7 +4525,20 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
                         worker_watch_scan_root("nfs1", &nfs1),
                         worker_watch_scan_root("nfs2", &nfs2),
                     ],
-                    host_object_grants: Vec::new(),
+                    host_object_grants: vec![
+                        worker_export(
+                            "node-c-deferred-query-peer-gate-reopen::nfs1",
+                            "node-c-deferred-query-peer-gate-reopen",
+                            "10.0.0.31",
+                            nfs1.clone(),
+                        ),
+                        worker_export(
+                            "node-c-deferred-query-peer-gate-reopen::nfs2",
+                            "node-c-deferred-query-peer-gate-reopen",
+                            "10.0.0.32",
+                            nfs2.clone(),
+                        ),
+                    ],
                     ..SourceConfig::default()
                 },
                 api: api::ApiConfig {
@@ -4754,7 +4843,20 @@ async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_f
                         worker_watch_scan_root("nfs1", &nfs1),
                         worker_watch_scan_root("nfs2", &nfs2),
                     ],
-                    host_object_grants: Vec::new(),
+                    host_object_grants: vec![
+                        worker_export(
+                            "node-c-deferred-query-peer-pending-overwrite::nfs1",
+                            "node-c-deferred-query-peer-pending-overwrite",
+                            "10.0.0.33",
+                            nfs1.clone(),
+                        ),
+                        worker_export(
+                            "node-c-deferred-query-peer-pending-overwrite::nfs2",
+                            "node-c-deferred-query-peer-pending-overwrite",
+                            "10.0.0.34",
+                            nfs2.clone(),
+                        ),
+                    ],
                     ..SourceConfig::default()
                 },
                 api: api::ApiConfig {

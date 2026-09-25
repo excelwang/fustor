@@ -1,18 +1,18 @@
 ports:
-  - route_token: union-graph.internal
-    use_port: query
-    dispatch_tag: query
+  - route_token: fustor.data-view.internal
+    use_port: data-view-query
+    dispatch_tag: data-view-query
     pattern: request_reply
-    route_key: union-graph.query:v1
+    route_key: fustor.data-view.query:v1
     visibility: internal
     roles:
       - serve
       - use
-  - route_token: union-graph.internal
-    use_port: ingest
-    dispatch_tag: ingest
+  - route_token: fustor.data-view.internal
+    use_port: data-view-command
+    dispatch_tag: data-view-command
     pattern: request_reply
-    route_key: union-graph.ingest:v1
+    route_key: fustor.data-view.command:v1
     visibility: internal
     roles:
       - serve

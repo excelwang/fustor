@@ -177,7 +177,20 @@ fn peer_cleanup_tail_setup(seed_ready_files: bool) -> PeerCleanupTailSinkStatusH
                         worker_watch_scan_root("nfs1", &nfs1),
                         worker_watch_scan_root("nfs2", &nfs2),
                     ],
-                    host_object_grants: Vec::new(),
+                    host_object_grants: vec![
+                        worker_export(
+                            "node-c-peer-cleanup-tail-sink-status::nfs1",
+                            "node-c-peer-cleanup-tail-sink-status",
+                            "10.0.0.11",
+                            nfs1.clone(),
+                        ),
+                        worker_export(
+                            "node-c-peer-cleanup-tail-sink-status::nfs2",
+                            "node-c-peer-cleanup-tail-sink-status",
+                            "10.0.0.12",
+                            nfs2.clone(),
+                        ),
+                    ],
                     ..SourceConfig::default()
                 },
                 ..FSMetaConfig::default()
@@ -543,7 +556,20 @@ async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_
                         worker_watch_scan_root("nfs1", &nfs1),
                         worker_watch_scan_root("nfs2", &nfs2),
                     ],
-                    host_object_grants: Vec::new(),
+                    host_object_grants: vec![
+                        worker_export(
+                            "node-c-peer-cleanup-tail-sink-status::nfs1",
+                            "node-c-peer-cleanup-tail-sink-status",
+                            "10.0.0.11",
+                            nfs1.clone(),
+                        ),
+                        worker_export(
+                            "node-c-peer-cleanup-tail-sink-status::nfs2",
+                            "node-c-peer-cleanup-tail-sink-status",
+                            "10.0.0.12",
+                            nfs2.clone(),
+                        ),
+                    ],
                     ..SourceConfig::default()
                 },
                 ..FSMetaConfig::default()
@@ -1127,7 +1153,20 @@ async fn generation_one_mixed_runtime_control_returns_before_deferred_local_sink
                         worker_watch_scan_root("nfs1", &nfs1),
                         worker_watch_scan_root("nfs2", &nfs2),
                     ],
-                    host_object_grants: Vec::new(),
+                    host_object_grants: vec![
+                        worker_export(
+                            "node-a-generation-one-mixed-republish::nfs1",
+                            "node-a-generation-one-mixed-republish",
+                            "10.0.0.21",
+                            nfs1.clone(),
+                        ),
+                        worker_export(
+                            "node-a-generation-one-mixed-republish::nfs2",
+                            "node-a-generation-one-mixed-republish",
+                            "10.0.0.22",
+                            nfs2.clone(),
+                        ),
+                    ],
                     ..SourceConfig::default()
                 },
                 ..FSMetaConfig::default()

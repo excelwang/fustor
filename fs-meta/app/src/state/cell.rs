@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -126,12 +127,25 @@ pub(crate) struct AuthorityJournal {
     handle: StateCellHandle,
     state_boundary: Arc<dyn StateBoundary>,
     state: Arc<Mutex<AuthorityJournalState>>,
+    deferred_flush: bool,
+    flush_scheduled: Arc<AtomicBool>,
+    flush_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone)]
 struct AuthorityJournalState {
     loaded: bool,
     snapshot: AuthoritySnapshot,
+    pending: VecDeque<PendingAuthorityEntry>,
+    compacted_pending_entries: u64,
+    pending_generation: u64,
+}
+
+#[derive(Clone)]
+struct PendingAuthorityEntry {
+    op: String,
+    detail: String,
+    committed_at_us: u64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -464,14 +478,47 @@ impl LogicalRootsCell {
         }
     }
 
-    pub(crate) fn refresh_from_boundary_blocking(&self) -> Result<Vec<RootSpec>, CnxError> {
-        let response = statecell_read_blocking(
-            &self.state_boundary,
-            &self.scope,
-            StateCellReadRequest {
-                handle: self.handle.clone(),
-            },
-        )?;
+    pub(crate) fn accept_propagated(
+        &self,
+        generation: u64,
+        roots: Vec<RootSpec>,
+    ) -> Result<(), CnxError> {
+        if generation == 0 {
+            return Err(CnxError::InvalidInput(
+                "propagated logical-roots generation must be positive".to_string(),
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("logical roots state lock poisoned".into()))?;
+        if generation < state.seq {
+            return Ok(());
+        }
+        if generation == state.seq {
+            let current = rmp_serde::to_vec_named(&state.roots).map_err(|err| {
+                CnxError::Internal(format!("encode current logical roots failed: {err}"))
+            })?;
+            let propagated = rmp_serde::to_vec_named(&roots).map_err(|err| {
+                CnxError::Internal(format!("encode propagated logical roots failed: {err}"))
+            })?;
+            if current != propagated {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "conflicting logical-roots declaration for generation {generation} scope={}",
+                    self.scope
+                )));
+            }
+            return Ok(());
+        }
+        state.seq = generation;
+        state.roots = roots;
+        Ok(())
+    }
+
+    fn accept_refresh_response(
+        &self,
+        response: capanix_app_sdk::runtime::KernelResultEnvelope,
+    ) -> Result<Vec<RootSpec>, CnxError> {
         if response.status != "ok" {
             return Err(CnxError::Internal(format!(
                 "statecell_read returned non-ok status for logical roots scope={}: {}",
@@ -491,12 +538,55 @@ impl LogicalRootsCell {
                 self.scope, decoded.scope
             )));
         }
-        let roots = decoded.roots.clone();
-        match self.state.lock() {
-            Ok(mut state) => *state = decoded,
-            Err(poisoned) => *poisoned.into_inner() = decoded,
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("logical roots state lock poisoned".into()))?;
+        if decoded.seq < state.seq {
+            return Ok(state.roots.clone());
         }
+        if decoded.seq == state.seq {
+            let current = rmp_serde::to_vec_named(&state.roots).map_err(|err| {
+                CnxError::Internal(format!("encode current logical roots failed: {err}"))
+            })?;
+            let refreshed = rmp_serde::to_vec_named(&decoded.roots).map_err(|err| {
+                CnxError::Internal(format!("encode refreshed logical roots failed: {err}"))
+            })?;
+            if current != refreshed {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "conflicting logical-roots StateCell content for generation {} scope={}",
+                    decoded.seq, self.scope
+                )));
+            }
+            return Ok(state.roots.clone());
+        }
+        let roots = decoded.roots.clone();
+        *state = decoded;
         Ok(roots)
+    }
+
+    pub(crate) async fn refresh_from_boundary(&self) -> Result<Vec<RootSpec>, CnxError> {
+        let response = self
+            .state_boundary
+            .statecell_read(
+                local_state_boundary_bridge(&self.scope),
+                StateCellReadRequest {
+                    handle: self.handle.clone(),
+                },
+            )
+            .await?;
+        self.accept_refresh_response(response)
+    }
+
+    pub(crate) fn refresh_from_boundary_blocking(&self) -> Result<Vec<RootSpec>, CnxError> {
+        let response = statecell_read_blocking(
+            &self.state_boundary,
+            &self.scope,
+            StateCellReadRequest {
+                handle: self.handle.clone(),
+            },
+        )?;
+        self.accept_refresh_response(response)
     }
 
     pub(crate) async fn replace(&self, roots: Vec<RootSpec>) -> Result<(), CnxError> {
@@ -744,18 +834,11 @@ fn write_host_object_grants_snapshot_blocking(
 }
 
 impl AuthorityJournal {
-    fn load_snapshot(
+    fn decode_snapshot_result(
         scope: &str,
-        handle: &StateCellHandle,
-        state_boundary: &Arc<dyn StateBoundary>,
+        result: Result<capanix_app_sdk::runtime::KernelResultEnvelope, CnxError>,
     ) -> std::io::Result<AuthoritySnapshot> {
-        match statecell_read_blocking(
-            state_boundary,
-            scope,
-            StateCellReadRequest {
-                handle: handle.clone(),
-            },
-        ) {
+        match result {
             Ok(resp) => {
                 if resp.status != "ok" {
                     return Err(std::io::Error::other(format!(
@@ -796,6 +879,47 @@ impl AuthorityJournal {
         }
     }
 
+    fn load_snapshot(
+        scope: &str,
+        handle: &StateCellHandle,
+        state_boundary: &Arc<dyn StateBoundary>,
+    ) -> std::io::Result<AuthoritySnapshot> {
+        Self::decode_snapshot_result(
+            scope,
+            statecell_read_blocking(
+                state_boundary,
+                scope,
+                StateCellReadRequest {
+                    handle: handle.clone(),
+                },
+            ),
+        )
+    }
+
+    async fn load_snapshot_async(&self) -> std::io::Result<AuthoritySnapshot> {
+        Self::decode_snapshot_result(
+            &self.scope,
+            self.state_boundary
+                .statecell_read(
+                    local_state_boundary_bridge(&self.scope),
+                    StateCellReadRequest {
+                        handle: self.handle.clone(),
+                    },
+                )
+                .await,
+        )
+    }
+
+    fn new_state(loaded: bool, snapshot: AuthoritySnapshot) -> AuthorityJournalState {
+        AuthorityJournalState {
+            loaded,
+            snapshot,
+            pending: VecDeque::new(),
+            compacted_pending_entries: 0,
+            pending_generation: 0,
+        }
+    }
+
     pub(crate) fn from_state_boundary(
         scope: &str,
         state_boundary: Arc<dyn StateBoundary>,
@@ -806,10 +930,10 @@ impl AuthorityJournal {
             scope: Arc::<str>::from(scope),
             handle,
             state_boundary,
-            state: Arc::new(Mutex::new(AuthorityJournalState {
-                loaded: true,
-                snapshot: loaded,
-            })),
+            state: Arc::new(Mutex::new(Self::new_state(true, loaded))),
+            deferred_flush: false,
+            flush_scheduled: Arc::new(AtomicBool::new(false)),
+            flush_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -819,10 +943,13 @@ impl AuthorityJournal {
             scope: Arc::<str>::from(scope),
             handle,
             state_boundary,
-            state: Arc::new(Mutex::new(AuthorityJournalState {
-                loaded: false,
-                snapshot: AuthoritySnapshot::empty(scope),
-            })),
+            state: Arc::new(Mutex::new(Self::new_state(
+                false,
+                AuthoritySnapshot::empty(scope),
+            ))),
+            deferred_flush: true,
+            flush_scheduled: Arc::new(AtomicBool::new(false)),
+            flush_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -863,19 +990,261 @@ impl AuthorityJournal {
         state.loaded = true;
     }
 
+    async fn ensure_loaded_async(&self) -> std::io::Result<()> {
+        let needs_load = match self.state.lock() {
+            Ok(state) => !state.loaded,
+            Err(poisoned) => !poisoned.into_inner().loaded,
+        };
+        if !needs_load {
+            return Ok(());
+        }
+        let loaded = self.load_snapshot_async().await?;
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!(
+                    "state-cell authority state lock poisoned during deferred load for scope={}; recovering",
+                    self.scope
+                );
+                poisoned.into_inner()
+            }
+        };
+        if !state.loaded {
+            state.snapshot = loaded;
+            state.loaded = true;
+        }
+        Ok(())
+    }
+
+    fn lock_state(&self, operation: &str) -> std::sync::MutexGuard<'_, AuthorityJournalState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!(
+                    "state-cell authority state lock poisoned during {} for scope={}; recovering",
+                    operation,
+                    self.scope
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn enqueue_deferred(&self, op: &str, detail: String) {
+        let mut state = self.lock_state("deferred enqueue");
+        if state.pending.len() >= AUTHORITY_JOURNAL_MAX_ENTRIES {
+            state.pending.pop_front();
+            state.compacted_pending_entries = state.compacted_pending_entries.saturating_add(1);
+        }
+        state.pending.push_back(PendingAuthorityEntry {
+            op: op.to_string(),
+            detail,
+            committed_at_us: now_us(),
+        });
+        state.pending_generation = state.pending_generation.wrapping_add(1);
+    }
+
+    fn pending_generation(&self) -> u64 {
+        self.lock_state("pending generation").pending_generation
+    }
+
+    fn has_pending(&self) -> bool {
+        let state = self.lock_state("pending inspection");
+        !state.pending.is_empty() || state.compacted_pending_entries > 0
+    }
+
+    fn restore_pending_batch(&self, mut batch: VecDeque<PendingAuthorityEntry>) {
+        let mut state = self.lock_state("deferred batch restore");
+        batch.append(&mut state.pending);
+        while batch.len() > AUTHORITY_JOURNAL_MAX_ENTRIES {
+            batch.pop_front();
+            state.compacted_pending_entries = state.compacted_pending_entries.saturating_add(1);
+        }
+        state.pending = batch;
+    }
+
+    async fn flush_deferred_batch(&self) -> std::io::Result<usize> {
+        let _flush_guard = self.flush_gate.lock().await;
+        self.ensure_loaded_async().await?;
+
+        let (base_snapshot, mut batch, compacted_pending_entries) = {
+            let mut state = self.lock_state("deferred batch capture");
+            if state.pending.is_empty() && state.compacted_pending_entries == 0 {
+                return Ok(0);
+            }
+            (
+                state.snapshot.clone(),
+                std::mem::take(&mut state.pending),
+                std::mem::take(&mut state.compacted_pending_entries),
+            )
+        };
+        if compacted_pending_entries > 0 {
+            batch.push_back(PendingAuthorityEntry {
+                op: "authority.pending.compacted".to_string(),
+                detail: format!("dropped_oldest_entries={compacted_pending_entries}"),
+                committed_at_us: now_us(),
+            });
+            while batch.len() > AUTHORITY_JOURNAL_MAX_ENTRIES {
+                batch.pop_front();
+            }
+        }
+
+        let mut candidate = base_snapshot;
+        for pending in &batch {
+            candidate.next_seq = candidate.next_seq.wrapping_add(1);
+            candidate.entries.push_back(AuthorityEntry {
+                seq: candidate.next_seq,
+                scope: self.scope.to_string(),
+                op: pending.op.clone(),
+                detail: pending.detail.clone(),
+                committed_at_us: pending.committed_at_us,
+            });
+        }
+        candidate.trim_tail();
+        let payload = match rmp_serde::to_vec_named(&candidate) {
+            Ok(payload) => payload,
+            Err(err) => {
+                self.restore_pending_batch(batch);
+                return Err(std::io::Error::other(format!(
+                    "serialize deferred authority snapshot failed for scope={}: {err}",
+                    self.scope
+                )));
+            }
+        };
+        let result = self
+            .state_boundary
+            .statecell_write(
+                local_state_boundary_bridge(&self.scope),
+                StateCellWriteRequest {
+                    handle: self.handle.clone(),
+                    payload,
+                    lease_epoch: Some(candidate.next_seq),
+                    retained_revision_limit: None,
+                },
+            )
+            .await;
+        match result {
+            Ok(result) if result.status == "committed" || result.status == "ok" => {
+                let batch_len = batch.len();
+                self.lock_state("deferred batch commit").snapshot = candidate;
+                Ok(batch_len)
+            }
+            Ok(result) => {
+                self.restore_pending_batch(batch);
+                Err(std::io::Error::other(format!(
+                    "statecell_write returned non-committed status for deferred authority scope={} status={} diagnostics={:?}",
+                    self.scope, result.status, result.diagnostics
+                )))
+            }
+            Err(err) => {
+                self.restore_pending_batch(batch);
+                Err(std::io::Error::other(format!(
+                    "statecell_write failed for deferred authority scope={}: {err}",
+                    self.scope
+                )))
+            }
+        }
+    }
+
+    async fn run_deferred_flush(self) {
+        const MAX_AUTOMATIC_FAILURES: usize = 5;
+        let mut failures = 0usize;
+        let mut last_attempt_generation = self.pending_generation();
+        loop {
+            match self.flush_deferred_batch().await {
+                Ok(0) => {
+                    self.flush_scheduled.store(false, AtomicOrdering::Release);
+                    if self.has_pending()
+                        && self
+                            .flush_scheduled
+                            .compare_exchange(
+                                false,
+                                true,
+                                AtomicOrdering::AcqRel,
+                                AtomicOrdering::Acquire,
+                            )
+                            .is_ok()
+                    {
+                        failures = 0;
+                        last_attempt_generation = self.pending_generation();
+                        continue;
+                    }
+                    return;
+                }
+                Ok(_) => {
+                    failures = 0;
+                    last_attempt_generation = self.pending_generation();
+                }
+                Err(err) => {
+                    failures += 1;
+                    log::warn!(
+                        "state-cell deferred authority flush failed scope={} attempt={}/{}: {}",
+                        self.scope,
+                        failures,
+                        MAX_AUTOMATIC_FAILURES,
+                        err
+                    );
+                    if failures >= MAX_AUTOMATIC_FAILURES {
+                        self.flush_scheduled.store(false, AtomicOrdering::Release);
+                        if self.pending_generation() != last_attempt_generation
+                            && self
+                                .flush_scheduled
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    AtomicOrdering::AcqRel,
+                                    AtomicOrdering::Acquire,
+                                )
+                                .is_ok()
+                        {
+                            failures = 0;
+                            last_attempt_generation = self.pending_generation();
+                            continue;
+                        }
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50u64 << (failures - 1)))
+                        .await;
+                }
+            }
+        }
+    }
+
+    fn schedule_deferred_flush(&self) {
+        if self
+            .flush_scheduled
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let journal = self.clone();
+        crate::runtime_app::shared_tokio_runtime().spawn(async move {
+            journal.run_deferred_flush().await;
+        });
+    }
+
+    pub(crate) async fn flush(&self) -> std::io::Result<()> {
+        if !self.deferred_flush {
+            return Ok(());
+        }
+        loop {
+            if self.flush_deferred_batch().await? == 0 {
+                return Ok(());
+            }
+        }
+    }
+
     pub(crate) fn append(&self, op: &str, detail: String) {
+        if self.deferred_flush {
+            self.enqueue_deferred(op, detail);
+            self.schedule_deferred_flush();
+            return;
+        }
+
         self.ensure_loaded();
         let (payload, lease_epoch) = {
-            let mut state = match self.state.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    log::warn!(
-                        "state-cell authority state lock poisoned for scope={}; recovering",
-                        self.scope
-                    );
-                    poisoned.into_inner()
-                }
-            };
+            let mut state = self.lock_state("append");
             state.snapshot.next_seq = state.snapshot.next_seq.wrapping_add(1);
             let entry = AuthorityEntry {
                 seq: state.snapshot.next_seq,
@@ -946,19 +1315,23 @@ mod tests {
     impl StateBoundary for UnsupportedBoundary {}
 
     #[derive(Default)]
-    struct CountingBoundary {
+    struct BlockingAuthorityBoundary {
         reads: AtomicUsize,
         writes: AtomicUsize,
+        read_entered: tokio::sync::Notify,
+        release_read: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
-    impl StateBoundary for CountingBoundary {
+    impl StateBoundary for BlockingAuthorityBoundary {
         async fn statecell_read(
             &self,
             _ctx: BoundaryContext,
             _request: StateCellReadRequest,
         ) -> Result<capanix_app_sdk::runtime::KernelResultEnvelope, CnxError> {
             self.reads.fetch_add(1, Ordering::Relaxed);
+            self.read_entered.notify_one();
+            self.release_read.notified().await;
             Ok(capanix_app_sdk::runtime::KernelResultEnvelope {
                 correlation_id: None,
                 status: "ok".to_string(),
@@ -1072,6 +1445,30 @@ mod tests {
         assert_eq!(grants, runtime_grants);
     }
 
+    #[tokio::test]
+    async fn logical_roots_refresh_does_not_regress_a_newer_propagated_generation() {
+        let boundary = in_memory_state_boundary();
+        let cell =
+            LogicalRootsCell::from_state_boundary("runtime.exec.source", Vec::new(), boundary)
+                .expect("seed logical roots");
+        let propagated = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+        cell.accept_propagated(2, propagated.clone())
+            .expect("accept propagated generation");
+
+        let refreshed = cell
+            .refresh_from_boundary()
+            .await
+            .expect("refresh older authority snapshot");
+        assert_eq!(cell.current_seq(), 2);
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].id, "nfs1");
+
+        let err = cell
+            .accept_propagated(2, vec![RootSpec::new("nfs2", "/mnt/nfs2")])
+            .expect_err("same-generation content conflict must fail closed");
+        assert!(matches!(err, CnxError::ProtocolViolation(_)));
+    }
+
     #[test]
     fn authority_journal_rejects_scope_mismatch_payload() {
         let boundary = in_memory_state_boundary();
@@ -1120,16 +1517,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deferred_authority_journal_defers_state_reads_until_first_append() {
-        let boundary = Arc::new(CountingBoundary::default());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_authority_journal_append_does_not_wait_for_statecell_read() {
+        let boundary = Arc::new(BlockingAuthorityBoundary::default());
         let journal = AuthorityJournal::deferred("runtime.exec.sink", boundary.clone());
         assert_eq!(boundary.reads.load(Ordering::Relaxed), 0);
         assert_eq!(boundary.writes.load(Ordering::Relaxed), 0);
 
         journal.append("sink.bootstrap", "roots=1 exports=1".to_string());
 
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            boundary.read_entered.notified(),
+        )
+        .await
+        .expect("deferred authority flush should start its statecell read");
         assert_eq!(boundary.reads.load(Ordering::Relaxed), 1);
+        assert_eq!(boundary.writes.load(Ordering::Relaxed), 0);
+
+        boundary.release_read.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), journal.flush())
+            .await
+            .expect("deferred authority flush timed out")
+            .expect("deferred authority flush failed");
         assert_eq!(boundary.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(journal.len(), 1);
     }
 }

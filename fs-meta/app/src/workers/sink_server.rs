@@ -420,7 +420,7 @@ fn bootstrap_start_sink_runtime_with_failure(
         "fs_meta_sink_worker_server: bootstrap_start begin node={} endpoints_started={}",
         node_id.0, state.endpoints_started
     );
-    sink.start_runtime_endpoints_with_failure(io_boundary, node_id)?;
+    sink.start_external_worker_runtime_endpoints_with_failure(io_boundary, node_id)?;
     eprintln!("fs_meta_sink_worker_server: bootstrap_start endpoints ok");
     if state.send_tx.is_none() {
         let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<QueuedSendBatch>();
@@ -598,7 +598,7 @@ fn plan_worker_request(
             ),
         },
         SinkWorkerRequest::StatusSnapshot => match state.sink.as_ref() {
-            Some(sink) => match sink.status_snapshot_with_failure() {
+            Some(sink) => match sink.cached_status_snapshot_with_failure() {
                 Ok(mut snapshot) => {
                     annotate_sink_status_snapshot_with_worker_stats(&mut snapshot, state);
                     SinkWorkerAction::Immediate(SinkWorkerResponse::StatusSnapshot(snapshot), false)
@@ -611,7 +611,10 @@ fn plan_worker_request(
             ),
         },
         SinkWorkerRequest::StatusSnapshotForRoute { route_key } => match state.sink.as_ref() {
-            Some(sink) => match sink.status_snapshot_for_route_with_failure(&route_key) {
+            Some(sink) => match sink
+                .build_cached_status_snapshot_for_route(&route_key)
+                .map_err(SinkFailure::from)
+            {
                 Ok(mut snapshot) => {
                     annotate_sink_status_snapshot_with_worker_stats(&mut snapshot, state);
                     SinkWorkerAction::Immediate(SinkWorkerResponse::StatusSnapshot(snapshot), false)
@@ -651,7 +654,7 @@ fn plan_worker_request(
         SinkWorkerRequest::MaterializedQuery { request } => match state.sink.as_ref() {
             Some(sink) => {
                 if debug_sink_query_flow_enabled()
-                    && let Ok(snapshot) = sink.status_snapshot_with_failure()
+                    && let Ok(snapshot) = sink.cached_status_snapshot_with_failure()
                 {
                     eprintln!(
                         "fs_meta_sink_worker_server: materialized_query begin selected_group={:?} path={} groups={:?}",
@@ -805,9 +808,10 @@ async fn execute_worker_action_with_runtime_boundary(
             if let (Some(boundary), Some(node_id)) =
                 (runtime_io_boundary.as_ref(), node_id.as_ref())
             {
-                if let Err(err) =
-                    sink.start_runtime_endpoints_with_failure(boundary.clone(), node_id.clone())
-                {
+                if let Err(err) = sink.start_external_worker_runtime_endpoints_with_failure(
+                    boundary.clone(),
+                    node_id.clone(),
+                ) {
                     return (classify_sink_worker_failure(err), false);
                 }
             }
@@ -833,8 +837,10 @@ async fn execute_worker_action_with_runtime_boundary(
                 Ok(_) => {
                     if let (Some(boundary), Some(node_id)) =
                         (runtime_io_boundary.as_ref(), node_id.as_ref())
-                        && let Err(err) = sink
-                            .start_runtime_endpoints_with_failure(boundary.clone(), node_id.clone())
+                        && let Err(err) = sink.start_external_worker_runtime_endpoints_with_failure(
+                            boundary.clone(),
+                            node_id.clone(),
+                        )
                     {
                         return (classify_sink_worker_failure(err), false);
                     }
@@ -934,15 +940,21 @@ impl TypedWorkerSession<SinkWorkerRpc> for SinkWorkerSession {
             ));
         };
         if let Some(node_id) = node_id.as_ref() {
-            sink.start_runtime_endpoints_with_failure(_context.io_boundary(), node_id.clone())
-                .map_err(SinkFailure::into_error)?;
+            sink.start_external_worker_runtime_endpoints_with_failure(
+                _context.io_boundary(),
+                node_id.clone(),
+            )
+            .map_err(SinkFailure::into_error)?;
         }
         sink.on_control_frame_with_failure(envelopes)
             .await
             .map_err(SinkFailure::into_error)?;
         if let Some(node_id) = node_id.as_ref() {
-            sink.start_runtime_endpoints_with_failure(_context.io_boundary(), node_id.clone())
-                .map_err(SinkFailure::into_error)?;
+            sink.start_external_worker_runtime_endpoints_with_failure(
+                _context.io_boundary(),
+                node_id.clone(),
+            )
+            .map_err(SinkFailure::into_error)?;
         }
         Ok(())
     }
@@ -1038,6 +1050,53 @@ mod tests {
             _request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
         ) -> capanix_app_sdk::Result<Vec<Event>> {
             Err(CnxError::Timeout)
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingAuthorityStateBoundary {
+        authority_reads: std::sync::atomic::AtomicUsize,
+        authority_writes: std::sync::atomic::AtomicUsize,
+        authority_read_entered: Notify,
+        release_authority_read: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl StateBoundary for BlockingAuthorityStateBoundary {
+        async fn statecell_read(
+            &self,
+            _ctx: capanix_runtime_entry_sdk::advanced::boundary::BoundaryContext,
+            request: capanix_app_sdk::runtime::StateCellReadRequest,
+        ) -> capanix_app_sdk::Result<capanix_app_sdk::runtime::KernelResultEnvelope> {
+            if request.handle.cell_id == "fs-meta.authority.runtime.exec.sink" {
+                self.authority_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.authority_read_entered.notify_one();
+                self.release_authority_read.notified().await;
+            }
+            Ok(capanix_app_sdk::runtime::KernelResultEnvelope {
+                correlation_id: None,
+                status: "ok".to_string(),
+                payload: Vec::new(),
+                diagnostics: None,
+            })
+        }
+
+        async fn statecell_write(
+            &self,
+            _ctx: capanix_runtime_entry_sdk::advanced::boundary::BoundaryContext,
+            request: capanix_app_sdk::runtime::StateCellWriteRequest,
+        ) -> capanix_app_sdk::Result<capanix_app_sdk::runtime::KernelResultEnvelope> {
+            if request.handle.cell_id == "fs-meta.authority.runtime.exec.sink" {
+                self.authority_writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(capanix_app_sdk::runtime::KernelResultEnvelope {
+                correlation_id: None,
+                status: "committed".to_string(),
+                payload: Vec::new(),
+                diagnostics: None,
+            })
         }
     }
 
@@ -1184,8 +1243,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_on_control_frame_ack_does_not_wait_for_delayed_events_stream_first_recv_after_deferred_authority_startup_for_local_split_primary_scope()
-     {
+    async fn worker_on_control_frame_ack_precedes_deferred_authority_read_and_stream_arm() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -1226,12 +1284,9 @@ mod tests {
         .expect("bootstrap init sink runtime");
 
         let boundary = Arc::new(StreamRecvCountingBoundary::default());
-        bootstrap_start_sink_runtime(
-            &mut state,
-            boundary.clone(),
-            capanix_app_sdk::runtime::in_memory_state_boundary(),
-        )
-        .expect("bootstrap start sink runtime");
+        let state_boundary = Arc::new(BlockingAuthorityStateBoundary::default());
+        bootstrap_start_sink_runtime(&mut state, boundary.clone(), state_boundary.clone())
+            .expect("bootstrap start sink runtime");
 
         let events_route = crate::runtime::routes::events_stream_route_for_scope(&node_id.0).0;
         crate::runtime::endpoint::install_stream_endpoint_before_first_recv_delay_hook(
@@ -1283,7 +1338,7 @@ mod tests {
         )
         .await
         .expect(
-            "worker-backed sink control ACK must not wait for events stream first recv observation",
+            "worker-backed sink control ACK must not wait for authority StateCell or events stream first recv",
         );
         assert!(!stop, "worker on_control_frame should not stop the session");
         assert!(
@@ -1296,6 +1351,54 @@ mod tests {
             events_route,
             boundary.recv_count(&events_route),
         );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            state_boundary.authority_read_entered.notified(),
+        )
+        .await
+        .expect("deferred sink authority read should start after control facts are queued");
+        assert_eq!(
+            state_boundary
+                .authority_writes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "authority write must remain pending while the injected read is blocked"
+        );
+
+        let update_action = plan_worker_request(
+            SinkWorkerRequest::UpdateLogicalRootsFromManagementApply {
+                roots: vec![root("nfs3", &nfs3.display().to_string())],
+                host_object_grants: vec![granted_mount_root(
+                    "node-b::nfs3",
+                    "node-b",
+                    "10.0.0.13",
+                    nfs3.clone(),
+                    true,
+                )],
+            },
+            &mut state,
+        );
+        let (response, stop) = tokio::time::timeout(
+            Duration::from_millis(100),
+            execute_worker_action(update_action),
+        )
+        .await
+        .expect("management roots ACK must not wait for the deferred authority flush");
+        assert!(!stop);
+        assert!(matches!(response, SinkWorkerResponse::Ack));
+
+        let status_action = plan_worker_request(SinkWorkerRequest::StatusSnapshot, &mut state);
+        let (response, stop) = tokio::time::timeout(
+            Duration::from_millis(100),
+            execute_worker_action(status_action),
+        )
+        .await
+        .expect("sink status must use the propagated local view while authority IPC is blocked");
+        assert!(!stop);
+        assert!(matches!(response, SinkWorkerResponse::StatusSnapshot(_)));
+
+        state_boundary.release_authority_read.notify_one();
+
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         while boundary.recv_count(&events_route) == 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1305,6 +1408,113 @@ mod tests {
             "events stream should still arm asynchronously after control ACK: route={} recv_count={}",
             events_route,
             boundary.recv_count(&events_route),
+        );
+
+        bootstrap_stop_sink_runtime(&mut state).await;
+        assert_eq!(
+            state_boundary
+                .authority_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            state_boundary
+                .authority_writes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "orderly sink close must observe the deferred authority batch as committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_sink_control_leaves_external_status_routes_to_app_proxy() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let node_id = NodeId("node-a-123".to_string());
+        let mut state = SinkWorkerState {
+            sink: None,
+            node_id: None,
+            pending_init: None,
+            endpoints_started: false,
+            send_tx: None,
+            last_control_frame_signals: Vec::new(),
+            received_stats: Arc::new(StdMutex::new(ReceivedBatchStats::default())),
+        };
+        bootstrap_init_sink_runtime(
+            node_id.clone(),
+            SinkWorkerInitConfig {
+                roots: vec![root("nfs1", &nfs1.display().to_string())],
+                host_object_grants: vec![granted_mount_root(
+                    "node-a::nfs1",
+                    "node-a",
+                    "10.0.0.11",
+                    nfs1,
+                    true,
+                )],
+                sink_tombstone_ttl_ms: 60_000,
+                sink_tombstone_tolerance_us: 0,
+            },
+            &mut state,
+        )
+        .await
+        .expect("bootstrap init sink runtime");
+
+        let boundary = Arc::new(StreamRecvCountingBoundary::default());
+        bootstrap_start_sink_runtime(
+            &mut state,
+            boundary.clone(),
+            capanix_app_sdk::runtime::in_memory_state_boundary(),
+        )
+        .expect("bootstrap start sink runtime");
+
+        let local_status_route =
+            crate::runtime::routes::sink_status_request_route_for(&node_id.0).0;
+        let generic_status_route = format!(
+            "{}.req",
+            crate::runtime::routes::ROUTE_KEY_SINK_STATUS_INTERNAL
+        );
+        let events_route = crate::runtime::routes::events_stream_route_for_scope(&node_id.0).0;
+        let envelopes = [
+            local_status_route.clone(),
+            generic_status_route.clone(),
+            events_route.clone(),
+        ]
+        .into_iter()
+        .map(|route_key| {
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key,
+                unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+            }))
+            .expect("encode sink endpoint activate")
+        })
+        .collect::<Vec<_>>();
+        let action =
+            plan_worker_request(SinkWorkerRequest::OnControlFrame { envelopes }, &mut state);
+        let (response, stop) =
+            execute_worker_action_with_runtime_boundary(action, Some(boundary.clone())).await;
+        assert!(!stop);
+        assert!(matches!(response, SinkWorkerResponse::Ack));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            boundary.recv_count(&events_route) > 0,
+            "external sink worker must still own its data-ingress stream"
+        );
+        assert_eq!(
+            boundary.recv_count(&local_status_route),
+            0,
+            "worker-backed sink must leave its node-scoped sink-status route to the app proxy"
+        );
+        assert_eq!(
+            boundary.recv_count(&generic_status_route),
+            0,
+            "worker-backed sink must leave generic sink-status to the app proxy"
         );
 
         bootstrap_stop_sink_runtime(&mut state).await;

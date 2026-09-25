@@ -13,14 +13,30 @@ resolver = "2"
 members = [
     ".",
     "source-kit",
+    "graph-source",
+    "tools/source-inspect",
+    "tools/data-view-inspect",
+    "source-test-kit",
     "es-source/lib",
     "es-source/app",
     "mysql-source/lib",
     "mysql-source/app",
+    "local-fs-source/lib",
+    "local-fs-source/app",
+    "pg-source/lib",
+    "pg-source/app",
+    "csv-source/lib",
+    "csv-source/app",
+    "jsonl-source/lib",
+    "jsonl-source/app",
     "s3-source/lib",
     "s3-source/app",
+    "data-view",
+    "data-view-normalizers",
+    "tests/source-system",
     "union-graph/lib",
     "union-graph/app",
+    "private-discovery",
     "fs-meta/lib",
     "fs-meta/app",
     "fs-meta/deploy",
@@ -33,10 +49,22 @@ default-members = [
     "es-source/app",
     "mysql-source/lib",
     "mysql-source/app",
+    "local-fs-source/lib",
+    "local-fs-source/app",
+    "pg-source/lib",
+    "pg-source/app",
+    "csv-source/lib",
+    "csv-source/app",
+    "jsonl-source/lib",
+    "jsonl-source/app",
     "s3-source/lib",
     "s3-source/app",
+    "data-view",
+    "data-view-normalizers",
+    "tests/source-system",
     "union-graph/lib",
     "union-graph/app",
+    "private-discovery",
     "fs-meta/lib",
     "fs-meta/app",
     "fs-meta/deploy",
@@ -45,14 +73,27 @@ default-members = [
 
 [workspace.dependencies]
 source-kit = { version = "0.1.0", path = "source-kit" }
+graph-source = { version = "0.1.0", path = "graph-source" }
+source-test-kit = { version = "0.1.0", path = "source-test-kit" }
 es-source = { version = "0.1.0", path = "es-source/lib" }
 es-source-runtime = { version = "0.1.0", path = "es-source/app" }
 mysql-source = { version = "0.1.0", path = "mysql-source/lib" }
 mysql-source-runtime = { version = "0.1.0", path = "mysql-source/app" }
+local-fs-source = { version = "0.1.0", path = "local-fs-source/lib" }
+local-fs-source-runtime = { version = "0.1.0", path = "local-fs-source/app" }
+pg-source = { version = "0.1.0", path = "pg-source/lib" }
+pg-source-runtime = { version = "0.1.0", path = "pg-source/app" }
+csv-source = { version = "0.1.0", path = "csv-source/lib" }
+csv-source-runtime = { version = "0.1.0", path = "csv-source/app" }
+jsonl-source = { version = "0.1.0", path = "jsonl-source/lib" }
+jsonl-source-runtime = { version = "0.1.0", path = "jsonl-source/app" }
 s3-source = { version = "0.1.0", path = "s3-source/lib" }
 s3-source-runtime = { version = "0.1.0", path = "s3-source/app" }
+data-view = { version = "0.1.0", path = "data-view" }
+data-view-normalizers = { version = "0.1.0", path = "data-view-normalizers" }
 union-graph = { version = "0.1.0", path = "union-graph/lib" }
 union-graph-runtime = { version = "0.1.0", path = "union-graph/app" }
+private-discovery = { version = "0.1.0", path = "private-discovery" }
 fs-meta = { version = "0.1.0", path = "fs-meta/lib" }
 fs-meta-runtime = { version = "0.1.0", path = "fs-meta/app" }
 fs-meta-deploy = { version = "0.1.0", path = "fs-meta/deploy" }
@@ -80,17 +121,24 @@ aws-credential-types = "1"
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
 bytes = "1"
 crossbeam-channel = "0.5"
+csv = "1"
 futures-core = "0.3"
 log = "0.4"
 mysql = "26"
+native-tls = "0.2"
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+postgres-native-tls = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rmp-serde = "1"
 serde = "1"
+serde_json = "1"
 serde_bytes = "0.11"
+sha2 = "0.10"
 tempfile = "3"
 tokio = "1"
 tokio-util = "0.7"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [dependencies]
 capanix-specs-vocabulary = { workspace = true }
@@ -142,6 +190,10 @@ path = "fs-meta/tests/fs_meta_api_e2e.rs"
 [[test]]
 name = "runtime_scope_e2e"
 path = "fs-meta/tests/runtime_scope_e2e.rs"
+
+[[test]]
+name = "specs_fustor_architecture"
+path = "tests/specs_fustor_architecture.rs"
 
 [patch.crates-io]
 capanix-app-sdk = { path = "../capanix/crates/app-sdk" }

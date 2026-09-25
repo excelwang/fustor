@@ -37,7 +37,7 @@ git grep -n '10\.0\.82'
 
 ## 3. 测试环境边界
 
-`CAPANIX_WORKER_HOST_BINARY` 不要写死到 `/root/repo/...`。测试脚本当前规则是：
+`CAPANIX_WORKER_HOST_BINARY` 不要写死到 `/opt/fusiongraph/src/...`。测试脚本当前规则是：
 
 1. 如果显式设置 `CAPANIX_WORKER_HOST_BINARY`，必须是绝对路径并且可执行。
 2. 如果未设置，优先解析当前 `fustor` worktree 的 sibling `../capanix/target/debug/capanix_worker_host`。

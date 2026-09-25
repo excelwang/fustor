@@ -16,7 +16,7 @@ use capanix_runtime_entry_sdk::control::{
     RuntimeHostObjectType, RuntimeObjectDescriptor, RuntimeUnitTick, encode_runtime_exec_control,
     encode_runtime_host_grant_change, encode_runtime_unit_tick,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 struct NoopBoundary;
 
@@ -25,6 +25,7 @@ impl ChannelIoSubset for NoopBoundary {}
 
 struct RecordingStateBoundary {
     inner: Arc<dyn StateBoundary>,
+    reads: AtomicUsize,
     writes: Mutex<Vec<StateCellWriteRequest>>,
 }
 
@@ -32,8 +33,13 @@ impl RecordingStateBoundary {
     fn new() -> Self {
         Self {
             inner: in_memory_state_boundary(),
+            reads: AtomicUsize::new(0),
             writes: Mutex::new(Vec::new()),
         }
+    }
+
+    fn read_count(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
     }
 
     fn writes(&self) -> Vec<StateCellWriteRequest> {
@@ -51,6 +57,7 @@ impl StateBoundary for RecordingStateBoundary {
         ctx: BoundaryContext,
         request: StateCellReadRequest,
     ) -> Result<capanix_app_sdk::runtime::KernelResultEnvelope> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         self.inner.statecell_read(ctx, request).await
     }
 
@@ -113,6 +120,84 @@ impl StateBoundary for FailingWriteStateBoundary {
         Err(CnxError::Internal(
             "simulated statecell backpressure".into(),
         ))
+    }
+}
+
+struct BlockingSinkSnapshotStateBoundary {
+    inner: Arc<dyn StateBoundary>,
+    write_started: tokio::sync::Semaphore,
+    write_release: tokio::sync::Semaphore,
+    writes: AtomicUsize,
+}
+
+impl BlockingSinkSnapshotStateBoundary {
+    fn new() -> Self {
+        Self {
+            inner: in_memory_state_boundary(),
+            write_started: tokio::sync::Semaphore::new(0),
+            write_release: tokio::sync::Semaphore::new(0),
+            writes: AtomicUsize::new(0),
+        }
+    }
+
+    async fn wait_for_write_started(&self) {
+        let permit = tokio::time::timeout(Duration::from_secs(2), self.write_started.acquire())
+            .await
+            .expect("sink snapshot write should start")
+            .expect("write-start semaphore should remain open");
+        permit.forget();
+    }
+
+    fn release_write(&self) {
+        self.write_release.add_permits(1);
+    }
+
+    fn write_count(&self) -> usize {
+        self.writes.load(Ordering::Acquire)
+    }
+}
+
+#[async_trait::async_trait]
+impl StateBoundary for BlockingSinkSnapshotStateBoundary {
+    async fn statecell_read(
+        &self,
+        ctx: BoundaryContext,
+        request: StateCellReadRequest,
+    ) -> Result<capanix_app_sdk::runtime::KernelResultEnvelope> {
+        self.inner.statecell_read(ctx, request).await
+    }
+
+    async fn statecell_write(
+        &self,
+        ctx: BoundaryContext,
+        request: StateCellWriteRequest,
+    ) -> Result<capanix_app_sdk::runtime::KernelResultEnvelope> {
+        if request.handle == sink_state_handle(SINK_RUNTIME_UNIT_ID) {
+            self.writes.fetch_add(1, Ordering::AcqRel);
+            self.write_started.add_permits(1);
+            let permit = self
+                .write_release
+                .acquire()
+                .await
+                .map_err(|_| CnxError::TransportClosed("write release closed".into()))?;
+            permit.forget();
+        }
+        self.inner.statecell_write(ctx, request).await
+    }
+}
+
+async fn wait_for_state_write_count(expected: usize, count: impl Fn() -> usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if count() >= expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "statecell write count did not reach {expected}; current={}",
+            count()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -419,6 +504,45 @@ impl ChannelIoSubset for RootsControlThenEventsBoundary {
     }
 }
 
+struct SingleRouteEventsBoundary {
+    events_route: String,
+    events: Vec<Event>,
+    delivered: AtomicBool,
+}
+
+impl SingleRouteEventsBoundary {
+    fn new(events_route: String, events: Vec<Event>) -> Self {
+        Self {
+            events_route,
+            events,
+            delivered: AtomicBool::new(false),
+        }
+    }
+
+    fn delivered(&self) -> bool {
+        self.delivered.load(Ordering::Acquire)
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelIoSubset for SingleRouteEventsBoundary {
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+    ) -> Result<Vec<Event>> {
+        if request.channel_key.0 == self.events_route
+            && self
+                .delivered
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Ok(self.events.clone());
+        }
+        Err(CnxError::Timeout)
+    }
+}
+
 fn default_materialized_request() -> InternalQueryRequest {
     InternalQueryRequest::default()
 }
@@ -615,13 +739,14 @@ fn build_single_group_sink() -> SinkFileMeta {
 }
 
 #[test]
-fn sink_snapshot_statecell_write_disables_revision_retention() {
+fn sink_snapshot_statecell_write_disables_revision_retention_and_uses_monotonic_lease() {
     let recording = Arc::new(RecordingStateBoundary::new());
     let state_boundary: Arc<dyn StateBoundary> = recording.clone();
     let snapshot_cell = SinkStateSnapshotCell {
         scope: Arc::<str>::from(SINK_RUNTIME_UNIT_ID),
         handle: sink_state_handle(SINK_RUNTIME_UNIT_ID),
         state_boundary,
+        last_lease_epoch: Arc::new(AtomicU64::new(0)),
     };
     let snapshot = PersistedSinkState {
         scope: SINK_RUNTIME_UNIT_ID.to_string(),
@@ -631,20 +756,29 @@ fn sink_snapshot_statecell_write_disables_revision_retention() {
     };
 
     snapshot_cell.persist(&snapshot).expect("persist snapshot");
+    snapshot_cell
+        .persist(&snapshot)
+        .expect("persist snapshot at repeated wall-clock timestamp");
 
     let writes = recording.writes();
-    let write = writes
+    let writes = writes
         .iter()
-        .find(|request| request.handle == sink_state_handle(SINK_RUNTIME_UNIT_ID))
-        .expect("sink snapshot statecell write");
-    assert_eq!(
-        write.retained_revision_limit,
-        Some(0),
-        "large sink memory-tree snapshots must overwrite the current statecell payload without retaining historical full-payload revisions"
-    );
+        .filter(|request| request.handle == sink_state_handle(SINK_RUNTIME_UNIT_ID))
+        .collect::<Vec<_>>();
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].lease_epoch, Some(42));
+    assert_eq!(writes[1].lease_epoch, Some(43));
+    for write in &writes {
+        assert_eq!(
+            write.retained_revision_limit,
+            Some(0),
+            "large sink memory-tree snapshots must overwrite the current statecell payload without retaining historical full-payload revisions"
+        );
+    }
     let decoded: PersistedSinkState =
-        rmp_serde::from_slice(&write.payload).expect("decode persisted sink state");
+        rmp_serde::from_slice(&writes[1].payload).expect("decode second persisted sink state");
     assert_eq!(decoded.scope, SINK_RUNTIME_UNIT_ID);
+    assert_eq!(decoded.persisted_at_us, 43);
 }
 
 #[tokio::test]
@@ -711,6 +845,7 @@ async fn sink_data_batches_do_not_persist_full_tree_snapshot_until_checkpoint() 
     .await
     .expect("apply control batch");
 
+    wait_for_state_write_count(1, sink_snapshot_writes).await;
     assert_eq!(
         sink_snapshot_writes(),
         1,
@@ -750,6 +885,14 @@ async fn sink_data_checkpoint_statecell_failure_does_not_block_event_apply() {
     .await
     .expect("data checkpoint persistence failure must not reject applied sink events");
 
+    wait_for_state_write_count(1, || {
+        failing
+            .writes()
+            .into_iter()
+            .filter(|request| request.handle == sink_state_handle(SINK_RUNTIME_UNIT_ID))
+            .count()
+    })
+    .await;
     assert_eq!(
         failing
             .writes()
@@ -761,6 +904,270 @@ async fn sink_data_checkpoint_statecell_failure_does_not_block_event_apply() {
     );
     let snapshot = sink.status_snapshot().expect("status snapshot");
     assert_eq!(snapshot.live_nodes, 1);
+}
+
+#[tokio::test]
+async fn sink_control_checkpoint_statecell_failure_does_not_reject_applied_events() {
+    let failing = Arc::new(FailingWriteStateBoundary::new());
+    let state_boundary: Arc<dyn StateBoundary> = failing.clone();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::exp",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let sink = SinkFileMeta::with_boundaries_and_state(
+        NodeId("node-a".to_string()),
+        None,
+        state_boundary,
+        cfg,
+    )
+    .expect("build sink");
+
+    sink.send(&[
+        mk_source_event(
+            "node-a::exp",
+            mk_record(b"/checkpoint.txt", "checkpoint.txt", 1, EventKind::Update),
+        ),
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            2,
+        ),
+    ])
+    .await
+    .expect("control checkpoint persistence failure must not reject applied sink events");
+
+    wait_for_state_write_count(1, || {
+        failing
+            .writes()
+            .into_iter()
+            .filter(|request| request.handle == sink_state_handle(SINK_RUNTIME_UNIT_ID))
+            .count()
+    })
+    .await;
+    assert_eq!(
+        failing
+            .writes()
+            .into_iter()
+            .filter(|request| request.handle == sink_state_handle(SINK_RUNTIME_UNIT_ID))
+            .count(),
+        1,
+        "control event should attempt one best-effort checkpoint"
+    );
+    assert_eq!(
+        sink.status_snapshot().expect("status snapshot").live_nodes,
+        1
+    );
+}
+
+#[tokio::test]
+async fn sink_control_checkpoint_does_not_block_stream_apply_or_readiness() {
+    let blocking = Arc::new(BlockingSinkSnapshotStateBoundary::new());
+    let state_boundary: Arc<dyn StateBoundary> = blocking.clone();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::exp",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let sink = SinkFileMeta::with_boundaries_and_state(
+        NodeId("node-a".to_string()),
+        None,
+        state_boundary,
+        cfg,
+    )
+    .expect("build sink");
+    let events = vec![
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochStart {
+                epoch_id: 1,
+                epoch_type: EpochType::Audit,
+            },
+            1,
+        ),
+        mk_source_event(
+            "node-a::exp",
+            mk_record(b"/ready.txt", "ready.txt", 2, EventKind::Update),
+        ),
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochEnd {
+                epoch_id: 1,
+                epoch_type: EpochType::Audit,
+            },
+            3,
+        ),
+    ];
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        sink.ingest_stream_events(&events)
+    })
+    .await
+    .expect("stream apply must return before the optional checkpoint is released")
+    .expect("stream apply should succeed");
+    blocking.wait_for_write_started().await;
+
+    let snapshot = sink.status_snapshot().expect("status snapshot");
+    assert_eq!(snapshot.live_nodes, 1);
+    assert_eq!(
+        snapshot
+            .stream_applied_events_by_node
+            .get("node-a")
+            .copied(),
+        Some(3),
+        "applied transport evidence must become visible before checkpoint completion"
+    );
+    assert!(
+        snapshot.progress_snapshot().ready_groups.contains("nfs1"),
+        "audit completion must open materialization readiness while the optional checkpoint is blocked"
+    );
+    assert_eq!(blocking.write_count(), 1);
+
+    blocking.release_write();
+}
+
+#[tokio::test]
+async fn sink_checkpoint_requests_coalesce_while_write_is_inflight() {
+    let blocking = Arc::new(BlockingSinkSnapshotStateBoundary::new());
+    let state_boundary: Arc<dyn StateBoundary> = blocking.clone();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::exp",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let sink = SinkFileMeta::with_boundaries_and_state(
+        NodeId("node-a".to_string()),
+        None,
+        state_boundary,
+        cfg,
+    )
+    .expect("build sink");
+
+    sink.send(&[mk_control_event(
+        "node-a::exp",
+        ControlEvent::WatchOverflow,
+        1,
+    )])
+    .await
+    .expect("schedule first checkpoint");
+    blocking.wait_for_write_started().await;
+
+    for timestamp in 2..=9 {
+        sink.send(&[mk_control_event(
+            "node-a::exp",
+            ControlEvent::WatchOverflow,
+            timestamp,
+        )])
+        .await
+        .expect("coalesce checkpoint request");
+    }
+    assert_eq!(
+        blocking.write_count(),
+        1,
+        "checkpoint requests must not start parallel statecell writes"
+    );
+
+    blocking.release_write();
+    blocking.wait_for_write_started().await;
+    assert_eq!(
+        blocking.write_count(),
+        2,
+        "all requests received during the first write must coalesce into one latest-state checkpoint"
+    );
+    blocking.release_write();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while sink.state.checkpoint_inflight.load(Ordering::Acquire) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "coalesced checkpoint worker did not become idle"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(blocking.write_count(), 2);
+}
+
+#[tokio::test]
+async fn sink_checkpoint_preserves_data_count_added_after_snapshot_capture() {
+    let blocking = Arc::new(BlockingSinkSnapshotStateBoundary::new());
+    let state_boundary: Arc<dyn StateBoundary> = blocking.clone();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::exp",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let sink = SinkFileMeta::with_boundaries_and_state(
+        NodeId("node-a".to_string()),
+        None,
+        state_boundary,
+        cfg,
+    )
+    .expect("build sink");
+
+    sink.send(&[mk_control_event(
+        "node-a::exp",
+        ControlEvent::WatchOverflow,
+        1,
+    )])
+    .await
+    .expect("schedule checkpoint");
+    blocking.wait_for_write_started().await;
+
+    sink.send(&[mk_source_event(
+        "node-a::exp",
+        mk_record(
+            b"/after-capture.txt",
+            "after-capture.txt",
+            2,
+            EventKind::Update,
+        ),
+    )])
+    .await
+    .expect("apply data while checkpoint write is blocked");
+    assert_eq!(
+        sink.state
+            .data_events_since_snapshot
+            .load(Ordering::Acquire),
+        1,
+        "data applied after snapshot capture must remain pending"
+    );
+
+    blocking.release_write();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while sink.state.checkpoint_inflight.load(Ordering::Acquire) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "checkpoint worker did not become idle"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(blocking.write_count(), 1);
+    assert_eq!(
+        sink.state
+            .data_events_since_snapshot
+            .load(Ordering::Acquire),
+        1,
+        "checkpoint completion must not clear post-capture event accounting"
+    );
 }
 
 #[tokio::test]
@@ -870,6 +1277,66 @@ async fn sink_runtime_group_reconcile_does_not_persist_full_tree_snapshot() {
             .all(|request| request.handle != sink_state_handle(SINK_RUNTIME_UNIT_ID)),
         "route/grant runtime reconcile must not serialize the full sink tree into statecell; checkpoints are reserved for recovery boundaries"
     );
+}
+
+#[tokio::test]
+async fn sink_partition_recovery_checkpoint_failure_does_not_reject_runtime_scope_change() {
+    let failing = Arc::new(FailingWriteStateBoundary::new());
+    let state_boundary: Arc<dyn StateBoundary> = failing.clone();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+    ];
+    cfg.host_object_grants = Vec::new();
+    let sink = SinkFileMeta::with_boundaries_and_state(
+        NodeId("node-a".to_string()),
+        None,
+        state_boundary,
+        cfg,
+    )
+    .expect("build sink");
+
+    let activate = |generation, groups: &[&str]| {
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation,
+            expires_at_ms: generation,
+            bound_scopes: groups
+                .iter()
+                .map(|group| bound_scope_with_resources(group, &[*group]))
+                .collect(),
+        }))
+        .expect("encode sink activate")
+    };
+    sink.on_control_frame(&[activate(1, &["nfs1", "nfs2"])])
+        .await
+        .expect("activate both groups");
+    sink.send(&[mk_source_event(
+        "nfs2",
+        mk_record(b"/retained.txt", "retained.txt", 1, EventKind::Update),
+    )])
+    .await
+    .expect("seed retained materialization state");
+
+    sink.on_control_frame(&[activate(2, &["nfs1"])])
+        .await
+        .expect("partition checkpoint failure must not reject accepted runtime scope");
+
+    assert_eq!(
+        failing
+            .writes()
+            .into_iter()
+            .filter(|request| request.handle == sink_state_handle(SINK_RUNTIME_UNIT_ID))
+            .count(),
+        1,
+        "active-to-retained partition change should attempt one bounded recovery checkpoint"
+    );
+    let state = sink.state.read().expect("state after partition change");
+    assert!(state.groups.contains_key("nfs1"));
+    assert!(state.retained_groups.contains_key("nfs2"));
 }
 
 fn finished_endpoint_task_for_test(route_key: &str) -> ManagedEndpointTask {
@@ -1024,6 +1491,32 @@ async fn start_runtime_endpoints_fast_path_keeps_existing_boundary_tasks() {
     );
 
     sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn external_worker_runtime_does_not_bind_app_owned_roots_control_routes() {
+    let sink = SinkFileMeta::new(NodeId("node-a".to_string())).expect("build sink");
+    sink.start_external_worker_runtime_endpoints_with_failure(
+        Arc::new(NoopBoundary),
+        NodeId("node-a".to_string()),
+    )
+    .expect("start external worker sink endpoints");
+
+    let generic_route = format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL);
+    let scoped_route = sink_roots_control_stream_route_for("node-a").0;
+    let endpoint_routes = lock_or_recover(
+        &sink.endpoint_tasks,
+        "test.sink.worker_roots_control_ownership.endpoint_tasks",
+    )
+    .iter()
+    .map(|task| task.route_key().to_string())
+    .collect::<BTreeSet<_>>();
+    assert!(
+        !endpoint_routes.contains(&generic_route) && !endpoint_routes.contains(&scoped_route),
+        "external worker sink must leave roots-control receive ownership to the app runtime wrapper; routes={endpoint_routes:?}"
+    );
+
+    sink.close().await.expect("close external worker sink");
 }
 
 #[tokio::test]
@@ -1652,6 +2145,94 @@ async fn owner_scoped_sink_status_endpoint_listens_on_request_route_after_activa
             .await,
         "sink owner-scoped status endpoint must listen on the request route after activation; recv_counts={:?}",
         boundary.recv_counts_snapshot()
+    );
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn sink_owner_dynamically_receives_an_active_remote_source_event_route() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::exp-a", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-b::exp-b", "node-b", "10.0.0.12", "/mnt/nfs1", true),
+    ];
+    let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
+        .expect("init node-a sink owner");
+    let local_route = events_stream_route_for_scope("node-a").0;
+    let remote_route = events_stream_route_for_scope("node-b").0;
+    let boundary = Arc::new(SingleRouteEventsBoundary::new(
+        remote_route.clone(),
+        vec![mk_source_event(
+            "node-b::exp-b",
+            mk_record(
+                b"/remote-ready.txt",
+                "remote-ready.txt",
+                7,
+                EventKind::Update,
+            ),
+        )],
+    ));
+    sink.start_runtime_endpoints(boundary.clone(), NodeId("node-a".to_string()))
+        .expect("start node-a sink endpoints");
+
+    let owner_scopes = vec![bound_scope_with_resources("nfs1", &["node-a::exp-a"])];
+    sink.on_control_frame(&[
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: local_route,
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 1,
+            bound_scopes: owner_scopes.clone(),
+        }))
+        .expect("encode owner event route activation"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: remote_route.clone(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 1,
+            bound_scopes: owner_scopes,
+        }))
+        .expect("encode remote source event route activation"),
+    ])
+    .await
+    .expect("activate owner schedule and remote source ingress");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if sink
+            .query_node(b"/remote-ready.txt")
+            .expect("query remote source event")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node-a sink owner did not ingest node-b source publication; delivered={} endpoint_routes={:?}",
+            boundary.delivered(),
+            lock_or_recover(
+                &sink.endpoint_tasks,
+                "test.remote_source_event.endpoint_tasks"
+            )
+            .iter()
+            .map(|task| task.route_key().to_string())
+            .collect::<BTreeSet<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(boundary.delivered(), "remote route batch must be consumed");
+    assert!(
+        lock_or_recover(
+            &sink.endpoint_tasks,
+            "test.remote_source_event.endpoint_present"
+        )
+        .iter()
+        .any(|task| task.route_key() == remote_route),
+        "active remote source route must own a live sink endpoint"
     );
 
     sink.close().await.expect("close sink");
@@ -4226,6 +4807,77 @@ async fn sink_status_management_apply_grants_do_not_filter_runtime_schedule() {
     );
 }
 
+#[test]
+fn management_apply_status_uses_local_grant_owner_while_route_is_bootstrap_only() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = Vec::new();
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-b::nfs2", "node-b", "10.0.0.12", "/mnt/nfs2", true),
+    ];
+    let sink = SinkFileMeta::with_boundaries(
+        NodeId("node-a".to_string()),
+        Some(Arc::new(NoopBoundary)),
+        cfg,
+    )
+    .expect("init runtime-managed sink");
+    let status_route = sink_status_request_route_for("node-a").0;
+
+    sink.apply_activate_signal(
+        SinkRuntimeUnit::Sink,
+        &status_route,
+        1,
+        &[bound_scope("__fsmeta_empty_roots_bootstrap")],
+    )
+    .expect("activate bootstrap-only sink status route");
+
+    sink.update_logical_roots_from_management_apply(
+        vec![
+            RootSpec::new("root-a", "/mnt/nfs1"),
+            RootSpec::new("root-b", "/mnt/nfs2"),
+        ],
+        &[
+            granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+            granted_mount_root("node-b::nfs2", "node-b", "10.0.0.12", "/mnt/nfs2", true),
+        ],
+    )
+    .expect("management apply should update local owner schedule");
+
+    let snapshot = sink
+        .build_status_snapshot_for_scope_evidence(
+            sink.route_scope_status_evidence(&status_route)
+                .expect("route status evidence after management apply"),
+            true,
+        )
+        .expect("route status after management apply");
+
+    assert_eq!(
+        snapshot.scheduled_groups_by_node,
+        BTreeMap::from([("node-a".to_string(), vec!["root-a".to_string()])]),
+        "bootstrap-only status route should expose the locally granted root after management apply without claiming remote roots: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.owner_scoped_primary_host_ref_by_group,
+        BTreeMap::from([("root-a".to_string(), "node-a".to_string())]),
+        "owner-scoped status must carry explicit local grant owner evidence during the post-apply/pre-route-catch-up window: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot
+            .groups
+            .iter()
+            .map(|group| group.group_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["root-a"])
+    );
+    assert!(
+        snapshot
+            .groups
+            .iter()
+            .all(|group| group.readiness == GroupReadinessState::PendingMaterialization),
+        "management-derived owner evidence may unblock bounded status, but it must not pretend materialization is ready: {snapshot:?}"
+    );
+}
+
 #[tokio::test]
 async fn sink_status_publishes_runtime_managed_bare_scope_when_no_matching_grants_exist() {
     let mut cfg = SourceConfig::default();
@@ -6106,7 +6758,7 @@ async fn full_root_logical_roots_refresh_preserves_runtime_owned_single_sink_gro
     cfg.roots = roots.clone();
     cfg.host_object_grants = grants.clone();
     let sink = SinkFileMeta::with_boundaries(
-        NodeId("panda145".to_string()),
+        NodeId("example-node-145".to_string()),
         Some(Arc::new(NoopBoundary)),
         cfg,
     )
@@ -6121,7 +6773,7 @@ async fn full_root_logical_roots_refresh_preserves_runtime_owned_single_sink_gro
             expires_at_ms: 1,
             bound_scopes: vec![bound_scope_with_resources(
                 "nfs-145",
-                &["panda145::nfs-145"],
+                &["example-node-145::nfs-145"],
             )],
         },
     ))
@@ -6138,7 +6790,7 @@ async fn full_root_logical_roots_refresh_preserves_runtime_owned_single_sink_gro
     assert_eq!(
         snapshot
             .scheduled_groups_by_node
-            .get("panda145")
+            .get("example-node-145")
             .cloned()
             .unwrap_or_default(),
         vec!["nfs-145".to_string()],
@@ -6249,7 +6901,7 @@ async fn full_root_bare_runtime_scopes_are_reported_as_runtime_schedule_not_hidd
     let mut cfg = SourceConfig::default();
     cfg.roots = roots;
     cfg.host_object_grants = grants;
-    let sink = SinkFileMeta::with_boundaries(NodeId("panda145".to_string()), None, cfg)
+    let sink = SinkFileMeta::with_boundaries(NodeId("example-node-145".to_string()), None, cfg)
         .expect("init sink");
 
     sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
@@ -6278,7 +6930,7 @@ async fn full_root_bare_runtime_scopes_are_reported_as_runtime_schedule_not_hidd
     assert_eq!(
         snapshot
             .scheduled_groups_by_node
-            .get("panda145")
+            .get("example-node-145")
             .cloned()
             .unwrap_or_default(),
         vec![
@@ -6288,7 +6940,7 @@ async fn full_root_bare_runtime_scopes_are_reported_as_runtime_schedule_not_hidd
             "nfs-147".to_string(),
             "nfs-148".to_string()
         ],
-        "if runtime hands panda145 every bare root scope, status must expose that runtime scheduling error instead of hiding it through local grant projection: {snapshot:?}"
+        "if runtime hands example-node-145 every bare root scope, status must expose that runtime scheduling error instead of hiding it through local grant projection: {snapshot:?}"
     );
 
     sink.close().await.expect("close sink");
@@ -6367,8 +7019,47 @@ async fn management_logical_roots_update_prunes_retired_runtime_scopes_without_a
     sink.close().await.expect("close sink");
 }
 
+#[test]
+fn cached_status_and_materialized_query_do_not_block_on_authoritative_statecell_reads() {
+    let recording = Arc::new(RecordingStateBoundary::new());
+    let state_boundary: Arc<dyn StateBoundary> = recording.clone();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::nfs1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let sink = SinkFileMeta::with_boundaries_and_state(
+        NodeId("node-a".to_string()),
+        Some(Arc::new(NoopBoundary)),
+        state_boundary,
+        cfg,
+    )
+    .expect("build sink with recording state boundary");
+    let reads_after_bootstrap = recording.read_count();
+
+    sink.build_cached_status_snapshot()
+        .expect("build cached status snapshot");
+    let _ = sink.perform_materialized_query(&InternalQueryRequest::default());
+    assert_eq!(
+        recording.read_count(),
+        reads_after_bootstrap,
+        "worker status/query hot paths must consume the propagated local view without synchronously re-entering StateCell IPC"
+    );
+
+    sink.status_snapshot()
+        .expect("explicit refreshing status snapshot");
+    assert!(
+        recording.read_count() > reads_after_bootstrap,
+        "fixture must prove that the explicit authority-refreshing path remains observable"
+    );
+}
+
 #[tokio::test]
-async fn status_snapshot_refreshes_logical_roots_without_expanding_sink_schedule() {
+async fn explicit_status_recovery_refreshes_logical_roots_without_expanding_sink_schedule() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![
         RootSpec::new("nfs1", "/mnt/nfs1"),
@@ -6447,7 +7138,7 @@ async fn status_snapshot_refreshes_logical_roots_without_expanding_sink_schedule
         .expect("apply restored sparse sink activate");
 
     let snapshot = sink
-        .status_snapshot_with_failure()
+        .status_snapshot()
         .expect("status snapshot should refresh authoritative roots before evaluation");
     let scheduled = snapshot
         .scheduled_groups_by_node

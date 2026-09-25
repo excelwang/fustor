@@ -13,3 +13,4 @@ capanix-app-sdk = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1"
 source-kit = { workspace = true }
+url = { workspace = true }

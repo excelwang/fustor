@@ -2,7 +2,7 @@ use super::*;
 use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
 use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID};
 use crate::runtime::orchestration::{
-    encode_logical_roots_control_payload_with_generation,
+    EventRouteScopeProjection, encode_logical_roots_control_payload_with_generation,
     encode_logical_roots_control_payload_with_generation_and_defer_scan_audit,
     encode_manual_rescan_envelope_with_request_id_and_scoped_target_acceptance_timeout,
     encode_manual_rescan_envelope_with_scoped_target_acceptance_timeout,
@@ -11,7 +11,7 @@ use crate::runtime::routes::{
     METHOD_SOURCE_RESCAN, METHOD_SOURCE_STATUS, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
     ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_TOKEN_FS_META_INTERNAL,
     source_find_route_bindings_for, source_rescan_route_bindings_for,
-    source_status_route_bindings_for,
+    source_roots_control_stream_route_for, source_status_route_bindings_for,
 };
 use crate::sink::SinkFileMeta;
 use crate::state::cell::LogicalRootsCell;
@@ -31,6 +31,60 @@ use capanix_runtime_entry_sdk::control::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
+
+struct StreamPathCaptureEnvReset {
+    previous: Option<std::ffi::OsString>,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+impl StreamPathCaptureEnvReset {
+    fn set(value: &str) -> Self {
+        let serial = debug_stream_path_capture_env_serial_guard()
+            .lock()
+            .expect("lock stream path capture environment");
+        let previous = std::env::var_os("FSMETA_DEBUG_STREAM_PATH_CAPTURE");
+        unsafe {
+            std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", value);
+        }
+        Self {
+            previous,
+            _serial: serial,
+        }
+    }
+}
+
+impl Drop for StreamPathCaptureEnvReset {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", value) },
+            None => unsafe { std::env::remove_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE") },
+        }
+    }
+}
+
+#[test]
+fn runtime_endpoint_tests_explicitly_close_source_ownership() {
+    let start_marker = concat!(".", "start_runtime_endpoints(");
+    let close_marker = concat!(".", "close().await");
+    for test_block in include_str!("tests.rs").split("#[tokio::test").skip(1) {
+        if !test_block.contains(start_marker) {
+            continue;
+        }
+        let test_name = test_block
+            .split("async fn ")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                    .next()
+            })
+            .unwrap_or("unknown");
+        assert!(
+            test_block.contains(close_marker),
+            "source test {test_name} starts runtime endpoints and must explicitly close their ownership"
+        );
+    }
+}
 
 struct SlowFailingWatchProvider {
     delay: Duration,
@@ -220,6 +274,8 @@ impl ChannelIoSubset for SourceLoopbackBoundary {
             .map(Duration::from_millis)
             .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
             {
                 let mut channels = self.channels.lock().expect("source loopback channels lock");
                 if let Some(events) = channels.remove(&route_key)
@@ -229,12 +285,12 @@ impl ChannelIoSubset for SourceLoopbackBoundary {
                 }
             }
             if let Some(deadline) = deadline {
-                match tokio::time::timeout_at(deadline, self.changed.notified()).await {
+                match tokio::time::timeout_at(deadline, notified).await {
                     Ok(()) => {}
                     Err(_) => return Err(CnxError::Timeout),
                 }
             } else {
-                self.changed.notified().await;
+                notified.await;
             }
         }
     }
@@ -371,6 +427,77 @@ fn build_source(initial_grants: Vec<GrantedMountRoot>) -> FSMetaSource {
     cfg.roots = vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")];
     cfg.host_object_grants = initial_grants;
     FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None).expect("build source")
+}
+
+#[test]
+fn event_route_scopes_are_group_scoped_generation_fenced_and_conflict_closed() {
+    let projection = |generation, route_scope: &str| EventRouteScopeProjection {
+        generation,
+        route_scope: route_scope.to_string(),
+    };
+    let source = build_source(vec![
+        test_export("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        test_export("node-a::nfs2", "node-a", "10.0.0.11", "/mnt/nfs2", true),
+    ]);
+
+    assert!(
+        source
+            .update_event_route_scopes_with_failure(BTreeMap::from([
+                ("nfs1".to_string(), projection(7, "node-b")),
+                ("nfs2".to_string(), projection(6, "node-c")),
+            ]),)
+            .expect("install initial route-scope projection")
+    );
+    assert_eq!(
+        source.event_route_scope_for_object_ref("node-a::nfs1"),
+        Some("node-b".to_string())
+    );
+    assert_eq!(
+        source.event_route_scope_for_object_ref("node-a::nfs2"),
+        Some("node-c".to_string())
+    );
+
+    assert!(
+        !source
+            .update_event_route_scopes_with_failure(BTreeMap::from([(
+                "nfs1".to_string(),
+                projection(6, "node-d")
+            )]),)
+            .expect("ignore stale route-scope projection")
+    );
+    assert_eq!(
+        source.event_route_scope_for_object_ref("node-a::nfs1"),
+        Some("node-b".to_string()),
+        "a stale projection must not redirect publication"
+    );
+
+    let conflict = source
+        .update_event_route_scopes_with_failure(BTreeMap::from([(
+            "nfs1".to_string(),
+            projection(7, "node-d"),
+        )]))
+        .expect_err("same-generation route disagreement must fail closed");
+    assert!(
+        matches!(conflict, CnxError::ProtocolViolation(_)),
+        "unexpected same-generation conflict error: {conflict:?}"
+    );
+
+    assert!(
+        source
+            .update_event_route_scopes_with_failure(BTreeMap::from([(
+                "nfs1".to_string(),
+                projection(8, "node-d")
+            )]),)
+            .expect("apply newer per-group route-scope projection")
+    );
+    assert_eq!(
+        source.event_route_scopes_snapshot(),
+        BTreeMap::from([
+            ("nfs1".to_string(), (8, "node-d".to_string())),
+            ("nfs2".to_string(), (6, "node-c".to_string())),
+        ]),
+        "a newer partial projection must not erase unrelated group routes"
+    );
 }
 
 fn finished_endpoint_task_for_test(route_key: &str) -> ManagedEndpointTask {
@@ -645,6 +772,23 @@ fn dropping_source_clone_does_not_cancel_shared_shutdown() {
 }
 
 #[tokio::test]
+async fn closing_source_closes_host_fs_admission_while_clone_is_retained() {
+    let source = build_source(vec![test_export(
+        "node-a::nfs1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )]);
+    let retained = source.clone();
+    assert!(source.host_fs_ops.worker_count_for_tests() > 0);
+
+    source.close().await.expect("close source");
+
+    assert!(retained.host_fs_ops.closed_for_tests());
+}
+
+#[tokio::test]
 async fn runtime_host_object_grants_changed_updates_fanout() {
     let source = build_source(vec![test_export(
         "node-a",
@@ -784,6 +928,48 @@ async fn start_runtime_endpoints_fast_path_keeps_existing_boundary_tasks() {
     );
 
     source.close().await.expect("close source");
+}
+
+#[tokio::test]
+async fn worker_runtime_does_not_bind_app_owned_roots_control_routes() {
+    let mut config = SourceConfig::default();
+    config.roots = vec![root("nfs1", "/mnt/nfs1")];
+    config.host_object_grants = vec![test_export(
+        "node-a",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_worker_runtime_boundaries_and_state_internal(
+        config,
+        NodeId("node-a".to_string()),
+        None,
+        in_memory_state_boundary(),
+        false,
+    )
+    .expect("build worker source");
+
+    source
+        .start_runtime_endpoints(Arc::new(RouteCountingTimeoutBoundary::default()))
+        .await
+        .expect("start worker runtime endpoints");
+
+    let generic_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let scoped_route = source_roots_control_stream_route_for("node-a").0;
+    let endpoint_routes = lock_or_recover(
+        &source.endpoint_tasks,
+        "test.source.worker_roots_control_ownership.endpoint_tasks",
+    )
+    .iter()
+    .map(|task| task.route_key().to_string())
+    .collect::<BTreeSet<_>>();
+    assert!(
+        !endpoint_routes.contains(&generic_route) && !endpoint_routes.contains(&scoped_route),
+        "external worker source must leave roots-control receive ownership to the app runtime wrapper; routes={endpoint_routes:?}"
+    );
+
+    source.close().await.expect("close worker source");
 }
 
 #[tokio::test]
@@ -1669,12 +1855,43 @@ async fn source_owned_source_status_release_opens_scan_audit_admission_and_recor
         NodeId("node-d".to_string()),
         source_status_route_bindings_for("node-a"),
     );
+    let release_event_routes = BTreeMap::from([(
+        "nfs1".to_string(),
+        EventRouteScopeProjection {
+            route_scope: "node-c".to_string(),
+            generation: 7,
+        },
+    )]);
+    let rejected = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        crate::query::api::release_scan_audit_source_status_request_payload_with_live_probe_timeout(
+            Duration::from_millis(100),
+            BTreeMap::new(),
+        ),
+        Duration::from_millis(100),
+        Duration::ZERO,
+    )
+    .await
+    .unwrap_or_default();
+    assert!(
+        rejected.is_empty()
+            && !source
+                .state_cell
+                .scan_audit_admission_open
+                .load(Ordering::Acquire)
+            && source.materialized_read_cache_epoch() == 0
+            && source.event_route_scopes_snapshot().is_empty(),
+        "a release without an event route projection must fail closed before opening admission or recording a rescan intent"
+    );
     let events = capanix_host_adapter_fs::HostAdapter::call_collect(
         &status_adapter,
         ROUTE_TOKEN_FS_META_INTERNAL,
         METHOD_SOURCE_STATUS,
         crate::query::api::release_scan_audit_source_status_request_payload_with_live_probe_timeout(
             Duration::from_millis(750),
+            release_event_routes.clone(),
         ),
         Duration::from_millis(750),
         Duration::ZERO,
@@ -1688,6 +1905,11 @@ async fn source_owned_source_status_release_opens_scan_audit_admission_and_recor
             .any(|event| event.metadata().origin_id == NodeId("node-a".to_string())),
         "source-status release probe must reply from the source owner: {events:?}"
     );
+    assert_eq!(
+        source.event_route_scopes_snapshot(),
+        BTreeMap::from([("nfs1".to_string(), (7, "node-c".to_string()))]),
+        "source-status release must install the target sink route before opening scan/audit admission"
+    );
     assert!(
         source
             .state_cell
@@ -1695,9 +1917,28 @@ async fn source_owned_source_status_release_opens_scan_audit_admission_and_recor
             .load(Ordering::Acquire),
         "source-owned release source-status endpoint must open deferred scan/audit admission"
     );
+    let first_release_epoch = source.materialized_read_cache_epoch();
     assert!(
-        source.materialized_read_cache_epoch() > 0,
+        first_release_epoch > 0,
         "source-owned release source-status endpoint must record a rescan intent epoch"
+    );
+
+    capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        crate::query::api::release_scan_audit_source_status_request_payload_with_live_probe_timeout(
+            Duration::from_millis(750),
+            release_event_routes,
+        ),
+        Duration::from_millis(750),
+        Duration::ZERO,
+    )
+    .await
+    .expect("a repeated release probe should record a fresh bounded rescan intent");
+    assert!(
+        source.materialized_read_cache_epoch() > first_release_epoch,
+        "an already-open admission gate does not prove publication after current sink readiness; each deduplicated release turn must record a rescan intent"
     );
 
     source.close().await.expect("close source");
@@ -1884,14 +2125,30 @@ async fn manual_rescan_source_status_rearm_preserves_healthy_rescan_endpoints() 
     let scoped_rescan_route = crate::runtime::routes::source_rescan_request_route_for("node-a").0;
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
-        if boundary.recv_count(&generic_rescan_route) > 0
-            && boundary.recv_count(&scoped_rescan_route) > 0
-        {
+        let (generic_receive_armed, scoped_receive_armed) = {
+            let tasks = lock_or_recover(
+                &source.endpoint_tasks,
+                "test.source.manual_rearm.endpoint_tasks.ready",
+            );
+            (
+                tasks.iter().any(|task| {
+                    task.route_key() == generic_rescan_route && task.is_receive_armed()
+                }),
+                tasks
+                    .iter()
+                    .any(|task| task.route_key() == scoped_rescan_route && task.is_receive_armed()),
+            )
+        };
+        if generic_receive_armed && scoped_receive_armed {
             break;
         }
         assert!(
             tokio::time::Instant::now() < ready_deadline,
-            "source rescan endpoints must enter their first receive before readiness rearm"
+            "source rescan endpoints must be receive-armed before readiness rearm: generic_count={} scoped_count={} generic_armed={} scoped_armed={}",
+            boundary.recv_count(&generic_rescan_route),
+            boundary.recv_count(&scoped_rescan_route),
+            generic_receive_armed,
+            scoped_receive_armed,
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -2441,7 +2698,7 @@ async fn authoritative_logical_roots_sync_recovers_local_runtime_after_missed_on
 }
 
 #[tokio::test]
-async fn roots_control_stream_persists_authoritative_roots_for_followup_status_and_force_find() {
+async fn roots_control_stream_applies_authoritative_generation_without_rewriting_statecell() {
     let state_boundary = in_memory_state_boundary();
     let mut cfg = SourceConfig::default();
     cfg.roots = Vec::new();
@@ -2458,12 +2715,22 @@ async fn roots_control_stream_persists_authoritative_roots_for_followup_status_a
     )
     .expect("build source");
 
-    let route_key = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
-    let payload = encode_logical_roots_control_payload_with_generation(
-        &vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")],
-        1,
+    let accepted_roots = vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")];
+    let authoritative = LogicalRootsCell::from_state_boundary(
+        SOURCE_RUNTIME_UNIT_ID,
+        Vec::new(),
+        state_boundary.clone(),
     )
-    .expect("encode logical-roots control payload");
+    .expect("authoritative logical roots cell");
+    authoritative
+        .replace(accepted_roots.clone())
+        .await
+        .expect("commit authoritative logical roots");
+    assert_eq!(authoritative.current_seq(), 2);
+
+    let route_key = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let payload = encode_logical_roots_control_payload_with_generation(&accepted_roots, 2)
+        .expect("encode logical-roots control payload");
     let boundary = Arc::new(SingleRootsControlEventBoundary::new(
         route_key.clone(),
         payload,
@@ -2506,10 +2773,10 @@ async fn roots_control_stream_persists_authoritative_roots_for_followup_status_a
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    let authoritative =
+    let observed_authority =
         LogicalRootsCell::from_state_boundary(SOURCE_RUNTIME_UNIT_ID, Vec::new(), state_boundary)
-            .expect("authoritative logical roots cell");
-    let authoritative_root_ids = authoritative
+            .expect("observed authoritative logical roots cell");
+    let authoritative_root_ids = observed_authority
         .snapshot()
         .into_iter()
         .map(|root| root.id)
@@ -2517,7 +2784,12 @@ async fn roots_control_stream_persists_authoritative_roots_for_followup_status_a
     assert_eq!(
         authoritative_root_ids,
         vec!["nfs1".to_string(), "nfs2".to_string()],
-        "roots-control stream must persist authoritative logical roots so later status/force-find reads do not revert peers back to empty roots",
+        "roots-control follower apply must preserve the management-committed authoritative roots",
+    );
+    assert_eq!(
+        observed_authority.current_seq(),
+        2,
+        "roots-control follower apply must not rewrite authority and advance generation to three",
     );
 
     let changed = source
@@ -2528,6 +2800,8 @@ async fn roots_control_stream_persists_authoritative_roots_for_followup_status_a
         !changed,
         "once roots-control applies the authoritative declaration locally, followup status/force-find sync should not observe stale logical-root drift",
     );
+
+    source.close().await.expect("close source");
 }
 
 #[tokio::test]
@@ -2556,17 +2830,25 @@ async fn roots_control_stream_defer_scan_audit_waits_for_explicit_admission_rele
         cfg,
         NodeId("node-a".to_string()),
         None,
-        state_boundary,
+        state_boundary.clone(),
     )
     .expect("build source");
     let mut stream = source.pub_().await.expect("start source pub stream");
 
-    let route_key = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
     let mut deferred_root = RootSpec::new("nfs1", nfs1.clone());
     deferred_root.watch = false;
+    let authoritative =
+        LogicalRootsCell::from_state_boundary(SOURCE_RUNTIME_UNIT_ID, Vec::new(), state_boundary)
+            .expect("authoritative logical roots cell");
+    authoritative
+        .replace(vec![deferred_root.clone()])
+        .await
+        .expect("commit deferred logical roots");
+
+    let route_key = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
     let payload = encode_logical_roots_control_payload_with_generation_and_defer_scan_audit(
         &[deferred_root],
-        1,
+        2,
         true,
     )
     .expect("encode deferred logical-roots control payload");
@@ -2580,17 +2862,32 @@ async fn roots_control_stream_defer_scan_audit_waits_for_explicit_admission_rele
         .await
         .expect("start runtime endpoints");
     source
-        .on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
-            RuntimeExecActivate {
+        .on_control_frame(&[
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key,
                 unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
                 lease: None,
                 generation: 2,
                 expires_at_ms: 1,
-                bound_scopes: Vec::new(),
-            },
-        ))
-        .expect("encode source roots-control activate")])
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source roots-control activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_RESCAN.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source scan activate"),
+        ])
         .await
         .expect("activate source roots-control route");
 
@@ -2668,12 +2965,21 @@ async fn roots_control_stream_ignores_older_declaration_after_newer_authoritativ
     )
     .expect("build source");
 
-    let route_key = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
-    let newer_payload = encode_logical_roots_control_payload_with_generation(
-        &vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")],
-        2,
+    let accepted_roots = vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")];
+    let authoritative = LogicalRootsCell::from_state_boundary(
+        SOURCE_RUNTIME_UNIT_ID,
+        vec![root("nfs1", "/mnt/nfs1")],
+        state_boundary.clone(),
     )
-    .expect("encode newer logical-roots control payload");
+    .expect("authoritative logical roots cell");
+    authoritative
+        .replace(accepted_roots.clone())
+        .await
+        .expect("commit newer authoritative roots");
+
+    let route_key = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let newer_payload = encode_logical_roots_control_payload_with_generation(&accepted_roots, 2)
+        .expect("encode newer logical-roots control payload");
     let older_payload =
         encode_logical_roots_control_payload_with_generation(&vec![root("nfs1", "/mnt/nfs1")], 1)
             .expect("encode older logical-roots control payload");
@@ -2732,6 +3038,9 @@ async fn roots_control_stream_ignores_older_declaration_after_newer_authoritativ
         vec!["nfs1".to_string(), "nfs2".to_string()],
         "stale logical-roots declarations must not overwrite a newer authoritative declaration",
     );
+    assert_eq!(authoritative.current_seq(), 2);
+
+    source.close().await.expect("close source");
 }
 
 #[tokio::test]
@@ -4055,7 +4364,8 @@ async fn runtime_managed_local_resource_ids_without_grant_change_build_primary_s
 }
 
 #[tokio::test]
-async fn runtime_managed_source_logical_root_update_with_empty_active_scopes_uses_local_grants() {
+async fn runtime_managed_source_logical_root_update_with_empty_active_scopes_waits_for_runtime_placement()
+ {
     let mut cfg = SourceConfig::default();
     cfg.roots = Vec::new();
     cfg.host_object_grants = vec![
@@ -4102,17 +4412,102 @@ async fn runtime_managed_source_logical_root_update_with_empty_active_scopes_use
         source
             .scheduled_source_group_ids()
             .expect("source groups after logical root update"),
-        Some(BTreeSet::from(["nfs1".to_string()])),
-        "runtime-managed logical root updates must preserve bare active scopes so local grants can schedule the elected source group",
+        Some(BTreeSet::new()),
+        "an app-authoritative logical root must not turn an empty runtime source placement into local ownership",
     );
     assert_eq!(
         source
             .scheduled_scan_group_ids()
             .expect("scan groups after logical root update"),
-        Some(BTreeSet::from(["nfs1".to_string()])),
-        "runtime-managed logical root updates must preserve bare active scopes so local grants can schedule the elected scan group",
+        Some(BTreeSet::new()),
+        "an app-authoritative logical root must not turn an empty runtime scan placement into local ownership",
+    );
+    assert!(
+        lock_or_recover(
+            &source.state_cell.roots,
+            "test.runtime_managed_empty_scope.no_local_roots",
+        )
+        .is_empty(),
+        "local grants are eligibility evidence, not runtime bind/run placement",
     );
 }
+
+#[tokio::test]
+async fn runtime_managed_source_logical_root_update_projects_only_explicit_bootstrap_carrier() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = Vec::new();
+    cfg.host_object_grants = vec![
+        test_export("node-a::nfs1", "node-a", "10.0.0.1", "/mnt/nfs1", true),
+        test_export("node-b::nfs2", "node-b", "10.0.0.2", "/mnt/nfs2", true),
+    ];
+    let source = FSMetaSource::with_boundaries(
+        cfg,
+        NodeId("node-a".to_string()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init runtime-managed source");
+    let bootstrap_scope = RuntimeBoundScope {
+        scope_id: "__fsmeta_empty_roots_bootstrap".to_string(),
+        resource_ids: Vec::new(),
+    };
+
+    source
+        .on_control_frame(&[
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_ROOTS_CONTROL.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bootstrap_scope.clone()],
+            }))
+            .expect("encode bootstrap source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_RESCAN.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bootstrap_scope],
+            }))
+            .expect("encode bootstrap scan activate"),
+        ])
+        .await
+        .expect("apply bootstrap carrier wave");
+
+    source
+        .update_logical_roots(vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")])
+        .await
+        .expect("update logical roots");
+
+    assert_eq!(
+        source
+            .scheduled_source_group_ids()
+            .expect("source groups after bootstrap projection"),
+        Some(BTreeSet::from(["nfs1".to_string()])),
+        "the explicit bootstrap carrier may project accepted roots only onto locally granted source members",
+    );
+    assert_eq!(
+        source
+            .scheduled_scan_group_ids()
+            .expect("scan groups after bootstrap projection"),
+        Some(BTreeSet::from(["nfs1".to_string()])),
+        "the explicit bootstrap carrier may project accepted roots only onto locally granted scan members",
+    );
+    assert_eq!(
+        lock_or_recover(
+            &source.state_cell.roots,
+            "test.runtime_managed_bootstrap_scope.local_roots",
+        )
+        .iter()
+        .map(|root| root.logical_root_id.clone())
+        .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["nfs1".to_string()]),
+    );
+
+    source.close().await.expect("close source");
+}
+
 #[tokio::test]
 async fn manual_rescan_publishes_baseline_for_each_split_primary_under_mixed_cluster_grants() {
     let tmp = tempfile::tempdir().expect("create temp dir");
@@ -5745,6 +6140,73 @@ fn rescan_request_invalidates_previous_audit_completion_evidence() {
 }
 
 #[test]
+fn clean_audit_recovery_clears_degraded_root_health() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::exp1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+        .expect("init source");
+    let primary_root = lock_or_recover(&source.state_cell.roots, "test.clean_audit_recovery.roots")
+        .iter()
+        .find(|root| root.is_group_primary)
+        .cloned()
+        .expect("primary root exists");
+    let root_key = FSMetaSource::root_runtime_key(&primary_root);
+
+    let degraded = source.sentinel.handle_signal(HealthSignal::HostFsTimeout {
+        root_key: root_key.clone(),
+        op: "metadata probe".to_string(),
+    });
+    FSMetaSource::execute_sentinel_actions(
+        &degraded,
+        &root_key,
+        None,
+        Some(&source.state_cell.fanout_health),
+    );
+    assert!(
+        source
+            .sentinel
+            .degraded_roots()
+            .iter()
+            .any(|(degraded_key, _)| degraded_key == &root_key),
+        "fixture should start with a sentinel-degraded root"
+    );
+
+    FSMetaSource::mark_root_audit_completed(&source.state_cell.fanout_health, &root_key, 10, 20);
+    let recovered = source.sentinel.handle_signal(HealthSignal::AuditDrift {
+        root_key: root_key.clone(),
+        corrections: 0,
+    });
+    FSMetaSource::execute_sentinel_actions(
+        &recovered,
+        &root_key,
+        None,
+        Some(&source.state_cell.fanout_health),
+    );
+
+    let health = lock_or_recover(
+        &source.state_cell.fanout_health,
+        "test.clean_audit_recovery.health",
+    );
+    let detail = health
+        .object_ref_detail
+        .get(&root_key)
+        .expect("root detail exists");
+    assert_eq!(detail.status, "running");
+    assert!(detail.last_error.is_none());
+    assert!(
+        source.sentinel.degraded_roots().is_empty(),
+        "clean audit recovery should clear sentinel degraded root state"
+    );
+}
+
+#[test]
 fn periodic_rescan_preserves_previous_audit_completion_evidence() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
@@ -5854,6 +6316,72 @@ fn periodic_rescan_preserves_previous_audit_completion_evidence() {
     assert_eq!(detail.last_audit_started_at_us, None);
     assert_eq!(detail.last_audit_completed_at_us, None);
     assert_eq!(detail.last_audit_duration_ms, None);
+}
+
+#[test]
+fn manual_rescan_acceptance_marker_survives_inflight_audit_guard() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::exp1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+        .expect("init source");
+    let primary_root = lock_or_recover(
+        &source.state_cell.roots,
+        "test.manual_rescan_acceptance_marker.roots",
+    )
+    .iter()
+    .find(|root| root.is_group_primary)
+    .cloned()
+    .expect("primary root exists");
+    let root_key = FSMetaSource::root_runtime_key(&primary_root);
+
+    FSMetaSource::mark_root_audit_completed(&source.state_cell.fanout_health, &root_key, 10, 20);
+    FSMetaSource::mark_root_rescan_requested(
+        &source.state_cell.fanout_health,
+        &root_key,
+        "periodic",
+    );
+    FSMetaSource::mark_root_audit_start(
+        &source.state_cell.fanout_health,
+        &root_key,
+        "periodic",
+        30,
+    );
+
+    FSMetaSource::request_rescan_on_primary_roots(
+        std::slice::from_ref(&primary_root),
+        None,
+        Some(&source.state_cell.fanout_health),
+        Some(&source.state_cell.manual_rescan_intents),
+        None,
+        "manual",
+    );
+
+    let health = lock_or_recover(
+        &source.state_cell.fanout_health,
+        "test.manual_rescan_acceptance_marker.health",
+    );
+    let detail = health
+        .object_ref_detail
+        .get(&root_key)
+        .expect("root detail exists");
+    assert!(
+        detail.last_manual_rescan_accepted_at_us.is_some(),
+        "manual acceptance evidence must be recorded even when the scan state is guarded by an in-flight audit"
+    );
+    assert!(
+        !detail.rescan_pending,
+        "acceptance evidence must not convert an in-flight audit into a second pending scan"
+    );
+    assert_eq!(detail.last_rescan_reason.as_deref(), Some("periodic"));
+    assert_eq!(detail.last_audit_started_at_us, Some(30));
+    assert_eq!(detail.last_audit_completed_at_us, Some(20));
 }
 
 #[test]
@@ -6715,9 +7243,7 @@ async fn manual_rescan_source_to_sink_materializes_new_entries_for_each_primary_
 
 #[tokio::test]
 async fn pub_stream_yielded_path_counts_include_newly_seeded_subtree_for_each_primary_root() {
-    unsafe {
-        std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
-    }
+    let _env_reset = StreamPathCaptureEnvReset::set("/force-find-stress");
 
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6781,10 +7307,7 @@ async fn pub_stream_yielded_path_counts_include_newly_seeded_subtree_for_each_pr
 
 #[tokio::test]
 async fn current_pub_stream_preserves_mixed_origin_target_membership_once_batch_is_dequeued() {
-    let previous = std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE").ok();
-    unsafe {
-        std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
-    }
+    let _env_reset = StreamPathCaptureEnvReset::set("/force-find-stress");
 
     let source =
         FSMetaSource::with_boundaries(SourceConfig::default(), NodeId("node-a".to_string()), None)
@@ -6832,16 +7355,6 @@ async fn current_pub_stream_preserves_mixed_origin_target_membership_once_batch_
     let pending_counts = source.pending_path_origin_counts_snapshot();
 
     source.close().await.expect("close source");
-
-    if let Some(value) = previous {
-        unsafe {
-            std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", value);
-        }
-    } else {
-        unsafe {
-            std::env::remove_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE");
-        }
-    }
 
     assert_eq!(
         event_origin_ids(&batch),
@@ -7055,10 +7568,7 @@ async fn current_pub_stream_realtime_lane_bypasses_scan_backpressure_window() {
 
 #[tokio::test]
 async fn current_pub_stream_surfaces_ready_later_origin_within_bounded_fairness_window() {
-    let previous = std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE").ok();
-    unsafe {
-        std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
-    }
+    let _env_reset = StreamPathCaptureEnvReset::set("/force-find-stress");
 
     let source =
         FSMetaSource::with_boundaries(SourceConfig::default(), NodeId("node-a".to_string()), None)
@@ -7127,16 +7637,6 @@ async fn current_pub_stream_surfaces_ready_later_origin_within_bounded_fairness_
 
     source.close().await.expect("close source");
 
-    if let Some(value) = previous {
-        unsafe {
-            std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", value);
-        }
-    } else {
-        unsafe {
-            std::env::remove_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE");
-        }
-    }
-
     assert_eq!(
         enqueued_counts.get("node-a::nfs1").copied(),
         Some(nfs1_backlog_batches)
@@ -7150,10 +7650,7 @@ async fn current_pub_stream_surfaces_ready_later_origin_within_bounded_fairness_
 
 #[tokio::test]
 async fn second_pub_stream_after_partial_root_respawn_still_yields_all_primary_roots() {
-    let previous = std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE").ok();
-    unsafe {
-        std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
-    }
+    let _env_reset = StreamPathCaptureEnvReset::set("/force-find-stress");
 
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7190,6 +7687,7 @@ async fn second_pub_stream_after_partial_root_respawn_still_yields_all_primary_r
     while tokio::time::Instant::now() < initial_deadline {
         match tokio::time::timeout(Duration::from_millis(250), first_stream.next()).await {
             Ok(Some(batch)) => {
+                source.record_batch_downstream_accepted(&batch);
                 for (origin, count) in summarize_event_path_origins(&batch, target) {
                     *initial_counts.entry(origin).or_default() += count;
                 }
@@ -7244,6 +7742,7 @@ async fn second_pub_stream_after_partial_root_respawn_still_yields_all_primary_r
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(250), second_stream.next()).await {
             Ok(Some(batch)) => {
+                source.record_batch_downstream_accepted(&batch);
                 for (origin, count) in summarize_event_path_origins(&batch, target) {
                     *second_stream_counts.entry(origin).or_default() += count;
                 }
@@ -7273,16 +7772,6 @@ async fn second_pub_stream_after_partial_root_respawn_still_yields_all_primary_r
         .collect::<BTreeMap<_, _>>();
 
     source.close().await.expect("close source");
-
-    if let Some(value) = previous {
-        unsafe {
-            std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", value);
-        }
-    } else {
-        unsafe {
-            std::env::remove_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE");
-        }
-    }
 
     assert!(
         final_nfs2_forwarded > initial_nfs2_forwarded,
@@ -7541,13 +8030,13 @@ async fn reconcile_root_tasks_falls_back_to_controlled_replace_when_candidate_ne
         RootTaskEntry {
             active: RootTaskSlot {
                 revision: 1,
-                stream_generation: 3,
+                stream_generation: 4,
                 signature: stale_signature.clone(),
                 handle: pending_root_task_handle(),
             },
             candidate: Some(RootTaskSlot {
                 revision: 2,
-                stream_generation: 3,
+                stream_generation: 4,
                 signature: desired_signature.clone(),
                 handle: pending_root_task_handle(),
             }),
@@ -7557,7 +8046,7 @@ async fn reconcile_root_tasks_falls_back_to_controlled_replace_when_candidate_ne
         &source.state_cell.fanout_health_handle(),
         &root_key,
         1,
-        3,
+        4,
         RootTaskRole::Active,
         &stale_signature,
         &source.config,
@@ -7568,7 +8057,7 @@ async fn reconcile_root_tasks_falls_back_to_controlled_replace_when_candidate_ne
         &source.state_cell.fanout_health_handle(),
         &root_key,
         2,
-        3,
+        4,
         RootTaskRole::Candidate,
         &desired_signature,
         &source.config,

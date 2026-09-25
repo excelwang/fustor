@@ -181,6 +181,38 @@ impl Default for BootstrapManagementConfig {
     }
 }
 
+impl ApiConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Err(
+                "api.enabled must be true; fs-meta management API boundary is mandatory".into(),
+            );
+        }
+        if self.facade_resource_id.trim().is_empty() {
+            return Err("api.facade_resource_id must not be empty when api is enabled".into());
+        }
+        if self.auth.session_ttl_secs == 0 {
+            return Err("api.auth.session_ttl_secs must be > 0".into());
+        }
+        if self.auth.management_group.trim().is_empty() {
+            return Err("api.auth.management_group must not be empty".into());
+        }
+        if self.auth.passwd_path.as_os_str().is_empty() {
+            return Err("api.auth.passwd_path must not be empty".into());
+        }
+        if self.auth.shadow_path.as_os_str().is_empty() {
+            return Err("api.auth.shadow_path must not be empty".into());
+        }
+        if self.auth.query_keys_path.as_os_str().is_empty() {
+            return Err("api.auth.query_keys_path must not be empty".into());
+        }
+        if let Some(bootstrap) = &self.auth.bootstrap_management {
+            bootstrap.validate()?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,37 +258,5 @@ mod tests {
         let shadow = std::fs::read_to_string(dir.join("fs-meta.shadow")).expect("read shadow");
         assert_eq!(shadow, "admin:plain$new-password:0\n");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-impl ApiConfig {
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.enabled {
-            return Err(
-                "api.enabled must be true; fs-meta management API boundary is mandatory".into(),
-            );
-        }
-        if self.facade_resource_id.trim().is_empty() {
-            return Err("api.facade_resource_id must not be empty when api is enabled".into());
-        }
-        if self.auth.session_ttl_secs == 0 {
-            return Err("api.auth.session_ttl_secs must be > 0".into());
-        }
-        if self.auth.management_group.trim().is_empty() {
-            return Err("api.auth.management_group must not be empty".into());
-        }
-        if self.auth.passwd_path.as_os_str().is_empty() {
-            return Err("api.auth.passwd_path must not be empty".into());
-        }
-        if self.auth.shadow_path.as_os_str().is_empty() {
-            return Err("api.auth.shadow_path must not be empty".into());
-        }
-        if self.auth.query_keys_path.as_os_str().is_empty() {
-            return Err("api.auth.query_keys_path must not be empty".into());
-        }
-        if let Some(bootstrap) = &self.auth.bootstrap_management {
-            bootstrap.validate()?;
-        }
-        Ok(())
     }
 }

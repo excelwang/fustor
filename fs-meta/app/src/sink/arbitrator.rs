@@ -242,10 +242,11 @@ fn process_upsert(
             }
         }
 
-        let mtime_changed = existing_before.modified_time_us != record.unix_stat.mtime_us;
-        let type_changed = existing_before.is_dir != record.unix_stat.is_dir;
+        let existing = &existing_before;
+        let mtime_changed = existing.modified_time_us != record.unix_stat.mtime_us;
+        let type_changed = existing.is_dir != record.unix_stat.is_dir;
 
-        if type_changed && !existing_before.is_tombstoned {
+        if type_changed && !existing.is_tombstoned {
             tree.purge_descendants(path);
         }
 

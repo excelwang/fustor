@@ -357,11 +357,13 @@ mod tests {
 
     #[test]
     fn effective_roots_rejects_duplicate_ids() {
-        let mut cfg = SourceConfig::default();
-        cfg.roots = vec![
-            RootSpec::new("a", "/mnt/nfs1"),
-            RootSpec::new("a", "/mnt/nfs2"),
-        ];
+        let cfg = SourceConfig {
+            roots: vec![
+                RootSpec::new("a", "/mnt/nfs1"),
+                RootSpec::new("a", "/mnt/nfs2"),
+            ],
+            ..SourceConfig::default()
+        };
         let err = cfg.effective_roots().expect_err("duplicate id must fail");
         assert!(err.contains("duplicate"));
     }

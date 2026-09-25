@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use capanix_app_sdk::runtime::{EventMetadata, NodeId};
 use capanix_app_sdk::{CnxError, Event, Result};
@@ -9,16 +10,27 @@ use mysql_source::shared_types::{
     MysqlSourcePayload, MysqlSourceRequest,
 };
 use mysql_source::{MysqlSourceRuntimeConfig, ResolvedMysqlEndpoint};
-use source_kit::{SourceErrorPayload, decode_msgpack, encode_msgpack};
+use serde_json::Value;
+use source_kit::{
+    DecodedSourceRequest, SourceCapabilityReport, SourceConsistencyCapability,
+    SourceContinuationCapability, SourceControlChange, SourceControlState,
+    SourceControlSubscription, SourceErrorPayload, SourceOperationBudget,
+    SourceOperationCapability, decode_source_request, encode_accounted_source_result,
+    encode_msgpack, source_now_ms, validate_source_grant_epoch, validate_source_request_limit,
+};
+use uuid::Uuid;
 
 use crate::driver::{MysqlSnapshotSession, MysqlSourceDriver};
 
+const MAX_ACTIVE_SNAPSHOT_SESSIONS: usize = 128;
+
 #[derive(Clone)]
 pub struct MysqlSourceService {
-    config: MysqlSourceRuntimeConfig,
+    control_state: SourceControlState<MysqlSourceRuntimeConfig>,
     driver: Arc<dyn MysqlSourceDriver>,
     origin_id: NodeId,
-    sessions: Arc<Mutex<HashMap<String, SnapshotSessionEntry>>>,
+    sessions: Arc<SnapshotSessionRegistry>,
+    _control_subscription: Option<SourceControlSubscription>,
 }
 
 struct SnapshotSessionEntry {
@@ -27,7 +39,144 @@ struct SnapshotSessionEntry {
     table: String,
     endpoint: ResolvedMysqlEndpoint,
     expires_at_unix_ms: u64,
+    expected_last_key: Option<Value>,
+    expected_offset: u64,
+    source_revision: String,
     session: Box<dyn MysqlSnapshotSession>,
+}
+
+struct SnapshotSessionRegistry {
+    entries: Arc<Mutex<HashMap<String, SnapshotSessionEntry>>>,
+    janitor_control: Arc<(Mutex<bool>, Condvar)>,
+    janitor: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl SnapshotSessionRegistry {
+    fn new() -> Arc<Self> {
+        let entries = Arc::new(Mutex::new(HashMap::new()));
+        let janitor_control = Arc::new((Mutex::new(false), Condvar::new()));
+        let janitor_entries = entries.clone();
+        let thread_control = janitor_control.clone();
+        let janitor = thread::Builder::new()
+            .name("mysql-source-session-expiry".into())
+            .spawn(move || mysql_session_expiry_loop(janitor_entries, thread_control))
+            .expect("start MySQL source session expiry worker");
+        Arc::new(Self {
+            entries,
+            janitor_control,
+            janitor: Mutex::new(Some(janitor)),
+        })
+    }
+
+    fn insert(&self, session_id: String, mut entry: SnapshotSessionEntry) -> Result<()> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| CnxError::Internal("mysql snapshot session lock poisoned".into()))?;
+        if entries.len() >= MAX_ACTIVE_SNAPSHOT_SESSIONS && !entries.contains_key(&session_id) {
+            drop(entries);
+            let _ = entry.session.close();
+            return Err(CnxError::ResourceExhausted(format!(
+                "mysql active snapshot session limit {MAX_ACTIVE_SNAPSHOT_SESSIONS} reached"
+            )));
+        }
+        entries.insert(session_id, entry);
+        drop(entries);
+        self.janitor_control.1.notify_one();
+        Ok(())
+    }
+
+    fn take(&self, session_id: &str) -> Result<SnapshotSessionEntry> {
+        self.entries
+            .lock()
+            .map_err(|_| CnxError::Internal("mysql snapshot session lock poisoned".into()))?
+            .remove(session_id)
+            .ok_or_else(|| CnxError::NotReady("mysql snapshot session is not active".into()))
+    }
+
+    fn active_count(&self) -> usize {
+        self.entries
+            .lock()
+            .map(|entries| entries.len())
+            .unwrap_or(0)
+    }
+
+    fn close_all(&self) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        for (_, mut entry) in entries.drain() {
+            let _ = entry.session.close();
+        }
+    }
+}
+
+impl Drop for SnapshotSessionRegistry {
+    fn drop(&mut self) {
+        let (shutdown, wake) = &*self.janitor_control;
+        *shutdown.lock().unwrap_or_else(|err| err.into_inner()) = true;
+        wake.notify_all();
+        if let Some(janitor) = self
+            .janitor
+            .get_mut()
+            .unwrap_or_else(|err| err.into_inner())
+            .take()
+        {
+            let _ = janitor.join();
+        }
+        let mut entries = self.entries.lock().unwrap_or_else(|err| err.into_inner());
+        for (_, mut entry) in entries.drain() {
+            let _ = entry.session.close();
+        }
+    }
+}
+
+fn mysql_session_expiry_loop(
+    entries: Arc<Mutex<HashMap<String, SnapshotSessionEntry>>>,
+    control: Arc<(Mutex<bool>, Condvar)>,
+) {
+    loop {
+        let (mut expired, wait) = {
+            let Ok(mut entries) = entries.lock() else {
+                return;
+            };
+            let now = now_ms();
+            let expired_ids = entries
+                .iter()
+                .filter(|(_, entry)| entry.expires_at_unix_ms <= now)
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>();
+            let expired = expired_ids
+                .into_iter()
+                .filter_map(|session_id| entries.remove(&session_id))
+                .collect::<Vec<_>>();
+            let wait = entries
+                .values()
+                .map(|entry| entry.expires_at_unix_ms.saturating_sub(now))
+                .min()
+                .map(Duration::from_millis)
+                .unwrap_or_else(|| Duration::from_secs(60));
+            (expired, wait)
+        };
+        for entry in &mut expired {
+            let _ = entry.session.close();
+        }
+
+        let (shutdown, wake) = &*control;
+        let Ok(shutdown) = shutdown.lock() else {
+            return;
+        };
+        if *shutdown {
+            return;
+        }
+        let Ok((shutdown, _)) = wake.wait_timeout(shutdown, wait.max(Duration::from_millis(1)))
+        else {
+            return;
+        };
+        if *shutdown {
+            return;
+        }
+    }
 }
 
 impl MysqlSourceService {
@@ -36,11 +185,34 @@ impl MysqlSourceService {
         driver: Arc<dyn MysqlSourceDriver>,
         origin_id: NodeId,
     ) -> Self {
+        Self::with_control_state(SourceControlState::new(config), driver, origin_id)
+    }
+
+    pub fn with_control_state(
+        control_state: SourceControlState<MysqlSourceRuntimeConfig>,
+        driver: Arc<dyn MysqlSourceDriver>,
+        origin_id: NodeId,
+    ) -> Self {
+        let sessions = SnapshotSessionRegistry::new();
+        let weak_sessions = Arc::downgrade(&sessions);
+        let control_subscription = control_state
+            .subscribe(move |change| {
+                let should_close = matches!(
+                    change,
+                    SourceControlChange::ConfigReplaced { .. }
+                        | SourceControlChange::FetchRouteActive { active: false }
+                );
+                if should_close && let Some(sessions) = weak_sessions.upgrade() {
+                    sessions.close_all();
+                }
+            })
+            .ok();
         Self {
-            config,
+            control_state,
             driver,
             origin_id,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions,
+            _control_subscription: control_subscription,
         }
     }
 
@@ -51,82 +223,231 @@ impl MysqlSourceService {
             .collect()
     }
 
+    pub fn handle_status_events(
+        &self,
+        events: Vec<Event>,
+        fetch_route: &str,
+        status_route: &str,
+    ) -> Vec<Event> {
+        events
+            .into_iter()
+            .map(|event| self.handle_status_event(event, fetch_route, status_route))
+            .collect()
+    }
+
     pub fn handle_event(&self, event: Event) -> Event {
         let correlation_id = event.metadata().correlation_id;
-        let payload = match self.handle_event_payload(event.payload_bytes()) {
-            Ok(payload) => payload,
-            Err(err) => MysqlSourcePayload::Error(source_kit::error_payload_from_cnx(
-                err,
-                "mysql-transport",
-            )),
+        let started = Instant::now();
+        let encoded = match decode_source_request::<MysqlSourceRequest>(
+            event.payload_bytes(),
+            source_now_ms(),
+        ) {
+            Ok(decoded) => encode_accounted_source_result(
+                &decoded,
+                self.validate_execution_context(&decoded)
+                    .and_then(|()| {
+                        SourceOperationBudget::from_context(
+                            decoded.context.as_ref(),
+                            source_now_ms(),
+                        )
+                    })
+                    .and_then(|mut budget| {
+                        let payload = self.handle_request(&decoded.request, &mut budget)?;
+                        Ok((payload, budget.accounting()))
+                    }),
+                started.elapsed().as_millis() as u64,
+                source_now_ms(),
+                |error| {
+                    MysqlSourcePayload::Error(source_kit::error_payload_from_cnx(
+                        error,
+                        "mysql-transport",
+                    ))
+                },
+            ),
+            Err(error) => encode_msgpack(&MysqlSourcePayload::Error(
+                source_kit::error_payload_from_cnx(error, "mysql-transport"),
+            ))
+            .map(|bytes| bytes.to_vec()),
         };
-        self.reply_event(payload, correlation_id)
+        self.reply_encoded_event(encoded, correlation_id)
             .unwrap_or_else(|err| self.fallback_error_event(err, correlation_id))
     }
 
-    fn handle_event_payload(&self, payload: &[u8]) -> Result<MysqlSourcePayload> {
-        let request: MysqlSourceRequest = decode_msgpack(payload)?;
+    fn handle_request(
+        &self,
+        request: &MysqlSourceRequest,
+        budget: &mut SourceOperationBudget,
+    ) -> Result<MysqlSourcePayload> {
+        if !self.control_state.snapshot()?.fetch_route_active {
+            self.sessions.close_all();
+            return Err(CnxError::NotReady(
+                "mysql-source fetch route is inactive".into(),
+            ));
+        }
         match request.operation {
-            MysqlSourceOperation::ProbeConnection => self.handle_probe(&request),
-            MysqlSourceOperation::DiscoverFields => self.handle_discover_fields(&request),
-            MysqlSourceOperation::SnapshotOpen => self.handle_snapshot_open(&request),
-            MysqlSourceOperation::SnapshotPage => self.handle_snapshot_page(&request),
-            MysqlSourceOperation::SnapshotClose => self.handle_snapshot_close(&request),
+            MysqlSourceOperation::ProbeConnection => self.handle_probe(request, budget),
+            MysqlSourceOperation::DiscoverFields => self.handle_discover_fields(request, budget),
+            MysqlSourceOperation::SnapshotOpen => self.handle_snapshot_open(request, budget),
+            MysqlSourceOperation::SnapshotPage => self.handle_snapshot_page(request, budget),
+            MysqlSourceOperation::SnapshotClose => self.handle_snapshot_close(request, budget),
         }
     }
 
-    fn handle_probe(&self, request: &MysqlSourceRequest) -> Result<MysqlSourcePayload> {
-        let endpoint = self.config.endpoint_for(&request.object_ref, None, None)?;
-        let credential = self
-            .config
-            .resolve_credential(endpoint.credential_ref.as_deref())?;
-        Ok(MysqlSourcePayload::Probe(
-            self.driver.probe(&endpoint, &credential)?,
-        ))
+    fn validate_execution_context(
+        &self,
+        decoded: &DecodedSourceRequest<MysqlSourceRequest>,
+    ) -> Result<()> {
+        let Some(context) = decoded.context.as_ref() else {
+            return Ok(());
+        };
+        validate_source_request_limit(Some(context), decoded.request.limit)?;
+        let (schema, table) = request_scope(&decoded.request)?;
+        let endpoint = self.control_state.config()?.endpoint_for(
+            &decoded.request.object_ref,
+            schema,
+            table,
+        )?;
+        validate_source_grant_epoch(Some(context), endpoint.grant_epoch, "mysql")
     }
 
-    fn handle_discover_fields(&self, request: &MysqlSourceRequest) -> Result<MysqlSourcePayload> {
-        let endpoint = self.config.endpoint_for(&request.object_ref, None, None)?;
-        let credential = self
+    fn handle_status_event(&self, event: Event, fetch_route: &str, status_route: &str) -> Event {
+        let correlation_id = event.metadata().correlation_id;
+        self.reply_event(
+            MysqlSourcePayload::Status(self.status_snapshot(fetch_route, status_route)),
+            correlation_id,
+        )
+        .unwrap_or_else(|err| self.fallback_error_event(err, correlation_id))
+    }
+
+    fn status_snapshot(
+        &self,
+        fetch_route: &str,
+        status_route: &str,
+    ) -> source_kit::SourceRuntimeStatus {
+        let snapshot = match self.control_state.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                return source_kit::SourceRuntimeStatus::new(
+                    "mysql",
+                    0,
+                    0,
+                    vec![format!("control state unavailable: {err}")],
+                )
+                .with_capabilities(mysql_capabilities());
+            }
+        };
+        let configured_endpoints = snapshot.config.product.endpoints.len();
+        let active_grants = snapshot
             .config
-            .resolve_credential(endpoint.credential_ref.as_deref())?;
+            .runtime
+            .endpoint_grants
+            .iter()
+            .filter(|grant| grant.active)
+            .count();
+        let mut diagnostics = vec![
+            "fetch route is request/reply only".to_string(),
+            format!("control_version={}", snapshot.control_version),
+            format!("fetch_route_active={}", snapshot.fetch_route_active),
+            format!("status_route_active={}", snapshot.status_route_active),
+            format!("fetch_route={fetch_route}"),
+            format!("status_route={status_route}"),
+            format!("active_snapshot_sessions={}", self.sessions.active_count()),
+            format!("max_snapshot_sessions={MAX_ACTIVE_SNAPSHOT_SESSIONS}"),
+        ];
+        if configured_endpoints == 0 {
+            diagnostics.push("no configured MySQL endpoints".to_string());
+        }
+        if active_grants == 0 {
+            diagnostics.push("no active runtime MySQL endpoint grants".to_string());
+        }
+        let mut status = source_kit::SourceRuntimeStatus::new(
+            "mysql",
+            configured_endpoints,
+            active_grants,
+            diagnostics,
+        )
+        .with_capabilities(mysql_capabilities());
+        if !snapshot.fetch_route_active || !snapshot.status_route_active {
+            status.ready = false;
+        }
+        status
+    }
+
+    fn handle_probe(
+        &self,
+        request: &MysqlSourceRequest,
+        budget: &mut SourceOperationBudget,
+    ) -> Result<MysqlSourcePayload> {
+        let config = self.control_state.config()?;
+        let endpoint = config.endpoint_for(&request.object_ref, None, None)?;
+        let credential = config.resolve_credential(endpoint.credential_ref.as_deref())?;
+        Ok(MysqlSourcePayload::Probe(self.driver.probe_with_budget(
+            &endpoint,
+            &credential,
+            budget,
+        )?))
+    }
+
+    fn handle_discover_fields(
+        &self,
+        request: &MysqlSourceRequest,
+        budget: &mut SourceOperationBudget,
+    ) -> Result<MysqlSourcePayload> {
+        let config = self.control_state.config()?;
+        let endpoint = config.endpoint_for(&request.object_ref, None, None)?;
+        let credential = config.resolve_credential(endpoint.credential_ref.as_deref())?;
         Ok(MysqlSourcePayload::Fields(
-            self.driver.discover_fields(&endpoint, &credential)?,
+            self.driver
+                .discover_fields_with_budget(&endpoint, &credential, budget)?,
         ))
     }
 
-    fn handle_snapshot_open(&self, request: &MysqlSourceRequest) -> Result<MysqlSourcePayload> {
+    fn handle_snapshot_open(
+        &self,
+        request: &MysqlSourceRequest,
+        budget: &mut SourceOperationBudget,
+    ) -> Result<MysqlSourcePayload> {
         let schema = required_request_field(request.schema.as_deref(), "schema")?;
         let table = required_request_field(request.table.as_deref(), "table")?;
-        let endpoint = self
-            .config
-            .endpoint_for(&request.object_ref, Some(schema), Some(table))?;
-        let credential = self
-            .config
-            .resolve_credential(endpoint.credential_ref.as_deref())?;
-        let mut session = self.driver.open_snapshot(
+        let config = self.control_state.config()?;
+        let endpoint = config.endpoint_for(&request.object_ref, Some(schema), Some(table))?;
+        let credential = config.resolve_credential(endpoint.credential_ref.as_deref())?;
+        let mut session = self.driver.open_snapshot_with_budget(
             &endpoint,
             &credential,
             schema,
             table,
             &request.field_filter,
+            budget,
         )?;
-        let expires_at_unix_ms = now_ms() + self.config.product.snapshot_ttl_ms;
-        let session_id = format!(
-            "{}-{}-{}-{}",
-            request.object_ref,
-            sanitize_id(schema),
-            sanitize_id(table),
-            now_us()
-        );
-        let limit = self.config.effective_limit(request.limit);
-        let page = session.fetch_page(limit, 0)?;
+        let expires_at_unix_ms = now_ms() + config.product.snapshot_ttl_ms;
+        let session_id = Uuid::new_v4().to_string();
+        let limit = config.effective_limit(request.limit);
+        let page = match session.fetch_page_with_budget(limit, None, budget) {
+            Ok(page) => page,
+            Err(error) => {
+                let _ = session.close();
+                return Err(error);
+            }
+        };
+        if page.source_revision.trim().is_empty() {
+            let _ = session.close();
+            return Err(CnxError::ProtocolViolation(
+                "mysql snapshot page is missing its source-native revision".into(),
+            ));
+        }
         let next_cursor = if page.has_more {
+            let Some(last_key) = page.last_key.clone() else {
+                let _ = session.close();
+                return Err(CnxError::ProtocolViolation(
+                    "mysql snapshot page with has_more=true missing keyset last_key".into(),
+                ));
+            };
             Some(MysqlSnapshotCursor {
                 snapshot_session_id: session_id.clone(),
                 schema: schema.to_string(),
                 table: table.to_string(),
-                last_key: None,
+                last_key: Some(last_key),
                 offset: page.rows.len() as u64,
                 expires_at_unix_ms,
             })
@@ -134,27 +455,28 @@ impl MysqlSourceService {
             None
         };
         if page.has_more || next_cursor.is_some() {
-            self.sessions
-                .lock()
-                .map_err(|_| CnxError::Internal("mysql snapshot session lock poisoned".into()))?
-                .insert(
-                    session_id.clone(),
-                    SnapshotSessionEntry {
-                        object_ref: request.object_ref.clone(),
-                        schema: schema.to_string(),
-                        table: table.to_string(),
-                        endpoint: endpoint.clone(),
-                        expires_at_unix_ms,
-                        session,
-                    },
-                );
+            self.sessions.insert(
+                session_id.clone(),
+                SnapshotSessionEntry {
+                    object_ref: request.object_ref.clone(),
+                    schema: schema.to_string(),
+                    table: table.to_string(),
+                    endpoint: endpoint.clone(),
+                    expires_at_unix_ms,
+                    expected_last_key: page.last_key.clone(),
+                    expected_offset: page.rows.len() as u64,
+                    source_revision: page.source_revision.clone(),
+                    session,
+                },
+            )?;
         } else {
-            let _ = session.close();
+            session.close_with_budget(budget)?;
         }
         Ok(MysqlSourcePayload::Rows(MysqlRowBatch {
             object_ref: request.object_ref.clone(),
             schema: schema.to_string(),
             table: table.to_string(),
+            source_revision: page.source_revision,
             fields: page.fields,
             rows: page.rows,
             next_cursor: next_cursor.map(|cursor| {
@@ -173,54 +495,82 @@ impl MysqlSourceService {
         }))
     }
 
-    fn handle_snapshot_page(&self, request: &MysqlSourceRequest) -> Result<MysqlSourcePayload> {
+    fn handle_snapshot_page(
+        &self,
+        request: &MysqlSourceRequest,
+        budget: &mut SourceOperationBudget,
+    ) -> Result<MysqlSourcePayload> {
         let MysqlSourceCursor::Snapshot(cursor) = request
             .cursor
             .as_ref()
             .ok_or_else(|| CnxError::InvalidInput("snapshot page cursor is required".into()))?;
-        if cursor.expires_at_unix_ms <= now_ms() {
-            self.drop_session(&cursor.snapshot_session_id)?;
-            return Err(CnxError::NotReady(format!(
-                "mysql snapshot session '{}' expired",
-                cursor.snapshot_session_id
-            )));
+        let config = self.control_state.config()?;
+        let limit = config.effective_limit(request.limit);
+        let mut entry = self.take_session(&cursor.snapshot_session_id)?;
+        if let Err(error) = validate_snapshot_cursor(request, cursor, &entry) {
+            let _ = entry.session.close();
+            return Err(error);
         }
-        let limit = self.config.effective_limit(request.limit);
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| CnxError::Internal("mysql snapshot session lock poisoned".into()))?;
-        let entry = sessions
-            .get_mut(&cursor.snapshot_session_id)
-            .ok_or_else(|| {
-                CnxError::NotReady(format!(
-                    "mysql snapshot session '{}' is not active",
-                    cursor.snapshot_session_id
-                ))
-            })?;
-        if entry.schema != cursor.schema || entry.table != cursor.table {
-            return Err(CnxError::InvalidInput(
-                "snapshot cursor schema/table does not match active session".into(),
+        let current_endpoint = match config.endpoint_for(
+            &entry.object_ref,
+            Some(entry.schema.as_str()),
+            Some(entry.table.as_str()),
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                let _ = entry.session.close();
+                return Err(error);
+            }
+        };
+        if current_endpoint != entry.endpoint {
+            let _ = entry.session.close();
+            return Err(CnxError::AccessDenied(
+                "mysql snapshot authority or grant changed during continuation".into(),
             ));
         }
         if entry.expires_at_unix_ms <= now_ms() {
+            let _ = entry.session.close();
             return Err(CnxError::NotReady(format!(
                 "mysql snapshot session '{}' expired",
                 cursor.snapshot_session_id
             )));
         }
-        let page = entry.session.fetch_page(limit, cursor.offset)?;
+        let page = match entry.session.fetch_page_with_budget(
+            limit,
+            entry.expected_last_key.as_ref(),
+            budget,
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                let _ = entry.session.close();
+                return Err(error);
+            }
+        };
+        if page.source_revision != entry.source_revision {
+            let _ = entry.session.close();
+            return Err(CnxError::ProtocolViolation(
+                "mysql snapshot source-native revision changed during continuation".into(),
+            ));
+        }
+        let page_row_count = page.rows.len() as u64;
+        let next_last_key = page.last_key.clone();
         let next_cursor = if page.has_more {
+            let Some(last_key) = next_last_key.clone() else {
+                let _ = entry.session.close();
+                return Err(CnxError::ProtocolViolation(
+                    "mysql snapshot page with has_more=true missing keyset last_key".into(),
+                ));
+            };
             Some(MysqlSourceCursor::Snapshot(MysqlSnapshotCursor {
                 snapshot_session_id: cursor.snapshot_session_id.clone(),
                 schema: entry.schema.clone(),
                 table: entry.table.clone(),
-                last_key: None,
-                offset: cursor.offset + page.rows.len() as u64,
+                last_key: Some(last_key),
+                offset: entry.expected_offset + page_row_count,
                 expires_at_unix_ms: entry.expires_at_unix_ms,
             }))
         } else {
-            let _ = entry.session.close();
+            entry.session.close_with_budget(budget)?;
             None
         };
         let has_more = page.has_more;
@@ -228,47 +578,55 @@ impl MysqlSourceService {
             object_ref: entry.object_ref.clone(),
             schema: entry.schema.clone(),
             table: entry.table.clone(),
+            source_revision: page.source_revision,
             fields: page.fields,
             rows: page.rows,
             next_cursor,
             has_more,
-            grant_epoch: entry.endpoint.grant_epoch,
+            grant_epoch: current_endpoint.grant_epoch,
             diagnostics: None,
         };
-        if !has_more {
-            sessions.remove(&cursor.snapshot_session_id);
+        if has_more {
+            entry.expected_last_key = next_last_key;
+            entry.expected_offset += page_row_count;
+            self.sessions
+                .insert(cursor.snapshot_session_id.clone(), entry)?;
         }
         Ok(MysqlSourcePayload::Rows(batch))
     }
 
-    fn handle_snapshot_close(&self, request: &MysqlSourceRequest) -> Result<MysqlSourcePayload> {
+    fn handle_snapshot_close(
+        &self,
+        request: &MysqlSourceRequest,
+        budget: &mut SourceOperationBudget,
+    ) -> Result<MysqlSourcePayload> {
         let MysqlSourceCursor::Snapshot(cursor) = request
             .cursor
             .as_ref()
             .ok_or_else(|| CnxError::InvalidInput("snapshot close cursor is required".into()))?;
-        self.drop_session(&cursor.snapshot_session_id)?;
+        let mut entry = self.take_session(&cursor.snapshot_session_id)?;
+        if let Err(error) = validate_snapshot_cursor(request, cursor, &entry) {
+            let _ = entry.session.close();
+            return Err(error);
+        }
+        let grant_epoch = entry.endpoint.grant_epoch;
+        entry.session.close_with_budget(budget)?;
         Ok(MysqlSourcePayload::Rows(MysqlRowBatch {
             object_ref: request.object_ref.clone(),
             schema: cursor.schema.clone(),
             table: cursor.table.clone(),
+            source_revision: entry.source_revision,
             fields: Vec::new(),
             rows: Vec::new(),
             next_cursor: None,
             has_more: false,
-            grant_epoch: None,
+            grant_epoch,
             diagnostics: Some("transaction snapshot session closed".into()),
         }))
     }
 
-    fn drop_session(&self, session_id: &str) -> Result<()> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| CnxError::Internal("mysql snapshot session lock poisoned".into()))?;
-        if let Some(mut entry) = sessions.remove(session_id) {
-            let _ = entry.session.close();
-        }
-        Ok(())
+    fn take_session(&self, session_id: &str) -> Result<SnapshotSessionEntry> {
+        self.sessions.take(session_id)
     }
 
     fn reply_event(
@@ -286,6 +644,24 @@ impl MysqlSourceService {
                 trace: None,
             },
             encode_msgpack(&payload)?,
+        ))
+    }
+
+    fn reply_encoded_event(
+        &self,
+        encoded: Result<Vec<u8>>,
+        correlation_id: Option<u64>,
+    ) -> Result<Event> {
+        Ok(Event::new(
+            EventMetadata {
+                origin_id: self.origin_id.clone(),
+                timestamp_us: now_us(),
+                logical_ts: None,
+                correlation_id,
+                ingress_auth: None,
+                trace: None,
+            },
+            encoded?.into(),
         ))
     }
 
@@ -310,23 +686,71 @@ impl MysqlSourceService {
     }
 }
 
+fn mysql_capabilities() -> SourceCapabilityReport {
+    SourceCapabilityReport::new(
+        "mysql",
+        vec![
+            SourceOperationCapability::Probe,
+            SourceOperationCapability::FieldDiscovery,
+            SourceOperationCapability::BoundedSnapshot,
+            SourceOperationCapability::ExplicitSessionClose,
+        ],
+        SourceConsistencyCapability::TransactionSnapshot,
+        SourceContinuationCapability::NativeSession,
+    )
+}
+
+fn request_scope(request: &MysqlSourceRequest) -> Result<(Option<&str>, Option<&str>)> {
+    match request.operation {
+        MysqlSourceOperation::ProbeConnection | MysqlSourceOperation::DiscoverFields => {
+            Ok((None, None))
+        }
+        MysqlSourceOperation::SnapshotOpen => Ok((
+            Some(required_request_field(request.schema.as_deref(), "schema")?),
+            Some(required_request_field(request.table.as_deref(), "table")?),
+        )),
+        MysqlSourceOperation::SnapshotPage | MysqlSourceOperation::SnapshotClose => {
+            let MysqlSourceCursor::Snapshot(cursor) = request
+                .cursor
+                .as_ref()
+                .ok_or_else(|| CnxError::InvalidInput("snapshot cursor is required".into()))?;
+            Ok((Some(&cursor.schema), Some(&cursor.table)))
+        }
+    }
+}
+
+fn validate_snapshot_cursor(
+    request: &MysqlSourceRequest,
+    cursor: &MysqlSnapshotCursor,
+    entry: &SnapshotSessionEntry,
+) -> Result<()> {
+    if request.object_ref != entry.object_ref {
+        return Err(CnxError::AccessDenied(
+            "snapshot cursor authority object does not match active session".into(),
+        ));
+    }
+    if entry.schema != cursor.schema || entry.table != cursor.table {
+        return Err(CnxError::InvalidInput(
+            "snapshot cursor schema/table does not match active session".into(),
+        ));
+    }
+    if cursor.expires_at_unix_ms != entry.expires_at_unix_ms {
+        return Err(CnxError::InvalidInput(
+            "snapshot cursor expiry does not match active session".into(),
+        ));
+    }
+    if cursor.last_key != entry.expected_last_key || cursor.offset != entry.expected_offset {
+        return Err(CnxError::InvalidInput(
+            "snapshot cursor continuation does not match active session".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn required_request_field<'a>(value: Option<&'a str>, key: &str) -> Result<&'a str> {
     value
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| CnxError::InvalidInput(format!("{key} is required")))
-}
-
-fn sanitize_id(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn now_us() -> u64 {
@@ -361,6 +785,11 @@ mod tests {
         ResolvedCredential,
     };
     use serde_json::json;
+    use source_kit::{
+        DecodedSourceResponse, SourceExecutionContext, SourceExecutionEnvelope,
+        SourceExecutionLimits, decode_msgpack, decode_source_response, encode_source_request,
+        source_now_ms,
+    };
 
     use super::*;
     use crate::driver::{MysqlSnapshotPage, MysqlSnapshotSession};
@@ -368,6 +797,7 @@ mod tests {
     struct FakeDriver {
         opened: AtomicUsize,
         closed: Arc<AtomicUsize>,
+        fail_on_page: Option<usize>,
     }
 
     impl FakeDriver {
@@ -375,6 +805,15 @@ mod tests {
             Self {
                 opened: AtomicUsize::new(0),
                 closed: Arc::new(AtomicUsize::new(0)),
+                fail_on_page: None,
+            }
+        }
+
+        fn failing_on_second_page() -> Self {
+            Self {
+                opened: AtomicUsize::new(0),
+                closed: Arc::new(AtomicUsize::new(0)),
+                fail_on_page: Some(2),
             }
         }
     }
@@ -417,6 +856,7 @@ mod tests {
             Ok(Box::new(FakeSnapshotSession {
                 pages: 0,
                 closed: self.closed.clone(),
+                fail_on_page: self.fail_on_page,
             }))
         }
     }
@@ -424,18 +864,33 @@ mod tests {
     struct FakeSnapshotSession {
         pages: usize,
         closed: Arc<AtomicUsize>,
+        fail_on_page: Option<usize>,
     }
 
     impl MysqlSnapshotSession for FakeSnapshotSession {
-        fn fetch_page(&mut self, _limit: usize, offset: u64) -> Result<MysqlSnapshotPage> {
+        fn fetch_page(
+            &mut self,
+            _limit: usize,
+            last_key: Option<&serde_json::Value>,
+        ) -> Result<MysqlSnapshotPage> {
             self.pages += 1;
+            if self.fail_on_page == Some(self.pages) {
+                return Err(CnxError::PeerError(
+                    "injected MySQL continuation failure".into(),
+                ));
+            }
             let has_more = self.pages == 1;
+            let id = last_key
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(1);
             Ok(MysqlSnapshotPage {
                 fields: vec!["id".into()],
                 rows: vec![MysqlRowEvent {
-                    values: json!({ "id": offset + 1 }),
+                    values: json!({ "id": id }),
                 }],
-                next_cursor: None,
+                source_revision: "mysql-consistent-snapshot:test".into(),
+                last_key: Some(json!(id)),
                 has_more,
             })
         }
@@ -450,6 +905,7 @@ mod tests {
         MysqlSourceRuntimeConfig {
             product: MysqlSourceConfig {
                 endpoints: vec![MysqlEndpointConfig {
+                    tls: None,
                     object_ref: "mysql-prod".into(),
                     endpoint_uri: "mysql://db:3306".into(),
                     credential_ref: None,
@@ -489,6 +945,78 @@ mod tests {
             },
             encode_msgpack(request).expect("encode request"),
         )
+    }
+
+    fn accounted_event_for(request: MysqlSourceRequest, max_calls: u64) -> Event {
+        let now_ms = source_now_ms();
+        let envelope = SourceExecutionEnvelope::new(
+            SourceExecutionContext {
+                request_id: format!("mysql-accounting-{max_calls}"),
+                grant_epoch: 3,
+                issued_at_ms: now_ms,
+                deadline_ms: now_ms + 5_000,
+                limits: SourceExecutionLimits {
+                    max_rows: 100,
+                    max_bytes: 1_048_576,
+                    max_calls,
+                    max_fanout: 1,
+                    max_latency_ms: 5_000,
+                    max_cost_units: max_calls,
+                },
+            },
+            request,
+        );
+        Event::new(
+            EventMetadata {
+                origin_id: NodeId("caller".into()),
+                timestamp_us: 1,
+                logical_ts: None,
+                correlation_id: Some(44),
+                ingress_auth: None,
+                trace: None,
+            },
+            encode_source_request(&envelope)
+                .expect("encode source envelope")
+                .into(),
+        )
+    }
+
+    fn empty_event() -> Event {
+        Event::new(
+            EventMetadata {
+                origin_id: NodeId("caller".into()),
+                timestamp_us: 1,
+                logical_ts: None,
+                correlation_id: Some(43),
+                ingress_auth: None,
+                trace: None,
+            },
+            Vec::<u8>::new().into(),
+        )
+    }
+
+    fn open_cursor(service: &MysqlSourceService) -> MysqlSnapshotCursor {
+        let mut open = MysqlSourceRequest::snapshot_open("mysql-prod", "app", "users");
+        open.limit = Some(1);
+        let reply = service.handle_event(event_for(&open));
+        match decode_msgpack::<MysqlSourcePayload>(reply.payload_bytes()).expect("payload") {
+            MysqlSourcePayload::Rows(batch) => match batch.next_cursor.expect("cursor") {
+                MysqlSourceCursor::Snapshot(cursor) => cursor,
+            },
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn page_request(cursor: MysqlSnapshotCursor) -> MysqlSourceRequest {
+        MysqlSourceRequest {
+            object_ref: "mysql-prod".into(),
+            schema: Some("app".into()),
+            table: Some("users".into()),
+            operation: MysqlSourceOperation::SnapshotPage,
+            limit: Some(1),
+            cursor: Some(MysqlSourceCursor::Snapshot(cursor)),
+            field_filter: Vec::new(),
+        }
     }
 
     #[test]
@@ -541,6 +1069,85 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_open_accounts_open_and_page_and_fails_before_overspend() {
+        let driver = Arc::new(FakeDriver::new());
+        let service = MysqlSourceService::new(
+            test_config(60_000),
+            driver,
+            NodeId("mysql-accounting-test".into()),
+        );
+        let mut open = MysqlSourceRequest::snapshot_open("mysql-prod", "app", "users");
+        open.limit = Some(1);
+        let reply = service.handle_event(accounted_event_for(open, 2));
+        let DecodedSourceResponse::Envelope(response) =
+            decode_source_response::<MysqlSourcePayload>(reply.payload_bytes())
+                .expect("decode response")
+        else {
+            panic!("expected versioned response");
+        };
+        let receipt = response.receipt.expect("receipt");
+        assert_eq!(receipt.actual.calls, 2);
+        assert_eq!(receipt.actual.cost_units, 2);
+
+        let driver = Arc::new(FakeDriver::new());
+        let service = MysqlSourceService::new(
+            test_config(60_000),
+            driver.clone(),
+            NodeId("mysql-accounting-reject".into()),
+        );
+        let mut open = MysqlSourceRequest::snapshot_open("mysql-prod", "app", "users");
+        open.limit = Some(1);
+        let reply = service.handle_event(accounted_event_for(open, 1));
+        let DecodedSourceResponse::Envelope(response) =
+            decode_source_response::<MysqlSourcePayload>(reply.payload_bytes())
+                .expect("decode rejected response")
+        else {
+            panic!("expected versioned response");
+        };
+        assert!(response.receipt.is_none());
+        assert!(matches!(
+            response.payload,
+            MysqlSourcePayload::Error(error) if error.code == "budget-exceeded"
+        ));
+        assert_eq!(driver.closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn status_route_returns_local_readiness_without_driver_call() {
+        let driver = Arc::new(FakeDriver::new());
+        let service = MysqlSourceService::new(
+            test_config(60_000),
+            driver.clone(),
+            NodeId("mysql-test".into()),
+        );
+
+        let replies = service.handle_status_events(
+            vec![empty_event()],
+            "mysql-source.fetch.node:v1.req",
+            "mysql-source.status.node:v1.req",
+        );
+        let payload: MysqlSourcePayload =
+            decode_msgpack(replies[0].payload_bytes()).expect("payload");
+
+        match payload {
+            MysqlSourcePayload::Status(status) => {
+                assert!(status.ready);
+                assert_eq!(status.source_kind, "mysql");
+                assert_eq!(status.configured_endpoints, 1);
+                assert_eq!(status.active_grants, 1);
+                assert!(
+                    status
+                        .diagnostics
+                        .iter()
+                        .any(|item| item == "control_version=0")
+                );
+            }
+            other => panic!("expected status, got {other:?}"),
+        }
+        assert_eq!(driver.opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn snapshot_page_after_expiry_returns_retryable_not_ready_error() {
         let driver = Arc::new(FakeDriver::new());
         let service =
@@ -577,6 +1184,190 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_session_expires_and_closes_without_followup_request() {
+        let driver = Arc::new(FakeDriver::new());
+        let service = MysqlSourceService::new(
+            test_config(20),
+            driver.clone(),
+            NodeId("mysql-expiry-test".into()),
+        );
+        let _cursor = open_cursor(&service);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while driver.closed.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(driver.closed.load(Ordering::SeqCst), 1);
+        assert_eq!(service.sessions.active_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_session_registry_fails_closed_at_capacity() {
+        let sessions = SnapshotSessionRegistry::new();
+        let closed = Arc::new(AtomicUsize::new(0));
+        let endpoint = test_config(60_000)
+            .endpoint_for("mysql-prod", Some("app"), Some("users"))
+            .expect("endpoint");
+        for index in 0..MAX_ACTIVE_SNAPSHOT_SESSIONS {
+            sessions
+                .insert(
+                    format!("session-{index}"),
+                    SnapshotSessionEntry {
+                        object_ref: "mysql-prod".into(),
+                        schema: "app".into(),
+                        table: "users".into(),
+                        endpoint: endpoint.clone(),
+                        expires_at_unix_ms: now_ms() + 60_000,
+                        expected_last_key: Some(json!(index)),
+                        expected_offset: index as u64,
+                        source_revision: "mysql-consistent-snapshot:test".into(),
+                        session: Box::new(FakeSnapshotSession {
+                            pages: 0,
+                            closed: closed.clone(),
+                            fail_on_page: None,
+                        }),
+                    },
+                )
+                .expect("fill session registry");
+        }
+
+        let error = sessions
+            .insert(
+                "session-overflow".into(),
+                SnapshotSessionEntry {
+                    object_ref: "mysql-prod".into(),
+                    schema: "app".into(),
+                    table: "users".into(),
+                    endpoint,
+                    expires_at_unix_ms: now_ms() + 60_000,
+                    expected_last_key: None,
+                    expected_offset: 0,
+                    source_revision: "mysql-consistent-snapshot:test".into(),
+                    session: Box::new(FakeSnapshotSession {
+                        pages: 0,
+                        closed: closed.clone(),
+                        fail_on_page: None,
+                    }),
+                },
+            )
+            .expect_err("session cap must fail closed");
+
+        assert!(matches!(error, CnxError::ResourceExhausted(_)));
+        assert_eq!(sessions.active_count(), MAX_ACTIVE_SNAPSHOT_SESSIONS);
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        sessions.close_all();
+        assert_eq!(
+            closed.load(Ordering::SeqCst),
+            MAX_ACTIVE_SNAPSHOT_SESSIONS + 1
+        );
+    }
+
+    #[test]
+    fn config_change_and_route_deactivation_close_active_snapshot_sessions_immediately() {
+        let driver = Arc::new(FakeDriver::new());
+        let control_state = SourceControlState::new(test_config(60_000));
+        let service = MysqlSourceService::with_control_state(
+            control_state.clone(),
+            driver.clone(),
+            NodeId("mysql-test".into()),
+        );
+        let cursor = open_cursor(&service);
+        let mut changed = test_config(60_000);
+        changed.runtime.endpoint_grants[0].grant_epoch = Some(4);
+
+        assert!(
+            control_state
+                .replace_config_if_newer(1, changed)
+                .expect("replace config")
+        );
+        assert_eq!(driver.closed.load(Ordering::SeqCst), 1);
+        let reply = service.handle_event(event_for(&page_request(cursor)));
+        assert!(matches!(
+            decode_msgpack::<MysqlSourcePayload>(reply.payload_bytes()).expect("payload"),
+            MysqlSourcePayload::Error(_)
+        ));
+
+        let cursor = open_cursor(&service);
+        control_state
+            .set_fetch_route_active(false)
+            .expect("deactivate route");
+        assert_eq!(driver.closed.load(Ordering::SeqCst), 2);
+        let reply = service.handle_event(event_for(&page_request(cursor)));
+        assert!(matches!(
+            decode_msgpack::<MysqlSourcePayload>(reply.payload_bytes()).expect("payload"),
+            MysqlSourcePayload::Error(_)
+        ));
+    }
+
+    #[test]
+    fn tampered_cursor_and_native_continuation_failure_close_session() {
+        let driver = Arc::new(FakeDriver::new());
+        let service = MysqlSourceService::new(
+            test_config(60_000),
+            driver.clone(),
+            NodeId("mysql-test".into()),
+        );
+        let mut cursor = open_cursor(&service);
+        cursor.offset += 1;
+        let reply = service.handle_event(event_for(&page_request(cursor)));
+        match decode_msgpack::<MysqlSourcePayload>(reply.payload_bytes()).expect("payload") {
+            MysqlSourcePayload::Error(error) => assert_eq!(error.code, "invalid-request"),
+            other => panic!("expected cursor error, got {other:?}"),
+        }
+        assert_eq!(driver.closed.load(Ordering::SeqCst), 1);
+
+        let driver = Arc::new(FakeDriver::failing_on_second_page());
+        let service = MysqlSourceService::new(
+            test_config(60_000),
+            driver.clone(),
+            NodeId("mysql-test".into()),
+        );
+        let cursor = open_cursor(&service);
+        let reply = service.handle_event(event_for(&page_request(cursor)));
+        assert!(matches!(
+            decode_msgpack::<MysqlSourcePayload>(reply.payload_bytes()).expect("payload"),
+            MysqlSourcePayload::Error(_)
+        ));
+        assert_eq!(driver.closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn explicit_close_runtime_drop_and_restart_loss_fail_closed() {
+        let driver = Arc::new(FakeDriver::new());
+        let service = MysqlSourceService::new(
+            test_config(60_000),
+            driver.clone(),
+            NodeId("mysql-test".into()),
+        );
+        let cursor = open_cursor(&service);
+        let close = MysqlSourceRequest {
+            operation: MysqlSourceOperation::SnapshotClose,
+            cursor: Some(MysqlSourceCursor::Snapshot(cursor.clone())),
+            ..page_request(cursor.clone())
+        };
+        let reply = service.handle_event(event_for(&close));
+        assert!(matches!(
+            decode_msgpack::<MysqlSourcePayload>(reply.payload_bytes()).expect("payload"),
+            MysqlSourcePayload::Rows(_)
+        ));
+        assert_eq!(driver.closed.load(Ordering::SeqCst), 1);
+
+        let lost_cursor = open_cursor(&service);
+        drop(service);
+        assert_eq!(driver.closed.load(Ordering::SeqCst), 2);
+        let restarted = MysqlSourceService::new(
+            test_config(60_000),
+            driver,
+            NodeId("mysql-test-restarted".into()),
+        );
+        let reply = restarted.handle_event(event_for(&page_request(lost_cursor)));
+        match decode_msgpack::<MysqlSourcePayload>(reply.payload_bytes()).expect("payload") {
+            MysqlSourcePayload::Error(error) => assert_eq!(error.code, "transient-runtime"),
+            other => panic!("expected restart-loss error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn manifest_runtime_config_shape_parses() {
         let cfg = std::collections::HashMap::from([
             (
@@ -604,6 +1395,10 @@ mod tests {
                         (
                             "object_ref".to_string(),
                             ConfigValue::String("mysql-prod".into()),
+                        ),
+                        (
+                            "interfaces".to_string(),
+                            ConfigValue::Array(vec![ConfigValue::String("read".into())]),
                         ),
                     ]))]),
                 )])),

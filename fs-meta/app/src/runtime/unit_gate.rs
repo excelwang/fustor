@@ -16,6 +16,7 @@ struct RouteControlState {
 struct UnitControlState {
     routes: HashMap<String, RouteControlState>,
     authoritative_bound_scopes: Option<Vec<RuntimeBoundScope>>,
+    authoritative_replacement_scope_ids: BTreeSet<String>,
 }
 
 #[derive(Clone, Default)]
@@ -82,9 +83,18 @@ impl UnitControlGate {
         }
     }
 
-    fn sync_active_scopes(&mut self, unit_id: &str, bound_scopes: &[RuntimeBoundScope]) {
+    fn sync_active_scopes_with_replacements(
+        &mut self,
+        unit_id: &str,
+        bound_scopes: &[RuntimeBoundScope],
+        replacement_scope_ids: &[&str],
+    ) {
         let state = self.units.entry(unit_id.to_string()).or_default();
         state.authoritative_bound_scopes = Some(bound_scopes.to_vec());
+        state.authoritative_replacement_scope_ids = replacement_scope_ids
+            .iter()
+            .map(|scope_id| scope_id.to_string())
+            .collect();
     }
 
     fn clear_route(&mut self, unit_id: &str, route_key: &str) {
@@ -102,32 +112,36 @@ impl UnitControlGate {
 fn effective_route_bound_scopes(
     route_bound_scopes: &[RuntimeBoundScope],
     authoritative_bound_scopes: Option<&[RuntimeBoundScope]>,
+    authoritative_replacement_scope_ids: &BTreeSet<String>,
 ) -> Vec<RuntimeBoundScope> {
     let Some(authoritative_bound_scopes) = authoritative_bound_scopes else {
         return route_bound_scopes.to_vec();
     };
-    let route_resources_by_scope = route_bound_scopes
+    let authoritative_scope_ids = authoritative_bound_scopes
         .iter()
-        .map(|scope| {
-            (
-                scope.scope_id.clone(),
-                scope.resource_ids.iter().cloned().collect::<BTreeSet<_>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    authoritative_bound_scopes
+        .map(|scope| scope.scope_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut effective = route_bound_scopes
         .iter()
-        .map(|scope| {
-            let resource_ids = route_resources_by_scope
-                .get(&scope.scope_id)
-                .cloned()
-                .unwrap_or_else(|| scope.resource_ids.iter().cloned().collect());
-            RuntimeBoundScope {
-                scope_id: scope.scope_id.clone(),
-                resource_ids: resource_ids.into_iter().collect(),
-            }
-        })
-        .collect()
+        .filter(|scope| authoritative_scope_ids.contains(scope.scope_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if route_bound_scopes
+        .iter()
+        .any(|scope| authoritative_replacement_scope_ids.contains(scope.scope_id.as_str()))
+    {
+        let existing_scope_ids = effective
+            .iter()
+            .map(|scope| scope.scope_id.clone())
+            .collect::<BTreeSet<_>>();
+        effective.extend(
+            authoritative_bound_scopes
+                .iter()
+                .filter(|scope| !existing_scope_ids.contains(&scope.scope_id))
+                .cloned(),
+        );
+    }
+    effective
 }
 
 /// Shared runtime unit control gate for fs-meta modules.
@@ -232,6 +246,7 @@ impl RuntimeUnitGate {
         Ok(gate.accepts_tick(unit_id, route_key, generation))
     }
 
+    #[cfg(test)]
     pub(crate) fn sync_active_scopes(
         &self,
         unit_id: &str,
@@ -242,7 +257,22 @@ impl RuntimeUnitGate {
             .gate
             .lock()
             .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
-        gate.sync_active_scopes(unit_id, bound_scopes);
+        gate.sync_active_scopes_with_replacements(unit_id, bound_scopes, &[]);
+        Ok(())
+    }
+
+    pub(crate) fn sync_active_scopes_with_replacements(
+        &self,
+        unit_id: &str,
+        bound_scopes: &[RuntimeBoundScope],
+        replacement_scope_ids: &[&str],
+    ) -> Result<()> {
+        self.validate_runtime_unit(unit_id)?;
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
+        gate.sync_active_scopes_with_replacements(unit_id, bound_scopes, replacement_scope_ids);
         Ok(())
     }
 
@@ -320,6 +350,7 @@ impl RuntimeUnitGate {
                         effective_route_bound_scopes(
                             &route.bound_scopes,
                             state.authoritative_bound_scopes.as_deref(),
+                            &state.authoritative_replacement_scope_ids,
                         ),
                     )
                 })
@@ -372,6 +403,7 @@ impl RuntimeUnitGate {
                 for scope in effective_route_bound_scopes(
                     &route.bound_scopes,
                     row.authoritative_bound_scopes.as_deref(),
+                    &row.authoritative_replacement_scope_ids,
                 ) {
                     let incoming = scope.resource_ids.iter().cloned().collect::<BTreeSet<_>>();
                     match merged.entry(scope.scope_id.clone()) {
@@ -580,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn synced_active_scopes_remain_authoritative_across_later_stale_activate() {
+    fn synced_active_scopes_filter_but_do_not_expand_runtime_placement() {
         let gate = RuntimeUnitGate::new_runtime_managed("test-gate", &["runtime.exec.source"]);
 
         assert!(
@@ -624,8 +656,53 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             scope_ids,
-            BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
-            "accepted logical roots are app-authoritative; later runtime route hints must not reintroduce retired roots or drop newly accepted roots",
+            BTreeSet::from(["nfs2".to_string()]),
+            "accepted logical roots filter retired roots, while a newly accepted root still needs runtime placement evidence",
+        );
+    }
+
+    #[test]
+    fn explicit_replacement_scope_projects_authoritative_scopes_without_general_empty_expansion() {
+        let gate = RuntimeUnitGate::new_runtime_managed("test-gate", &["runtime.exec.source"]);
+
+        gate.apply_activate(
+            "runtime.exec.source",
+            "source-status:v1.req",
+            2,
+            &[bare_scope("__bootstrap")],
+        )
+        .expect("activate explicit bootstrap carrier");
+        gate.sync_active_scopes_with_replacements(
+            "runtime.exec.source",
+            &[bare_scope("nfs1"), bare_scope("nfs2")],
+            &["__bootstrap"],
+        )
+        .expect("project accepted roots through bootstrap carrier");
+
+        let state = gate
+            .unit_state("runtime.exec.source")
+            .expect("unit_state")
+            .expect("unit should exist");
+        assert!(state.0, "replacement carrier should keep the unit active");
+        assert_eq!(
+            state
+                .1
+                .into_iter()
+                .map(|scope| scope.scope_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        );
+
+        gate.sync_active_scopes(
+            "runtime.exec.source",
+            &[bare_scope("nfs1"), bare_scope("nfs2")],
+        )
+        .expect("clear replacement semantics");
+        assert_eq!(
+            gate.unit_state("runtime.exec.source")
+                .expect("unit_state after replacement clear"),
+            Some((false, Vec::new())),
+            "ordinary empty route scope must not inherit bootstrap replacement semantics",
         );
     }
 

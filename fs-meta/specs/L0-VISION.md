@@ -1,5 +1,5 @@
 ---
-version: 3.0.0
+version: 3.1.0
 ---
 
 # L0: fs-meta Domain Vision
@@ -277,6 +277,18 @@ User wants one logical observation snapshot to keep stable metadata until new in
 ### VISION.DATA_BOUNDARY.REFERENCE_DOMAIN_SLICE_CONNECTIVITY
 
 User wants related file-system slice updates to remain connected inside the same fs-meta domain boundary instead of fragmenting across unrelated views.
+
+### VISION.DATA_BOUNDARY.SOURCE_PROVIDER_EVIDENCE_EXPORT
+
+User wants authoritative filesystem observations to be exportable as typed source evidence with native anchors, source revision, change identity, and authority epoch preserved.
+
+### VISION.DATA_BOUNDARY.SOURCE_PROJECTION_EVIDENCE_EXPORT
+
+User wants the rebuildable materialized tree to be usable as an optional projection path only when its source revision, projection revision, coverage, readiness, and apply evidence remain explicit.
+
+### VISION.DATA_BOUNDARY.TRACKED_RESULT_STREAM_REFRESH_ONLY
+
+User wants realtime output to refresh, invalidate, or delete only results that an external consumer already tracks, without using the stream to discover previously unknown objects.
 
 ### VISION.FAILURE_ISOLATION_BOUNDARY
 

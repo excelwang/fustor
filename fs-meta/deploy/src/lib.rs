@@ -909,6 +909,11 @@ pub fn build_app_scopes_json_for_roots(
     scopes
 }
 
+pub fn scope_only_followup_logical_roots_pending(message: &str) -> bool {
+    message.contains("activation blocked")
+        && message.contains("has no current logical-root declaration")
+}
+
 fn build_app_scopes_json(spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
     build_app_scopes_json_for_roots(&spec.api_facade_resource_id, &spec.roots)
 }
@@ -1107,6 +1112,20 @@ mod tests {
             query_peer.get("cardinality"),
             Some(&serde_json::json!("all"))
         );
+    }
+
+    #[test]
+    fn scope_only_followup_pending_classifier_is_narrow() {
+        assert!(scope_only_followup_logical_roots_pending(
+            "config commit failed: activation blocked routes=1 blocked_details=[source route failed: not ready: source runtime logical scope 'nfs-144' has no current logical-root declaration]"
+        ));
+        assert!(!scope_only_followup_logical_roots_pending(
+            "config commit failed: activation blocked routes=1 blocked_details=[source route failed: access denied]"
+        ));
+        assert!(!scope_only_followup_logical_roots_pending(
+            "source runtime logical scope 'nfs-144' has no current logical-root declaration"
+        ));
+        assert!(!scope_only_followup_logical_roots_pending("tx busy"));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 The app artifact manifest is [s3-source.yaml](../fixtures/manifests/s3-source.yaml). It declares internal request/reply ports only:
 
 - `s3-source.internal` / `fetch` routes to `s3-source.fetch:v1` for `S3SourceRequest` -> `S3SourcePayload`.
-- `s3-source.internal` / `status` is reserved for diagnostics/status. The v1 runtime currently serves the fetch route.
+- `s3-source.internal` / `status` returns local readiness diagnostics from manifest endpoints and active runtime grants. It is a request/reply route and does not call the native S3 driver.
 
 Runtime instances scope the concrete bound route by node id, matching the `fs-meta` pattern. A node `s3-source-node-a` serves `s3-source.fetch.s3_source_node_a:v1.req`.
 
@@ -45,6 +45,21 @@ Callers send MessagePack-encoded `S3SourceRequest` to the internal fetch route. 
 - `Objects`: object metadata batches plus `next_cursor`.
 - `Fields`: the object metadata field catalog.
 - `Probe`: connection probe result.
+- `Status`: local runtime readiness from configured endpoints and active grants.
 - `Error`: typed app error with retryability.
 
-V1 supports snapshot listing and polling. Snapshot maps to paged S3 `ListObjectsV2` style traversal with an opaque continuation token. Polling is checkpointed by `(last_modified_unix_ms, last_key)` so downstream callers can persist checkpoints without the app owning global state.
+V1 supports snapshot listing and polling. Snapshot maps to paged S3 `ListObjectsV2` style traversal with an opaque continuation token. Polling is checkpointed by `(last_modified_unix_ms, last_key)` plus an optional `continuation_token`; old poll cursors without the token still decode. Polling is intentionally bounded to a fixed number of S3 list pages per request and may return `has_more=true` before the full prefix has been scanned, so downstream callers must persist and continue from `next_cursor` instead of assuming one call drains the prefix.
+
+## Native Integration Tests
+
+The native S3 tests are ignored by default. To run them against a disposable S3-compatible bucket:
+
+```bash
+FUSTOR_S3_SOURCE_ENDPOINT_URI=http://127.0.0.1:9000 \
+FUSTOR_S3_SOURCE_ACCESS_KEY=minioadmin \
+FUSTOR_S3_SOURCE_SECRET_KEY=minioadmin \
+FUSTOR_S3_SOURCE_BUCKET=fustor-source-it \
+cargo test -p s3-source-runtime --test native_s3_integration -- --ignored
+```
+
+`FUSTOR_S3_SOURCE_REGION` is optional and defaults to `us-east-1`.

@@ -7,9 +7,9 @@
 The app artifact manifest is [es-source.yaml](../fixtures/manifests/es-source.yaml). It declares internal request/reply ports only:
 
 - `es-source.internal` / `fetch` routes to `es-source.fetch:v1` for `EsSourceRequest` -> `EsSourcePayload`.
-- `es-source.internal` / `status` is reserved for diagnostics/status. The v1 runtime currently serves the fetch route.
+- `es-source.internal` / `status` routes to `es-source.status:v1` for local readiness/status checks returning `EsSourcePayload::Status`.
 
-Runtime instances scope the concrete bound route by node id, matching the `fs-meta` pattern. A node `es-source-node-a` serves `es-source.fetch.es_source_node_a:v1.req`.
+Runtime instances scope the concrete bound routes by node id, matching the `fs-meta` pattern. A node `es-source-node-a` serves `es-source.fetch.es_source_node_a:v1.req` and `es-source.status.es_source_node_a:v1.req`.
 
 ## Product Config
 
@@ -44,6 +44,7 @@ Callers send MessagePack-encoded `EsSourceRequest` to the internal fetch route. 
 - `Batch`: raw ES document envelopes plus `next_cursor`.
 - `Fields`: flattened mapping fields.
 - `Probe`: connection probe result.
+- `Status`: local runtime readiness for the status route, including node id, bound fetch/status routes, configured endpoint count, active grant count, and diagnostics.
 - `Error`: typed app error with retryability.
 
-Downstream owns cursor persistence. Snapshot uses PIT + `search_after`; polling uses timestamp plus stable sort cursor. `es-source` does not persist a global checkpoint.
+The status route is intentionally local and non-invasive: it does not call Elasticsearch, resolve secret material, or perform fetch work. Downstream owns cursor persistence. Snapshot uses PIT + `search_after`; polling uses timestamp plus stable sort cursor. `es-source` does not persist a global checkpoint.

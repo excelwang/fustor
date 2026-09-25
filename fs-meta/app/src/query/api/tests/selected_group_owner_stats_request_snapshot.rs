@@ -572,7 +572,7 @@ async fn public_trusted_file_path_stats_preserves_request_source_roots_when_loca
         .oneshot(
             Request::builder()
                 .uri(format!(
-                    "/stats?path={file_path}&recursive=true&group_order=group-key&read_class=trusted-materialized"
+                    "/stats?path={file_path}&recursive=true&read_class=trusted-materialized"
                 ))
                 .method("GET")
                 .body(Body::empty())
@@ -580,16 +580,18 @@ async fn public_trusted_file_path_stats_preserves_request_source_roots_when_loca
         )
         .await
         .expect("serve stats request");
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "trusted exact-file stats request should stay 200 while route source/sink status advertise three ready groups; owner_a_send_batches={} owner_b_send_batches={}",
-        boundary.send_batch_count(&owner_route_a.0),
-        boundary.send_batch_count(&owner_route_b.0),
-    );
+    let response_status = response.status();
     let body = to_bytes(response.into_body(), 1024 * 1024)
         .await
         .expect("stats response body");
+    assert_eq!(
+        response_status,
+        StatusCode::OK,
+        "trusted exact-file stats request should stay 200 while route source/sink status advertise three ready groups; owner_a_send_batches={} owner_b_send_batches={} body={}",
+        boundary.send_batch_count(&owner_route_a.0),
+        boundary.send_batch_count(&owner_route_b.0),
+        String::from_utf8_lossy(&body),
+    );
     let payload: serde_json::Value =
         serde_json::from_slice(&body).expect("stats response json");
     let mut groups = payload["groups"]

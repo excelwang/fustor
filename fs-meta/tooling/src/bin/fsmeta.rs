@@ -24,7 +24,7 @@ use fs_meta_deploy::{
     FsMetaReleaseSpec, FsMetaReleaseWorkerMode, FsMetaReleaseWorkerModes,
     build_app_scopes_json_for_roots, build_release_doc_value,
     compile_release_doc_to_relation_target_intent, compile_scope_worker_relation_target_intent,
-    write_startup_manifest,
+    scope_only_followup_logical_roots_pending, write_startup_manifest,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -236,6 +236,8 @@ enum RootsFile {
 const DEFAULT_APP_ID: &str = "fs-meta";
 const DEFAULT_CNXCTL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const CNXCTL_TIMEOUT_ENV: &str = "FSMETA_CNXCTL_TIMEOUT_MS";
+const SCOPE_ONLY_FOLLOWUP_MAX_ATTEMPTS: usize = 3;
+const SCOPE_ONLY_FOLLOWUP_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 fn default_local_ingress_bind_addr() -> String {
     "127.0.0.1:19180".to_string()
@@ -559,15 +561,18 @@ async fn roots_apply(args: RootsApplyArgs) -> anyhow::Result<serde_json::Value> 
         let target_generation = intent
             .get("target_generation")
             .and_then(serde_json::Value::as_u64);
-        let apply_result = control.apply_relation_target_intent(&intent).await?;
+        let apply = control
+            .apply_scope_only_relation_target_intent(&intent)
+            .await?;
         Some(json!({
             "mode": "management_api_with_accepted_scope_followup",
             "relation_target_apply": "scope_only_followup",
-            "tx_busy_retries": 0,
+            "tx_busy_retries": apply.tx_busy_retries,
+            "logical_roots_pending_retries": apply.logical_roots_pending_retries,
             "reason": "online_root_reconfiguration_without_restart",
             "target_generation": target_generation,
             "app_scope_count": app_scope_count,
-            "result": apply_result,
+            "result": apply.result,
         }))
     } else {
         None
@@ -1291,6 +1296,12 @@ struct CnxctlCommandError {
     message: String,
 }
 
+struct ScopeOnlyFollowupApplyResult {
+    result: serde_json::Value,
+    tx_busy_retries: usize,
+    logical_roots_pending_retries: usize,
+}
+
 impl CnxctlCommandError {
     fn new(code: Option<String>, category: Option<String>, message: impl Into<String>) -> Self {
         Self {
@@ -1381,6 +1392,51 @@ impl ControlClient {
         output
     }
 
+    async fn apply_scope_only_relation_target_intent(
+        &self,
+        intent: &serde_json::Value,
+    ) -> anyhow::Result<ScopeOnlyFollowupApplyResult> {
+        let mut tx_busy_retries = 0;
+        let mut logical_roots_pending_retries = 0;
+        for attempt in 1..=SCOPE_ONLY_FOLLOWUP_MAX_ATTEMPTS {
+            match self.apply_relation_target_intent_once(intent).await {
+                Ok(result) => {
+                    return Ok(ScopeOnlyFollowupApplyResult {
+                        result,
+                        tx_busy_retries,
+                        logical_roots_pending_retries,
+                    });
+                }
+                Err(err) => {
+                    let tx_busy = err.code.as_deref() == Some("tx_busy")
+                        || err.message.to_ascii_lowercase().contains("tx busy");
+                    let logical_roots_pending =
+                        scope_only_followup_logical_roots_pending(&err.message);
+                    if attempt == SCOPE_ONLY_FOLLOWUP_MAX_ATTEMPTS
+                        || (!tx_busy && !logical_roots_pending)
+                    {
+                        if attempt == SCOPE_ONLY_FOLLOWUP_MAX_ATTEMPTS
+                            && (tx_busy || logical_roots_pending)
+                        {
+                            return Err(anyhow::Error::new(err).context(format!(
+                                "scope-only accepted-scope followup exhausted {} bounded attempts",
+                                SCOPE_ONLY_FOLLOWUP_MAX_ATTEMPTS
+                            )));
+                        }
+                        return Err(anyhow::Error::from(err));
+                    }
+                    if tx_busy {
+                        tx_busy_retries += 1;
+                    } else {
+                        logical_roots_pending_retries += 1;
+                    }
+                    tokio::time::sleep(SCOPE_ONLY_FOLLOWUP_RETRY_BACKOFF).await;
+                }
+            }
+        }
+        unreachable!("scope-only followup bounded attempt loop must return")
+    }
+
     async fn clear_relation_target(&self, target_id: String) -> anyhow::Result<serde_json::Value> {
         self.run_cnxctl(&["config", "relation-target-clear", &target_id])
             .await
@@ -1456,10 +1512,10 @@ impl ControlClient {
         } else {
             String::from_utf8_lossy(&output.stderr).into_owned()
         };
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stderr) {
-            if let Some(error) = CnxctlCommandError::from_cnxctl_json(&parsed) {
-                return Err(error);
-            }
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stderr)
+            && let Some(error) = CnxctlCommandError::from_cnxctl_json(&parsed)
+        {
+            return Err(error);
         }
         Err(CnxctlCommandError::other(format!(
             "{} failed with status {}: {}",
@@ -1512,18 +1568,15 @@ fn resolve_cnxctl_bin() -> PathBuf {
 }
 
 fn resolve_cnxctl_bin_from(env_path: Option<&str>, current_exe: Option<&Path>) -> PathBuf {
-    if let Some(path) = env_path {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return path;
-        }
+    if let Some(path) = env_path.map(PathBuf::from)
+        && path.exists()
+    {
+        return path;
     }
-    if let Some(current_exe) = current_exe {
-        if let Some(dir) = current_exe.parent() {
-            let sibling = dir.join("cnxctl");
-            if sibling.exists() {
-                return sibling;
-            }
+    if let Some(dir) = current_exe.and_then(Path::parent) {
+        let sibling = dir.join("cnxctl");
+        if sibling.exists() {
+            return sibling;
         }
     }
     PathBuf::from("cnxctl")
@@ -1535,10 +1588,9 @@ fn derive_route_plan_node_ids_from_config_dump(config_dump: &serde_json::Value) 
     if let Some(node_id) = config_dump
         .get("node_id")
         .and_then(serde_json::Value::as_str)
+        && !node_id.is_empty()
     {
-        if !node_id.is_empty() {
-            node_ids.insert(node_id.to_string());
-        }
+        node_ids.insert(node_id.to_string());
     }
 
     if let Some(resources) = config_dump
@@ -1546,10 +1598,10 @@ fn derive_route_plan_node_ids_from_config_dump(config_dump: &serde_json::Value) 
         .and_then(serde_json::Value::as_array)
     {
         for resource in resources {
-            if let Some(node_id) = resource.get("node_id").and_then(serde_json::Value::as_str) {
-                if !node_id.is_empty() {
-                    node_ids.insert(node_id.to_string());
-                }
+            if let Some(node_id) = resource.get("node_id").and_then(serde_json::Value::as_str)
+                && !node_id.is_empty()
+            {
+                node_ids.insert(node_id.to_string());
             }
         }
     }
@@ -1559,10 +1611,10 @@ fn derive_route_plan_node_ids_from_config_dump(config_dump: &serde_json::Value) 
         .and_then(serde_json::Value::as_array)
     {
         for peer in peers {
-            if let Some(node_id) = peer.get("node_id").and_then(serde_json::Value::as_str) {
-                if !node_id.is_empty() {
-                    node_ids.insert(node_id.to_string());
-                }
+            if let Some(node_id) = peer.get("node_id").and_then(serde_json::Value::as_str)
+                && !node_id.is_empty()
+            {
+                node_ids.insert(node_id.to_string());
             }
         }
     }
@@ -1929,7 +1981,7 @@ mod tests {
             RootEntry {
                 id: "nfs-144".to_string(),
                 selector: RootSelector {
-                    host_ref: Some("panda144".to_string()),
+                    host_ref: Some("example-node-144".to_string()),
                     ..RootSelector::default()
                 },
                 subpath_scope: PathBuf::from("/"),
@@ -1940,7 +1992,7 @@ mod tests {
             RootEntry {
                 id: "nfs-145".to_string(),
                 selector: RootSelector {
-                    host_ref: Some("panda145".to_string()),
+                    host_ref: Some("example-node-145".to_string()),
                     ..RootSelector::default()
                 },
                 subpath_scope: PathBuf::from("/"),
@@ -1955,7 +2007,7 @@ mod tests {
             &PathBuf::from("/tmp/fs-meta-runtime.so"),
             &manifest,
             &dir,
-            vec!["panda144".to_string(), "panda145".to_string()],
+            vec!["example-node-144".to_string(), "example-node-145".to_string()],
             roots,
         )
         .expect("roots-bearing intent should compile");
@@ -1990,6 +2042,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // The guard intentionally spans the await so process-global environment
+    // overrides cannot race another CLI test.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn roots_apply_bounds_hung_child_cnxctl_app_apply_as_non_tx_busy() {
         let _guard = ENV_LOCK.lock().expect("test env lock");
@@ -2042,6 +2097,74 @@ mod tests {
         );
     }
 
+    // The guard intentionally spans the await so process-global environment
+    // overrides cannot race another CLI test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn scope_only_followup_retries_unchanged_intent_after_logical_roots_pending() {
+        let _guard = ENV_LOCK.lock().expect("test env lock");
+        let dir = unique_temp_path("scope-followup-retry");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let cnxctl = dir.join("cnxctl");
+        let attempts_path = dir.join("attempts");
+        fs::write(
+            &cnxctl,
+            format!(
+                "#!/bin/sh\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{}'\nif [ \"$count\" -eq 1 ]; then\n  printf '%s\\n' '{{\"status\":\"error\",\"error\":{{\"code\":\"tx_failed\",\"category\":\"remote_execution\",\"message\":\"config commit failed: activation blocked routes=1 blocked_details=[source runtime logical scope nfs-144 has no current logical-root declaration]\"}}}}' >&2\n  exit 1\nfi\nprintf '%s\\n' '{{\"result\":{{\"accepted\":true}}}}'\n",
+                attempts_path.display(),
+                attempts_path.display(),
+                attempts_path.display()
+            ),
+        )
+        .expect("write fake cnxctl");
+        let mut perms = fs::metadata(&cnxctl)
+            .expect("fake cnxctl metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&cnxctl, perms).expect("chmod fake cnxctl");
+        let previous_cnxctl = std::env::var_os("CNXCTL_BIN");
+        unsafe {
+            std::env::set_var("CNXCTL_BIN", &cnxctl);
+        }
+
+        let client = ControlClient {
+            socket_path: "test.sock".to_string(),
+            actor_id: "tester".to_string(),
+            domain_id: "fsmeta-test".to_string(),
+            key_id: "test-key".to_string(),
+            admin_sk_b64: "redacted".to_string(),
+        };
+        let intent = json!({
+            "target_id": "fs-meta",
+            "target_generation": 77,
+            "workers": [{"runtime": {"app_scopes": [{"scope_id": "nfs-144"}]}}]
+        });
+        let intent_before = intent.clone();
+        let result = client
+            .apply_scope_only_relation_target_intent(&intent)
+            .await
+            .expect("logical-roots follower gap should retry and converge");
+
+        unsafe {
+            match previous_cnxctl {
+                Some(value) => std::env::set_var("CNXCTL_BIN", value),
+                None => std::env::remove_var("CNXCTL_BIN"),
+            }
+        }
+        assert_eq!(intent, intent_before, "retry must not mutate the intent");
+        assert_eq!(result.result, json!({"accepted": true}));
+        assert_eq!(result.tx_busy_retries, 0);
+        assert_eq!(result.logical_roots_pending_retries, 1);
+        assert_eq!(
+            fs::read_to_string(&attempts_path).expect("read attempt count"),
+            "2"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // The guard intentionally spans the await so process-global environment
+    // overrides cannot race another CLI test.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn roots_apply_config_submits_scope_only_runtime_followup_without_static_roots_mutation()
     {
@@ -2078,7 +2201,7 @@ mod tests {
             serde_json::to_string(&json!({
                 "roots": [{
                     "id": "nfs-144",
-                    "selector": { "host_ref": "panda144" },
+                    "selector": { "host_ref": "example-node-144" },
                     "subpath_scope": "/",
                     "watch": true,
                     "scan": true
@@ -2097,9 +2220,9 @@ mod tests {
                     "runtime_target_state": {
                         "target_route_plans": {
                             "fs-meta": [{
-                                "route_key": "fs-meta.source-status:panda144:v1.req",
+                                "route_key": "fs-meta.source-status:example-node-144:v1.req",
                                 "mode": "fan_in",
-                                "peers": [{"node_id": "panda144", "addr": ""}]
+                                "peers": [{"node_id": "example-node-144", "addr": ""}]
                             }]
                         },
                         "records": [{
@@ -2295,9 +2418,9 @@ mod tests {
         assert_eq!(
             intent["route_plans"],
             json!([{
-                "route_key": "fs-meta.source-status:panda144:v1.req",
+                "route_key": "fs-meta.source-status:example-node-144:v1.req",
                 "mode": "fan_in",
-                "peers": [{"node_id": "panda144", "addr": ""}]
+                "peers": [{"node_id": "example-node-144", "addr": ""}]
             }]),
             "scope-only followup must preserve current target route plans"
         );
@@ -2400,25 +2523,23 @@ mod tests {
         let workers = intent["workers"][0]["config"]["workers"]
             .as_object()
             .expect("compiled fs-meta release config should declare workers");
-        for role in ["source"] {
-            let row = workers
-                .get(role)
-                .expect("source worker config should exist")
-                .as_object()
-                .expect("worker config should encode as an object");
-            assert_eq!(
-                row.get("mode").and_then(serde_json::Value::as_str),
-                Some("embedded")
-            );
-            assert!(
-                row.get("startup").is_none(),
-                "embedded source mode must not emit startup.path"
-            );
-            assert!(
-                row.get("socket_dir").is_none(),
-                "embedded source mode must not emit worker socket_dir"
-            );
-        }
+        let row = workers
+            .get("source")
+            .expect("source worker config should exist")
+            .as_object()
+            .expect("worker config should encode as an object");
+        assert_eq!(
+            row.get("mode").and_then(serde_json::Value::as_str),
+            Some("embedded")
+        );
+        assert!(
+            row.get("startup").is_none(),
+            "embedded source mode must not emit startup.path"
+        );
+        assert!(
+            row.get("socket_dir").is_none(),
+            "embedded source mode must not emit worker socket_dir"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2492,15 +2613,15 @@ mod tests {
     #[test]
     fn route_plan_node_discovery_collects_unique_nodes_from_config_dump() {
         let dump = json!({
-            "node_id": "panda145",
+            "node_id": "example-node-145",
             "announced_resources": [
-                {"node_id": "panda144"},
-                {"node_id": "panda145"},
-                {"node_id": "panda147"}
+                {"node_id": "example-node-144"},
+                {"node_id": "example-node-145"},
+                {"node_id": "example-node-147"}
             ],
             "management_peers": [
-                {"node_id": "panda146"},
-                {"node_id": "panda147"},
+                {"node_id": "example-node-146"},
+                {"node_id": "example-node-147"},
                 {"node_id": ""}
             ]
         });
@@ -2510,10 +2631,10 @@ mod tests {
         assert_eq!(
             actual,
             vec![
-                "panda144".to_string(),
-                "panda145".to_string(),
-                "panda146".to_string(),
-                "panda147".to_string(),
+                "example-node-144".to_string(),
+                "example-node-145".to_string(),
+                "example-node-146".to_string(),
+                "example-node-147".to_string(),
             ]
         );
     }

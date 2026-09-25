@@ -4,7 +4,6 @@ use capanix_app_sdk::runtime::ConfigValue;
 use capanix_app_sdk::{CnxError, Result};
 use serde::{Deserialize, Serialize};
 
-pub mod bio_mock;
 pub mod product_model;
 
 pub use source_kit::{SourceErrorPayload, decode_msgpack, encode_msgpack};
@@ -18,6 +17,8 @@ pub enum SourceKind {
     Es,
     Mysql,
     Pg,
+    Csv,
+    Jsonl,
     Other(String),
 }
 
@@ -30,6 +31,8 @@ impl SourceKind {
             Self::Es => "es",
             Self::Mysql => "mysql",
             Self::Pg => "pg",
+            Self::Csv => "csv",
+            Self::Jsonl => "jsonl",
             Self::Other(value) => value,
         }
     }
@@ -279,11 +282,41 @@ impl SourceGraphSkeleton {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "kebab-case")]
 pub enum UnionGraphRequest {
     IngestSkeleton {
         skeleton: SourceGraphSkeleton,
+    },
+    IngestS3Batch {
+        batch: s3_source::S3ObjectBatch,
+    },
+    IngestLocalFsEntries {
+        batch: local_fs_source::LocalFsEntryBatch,
+    },
+    IngestEsFields {
+        catalog: es_source::EsFieldCatalog,
+    },
+    IngestEsBatch {
+        batch: es_source::EsSourceBatch,
+    },
+    IngestMysqlFields {
+        catalog: mysql_source::MysqlFieldCatalog,
+    },
+    IngestPgFields {
+        catalog: pg_source::PgFieldCatalog,
+    },
+    IngestCsvFields {
+        catalog: csv_source::CsvFieldCatalog,
+    },
+    IngestCsvBatch {
+        batch: csv_source::CsvRecordBatch,
+    },
+    IngestJsonlFields {
+        catalog: jsonl_source::JsonlFieldCatalog,
+    },
+    IngestJsonlBatch {
+        batch: jsonl_source::JsonlRecordBatch,
     },
     ListNodes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -760,6 +793,8 @@ fn observed_by(source_kind: &SourceKind) -> &str {
         SourceKind::Es => "es-source",
         SourceKind::Mysql => "mysql-source",
         SourceKind::Pg => "pg-source",
+        SourceKind::Csv => "csv-source",
+        SourceKind::Jsonl => "jsonl-source",
         SourceKind::Other(_) => "source-adapter",
     }
 }
@@ -772,6 +807,36 @@ pub fn handle_store_request(
         UnionGraphRequest::IngestSkeleton { skeleton } => {
             Ok(UnionGraphPayload::IngestAck(store.ingest(skeleton)?))
         }
+        UnionGraphRequest::IngestS3Batch { batch } => Ok(UnionGraphPayload::IngestAck(
+            store.ingest(skeleton_from_s3_batch(&batch))?,
+        )),
+        UnionGraphRequest::IngestLocalFsEntries { batch } => Ok(UnionGraphPayload::IngestAck(
+            store.ingest(skeleton_from_local_fs_entries(&batch))?,
+        )),
+        UnionGraphRequest::IngestEsFields { catalog } => Ok(UnionGraphPayload::IngestAck(
+            store.ingest(skeleton_from_es_fields(&catalog))?,
+        )),
+        UnionGraphRequest::IngestEsBatch { batch } => Ok(UnionGraphPayload::IngestAck(
+            store.ingest(skeleton_from_es_batch(&batch))?,
+        )),
+        UnionGraphRequest::IngestMysqlFields { catalog } => Ok(UnionGraphPayload::IngestAck(
+            store.ingest(skeleton_from_mysql_fields(&catalog))?,
+        )),
+        UnionGraphRequest::IngestPgFields { catalog } => Ok(UnionGraphPayload::IngestAck(
+            store.ingest(skeleton_from_pg_fields(&catalog))?,
+        )),
+        UnionGraphRequest::IngestCsvFields { catalog } => Ok(UnionGraphPayload::IngestAck(
+            store.ingest(skeleton_from_csv_fields(&catalog))?,
+        )),
+        UnionGraphRequest::IngestCsvBatch { batch } => Ok(UnionGraphPayload::IngestAck(
+            store.ingest(skeleton_from_csv_batch(&batch))?,
+        )),
+        UnionGraphRequest::IngestJsonlFields { catalog } => Ok(UnionGraphPayload::IngestAck(
+            store.ingest(skeleton_from_jsonl_fields(&catalog))?,
+        )),
+        UnionGraphRequest::IngestJsonlBatch { batch } => Ok(UnionGraphPayload::IngestAck(
+            store.ingest(skeleton_from_jsonl_batch(&batch))?,
+        )),
         UnionGraphRequest::ListNodes {
             source_kind,
             node_kind,
@@ -858,9 +923,6 @@ pub fn skeleton_from_manifest_config(
             });
         }
     }
-    if let Some(config) = bio_mock::BioPipelineMockConfig::from_manifest_config(cfg)? {
-        skeleton.extend(bio_mock::skeleton_from_bio_pipeline_mock_config(&config)?);
-    }
     Ok(skeleton)
 }
 
@@ -897,6 +959,12 @@ pub fn fs_node_from_query_node(
 pub fn skeleton_from_s3_batch(batch: &s3_source::S3ObjectBatch) -> SourceGraphSkeleton {
     let mut skeleton = SourceGraphSkeleton::default();
     let bucket_id = batch.bucket.clone();
+    let observed_at = batch
+        .objects
+        .iter()
+        .map(|object| object.last_modified_unix_ms)
+        .max()
+        .unwrap_or_default();
     skeleton.nodes.push(SourceGraphNode {
         source_kind: SourceKind::S3,
         source_instance: batch.object_ref.clone(),
@@ -906,7 +974,7 @@ pub fn skeleton_from_s3_batch(batch: &s3_source::S3ObjectBatch) -> SourceGraphSk
         display_name: batch.bucket.clone(),
         native_pointer: format!("s3://{}", batch.bucket),
         fingerprint: None,
-        observed_at: 0,
+        observed_at,
         grant_epoch: batch.grant_epoch,
     });
     for object in &batch.objects {
@@ -937,6 +1005,64 @@ pub fn skeleton_from_s3_batch(batch: &s3_source::S3ObjectBatch) -> SourceGraphSk
             evidence_ref: String::new(),
             confidence: Confidence::Observed,
             observed_at: object.last_modified_unix_ms,
+            grant_epoch: batch.grant_epoch,
+        });
+    }
+    skeleton
+}
+
+pub fn skeleton_from_local_fs_entries(
+    batch: &local_fs_source::LocalFsEntryBatch,
+) -> SourceGraphSkeleton {
+    let mut skeleton = SourceGraphSkeleton::default();
+    let root_id = batch.root_path.clone();
+    let observed_at = batch
+        .entries
+        .iter()
+        .filter_map(|entry| entry.modified_unix_ms)
+        .max()
+        .unwrap_or_default();
+    skeleton.nodes.push(SourceGraphNode {
+        source_kind: SourceKind::LocalFs,
+        source_instance: batch.object_ref.clone(),
+        local_id: root_id.clone(),
+        node_kind: NodeKind::Root,
+        native_ref: format!("local-fs://{}/{}", batch.object_ref, batch.root_path),
+        display_name: batch.root_path.clone(),
+        native_pointer: batch.root_path.clone(),
+        fingerprint: None,
+        observed_at,
+        grant_epoch: batch.grant_epoch,
+    });
+    for entry in &batch.entries {
+        skeleton.nodes.push(SourceGraphNode {
+            source_kind: SourceKind::LocalFs,
+            source_instance: batch.object_ref.clone(),
+            local_id: entry.path.clone(),
+            node_kind: if entry.is_dir {
+                NodeKind::Namespace
+            } else {
+                NodeKind::Asset
+            },
+            native_ref: format!("local-fs://{}/{}", batch.object_ref, entry.path),
+            display_name: entry.file_name.clone(),
+            native_pointer: format!("{}/{}", batch.root_path.trim_end_matches('/'), entry.path),
+            fingerprint: Some(format!(
+                "size={};mtime={:?}",
+                entry.size, entry.modified_unix_ms
+            )),
+            observed_at: entry.modified_unix_ms.unwrap_or_default(),
+            grant_epoch: batch.grant_epoch,
+        });
+        skeleton.edges.push(SourceGraphEdge {
+            source_kind: SourceKind::LocalFs,
+            source_instance: batch.object_ref.clone(),
+            from_local_id: root_id.clone(),
+            to_local_id: entry.path.clone(),
+            edge_kind: EdgeKind::Contains,
+            evidence_ref: String::new(),
+            confidence: Confidence::Observed,
+            observed_at: entry.modified_unix_ms.unwrap_or_default(),
             grant_epoch: batch.grant_epoch,
         });
     }
@@ -1131,6 +1257,250 @@ pub fn skeleton_from_mysql_fields(
     skeleton
 }
 
+pub fn skeleton_from_pg_fields(catalog: &pg_source::PgFieldCatalog) -> SourceGraphSkeleton {
+    let mut skeleton = SourceGraphSkeleton::default();
+    let mut tables = BTreeMap::<(String, String), Vec<&pg_source::PgFieldDescriptor>>::new();
+    for field in &catalog.fields {
+        tables
+            .entry((field.schema.clone(), field.table.clone()))
+            .or_default()
+            .push(field);
+    }
+    for ((schema, table), fields) in tables {
+        let schema_id = schema.clone();
+        let table_id = format!("{schema}/{table}");
+        skeleton.nodes.push(SourceGraphNode {
+            source_kind: SourceKind::Pg,
+            source_instance: catalog.object_ref.clone(),
+            local_id: schema_id.clone(),
+            node_kind: NodeKind::Namespace,
+            native_ref: format!("pg://{}/{}", catalog.object_ref, schema),
+            display_name: schema.clone(),
+            native_pointer: format!("pg://{}/{}", catalog.object_ref, schema),
+            fingerprint: None,
+            observed_at: 0,
+            grant_epoch: None,
+        });
+        skeleton.nodes.push(SourceGraphNode {
+            source_kind: SourceKind::Pg,
+            source_instance: catalog.object_ref.clone(),
+            local_id: table_id.clone(),
+            node_kind: NodeKind::Collection,
+            native_ref: format!("pg://{}/{}/{}", catalog.object_ref, schema, table),
+            display_name: table.clone(),
+            native_pointer: format!("pg://{}/{}/{}", catalog.object_ref, schema, table),
+            fingerprint: Some(format!("fields={}", fields.len())),
+            observed_at: 0,
+            grant_epoch: None,
+        });
+        skeleton.edges.push(SourceGraphEdge {
+            source_kind: SourceKind::Pg,
+            source_instance: catalog.object_ref.clone(),
+            from_local_id: schema_id,
+            to_local_id: table_id.clone(),
+            edge_kind: EdgeKind::Contains,
+            evidence_ref: String::new(),
+            confidence: Confidence::Observed,
+            observed_at: 0,
+            grant_epoch: None,
+        });
+        for field in fields {
+            let field_id = format!("{schema}/{table}/{}", field.column);
+            skeleton.nodes.push(SourceGraphNode {
+                source_kind: SourceKind::Pg,
+                source_instance: catalog.object_ref.clone(),
+                local_id: field_id.clone(),
+                node_kind: NodeKind::Field,
+                native_ref: format!(
+                    "pg://{}/{}/{}/{}",
+                    catalog.object_ref, schema, table, field.column
+                ),
+                display_name: field.column.clone(),
+                native_pointer: format!(
+                    "pg://{}/{}/{}/{}",
+                    catalog.object_ref, schema, table, field.column
+                ),
+                fingerprint: field.column_type.clone(),
+                observed_at: 0,
+                grant_epoch: None,
+            });
+            skeleton.edges.push(SourceGraphEdge {
+                source_kind: SourceKind::Pg,
+                source_instance: catalog.object_ref.clone(),
+                from_local_id: table_id.clone(),
+                to_local_id: field_id,
+                edge_kind: EdgeKind::HasField,
+                evidence_ref: String::new(),
+                confidence: Confidence::Observed,
+                observed_at: 0,
+                grant_epoch: None,
+            });
+        }
+    }
+    skeleton
+}
+
+pub fn skeleton_from_csv_fields(catalog: &csv_source::CsvFieldCatalog) -> SourceGraphSkeleton {
+    skeleton_from_delimited_fields(
+        SourceKind::Csv,
+        &catalog.object_ref,
+        &catalog.path,
+        catalog
+            .fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.field_type.as_str())),
+        None,
+    )
+}
+
+pub fn skeleton_from_csv_batch(batch: &csv_source::CsvRecordBatch) -> SourceGraphSkeleton {
+    let mut skeleton = skeleton_from_delimited_fields(
+        SourceKind::Csv,
+        &batch.object_ref,
+        &batch.path,
+        batch.fields.iter().map(|field| (field.as_str(), "string")),
+        batch.grant_epoch,
+    );
+    for record in &batch.records {
+        let record_id = format!("{}/_row/{}", batch.path, record.row_number);
+        skeleton.nodes.push(SourceGraphNode {
+            source_kind: SourceKind::Csv,
+            source_instance: batch.object_ref.clone(),
+            local_id: record_id.clone(),
+            node_kind: NodeKind::Entity,
+            native_ref: format!(
+                "csv://{}/{}#row={}",
+                batch.object_ref, batch.path, record.row_number
+            ),
+            display_name: format!("row {}", record.row_number),
+            native_pointer: format!("{}:{}", batch.path, record.row_number),
+            fingerprint: Some(format!("row_number={}", record.row_number)),
+            observed_at: 0,
+            grant_epoch: batch.grant_epoch,
+        });
+        skeleton.edges.push(SourceGraphEdge {
+            source_kind: SourceKind::Csv,
+            source_instance: batch.object_ref.clone(),
+            from_local_id: batch.path.clone(),
+            to_local_id: record_id,
+            edge_kind: EdgeKind::Contains,
+            evidence_ref: String::new(),
+            confidence: Confidence::Observed,
+            observed_at: 0,
+            grant_epoch: batch.grant_epoch,
+        });
+    }
+    skeleton
+}
+
+pub fn skeleton_from_jsonl_fields(
+    catalog: &jsonl_source::JsonlFieldCatalog,
+) -> SourceGraphSkeleton {
+    skeleton_from_delimited_fields(
+        SourceKind::Jsonl,
+        &catalog.object_ref,
+        &catalog.path,
+        catalog
+            .fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.field_type.as_str())),
+        None,
+    )
+}
+
+pub fn skeleton_from_jsonl_batch(batch: &jsonl_source::JsonlRecordBatch) -> SourceGraphSkeleton {
+    let mut skeleton = skeleton_from_delimited_fields(
+        SourceKind::Jsonl,
+        &batch.object_ref,
+        &batch.path,
+        std::iter::empty::<(&str, &str)>(),
+        batch.grant_epoch,
+    );
+    for record in &batch.records {
+        let record_id = format!("{}/_line/{}", batch.path, record.line_number);
+        skeleton.nodes.push(SourceGraphNode {
+            source_kind: SourceKind::Jsonl,
+            source_instance: batch.object_ref.clone(),
+            local_id: record_id.clone(),
+            node_kind: NodeKind::Entity,
+            native_ref: format!(
+                "jsonl://{}/{}#line={}",
+                batch.object_ref, batch.path, record.line_number
+            ),
+            display_name: format!("line {}", record.line_number),
+            native_pointer: format!("{}:{}", batch.path, record.line_number),
+            fingerprint: Some(format!("line_number={}", record.line_number)),
+            observed_at: 0,
+            grant_epoch: batch.grant_epoch,
+        });
+        skeleton.edges.push(SourceGraphEdge {
+            source_kind: SourceKind::Jsonl,
+            source_instance: batch.object_ref.clone(),
+            from_local_id: batch.path.clone(),
+            to_local_id: record_id,
+            edge_kind: EdgeKind::Contains,
+            evidence_ref: String::new(),
+            confidence: Confidence::Observed,
+            observed_at: 0,
+            grant_epoch: batch.grant_epoch,
+        });
+    }
+    skeleton
+}
+
+fn skeleton_from_delimited_fields<'a, I>(
+    source_kind: SourceKind,
+    object_ref: &str,
+    path: &str,
+    fields: I,
+    grant_epoch: Option<u64>,
+) -> SourceGraphSkeleton
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut skeleton = SourceGraphSkeleton::default();
+    let scheme = source_kind.as_str();
+    skeleton.nodes.push(SourceGraphNode {
+        source_kind: source_kind.clone(),
+        source_instance: object_ref.to_string(),
+        local_id: path.to_string(),
+        node_kind: NodeKind::Collection,
+        native_ref: format!("{scheme}://{object_ref}/{path}"),
+        display_name: path.to_string(),
+        native_pointer: path.to_string(),
+        fingerprint: None,
+        observed_at: 0,
+        grant_epoch,
+    });
+    for (name, field_type) in fields {
+        let field_id = format!("{path}/_field/{name}");
+        skeleton.nodes.push(SourceGraphNode {
+            source_kind: source_kind.clone(),
+            source_instance: object_ref.to_string(),
+            local_id: field_id.clone(),
+            node_kind: NodeKind::Field,
+            native_ref: format!("{scheme}://{object_ref}/{path}/_field/{name}"),
+            display_name: name.to_string(),
+            native_pointer: format!("{path}:{name}"),
+            fingerprint: Some(field_type.to_string()),
+            observed_at: 0,
+            grant_epoch,
+        });
+        skeleton.edges.push(SourceGraphEdge {
+            source_kind: source_kind.clone(),
+            source_instance: object_ref.to_string(),
+            from_local_id: path.to_string(),
+            to_local_id: field_id,
+            edge_kind: EdgeKind::HasField,
+            evidence_ref: String::new(),
+            confidence: Confidence::Observed,
+            observed_at: 0,
+            grant_epoch,
+        });
+    }
+    skeleton
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PgCatalogSeed {
     pub object_ref: String,
@@ -1232,6 +1602,8 @@ fn parse_source_kind(value: String) -> SourceKind {
         "es" => SourceKind::Es,
         "mysql" => SourceKind::Mysql,
         "pg" => SourceKind::Pg,
+        "csv" => SourceKind::Csv,
+        "jsonl" => SourceKind::Jsonl,
         _ => SourceKind::Other(value),
     }
 }
@@ -1296,6 +1668,8 @@ mod tests {
             SourceKind::Es,
             SourceKind::Mysql,
             SourceKind::Pg,
+            SourceKind::Csv,
+            SourceKind::Jsonl,
         ] {
             let skeleton = SourceGraphSkeleton {
                 nodes: vec![SourceGraphNode {
@@ -1317,10 +1691,12 @@ mod tests {
             store.ingest(skeleton).expect("ingest");
         }
         let coverage = store.coverage();
-        assert_eq!(coverage.source_counts.len(), 6);
+        assert_eq!(coverage.source_counts.len(), 8);
         assert_eq!(coverage.source_counts[&SourceKind::Fs], 1);
         assert_eq!(coverage.source_counts[&SourceKind::LocalFs], 1);
         assert_eq!(coverage.source_counts[&SourceKind::Pg], 1);
+        assert_eq!(coverage.source_counts[&SourceKind::Csv], 1);
+        assert_eq!(coverage.source_counts[&SourceKind::Jsonl], 1);
     }
 
     #[test]
@@ -1384,14 +1760,14 @@ mod tests {
                     SourceGraphNode {
                         source_kind: SourceKind::Fs,
                         source_instance: "bio-nfs".into(),
-                        local_id: "/mnt/ncbi_backup_2022/GEN/gene/DATA/gene_info.gz".into(),
+                        local_id: "/srv/source-data/ncbi/GEN/gene/DATA/gene_info.gz".into(),
                         node_kind: NodeKind::Asset,
                         native_ref:
-                            "fs://10.3.200.29/mnt/ncbi_backup_2022/GEN/gene/DATA/gene_info.gz"
+                            "fs://192.0.2.29/srv/source-data/ncbi/GEN/gene/DATA/gene_info.gz"
                                 .into(),
                         display_name: "gene_info.gz".into(),
                         native_pointer:
-                            "fs-meta:bio-nfs:/mnt/ncbi_backup_2022/GEN/gene/DATA/gene_info.gz"
+                            "fs-meta:bio-nfs:/srv/source-data/ncbi/GEN/gene/DATA/gene_info.gz"
                                 .into(),
                         fingerprint: Some("gene_info".into()),
                         observed_at: 1,
@@ -1415,7 +1791,7 @@ mod tests {
                     from: SourceGraphEndpoint::new(
                         SourceKind::Fs,
                         "bio-nfs",
-                        "/mnt/ncbi_backup_2022/GEN/gene/DATA/gene_info.gz",
+                        "/srv/source-data/ncbi/GEN/gene/DATA/gene_info.gz",
                     ),
                     to: SourceGraphEndpoint::new(
                         SourceKind::Pg,
@@ -1435,7 +1811,7 @@ mod tests {
         let source_gid = graph_gid(
             &SourceKind::Fs,
             "bio-nfs",
-            "/mnt/ncbi_backup_2022/GEN/gene/DATA/gene_info.gz",
+            "/srv/source-data/ncbi/GEN/gene/DATA/gene_info.gz",
         );
         let edges = store.neighbors(
             &source_gid,
@@ -1452,63 +1828,11 @@ mod tests {
     }
 
     #[test]
-    fn manifest_config_can_seed_bio_pipeline_mock() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/bio-mock");
-        let mut bio_cfg = HashMap::new();
-        bio_cfg.insert("enabled".into(), ConfigValue::Bool(true));
-        bio_cfg.insert(
-            "schema_path".into(),
-            ConfigValue::String(root.join("PPG_Schema.json").display().to_string()),
-        );
-        bio_cfg.insert(
-            "union_schema_path".into(),
-            ConfigValue::String(root.join("PPG_Union_Schema.json").display().to_string()),
-        );
-        bio_cfg.insert(
-            "ppg_status_json_path".into(),
-            ConfigValue::String(root.join("ppg-status.json").display().to_string()),
-        );
-        let mut cfg = HashMap::new();
-        cfg.insert("bio_pipeline_mock".into(), ConfigValue::Map(bio_cfg));
-
-        let skeleton = skeleton_from_manifest_config(&cfg).expect("manifest skeleton");
-        assert!(
-            skeleton
-                .nodes
-                .iter()
-                .any(|node| node.source_kind == SourceKind::Fs)
-        );
-        assert!(
-            skeleton
-                .nodes
-                .iter()
-                .any(|node| node.source_kind == SourceKind::LocalFs)
-        );
-        assert!(
-            skeleton
-                .nodes
-                .iter()
-                .any(|node| node.source_kind == SourceKind::Es)
-        );
-        assert!(
-            skeleton
-                .nodes
-                .iter()
-                .any(|node| node.source_kind == SourceKind::Pg)
-        );
-        assert!(
-            skeleton
-                .cross_edges
-                .iter()
-                .any(|edge| edge.edge_kind == EdgeKind::ProjectedAs)
-        );
-    }
-
-    #[test]
     fn es_adapter_does_not_copy_document_source_payload() {
         let batch = es_source::EsSourceBatch {
             object_ref: "es-prod".into(),
             index: "reads".into(),
+            source_revision: "es-pit:reads".into(),
             documents: vec![es_source::EsDocumentEvent {
                 event_kind: es_source::EsDocumentEventKind::SnapshotInsert,
                 index: "reads".into(),
@@ -1534,6 +1858,267 @@ mod tests {
                     .unwrap_or("")
                     .contains("payload")
         }));
+    }
+
+    #[test]
+    fn typed_source_ingest_requests_promote_payloads_to_graph() {
+        let mut store = UnionGraphStore::default();
+
+        let s3_batch = s3_source::S3ObjectBatch {
+            object_ref: "s3-prod".into(),
+            bucket: "logs".into(),
+            prefix: "2026/".into(),
+            source_revision: "s3-list-observation:a".into(),
+            objects: vec![s3_source::S3ObjectEvent {
+                key: "2026/a.json".into(),
+                size: 12,
+                last_modified_unix_ms: 123,
+                etag: Some("etag-a".into()),
+                storage_class: Some("STANDARD".into()),
+                owner_id: None,
+                owner_display_name: None,
+                metadata: json!({}),
+            }],
+            next_cursor: None,
+            has_more: false,
+            grant_epoch: Some(7),
+            diagnostics: None,
+        };
+        let payload = handle_store_request(
+            &mut store,
+            UnionGraphRequest::IngestS3Batch { batch: s3_batch },
+        )
+        .expect("s3 ingest");
+        match payload {
+            UnionGraphPayload::IngestAck(ack) => {
+                assert_eq!(ack.nodes_upserted, 2);
+                assert_eq!(ack.edges_upserted, 1);
+            }
+            other => panic!("expected ingest ack, got {other:?}"),
+        }
+        let bucket_gid = graph_gid(&SourceKind::S3, "s3-prod", "logs");
+        assert_eq!(store.get_node(&bucket_gid).unwrap().observed_at, 123);
+
+        let es_fields = es_source::EsFieldCatalog {
+            object_ref: "es-prod".into(),
+            index: "reads".into(),
+            fields: vec![es_source::EsFieldDescriptor {
+                name: "sample_id".into(),
+                field_type: Some("keyword".into()),
+            }],
+        };
+        handle_store_request(
+            &mut store,
+            UnionGraphRequest::IngestEsFields { catalog: es_fields },
+        )
+        .expect("es fields ingest");
+
+        let es_batch = es_source::EsSourceBatch {
+            object_ref: "es-prod".into(),
+            index: "reads".into(),
+            source_revision: "es-pit:reads".into(),
+            documents: vec![es_source::EsDocumentEvent {
+                event_kind: es_source::EsDocumentEventKind::SnapshotInsert,
+                index: "reads".into(),
+                id: "doc-1".into(),
+                timestamp_value: None,
+                sort: Vec::new(),
+                seq_no: Some(1),
+                primary_term: Some(1),
+                source: json!({"large": "payload"}),
+                metadata: BTreeMap::new(),
+            }],
+            next_cursor: None,
+            has_more: false,
+            grant_epoch: Some(8),
+            diagnostics: None,
+        };
+        handle_store_request(
+            &mut store,
+            UnionGraphRequest::IngestEsBatch { batch: es_batch },
+        )
+        .expect("es batch ingest");
+
+        let mysql_fields = mysql_source::MysqlFieldCatalog {
+            object_ref: "mysql-prod".into(),
+            fields: vec![mysql_source::MysqlFieldDescriptor {
+                schema: "app".into(),
+                table: "users".into(),
+                column: "id".into(),
+                ordinal_position: Some(1),
+                column_type: Some("bigint".into()),
+            }],
+        };
+        handle_store_request(
+            &mut store,
+            UnionGraphRequest::IngestMysqlFields {
+                catalog: mysql_fields,
+            },
+        )
+        .expect("mysql fields ingest");
+
+        let local_fs_batch = local_fs_source::LocalFsEntryBatch {
+            object_ref: "local".into(),
+            root_path: "/data".into(),
+            path: "datasets".into(),
+            source_revision: "fs:datasets".into(),
+            entries: vec![local_fs_source::LocalFsEntry {
+                path: "datasets/a.csv".into(),
+                file_name: "a.csv".into(),
+                is_dir: false,
+                size: 10,
+                modified_unix_ms: Some(321),
+            }],
+            next_cursor: None,
+            has_more: false,
+            grant_epoch: Some(4),
+            diagnostics: None,
+        };
+        handle_store_request(
+            &mut store,
+            UnionGraphRequest::IngestLocalFsEntries {
+                batch: local_fs_batch,
+            },
+        )
+        .expect("local-fs ingest");
+
+        let pg_fields = pg_source::PgFieldCatalog {
+            object_ref: "pg-prod".into(),
+            fields: vec![pg_source::PgFieldDescriptor {
+                schema: "public".into(),
+                table: "events".into(),
+                column: "id".into(),
+                ordinal_position: Some(1),
+                column_type: Some("bigint".into()),
+            }],
+        };
+        handle_store_request(
+            &mut store,
+            UnionGraphRequest::IngestPgFields { catalog: pg_fields },
+        )
+        .expect("pg fields ingest");
+
+        let csv_fields = csv_source::CsvFieldCatalog {
+            object_ref: "csv-prod".into(),
+            path: "datasets/a.csv".into(),
+            fields: vec![csv_source::CsvFieldDescriptor {
+                name: "sample_id".into(),
+                field_type: "string".into(),
+            }],
+        };
+        handle_store_request(
+            &mut store,
+            UnionGraphRequest::IngestCsvFields {
+                catalog: csv_fields,
+            },
+        )
+        .expect("csv fields ingest");
+
+        let csv_batch = csv_source::CsvRecordBatch {
+            object_ref: "csv-prod".into(),
+            root_path: "/data".into(),
+            path: "datasets/a.csv".into(),
+            source_revision: "fs:csv-a".into(),
+            fields: vec!["sample_id".into()],
+            records: vec![csv_source::CsvRecord {
+                row_number: 2,
+                values: json!({"sample_id": "S1", "large": "payload"}),
+            }],
+            next_cursor: None,
+            has_more: false,
+            grant_epoch: Some(5),
+            diagnostics: None,
+        };
+        handle_store_request(
+            &mut store,
+            UnionGraphRequest::IngestCsvBatch { batch: csv_batch },
+        )
+        .expect("csv batch ingest");
+
+        let jsonl_fields = jsonl_source::JsonlFieldCatalog {
+            object_ref: "jsonl-prod".into(),
+            path: "datasets/a.jsonl".into(),
+            fields: vec![jsonl_source::JsonlFieldDescriptor {
+                name: "sample_id".into(),
+                field_type: "string".into(),
+            }],
+        };
+        handle_store_request(
+            &mut store,
+            UnionGraphRequest::IngestJsonlFields {
+                catalog: jsonl_fields,
+            },
+        )
+        .expect("jsonl fields ingest");
+
+        let jsonl_batch = jsonl_source::JsonlRecordBatch {
+            object_ref: "jsonl-prod".into(),
+            root_path: "/data".into(),
+            path: "datasets/a.jsonl".into(),
+            source_revision: "fs:jsonl-a".into(),
+            records: vec![jsonl_source::JsonlRecord {
+                line_number: 1,
+                values: json!({"sample_id": "S1", "large": "payload"}),
+            }],
+            next_cursor: None,
+            has_more: false,
+            grant_epoch: Some(6),
+            diagnostics: None,
+        };
+        handle_store_request(
+            &mut store,
+            UnionGraphRequest::IngestJsonlBatch { batch: jsonl_batch },
+        )
+        .expect("jsonl batch ingest");
+
+        let coverage = store.coverage();
+        assert_eq!(coverage.source_counts[&SourceKind::S3], 2);
+        assert!(coverage.source_counts[&SourceKind::Es] >= 3);
+        assert_eq!(coverage.source_counts[&SourceKind::Mysql], 3);
+        assert_eq!(coverage.source_counts[&SourceKind::LocalFs], 2);
+        assert_eq!(coverage.source_counts[&SourceKind::Pg], 3);
+        assert_eq!(coverage.source_counts[&SourceKind::Csv], 3);
+        assert_eq!(coverage.source_counts[&SourceKind::Jsonl], 3);
+        assert!(store.nodes.values().all(|node| {
+            !node.native_pointer.contains("payload")
+                && !node
+                    .fingerprint
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("payload")
+        }));
+    }
+
+    #[test]
+    fn typed_source_ingest_request_roundtrips_msgpack() {
+        let request = UnionGraphRequest::IngestS3Batch {
+            batch: s3_source::S3ObjectBatch {
+                object_ref: "s3-prod".into(),
+                bucket: "logs".into(),
+                prefix: "2026/".into(),
+                source_revision: "s3-list-observation:a".into(),
+                objects: vec![s3_source::S3ObjectEvent {
+                    key: "2026/a.json".into(),
+                    size: 12,
+                    last_modified_unix_ms: 123,
+                    etag: Some("etag-a".into()),
+                    storage_class: Some("STANDARD".into()),
+                    owner_id: None,
+                    owner_display_name: None,
+                    metadata: json!({"class": "example"}),
+                }],
+                next_cursor: None,
+                has_more: false,
+                grant_epoch: Some(7),
+                diagnostics: None,
+            },
+        };
+
+        let encoded = encode_msgpack(&request).expect("encode typed ingest request");
+        let restored: UnionGraphRequest =
+            decode_msgpack(&encoded).expect("decode typed ingest request");
+
+        assert_eq!(restored, request);
     }
 
     #[test]

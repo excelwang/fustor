@@ -470,7 +470,7 @@
                 .resolve_for_candidate_ids(&["listener-a".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
-            app.runtime_boundary.clone(),
+            None,
             app.source.clone(),
             app.sink.clone(),
             app.query_sink.clone(),

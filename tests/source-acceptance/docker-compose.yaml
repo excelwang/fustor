@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:14
+    cpus: "${SOURCE_ACCEPTANCE_POSTGRES_CPUS:-0.50}"
+    pull_policy: ${SOURCE_ACCEPTANCE_PULL_POLICY:-missing}
+    environment:
+      POSTGRES_DB: fustor_demo
+      POSTGRES_USER: fustor
+      POSTGRES_PASSWORD: fustorpass
+    ports:
+      - "127.0.0.1::5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fustor -d fustor_demo"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  mysql:
+    image: mysql:8.4
+    cpus: "${SOURCE_ACCEPTANCE_MYSQL_CPUS:-0.75}"
+    pull_policy: ${SOURCE_ACCEPTANCE_PULL_POLICY:-missing}
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: fustor_demo
+    ports:
+      - "127.0.0.1::3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -prootpass --silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    cpus: "${SOURCE_ACCEPTANCE_ELASTICSEARCH_CPUS:-1.50}"
+    pull_policy: ${SOURCE_ACCEPTANCE_PULL_POLICY:-missing}
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "127.0.0.1::9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9200/_cluster/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    cpus: "${SOURCE_ACCEPTANCE_MINIO_CPUS:-0.50}"
+    pull_policy: ${SOURCE_ACCEPTANCE_PULL_POLICY:-missing}
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "127.0.0.1::9000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  minio-mc:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    cpus: "${SOURCE_ACCEPTANCE_MINIO_MC_CPUS:-0.25}"
+    pull_policy: ${SOURCE_ACCEPTANCE_PULL_POLICY:-missing}
+    entrypoint: ["/bin/sh"]
+    depends_on:
+      minio:
+        condition: service_healthy

@@ -24,6 +24,13 @@ pub type ManagementWriteRecoveryFuture =
 pub type ManagementWriteRecovery =
     Arc<dyn Fn() -> ManagementWriteRecoveryFuture + Send + Sync + 'static>;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SinkObservationRepairRepublishRequest {
+    pub(crate) groups: BTreeSet<String>,
+    pub(crate) sink_owner_candidates_by_group: BTreeMap<String, BTreeSet<String>>,
+    pub(crate) source_owner_candidates_by_group: BTreeMap<String, BTreeSet<String>>,
+}
+
 #[derive(Clone, Default)]
 pub struct ForceFindRunnerEvidence {
     runners_by_group: Arc<Mutex<BTreeMap<String, BTreeSet<String>>>>,
@@ -63,15 +70,18 @@ pub struct ApiRequestTracker {
 #[derive(Clone, Copy, Debug)]
 pub struct ApiRequestControlReadinessSnapshot {
     pub control_gate_fully_ready: bool,
+    pub source_repair_ready: bool,
 }
 
 pub struct ApiControlGate {
+    instance_id: u64,
     ready: AtomicBool,
     management_write_ready: AtomicBool,
     source_repair_ready: AtomicBool,
     management_write_drain_closed: AtomicBool,
     sink_observation_repair_force_republish: AtomicBool,
-    sink_observation_repair_republish_groups: Mutex<BTreeSet<String>>,
+    sink_observation_repair_wake_inflight: AtomicBool,
+    sink_observation_repair_republish_request: Mutex<SinkObservationRepairRepublishRequest>,
     epoch: AtomicU64,
     changed: Notify,
     facade_request_tracker: Arc<ApiRequestTracker>,
@@ -81,6 +91,8 @@ pub struct ApiControlGate {
     source_repair_recovery: RwLock<Option<ManagementWriteRecovery>>,
     sink_repair_recovery: RwLock<Option<ManagementWriteRecovery>>,
 }
+
+static NEXT_API_CONTROL_GATE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct ApiRequestGuard {
     tracker: Arc<ApiRequestTracker>,
@@ -111,12 +123,16 @@ impl ApiRequestTracker {
 impl ApiControlGate {
     pub fn new(ready: bool) -> Self {
         Self {
+            instance_id: NEXT_API_CONTROL_GATE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             ready: AtomicBool::new(ready),
             management_write_ready: AtomicBool::new(ready),
             source_repair_ready: AtomicBool::new(ready),
             management_write_drain_closed: AtomicBool::new(false),
             sink_observation_repair_force_republish: AtomicBool::new(false),
-            sink_observation_repair_republish_groups: Mutex::new(BTreeSet::new()),
+            sink_observation_repair_wake_inflight: AtomicBool::new(false),
+            sink_observation_repair_republish_request: Mutex::new(
+                SinkObservationRepairRepublishRequest::default(),
+            ),
             epoch: AtomicU64::new(0),
             changed: Notify::new(),
             facade_request_tracker: Arc::new(ApiRequestTracker::default()),
@@ -126,6 +142,10 @@ impl ApiControlGate {
             source_repair_recovery: RwLock::new(None),
             sink_repair_recovery: RwLock::new(None),
         }
+    }
+
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     pub fn is_ready(&self) -> bool {
@@ -279,21 +299,86 @@ impl ApiControlGate {
             .and_then(|guard| guard.clone())
     }
 
+    pub(crate) fn try_begin_sink_observation_repair_wake(&self) -> bool {
+        self.sink_observation_repair_wake_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn finish_sink_observation_repair_wake(&self) {
+        self.sink_observation_repair_wake_inflight
+            .store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sink_observation_repair_wake_inflight(&self) -> bool {
+        self.sink_observation_repair_wake_inflight
+            .load(Ordering::Acquire)
+    }
+
     pub fn request_sink_observation_repair_republish(&self) {
         self.sink_observation_repair_force_republish
             .store(true, Ordering::Release);
     }
 
+    #[cfg(test)]
     pub fn request_sink_observation_repair_republish_for_groups(&self, groups: &BTreeSet<String>) {
+        self.request_sink_observation_repair_republish_for_groups_with_owner_candidates(
+            groups,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+    }
+
+    pub fn request_sink_observation_repair_republish_for_groups_with_owner_candidates(
+        &self,
+        groups: &BTreeSet<String>,
+        sink_owner_candidates_by_group: &BTreeMap<String, BTreeSet<String>>,
+        source_owner_candidates_by_group: &BTreeMap<String, BTreeSet<String>>,
+    ) {
         if !groups.is_empty()
-            && let Ok(mut guard) = self.sink_observation_repair_republish_groups.lock()
+            && let Ok(mut guard) = self.sink_observation_repair_republish_request.lock()
         {
-            guard.extend(groups.iter().filter(|group| !group.is_empty()).cloned());
+            guard
+                .groups
+                .extend(groups.iter().filter(|group| !group.is_empty()).cloned());
+            for (group, owner_candidates) in sink_owner_candidates_by_group {
+                if !groups.contains(group) || group.is_empty() {
+                    continue;
+                }
+                guard
+                    .sink_owner_candidates_by_group
+                    .entry(group.clone())
+                    .or_default()
+                    .extend(
+                        owner_candidates
+                            .iter()
+                            .filter(|owner| !owner.trim().is_empty())
+                            .cloned(),
+                    );
+            }
+            for (group, owner_candidates) in source_owner_candidates_by_group {
+                if !groups.contains(group) || group.is_empty() {
+                    continue;
+                }
+                guard
+                    .source_owner_candidates_by_group
+                    .entry(group.clone())
+                    .or_default()
+                    .extend(
+                        owner_candidates
+                            .iter()
+                            .filter(|owner| !owner.trim().is_empty())
+                            .cloned(),
+                    );
+            }
         }
         self.request_sink_observation_repair_republish();
     }
 
-    pub fn take_sink_observation_repair_republish_groups(&self) -> Option<BTreeSet<String>> {
+    pub(crate) fn take_sink_observation_repair_republish_request(
+        &self,
+    ) -> Option<SinkObservationRepairRepublishRequest> {
         if !self
             .sink_observation_repair_force_republish
             .swap(false, Ordering::AcqRel)
@@ -301,16 +386,21 @@ impl ApiControlGate {
             return None;
         }
         Some(
-            self.sink_observation_repair_republish_groups
+            self.sink_observation_repair_republish_request
                 .lock()
                 .map(|mut guard| std::mem::take(&mut *guard))
                 .unwrap_or_default(),
         )
     }
 
+    pub(crate) fn sink_observation_repair_republish_pending(&self) -> bool {
+        self.sink_observation_repair_force_republish
+            .load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub fn take_sink_observation_repair_republish(&self) -> bool {
-        self.take_sink_observation_repair_republish_groups()
+        self.take_sink_observation_repair_republish_request()
             .is_some()
     }
 

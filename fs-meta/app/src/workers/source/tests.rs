@@ -369,6 +369,7 @@ fn source_control_frame_machine_owns_post_ack_schedule_refresh_followup_lane() {
         saw_activate_with_bound_scopes: true,
         has_local_runnable_groups: true,
         saw_runtime_host_grant_change: false,
+        local_schedule_changed: true,
     });
     let post_ack = machine
         .advance(SourceControlFrameEvent::RpcCompleted {
@@ -435,6 +436,7 @@ fn source_control_frame_machine_skips_replay_recovery_cache_priming_without_refr
         saw_activate_with_bound_scopes: true,
         has_local_runnable_groups: true,
         saw_runtime_host_grant_change: false,
+        local_schedule_changed: false,
     });
 
     let post_ack = machine
@@ -455,6 +457,77 @@ fn source_control_frame_machine_skips_replay_recovery_cache_priming_without_refr
             )
         ) && machine.pending_refresh.is_none(),
         "source control-frame machine should keep replay-recovery cache priming inside explicit post-ack effect payload instead of running replay-recovery priming unconditionally",
+    );
+}
+
+#[test]
+fn source_control_frame_machine_skips_equivalent_route_refresh_but_preserves_replay_probe() {
+    let activate = source_control_state_test_activate_signal(
+        SourceRuntimeUnit::Source,
+        ROUTE_KEY_QUERY,
+        2,
+        vec![RuntimeBoundScope {
+            scope_id: "nfs1".to_string(),
+            resource_ids: vec!["node-a::nfs1".to_string()],
+        }],
+    );
+    let unchanged_schedule = PrimedLocalScheduleSummary {
+        saw_activate_with_bound_scopes: true,
+        has_local_runnable_groups: true,
+        saw_runtime_host_grant_change: false,
+        local_schedule_changed: false,
+    };
+
+    let mut equivalent_route = source_control_frame_test_machine();
+    equivalent_route.decoded_signals =
+        SourceControlFrameDecodedSignals::Decoded(vec![activate.clone()]);
+    equivalent_route.post_ack_refresh_requirement =
+        SourceControlFramePostAckRefreshRequirement::Required;
+    equivalent_route.primed_local_schedule = Some(unchanged_schedule);
+    let equivalent_route_post_ack = equivalent_route
+        .advance(SourceControlFrameEvent::RpcCompleted {
+            rpc_result: Ok(SourceWorkerResponse::Ack),
+            before: SourceProgressState::default(),
+            after: SourceProgressState::default(),
+        })
+        .expect("equivalent route ACK should complete through cache retention");
+
+    assert!(
+        matches!(
+            equivalent_route_post_ack.inspect(),
+            Some(
+                SourceControlFrameLaneInspect::ApplyPostAckCacheAndRetainSignals {
+                    cache_priming: SourceControlFramePostAckCachePriming::Standard,
+                }
+            )
+        ) && equivalent_route.pending_refresh.is_none(),
+        "a route-only activation that leaves the local source/scan schedule unchanged must not spend the process activation budget on a redundant live schedule read",
+    );
+
+    let mut retained_replay = source_control_frame_test_machine();
+    retained_replay.decoded_signals = SourceControlFrameDecodedSignals::Decoded(vec![activate]);
+    retained_replay.post_ack_refresh_requirement =
+        SourceControlFramePostAckRefreshRequirement::Required;
+    retained_replay.primed_local_schedule = Some(unchanged_schedule);
+    retained_replay.replay_required_for_current_wave = true;
+    let replay_post_ack = retained_replay
+        .advance(SourceControlFrameEvent::RpcCompleted {
+            rpc_result: Ok(SourceWorkerResponse::Ack),
+            before: SourceProgressState::default(),
+            after: SourceProgressState::default(),
+        })
+        .expect("retained replay ACK should retain its live schedule followup");
+
+    assert!(
+        matches!(
+            replay_post_ack.inspect(),
+            Some(
+                SourceControlFrameLaneInspect::ApplyPostAckCacheAndRetainSignals {
+                    cache_priming: SourceControlFramePostAckCachePriming::ReplayRecovery,
+                }
+            )
+        ) && retained_replay.pending_refresh.is_some(),
+        "retained replay must keep the live schedule continuity probe even when the projected local schedule is unchanged",
     );
 }
 
@@ -1123,10 +1196,10 @@ fn source_operations_hard_cut_removed_generic_operation_machine_family() {
         "fn shape_source_retry_budget_exhaustion(",
         "fn into_error(self) -> CnxError {",
         "enum SourceReconnectRetryDisposition {",
-        "enum SourceWaitRetryDisposition {",
+        "enum SourceScheduledGroupsRefreshRetryDisposition {",
         "struct SourceRetryMachine {",
         "fn reconnect_after_update_roots_gap(",
-        "fn wait_after_retryable_gap(",
+        "fn reconnect_after_retryable_gap(",
         "fn take_pending_reconnect_wait_after(",
         "fn missing_source_reconnect_wait_after(",
         "fn missing_control_frame_pending_reconnect_resume(",
@@ -2151,6 +2224,27 @@ fn source_local_update_roots_typed_helper_does_not_bounce_through_raw_wrapper() 
 }
 
 #[test]
+fn source_roots_control_uses_generation_aware_follower_apply_without_authority_rewrite() {
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+    let worker_client_impl = include_str!("../source.rs");
+    let worker_protocol = include_str!("../source_ipc.rs");
+    let runtime_app = include_str!("../../runtime_app.rs");
+
+    assert!(
+        source_runtime_impl
+            .contains("pub(crate) async fn apply_propagated_logical_roots_declaration(")
+    );
+    assert!(source_runtime_impl.contains(
+        "self.apply_logical_roots_snapshot(roots, false, \"source.apply_propagated_logical_roots\")"
+    ));
+    assert!(source_runtime_impl.contains(".accept_propagated(generation"));
+    assert!(worker_protocol.contains("ApplyPropagatedLogicalRoots"));
+    assert!(worker_client_impl.contains("Some(generation)"));
+    assert!(runtime_app.contains(".apply_propagated_logical_roots_with_failure("));
+    assert!(runtime_app.contains("payload.generation,"));
+}
+
+#[test]
 fn source_local_manual_rescan_typed_helper_does_not_bounce_through_raw_wrapper() {
     let source_impl = include_str!("../source.rs");
     let source_runtime_impl = include_str!("../../source/mod.rs");
@@ -3146,8 +3240,10 @@ fn source_scan_audit_admission_release_submits_intent_without_waiting_for_observ
         .expect("missing following source facade helper");
     let facade_body = &facade_tail[..facade_end];
     assert!(
-        facade_body.contains("Self::Local(source) => {\n                if source.open_scan_audit_admission_if_closed() {\n                    Ok(source.submit_rescan_request_epoch())"),
-        "local source facade admission release must submit the rescan intent without waiting for scan readiness"
+        facade_body.contains(
+            "Self::Local(source) => {\n                Ok(source.open_scan_audit_admission_and_submit_rescan_request_epoch())"
+        ),
+        "local source facade admission release must submit a rescan intent even when admission was already open, without waiting for scan readiness"
     );
 }
 
@@ -3477,6 +3573,8 @@ impl ChannelIoSubset for LoopbackWorkerBoundary {
             .map(Duration::from_millis)
             .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
             {
                 let mut channels = self.channels.lock().await;
                 if let Some(events) = channels.remove(&request.channel_key.0)
@@ -3491,7 +3589,6 @@ impl ChannelIoSubset for LoopbackWorkerBoundary {
                     return Err(CnxError::ChannelClosed);
                 }
             }
-            let notified = self.changed.notified();
             if let Some(deadline) = deadline {
                 match tokio::time::timeout_at(deadline, notified).await {
                     Ok(()) => {}
@@ -3521,6 +3618,8 @@ impl LoopbackWorkerBoundary {
     async fn recv_any_events_stream(&self, timeout_ms: u64) -> Result<Vec<Event>> {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         loop {
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
             {
                 let mut channels = self.channels.lock().await;
                 if let Some(route) = channels
@@ -3543,7 +3642,6 @@ impl LoopbackWorkerBoundary {
             if now >= deadline {
                 return Err(CnxError::Timeout);
             }
-            let notified = self.changed.notified();
             match tokio::time::timeout_at(deadline, notified).await {
                 Ok(()) => {}
                 Err(_) => return Err(CnxError::Timeout),
@@ -3890,6 +3988,10 @@ fn prime_cached_schedule_from_control_signals_treats_source_unit_as_source_side_
         summary.has_local_runnable_groups,
         "scan-enabled roots should still report local runnable groups"
     );
+    assert!(
+        summary.local_schedule_changed,
+        "the first local source/scan projection must be reported as a schedule change"
+    );
     assert_eq!(
         cache.scheduled_source_groups_by_node,
         Some(std::collections::BTreeMap::from([(
@@ -3905,6 +4007,17 @@ fn prime_cached_schedule_from_control_signals_treats_source_unit_as_source_side_
             vec!["nfs1".to_string(), "nfs2".to_string()],
         )])),
         "scan-enabled roots should still prime scheduled scan groups"
+    );
+    let repeated_summary = prime_cached_schedule_from_control_signals(
+        &mut cache,
+        &NodeId("node-a".to_string()),
+        &signals,
+        &roots,
+        &grants,
+    );
+    assert!(
+        !repeated_summary.local_schedule_changed,
+        "an equivalent route activation must preserve the accepted local schedule without requesting another live schedule probe"
     );
 }
 
@@ -3973,6 +4086,10 @@ fn peer_only_activate_wave_does_not_clear_cached_local_runtime_scope() {
     assert!(
         !summary.has_local_runnable_groups,
         "peer-only route activation should not claim local runnable groups"
+    );
+    assert!(
+        !summary.local_schedule_changed,
+        "a peer-only activation must not report a local schedule change"
     );
     assert_eq!(
         cache.scheduled_source_groups_by_node,
@@ -4309,6 +4426,57 @@ fn bound_scope_with_resources(scope_id: &str, resource_ids: &[&str]) -> RuntimeB
         scope_id: scope_id.to_string(),
         resource_ids: resource_ids.iter().map(|id| (*id).to_string()).collect(),
     }
+}
+
+fn source_runtime_control_wave_with_schedules(
+    generation: u64,
+    source_scope_resources: &[(&str, &str)],
+    scan_scope_resources: &[(&str, &str)],
+) -> Vec<capanix_app_sdk::runtime::ControlEnvelope> {
+    let scopes = |rows: &[(&str, &str)]| {
+        rows.iter()
+            .map(|(scope_id, resource_id)| bound_scope_with_resources(scope_id, &[*resource_id]))
+            .collect::<Vec<_>>()
+    };
+
+    vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation,
+            expires_at_ms: 1,
+            bound_scopes: scopes(source_scope_resources),
+        }))
+        .expect("encode source roots activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation,
+            expires_at_ms: 1,
+            bound_scopes: scopes(source_scope_resources),
+        }))
+        .expect("encode source rescan-control activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation,
+            expires_at_ms: 1,
+            bound_scopes: scopes(source_scope_resources),
+        }))
+        .expect("encode source rescan activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation,
+            expires_at_ms: 1,
+            bound_scopes: scopes(scan_scope_resources),
+        }))
+        .expect("encode source scan activate"),
+    ]
 }
 
 fn selected_group_request(path: &[u8], group_id: &str) -> InternalQueryRequest {
@@ -6584,11 +6752,16 @@ async fn observability_snapshot_nonblocking_retries_bound_route_unexpected_corre
         ),
     });
 
-    let snapshot = client
-        .observability_snapshot_nonblocking_for_status_route()
-        .await
-        .0;
+    let (snapshot, used_cached_fallback) = client
+        .current_owner_health_observability_snapshot_for_status_route_with_timeout(Some(
+            Duration::from_secs(5),
+        ))
+        .await;
     let expected = vec!["nfs1".to_string(), "nfs2".to_string()];
+    assert!(
+        !used_cached_fallback,
+        "correlation-mismatch recovery must return a live worker observation, not cached fallback evidence"
+    );
     assert_ne!(
         snapshot.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
         "observability_snapshot_nonblocking should retry a transient bound-route correlation mismatch and reach the live worker"
@@ -6606,9 +6779,9 @@ async fn observability_snapshot_nonblocking_retries_bound_route_unexpected_corre
         snapshot.scheduled_scan_groups_by_node
     );
     assert!(
-        snapshot.status.degraded_roots.is_empty(),
-        "live observability snapshot after correlation-mismatch retry should not degrade: {:?}",
-        snapshot.status.degraded_roots
+        !source_observability_snapshot_is_degraded_worker_cache(&snapshot),
+        "live observability snapshot after correlation-mismatch retry must not carry synthetic worker-cache degradation; concrete-root health remains authoritative: {:?}",
+        snapshot.status.degraded_roots,
     );
 
     client.close().await.expect("close source worker");
@@ -6713,11 +6886,16 @@ async fn observability_snapshot_nonblocking_retries_peer_bridge_stopped_errors_a
         err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
     });
 
-    let snapshot = client
-        .observability_snapshot_nonblocking_for_status_route()
-        .await
-        .0;
+    let (snapshot, used_cached_fallback) = client
+        .current_owner_health_observability_snapshot_for_status_route_with_timeout(Some(
+            Duration::from_secs(5),
+        ))
+        .await;
     let expected = vec!["nfs1".to_string(), "nfs2".to_string()];
+    assert!(
+        !used_cached_fallback,
+        "bridge-stop recovery must return a live worker observation, not cached fallback evidence"
+    );
     assert_ne!(
         snapshot.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
         "observability_snapshot_nonblocking should retry a peer bridge-stopped error after begin and reach the live worker"
@@ -6735,9 +6913,9 @@ async fn observability_snapshot_nonblocking_retries_peer_bridge_stopped_errors_a
         snapshot.scheduled_scan_groups_by_node
     );
     assert!(
-        snapshot.status.degraded_roots.is_empty(),
-        "live observability snapshot after bridge-stopped retry should not degrade: {:?}",
-        snapshot.status.degraded_roots
+        !source_observability_snapshot_is_degraded_worker_cache(&snapshot),
+        "live observability snapshot after bridge-stopped retry must not carry synthetic worker-cache degradation; concrete-root health remains authoritative: {:?}",
+        snapshot.status.degraded_roots,
     );
 
     client.close().await.expect("close source worker");
@@ -8417,7 +8595,7 @@ async fn rootless_source_worker_replacement_bootstraps_from_current_logical_root
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn distinct_worker_bindings_share_started_source_worker_client_on_same_node() {
+async fn distinct_worker_bindings_do_not_share_started_source_worker_client_on_same_node() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -8480,27 +8658,32 @@ async fn distinct_worker_bindings_share_started_source_worker_client_on_same_nod
             .existing_client()
             .await
             .expect("successor existing client after predecessor start")
-            .is_some(),
-        "same-node successor handle should reuse the already-started source worker client even when socket_dir/module_path differ across runtime instances"
-    );
-
-    let roots = successor
-        .logical_roots_snapshot_with_failure()
-        .await
-        .expect("successor logical_roots_snapshot through shared started worker");
-    assert_eq!(
-        roots
-            .iter()
-            .map(|root| root.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["nfs1"],
-        "successor handle should see the shared started worker state after predecessor start"
+            .is_none(),
+        "distinct socket/module bindings must isolate same-node source worker clients"
     );
 
     predecessor
         .close()
         .await
         .expect("close predecessor source worker");
+    tokio::time::timeout(Duration::from_secs(8), successor.start())
+        .await
+        .expect("successor source worker start timed out")
+        .expect("start successor source worker");
+
+    let roots = successor
+        .logical_roots_snapshot_with_failure()
+        .await
+        .expect("successor logical_roots_snapshot through its isolated worker");
+    assert_eq!(
+        roots
+            .iter()
+            .map(|root| root.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["nfs1"],
+        "successor isolated worker should initialize from its own current config"
+    );
+
     successor
         .close()
         .await
@@ -10209,6 +10392,13 @@ async fn generation_two_fs_source_selected_wave_reacquires_worker_client_after_s
         .expect("start source worker");
 
     let source_wave = |generation| {
+        if generation == 1 {
+            return source_runtime_control_wave_with_schedules(
+                generation,
+                &[("nfs1", "nfs1")],
+                &[],
+            );
+        }
         vec![
             encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
@@ -11030,6 +11220,13 @@ async fn generation_two_real_source_route_reacquires_worker_client_after_sticky_
         .expect("start source worker");
 
     let source_wave = |generation| {
+        if generation == 1 {
+            return source_runtime_control_wave_with_schedules(
+                generation,
+                &[("nfs1", "node-a::nfs1")],
+                &[("nfs1", "node-a::nfs1"), ("nfs2", "node-a::nfs2")],
+            );
+        }
         vec![
             encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
@@ -11200,6 +11397,13 @@ async fn generation_two_real_source_route_reacquires_worker_client_after_timeout
         .expect("start source worker");
 
     let source_wave = |generation| {
+        if generation == 1 {
+            return source_runtime_control_wave_with_schedules(
+                generation,
+                &[("nfs1", "node-b::nfs1")],
+                &[("nfs1", "node-b::nfs1"), ("nfs2", "node-b::nfs2")],
+            );
+        }
         vec![
             encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
@@ -11669,6 +11873,13 @@ async fn generation_two_real_source_route_does_not_fail_closed_from_primed_cache
         .expect("start source worker");
 
     let source_wave = |generation| {
+        if generation == 1 {
+            return source_runtime_control_wave_with_schedules(
+                generation,
+                &[("nfs1", "node-b::nfs1")],
+                &[("nfs1", "node-b::nfs1"), ("nfs2", "node-b::nfs2")],
+            );
+        }
         vec![
             encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
@@ -11838,6 +12049,13 @@ async fn generation_two_real_source_route_post_ack_schedule_refresh_exhaustion_d
         .expect("start source worker");
 
     let source_wave = |generation| {
+        if generation == 1 {
+            return source_runtime_control_wave_with_schedules(
+                generation,
+                &[("nfs1", "node-b::nfs1")],
+                &[("nfs1", "node-b::nfs1"), ("nfs2", "node-b::nfs2")],
+            );
+        }
         vec![
             encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
@@ -11989,6 +12207,13 @@ async fn generation_two_real_source_route_post_ack_schedule_refresh_schedule_rpc
         .expect("start source worker");
 
     let source_wave = |generation| {
+        if generation == 1 {
+            return source_runtime_control_wave_with_schedules(
+                generation,
+                &[("nfs1", "node-b::nfs1")],
+                &[("nfs1", "node-b::nfs1"), ("nfs2", "node-b::nfs2")],
+            );
+        }
         vec![
             encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
@@ -12329,6 +12554,13 @@ async fn generation_two_real_source_route_reacquires_worker_client_after_missing
         .expect("start source worker");
 
     let source_wave = |generation| {
+        if generation == 1 {
+            return source_runtime_control_wave_with_schedules(
+                generation,
+                &[("nfs1", "node-d::nfs1")],
+                &[("nfs1", "node-d::nfs1"), ("nfs2", "node-d::nfs2")],
+            );
+        }
         vec![
             encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
@@ -12499,6 +12731,13 @@ async fn generation_two_real_source_route_reacquires_worker_client_after_worker_
         .expect("start source worker");
 
     let source_wave = |generation| {
+        if generation == 1 {
+            return source_runtime_control_wave_with_schedules(
+                generation,
+                &[("nfs1", "node-a::nfs1")],
+                &[("nfs1", "node-a::nfs1"), ("nfs2", "node-a::nfs2")],
+            );
+        }
         vec![
             encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
@@ -12665,6 +12904,13 @@ async fn generation_two_real_source_route_post_ack_schedule_refresh_detaches_sta
         .expect("start source worker");
 
     let source_wave = |generation| {
+        if generation == 1 {
+            return source_runtime_control_wave_with_schedules(
+                generation,
+                &[("nfs1", "node-a::nfs1")],
+                &[("nfs1", "node-a::nfs1"), ("nfs2", "node-a::nfs2")],
+            );
+        }
         vec![
             encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
@@ -12827,6 +13073,13 @@ async fn generation_two_real_source_route_post_ack_schedule_refresh_aborts_infli
         .expect("start source worker");
 
     let source_wave = |generation| {
+        if generation == 1 {
+            return source_runtime_control_wave_with_schedules(
+                generation,
+                &[("nfs1", "node-a::nfs1")],
+                &[("nfs1", "node-a::nfs1"), ("nfs2", "node-a::nfs2")],
+            );
+        }
         vec![
             encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
@@ -14073,10 +14326,29 @@ async fn external_source_worker_real_nfs_manual_rescan_publishes_newly_seeded_su
     client.close().await.expect("close source worker");
 }
 
+// The external worker must observe one process-global debug env value for its full lifetime.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_source_worker_nonblocking_observability_can_serve_stale_published_path_counts_during_control_inflight()
  {
+    struct StreamPathCaptureEnvReset(Option<String>);
+
+    impl Drop for StreamPathCaptureEnvReset {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => unsafe {
+                    std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", value)
+                },
+                None => unsafe { std::env::remove_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE") },
+            }
+        }
+    }
+
+    let _env_serial = crate::source::debug_stream_path_capture_env_serial_guard()
+        .lock()
+        .expect("lock stream path capture environment");
     let previous = std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE").ok();
+    let _env_reset = StreamPathCaptureEnvReset(previous);
     unsafe {
         std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
     }
@@ -14230,15 +14502,31 @@ async fn external_source_worker_nonblocking_observability_can_serve_stale_publis
     );
 
     let _live_worker = client.client().await.expect("reconnect source worker");
-    let live = client
-        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
-        .await
-        .expect("fetch live post-rescan observability snapshot");
-    let live_counts = live
-        .published_path_origin_counts_by_node
-        .get("node-a")
-        .cloned()
-        .unwrap_or_default();
+    let live_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let live_counts = loop {
+        let live = client
+            .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+            .await
+            .expect("fetch live post-rescan observability snapshot");
+        let counts = live
+            .published_path_origin_counts_by_node
+            .get("node-a")
+            .cloned()
+            .unwrap_or_default();
+        let complete = ["node-a::nfs1", "node-a::nfs2"].iter().all(|origin| {
+            counts
+                .iter()
+                .any(|entry| entry.starts_with(&format!("{origin}=")))
+        });
+        if complete {
+            break counts;
+        }
+        assert!(
+            tokio::time::Instant::now() < live_deadline,
+            "published path statistics must converge after both source batches are downstream visible: {counts:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     assert!(
         live_counts
             .iter()
@@ -14253,10 +14541,6 @@ async fn external_source_worker_nonblocking_observability_can_serve_stale_publis
     );
 
     client.close().await.expect("close source worker");
-    match previous {
-        Some(value) => unsafe { std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", value) },
-        None => unsafe { std::env::remove_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE") },
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -14664,6 +14948,45 @@ async fn concurrent_nonblocking_observability_reads_share_one_live_worker_rpc() 
             .scheduled_source_groups_by_node
             .get("node-a"),
         Some(&vec!["nfs1".to_string(), "nfs2".to_string()])
+    );
+
+    let first_owner = client
+        .current_owner_health_observability_snapshot_for_status_route_with_timeout(Some(
+            Duration::from_secs(2),
+        ));
+    let second_owner = client
+        .current_owner_health_observability_snapshot_for_status_route_with_timeout(Some(
+            Duration::from_secs(2),
+        ));
+    let ((first_owner_snapshot, first_owner_cached), (second_owner_snapshot, second_owner_cached)) =
+        tokio::join!(first_owner, second_owner);
+
+    assert_eq!(
+        observability_rpc_count.load(Ordering::Relaxed),
+        2,
+        "overlapping current-owner health reads should share one fresh live worker RPC"
+    );
+    assert!(
+        !first_owner_cached && !second_owner_cached,
+        "an overlapping follower shares the completed live result, not cache-only evidence"
+    );
+    for snapshot in [&first_owner_snapshot, &second_owner_snapshot] {
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string(), "nfs2".to_string()])
+        );
+    }
+
+    let (_, sequential_owner_cached) = client
+        .current_owner_health_observability_snapshot_for_status_route_with_timeout(Some(
+            Duration::from_secs(2),
+        ))
+        .await;
+    assert!(!sequential_owner_cached);
+    assert_eq!(
+        observability_rpc_count.load(Ordering::Relaxed),
+        3,
+        "a later non-overlapping current-owner read must still refresh owner-local evidence"
     );
 
     client.close().await.expect("close source worker");
@@ -15090,7 +15413,7 @@ async fn current_owner_health_observability_reads_live_worker_before_control_cac
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn current_owner_health_observability_reuses_recent_complete_live_cache() {
+async fn current_owner_health_observability_refreshes_recent_complete_live_cache() {
     let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
     let _count_hook_reset = SourceWorkerObservabilityCallCountHookReset;
     let tmp = tempdir().expect("create temp dir");
@@ -15167,13 +15490,13 @@ async fn current_owner_health_observability_reuses_recent_complete_live_cache() 
         .await;
 
     assert!(
-        used_cached_fallback,
-        "recent complete live status should be reused as bounded current-owner evidence"
+        !used_cached_fallback,
+        "current-owner health must refresh even a recent complete snapshot because owner-local scope is current evidence"
     );
     assert_eq!(
         observability_rpc_count.load(Ordering::Relaxed),
-        0,
-        "a second current-owner health probe should not issue another live worker read while a complete live snapshot is still fresh"
+        1,
+        "current-owner health must issue a fresh owner-local worker read"
     );
     assert_eq!(
         owner_health.scheduled_source_groups_by_node.get("node-a"),
@@ -18292,12 +18615,12 @@ fn merge_live_observability_snapshot_with_recent_cache_preserves_missing_current
         last_force_find_runner_by_group: std::collections::BTreeMap::new(),
         force_find_inflight_groups: Vec::new(),
         scheduled_source_groups_by_node: std::collections::BTreeMap::from([
-            ("panda145".to_string(), vec!["nfs-145".to_string()]),
-            ("panda146".to_string(), vec!["nfs-146".to_string()]),
+            ("example-node-145".to_string(), vec!["nfs-145".to_string()]),
+            ("example-node-146".to_string(), vec!["nfs-146".to_string()]),
         ]),
         scheduled_scan_groups_by_node: std::collections::BTreeMap::from([
-            ("panda145".to_string(), vec!["nfs-145".to_string()]),
-            ("panda146".to_string(), vec!["nfs-146".to_string()]),
+            ("example-node-145".to_string(), vec!["nfs-145".to_string()]),
+            ("example-node-146".to_string(), vec!["nfs-146".to_string()]),
         ]),
         last_control_frame_signals_by_node: std::collections::BTreeMap::new(),
         published_batches_by_node: std::collections::BTreeMap::new(),
@@ -18319,19 +18642,19 @@ fn merge_live_observability_snapshot_with_recent_cache_preserves_missing_current
         status: Some(live.status.clone()),
         scheduled_source_groups_by_node: Some(std::collections::BTreeMap::from([
             (
-                "panda144".to_string(),
+                "example-node-144".to_string(),
                 vec!["nfs-144".to_string(), "nfs-retired".to_string()],
             ),
-            ("panda145".to_string(), vec!["nfs-145".to_string()]),
-            ("panda146".to_string(), vec!["nfs-146".to_string()]),
+            ("example-node-145".to_string(), vec!["nfs-145".to_string()]),
+            ("example-node-146".to_string(), vec!["nfs-146".to_string()]),
         ])),
         scheduled_scan_groups_by_node: Some(std::collections::BTreeMap::from([
             (
-                "panda144".to_string(),
+                "example-node-144".to_string(),
                 vec!["nfs-144".to_string(), "nfs-retired".to_string()],
             ),
-            ("panda145".to_string(), vec!["nfs-145".to_string()]),
-            ("panda146".to_string(), vec!["nfs-146".to_string()]),
+            ("example-node-145".to_string(), vec!["nfs-145".to_string()]),
+            ("example-node-146".to_string(), vec!["nfs-146".to_string()]),
         ])),
         ..SourceWorkerSnapshotCache::default()
     };
@@ -18339,12 +18662,12 @@ fn merge_live_observability_snapshot_with_recent_cache_preserves_missing_current
     let merged = merge_live_observability_snapshot_with_recent_cache(&cache, &live);
 
     assert_eq!(
-        merged.scheduled_source_groups_by_node.get("panda144"),
+        merged.scheduled_source_groups_by_node.get("example-node-144"),
         Some(&vec!["nfs-144".to_string()]),
         "a partial live source-status map must not erase a still-current cached owner scope: {merged:?}"
     );
     assert_eq!(
-        merged.scheduled_scan_groups_by_node.get("panda144"),
+        merged.scheduled_scan_groups_by_node.get("example-node-144"),
         Some(&vec!["nfs-144".to_string()]),
         "a partial live source-status map must not erase a still-current cached scan owner scope: {merged:?}"
     );
@@ -19269,10 +19592,10 @@ async fn control_inflight_nonblocking_observability_preserves_latest_control_fra
     let expected = std::collections::BTreeMap::from([(
         "node-c-29776225407437800789245953".to_string(),
         vec![
+            "activate unit=runtime.exec.scan route=source-manual-rescan:v1.req generation=2 scopes=[\"nfs1=>node-c::nfs1\", \"nfs2=>node-c::nfs2\"]".to_string(),
             "activate unit=runtime.exec.source route=source-logical-roots-control:v1.stream generation=2 scopes=[\"nfs1=>node-c::nfs1\", \"nfs2=>node-c::nfs2\"]".to_string(),
             "activate unit=runtime.exec.source route=source-manual-rescan-control:v1.stream generation=2 scopes=[\"nfs1=>node-c::nfs1\", \"nfs2=>node-c::nfs2\"]".to_string(),
             "activate unit=runtime.exec.source route=source-manual-rescan:v1.req generation=2 scopes=[\"nfs1=>node-c::nfs1\", \"nfs2=>node-c::nfs2\"]".to_string(),
-            "activate unit=runtime.exec.scan route=source-manual-rescan:v1.req generation=2 scopes=[\"nfs1=>node-c::nfs1\", \"nfs2=>node-c::nfs2\"]".to_string(),
         ],
     )]);
     assert_eq!(
@@ -20311,6 +20634,7 @@ async fn local_source_observability_preserves_published_maps_after_local_stream_
     let mut stream = source.pub_().await.expect("start source pub stream");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut accepted_batch_count = 0u64;
     let mut control_counts = std::collections::BTreeMap::<String, usize>::new();
     let mut data_counts = std::collections::BTreeMap::<String, usize>::new();
     while tokio::time::Instant::now() < deadline {
@@ -20319,7 +20643,9 @@ async fn local_source_observability_preserves_published_maps_after_local_stream_
             Ok(None) => panic!("local pub stream should yield initial scan batch"),
             Err(_) => continue,
         };
-        for event in batch {
+        source.record_batch_downstream_accepted(&batch);
+        accepted_batch_count = accepted_batch_count.saturating_add(1);
+        for event in &batch {
             let origin = event.metadata().origin_id.0.clone();
             if rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok() {
                 *control_counts.entry(origin).or_insert(0) += 1;
@@ -20349,45 +20675,38 @@ async fn local_source_observability_preserves_published_maps_after_local_stream_
         .await
         .expect("fetch local source observability after local stream publish");
 
-    assert!(
-        snapshot
-            .published_batches_by_node
-            .get("node-a")
-            .copied()
-            .unwrap_or(0)
-            > 0,
-        "local source observability must not report active scheduling/control truth with published_batches_by_node still empty after the local stream emitted batches: {:?}",
-        snapshot
+    let accepted_control_event_count = control_counts.values().sum::<usize>() as u64;
+    let accepted_data_event_count = data_counts.values().sum::<usize>() as u64;
+
+    assert_eq!(
+        snapshot.published_batches_by_node.get("node-a").copied(),
+        Some(accepted_batch_count),
+        "local source observability must report each downstream-accepted batch exactly once: {:?}",
+        snapshot,
     );
-    assert!(
-        snapshot
-            .published_events_by_node
-            .get("node-a")
-            .copied()
-            .unwrap_or(0)
-            > 0,
-        "local source observability must preserve published event counts after local stream publish: {:?}",
-        snapshot
+    assert_eq!(
+        snapshot.published_events_by_node.get("node-a").copied(),
+        Some(accepted_control_event_count + accepted_data_event_count),
+        "local source observability must report each downstream-accepted event exactly once: {:?}",
+        snapshot,
     );
-    assert!(
+    assert_eq!(
         snapshot
             .published_control_events_by_node
             .get("node-a")
-            .copied()
-            .unwrap_or(0)
-            > 0,
-        "local source observability must preserve published control-event counts after local stream publish: {:?}",
-        snapshot
+            .copied(),
+        Some(accepted_control_event_count),
+        "local source observability must classify downstream-accepted control events exactly: {:?}",
+        snapshot,
     );
-    assert!(
+    assert_eq!(
         snapshot
             .published_data_events_by_node
             .get("node-a")
-            .copied()
-            .unwrap_or(0)
-            > 0,
-        "local source observability must preserve published data-event counts after local stream publish: {:?}",
-        snapshot
+            .copied(),
+        Some(accepted_data_event_count),
+        "local source observability must classify downstream-accepted data events exactly: {:?}",
+        snapshot,
     );
     assert!(
         snapshot.last_published_at_us_by_node.contains_key("node-a"),
@@ -20474,6 +20793,7 @@ async fn recovered_active_local_status_yields_schedule_and_control_summary_when_
             overflow_pending: false,
             rescan_pending: false,
             last_rescan_requested_at_us: None,
+            last_manual_rescan_accepted_at_us: None,
             last_rescan_reason: None,
             last_error: None,
             last_audit_started_at_us: None,

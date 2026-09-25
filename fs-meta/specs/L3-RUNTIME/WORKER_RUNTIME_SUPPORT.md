@@ -1,5 +1,5 @@
 ---
-version: 3.0.0
+version: 3.4.0
 ---
 
 # L3 Runtime: Worker Runtime Support
@@ -27,6 +27,29 @@ version: 3.0.0
 4. retry loops compute an absolute wall-clock deadline from the configured total timeout.
 5. each RPC attempt uses the smaller of the per-call timeout and remaining deadline as its effective timeout budget; one oversized per-call timeout MUST NOT extend the wall-clock retry budget.
 6. once the wall-clock deadline expires, retry stops immediately with the last timeout or transport failure instead of silently sleeping or extending the worker bring-up window.
+
+## [workflow] ExternalWorkerAuthorityCommitOrdering
+
+**Steps**
+
+1. An external worker applies and retains accepted domain control facts before returning its process-level control acknowledgement.
+2. If recording those facts requires a reverse `StateCell` authority-journal read or write, the control callback enqueues the journal mutation in a bounded FIFO and MUST NOT synchronously wait for that reverse primitive before becoming acknowledgement-eligible.
+3. One single-flight asynchronous flusher loads the existing authority snapshot, appends queued mutations in order, and writes the resulting bounded journal after the control callback can return; concurrent control mutations join the same queue instead of creating one blocking thread or flush task per mutation.
+4. Queue compaction uses the same retained-tail bound as the authority journal and emits explicit compaction evidence. Transient flush failures retain the queued mutations for bounded automatic retry or a later explicit drain instead of reporting a false commit.
+5. Orderly worker close explicitly drains deferred authority commits after stopping endpoint work. Process-level acknowledgement decoupling changes carrier timing only; it does not weaken the authority journal's truth-ledger role or permit accepted mutations to disappear silently.
+6. This ordering is app-owned use of a generic runtime state-carrier boundary. It does not require Capanix to know fs-meta roles or add an app-specific activation path.
+
+## [workflow] ExternalWorkerStateCarrierExecutorIsolation
+
+**Steps**
+
+1. Worker bootstrap may synchronously recover its initial state before opening request traffic, but an already-running worker treats `StateBoundary` access as asynchronous I/O.
+2. Source status recovery awaits the authoritative logical-roots read without blocking a Tokio executor thread; cancellation or timeout therefore leaves the worker IPC reader/writer schedulable.
+3. Sink status, materialized-query, and roots-control request hot paths consume the current local logical-roots projection already delivered by management apply or roots-control propagation. They MUST NOT call a blocking `StateCell` bridge while serving a request.
+4. The accepted management roots update owns the single authoritative logical-roots replace. Its source roots-control propagation sends a typed follower declaration containing the accepted generation; each worker reconciles local roots and records that generation locally without writing the authoritative cell again. Stale generations are no-ops and same-generation content conflicts fail closed.
+5. A later authority repair remains available as an explicit asynchronous recovery operation. Until it completes, status reports the current local projection and query remains scoped by current runtime placement instead of inventing roots or blocking unrelated worker RPC acknowledgements.
+6. Regression coverage holds deferred authority I/O open while management roots and status requests complete within their own reply budget, separately proves that cached status/query evaluation performs no new authoritative state read, and blocks any second logical-roots write while a propagated source declaration still acknowledges and advances its local generation.
+7. This executor-isolation rule is fs-meta scheduling policy over the generic Capanix state boundary; it neither changes StateCell ownership nor adds fs-meta knowledge to Capanix.
 
 ## [workflow] SharedWorkerModuleRoleDispatch
 

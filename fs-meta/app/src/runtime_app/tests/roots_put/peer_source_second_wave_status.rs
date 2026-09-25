@@ -1,5 +1,5 @@
     #[tokio::test]
-    async fn peer_source_status_fails_closed_while_successor_second_exact_shaped_wave_source_apply_is_pending()
+    async fn peer_source_status_serves_pending_cache_while_successor_second_exact_shaped_wave_source_apply_is_pending()
      {
         struct SinkControlErrorHookReset;
 
@@ -264,16 +264,26 @@
 
         entered.notified().await;
 
-        let request_result = internal_source_status_snapshots_with_timeout(
+        let pending_snapshots = internal_source_status_snapshots_with_timeout(
             boundary.clone(),
             NodeId("node-d".into()),
             Duration::from_millis(250),
             Duration::from_millis(50),
         )
-        .await;
+        .await
+        .expect("peer-facing source-status must return bounded runtime-scope cache evidence while source.apply is pending");
         assert!(
-            request_result.is_err(),
-            "peer-facing source-status must fail closed while the successor exact-shaped second wave is still paused in source.apply"
+            pending_snapshots.iter().any(|snapshot| {
+                snapshot
+                    .scheduled_source_groups_by_node
+                    .get("node-a")
+                    .is_some_and(|groups| {
+                        groups == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                    }) && snapshot.status.degraded_roots.iter().any(|(_, reason)| {
+                    reason == SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON
+                })
+            }),
+            "peer-facing source-status must preserve runtime-scope ownership and mark pending source state while source.apply is pending: {pending_snapshots:?}"
         );
 
         release.notify_waiters();

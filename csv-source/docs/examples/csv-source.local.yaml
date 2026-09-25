@@ -1,0 +1,21 @@
+default_page_size: 1000
+max_page_size: 10000
+endpoints:
+  - object_ref: csv-prod
+    root_path: /data/fustor
+    path_scopes:
+      - datasets/*.csv
+    has_headers: true
+    delimiter: ","
+    active: true
+__cnx_runtime:
+  local_host_ref: csv-source-node-a
+  resource_grants:
+    - resource_kind: csv
+      object_ref: csv-prod
+      grant_state: active
+      grant_epoch: 1
+      interfaces:
+        - read
+      path_scopes:
+        - datasets/*.csv

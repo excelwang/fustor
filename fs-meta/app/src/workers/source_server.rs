@@ -21,6 +21,8 @@ use tokio::task::JoinHandle;
 use crate::FileMetaRecord;
 use crate::query::path::is_under_query_path;
 use crate::runtime::execution_units;
+#[cfg(test)]
+use crate::runtime::orchestration::EventRouteScopeProjection;
 use crate::runtime::orchestration::{SourceControlSignal, source_control_signals_from_envelopes};
 use crate::runtime::routes::events_stream_route_for_scope;
 use crate::source::config::SourceConfig;
@@ -111,17 +113,14 @@ struct PublishedBatchUpdate {
 
 enum SourceWorkerAction {
     Immediate(SourceWorkerResponse, bool),
-    SyncLogicalRootsAndStatusSnapshot {
-        source: Arc<FSMetaSource>,
-        authoritative_roots: Vec<crate::source::config::RootSpec>,
-    },
-    SyncRuntimeRootsAndStatusSnapshot {
+    StatusSnapshot {
         source: Arc<FSMetaSource>,
     },
     UpdateLogicalRoots {
         source: Arc<FSMetaSource>,
         roots: Vec<crate::source::config::RootSpec>,
         defer_scan_audit: bool,
+        propagated_generation: Option<u64>,
     },
     PublishManualRescanSignal {
         source: Arc<FSMetaSource>,
@@ -180,6 +179,7 @@ fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
         SourceWorkerRequest::UpdateLogicalRootsDeferScanAudit { .. } => {
             "UpdateLogicalRootsDeferScanAudit"
         }
+        SourceWorkerRequest::ApplyPropagatedLogicalRoots { .. } => "ApplyPropagatedLogicalRoots",
         SourceWorkerRequest::LogicalRootsSnapshot => "LogicalRootsSnapshot",
         SourceWorkerRequest::LogicalRootsGenerationSnapshot => "LogicalRootsGenerationSnapshot",
         SourceWorkerRequest::HostObjectGrantsSnapshot => "HostObjectGrantsSnapshot",
@@ -199,6 +199,7 @@ fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
         SourceWorkerRequest::RearmSourceRescanEndpoints => "RearmSourceRescanEndpoints",
         SourceWorkerRequest::ForceFind { .. } => "ForceFind",
         SourceWorkerRequest::ResolveGroupIdForObjectRef { .. } => "ResolveGroupIdForObjectRef",
+        SourceWorkerRequest::UpdateEventRouteScopes { .. } => "UpdateEventRouteScopes",
         SourceWorkerRequest::PublishManualRescanSignal => "PublishManualRescanSignal",
         SourceWorkerRequest::SubmitRescanRequestEpoch => "SubmitRescanRequestEpoch",
         SourceWorkerRequest::SubmitTargetedRescanRequestEpoch => "SubmitTargetedRescanRequestEpoch",
@@ -663,9 +664,14 @@ where
                     summarize_published_batch_path_counts(&batch, &target),
                 );
             }
-            if let Err(err) =
-                publish_event_stream_batch(boundary.clone(), &batch, &origin, &event_route_scope)
-                    .await
+            if let Err(err) = publish_event_stream_batch(
+                boundary.clone(),
+                source.as_deref(),
+                &batch,
+                &origin,
+                &event_route_scope,
+            )
+            .await
             {
                 log::error!(
                     "source worker pump failed to publish source event stream origin={}: {:?}",
@@ -694,18 +700,37 @@ where
 
 async fn publish_event_stream_batch(
     boundary: Arc<StdMutex<Arc<dyn ChannelIoSubset>>>,
+    source: Option<&FSMetaSource>,
     batch: &[Event],
     origin: &str,
-    event_route_scope: &str,
+    fallback_event_route_scope: &str,
 ) -> Result<()> {
-    publish_event_stream_batch_with_send_timeout(
-        boundary,
-        batch,
-        origin,
-        event_route_scope,
-        SOURCE_WORKER_EVENT_STREAM_SEND_TIMEOUT,
-    )
-    .await
+    let mut by_route_scope = std::collections::BTreeMap::<String, Vec<Event>>::new();
+    for event in batch {
+        let event_origin = event.metadata().origin_id.0.as_str();
+        let route_scope = source
+            .and_then(|source| source.event_route_scope_for_object_ref(event_origin))
+            .unwrap_or_else(|| fallback_event_route_scope.to_string());
+        by_route_scope
+            .entry(route_scope)
+            .or_default()
+            .push(event.clone());
+    }
+    for (route_scope, route_batch) in by_route_scope {
+        let route_origin = route_batch
+            .first()
+            .map(|event| event.metadata().origin_id.0.as_str())
+            .unwrap_or(origin);
+        publish_event_stream_batch_with_send_timeout(
+            boundary.clone(),
+            &route_batch,
+            route_origin,
+            &route_scope,
+            SOURCE_WORKER_EVENT_STREAM_SEND_TIMEOUT,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn publish_event_stream_batch_with_send_timeout(
@@ -809,6 +834,8 @@ fn request_requires_live_publish_pump(request: &SourceWorkerRequest) -> bool {
         request,
         SourceWorkerRequest::UpdateLogicalRoots { .. }
             | SourceWorkerRequest::UpdateLogicalRootsDeferScanAudit { .. }
+            | SourceWorkerRequest::ApplyPropagatedLogicalRoots { .. }
+            | SourceWorkerRequest::UpdateEventRouteScopes { .. }
             | SourceWorkerRequest::PublishManualRescanSignal
             | SourceWorkerRequest::SubmitRescanRequestEpoch
             | SourceWorkerRequest::SubmitTargetedRescanRequestEpoch
@@ -1030,6 +1057,7 @@ fn plan_worker_request(
                 source,
                 roots,
                 defer_scan_audit: false,
+                propagated_generation: None,
             },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
@@ -1042,6 +1070,7 @@ fn plan_worker_request(
                     source,
                     roots,
                     defer_scan_audit: true,
+                    propagated_generation: None,
                 },
                 None => SourceWorkerAction::Immediate(
                     SourceWorkerResponse::Error("worker not initialized".into()),
@@ -1049,6 +1078,22 @@ fn plan_worker_request(
                 ),
             }
         }
+        SourceWorkerRequest::ApplyPropagatedLogicalRoots {
+            roots,
+            generation,
+            defer_scan_audit,
+        } => match state.source.clone() {
+            Some(source) => SourceWorkerAction::UpdateLogicalRoots {
+                source,
+                roots,
+                defer_scan_audit,
+                propagated_generation: Some(generation),
+            },
+            None => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
         SourceWorkerRequest::LogicalRootsSnapshot => match state.source.as_ref() {
             Some(source) => match source.logical_roots_snapshot_with_failure() {
                 Ok(roots) => {
@@ -1106,20 +1151,8 @@ fn plan_worker_request(
             ),
         },
         SourceWorkerRequest::StatusSnapshot => match state.source.as_ref() {
-            Some(source) => match source.authoritative_logical_roots_if_changed() {
-                Ok(Some(authoritative_roots)) => {
-                    SourceWorkerAction::SyncLogicalRootsAndStatusSnapshot {
-                        source: source.clone(),
-                        authoritative_roots,
-                    }
-                }
-                Ok(None) => SourceWorkerAction::SyncRuntimeRootsAndStatusSnapshot {
-                    source: source.clone(),
-                },
-                Err(err) => SourceWorkerAction::Immediate(
-                    SourceWorkerResponse::Error(err.to_string()),
-                    false,
-                ),
+            Some(source) => SourceWorkerAction::StatusSnapshot {
+                source: source.clone(),
             },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
@@ -1330,6 +1363,20 @@ fn plan_worker_request(
                 ),
             }
         }
+        SourceWorkerRequest::UpdateEventRouteScopes {
+            route_scopes_by_group,
+        } => match state.source.as_ref() {
+            Some(source) => match source
+                .update_event_route_scopes_with_failure(route_scopes_by_group)
+            {
+                Ok(_) => SourceWorkerAction::Immediate(SourceWorkerResponse::Ack, false),
+                Err(err) => SourceWorkerAction::Immediate(classify_source_worker_error(err), false),
+            },
+            None => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
         SourceWorkerRequest::PublishManualRescanSignal => match state.source.clone() {
             Some(source) => SourceWorkerAction::PublishManualRescanSignal { source },
             None => SourceWorkerAction::Immediate(
@@ -1435,28 +1482,23 @@ async fn execute_worker_action(
 ) {
     match action {
         SourceWorkerAction::Immediate(response, stop) => (response, stop, None),
-        SourceWorkerAction::SyncLogicalRootsAndStatusSnapshot {
-            source,
-            authoritative_roots,
-        } => match source
-            .apply_logical_roots_snapshot(
-                authoritative_roots,
-                false,
-                "source_worker_server.status_snapshot_authority_sync",
-            )
-            .await
-        {
-            Ok(()) => match source.status_snapshot_with_failure() {
-                Ok(snapshot) => (SourceWorkerResponse::StatusSnapshot(snapshot), false, None),
-                Err(err) => (classify_source_worker_failure(err), false, None),
-            },
-            Err(err) => (classify_source_worker_error(err), false, None),
-        },
-        SourceWorkerAction::SyncRuntimeRootsAndStatusSnapshot { source } => {
-            match source.refresh_runtime_roots(false).await {
-                Ok(()) => match source.status_snapshot_with_failure() {
+        SourceWorkerAction::StatusSnapshot { source } => {
+            match source
+                .sync_logical_roots_from_authoritative_cell_if_changed()
+                .await
+            {
+                Ok(true) => match source.status_snapshot_with_failure() {
                     Ok(snapshot) => (SourceWorkerResponse::StatusSnapshot(snapshot), false, None),
                     Err(err) => (classify_source_worker_failure(err), false, None),
+                },
+                Ok(false) => match source.refresh_runtime_roots(false).await {
+                    Ok(()) => match source.status_snapshot_with_failure() {
+                        Ok(snapshot) => {
+                            (SourceWorkerResponse::StatusSnapshot(snapshot), false, None)
+                        }
+                        Err(err) => (classify_source_worker_failure(err), false, None),
+                    },
+                    Err(err) => (classify_source_worker_error(err), false, None),
                 },
                 Err(err) => (classify_source_worker_error(err), false, None),
             }
@@ -1465,12 +1507,37 @@ async fn execute_worker_action(
             source,
             roots,
             defer_scan_audit,
+            propagated_generation,
         } => {
             eprintln!(
-                "fs_meta_source_worker_server: update_logical_roots begin roots={} defer_scan_audit={}",
+                "fs_meta_source_worker_server: update_logical_roots begin roots={} defer_scan_audit={} propagated_generation={:?}",
                 roots.len(),
                 defer_scan_audit,
+                propagated_generation,
             );
+            if let Some(generation) = propagated_generation {
+                return match source
+                    .apply_propagated_logical_roots_declaration(roots, generation, defer_scan_audit)
+                    .await
+                {
+                    Ok(()) => {
+                        eprintln!(
+                            "fs_meta_source_worker_server: apply_propagated_logical_roots ok generation={generation}"
+                        );
+                        (SourceWorkerResponse::Ack, false, None)
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "fs_meta_source_worker_server: apply_propagated_logical_roots err={err}"
+                        );
+                        (
+                            classify_source_worker_failure(SourceFailure::from(err)),
+                            false,
+                            None,
+                        )
+                    }
+                };
+            }
             let deadline =
                 tokio::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_FENCED_RETRY_TIMEOUT;
             loop {
@@ -1529,16 +1596,21 @@ async fn execute_worker_action(
             }
         }
         SourceWorkerAction::OpenScanAuditAdmissionAndTriggerRescanWhenReadyEpoch { source } => {
-            if source.open_scan_audit_admission_if_closed() {
-                let (epoch, root_keys) = source.begin_rescan_request_epoch();
-                (
-                    SourceWorkerResponse::RescanRequestEpoch(epoch),
-                    false,
-                    deferred_manual_rescan_signal(source, root_keys),
-                )
-            } else {
-                (SourceWorkerResponse::RescanRequestEpoch(0), false, None)
+            let _ = source.open_scan_audit_admission_if_closed();
+            let (epoch, root_keys) = source.begin_rescan_request_epoch();
+            if debug_source_batch_flow_enabled() {
+                eprintln!(
+                    "fs_meta_source_worker_server: scan-audit release recorded node={} epoch={} root_keys={:?}",
+                    source.node_id().0,
+                    epoch,
+                    root_keys
+                );
             }
+            (
+                SourceWorkerResponse::RescanRequestEpoch(epoch),
+                false,
+                deferred_manual_rescan_signal(source, root_keys),
+            )
         }
         SourceWorkerAction::SubmitTargetedRescanRequestEpoch { source } => {
             match source.begin_targeted_rescan_request_epoch_with_failure() {
@@ -1692,7 +1764,21 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
         for action in deferred {
             match action {
                 DeferredSourceWorkerAction::SignalManualRescanIntents { source, root_keys } => {
+                    if debug_source_batch_flow_enabled() {
+                        eprintln!(
+                            "fs_meta_source_worker_server: scan-audit release after-response signal begin node={} root_keys={:?}",
+                            source.node_id().0,
+                            root_keys
+                        );
+                    }
                     source.signal_recorded_manual_rescan_intents(&root_keys);
+                    if debug_source_batch_flow_enabled() {
+                        eprintln!(
+                            "fs_meta_source_worker_server: scan-audit release after-response signal done node={} root_keys={:?}",
+                            source.node_id().0,
+                            root_keys
+                        );
+                    }
                 }
             }
         }
@@ -2299,6 +2385,8 @@ mod tests {
                 .map(Duration::from_millis)
                 .map(|timeout| tokio::time::Instant::now() + timeout);
             loop {
+                let mut notified = std::pin::pin!(self.changed.notified());
+                notified.as_mut().enable();
                 {
                     let mut channels = self.channels.lock().await;
                     if let Some(events) = channels.remove(&request.channel_key.0)
@@ -2307,7 +2395,6 @@ mod tests {
                         return Ok(events);
                     }
                 }
-                let notified = self.changed.notified();
                 if let Some(deadline) = deadline {
                     match tokio::time::timeout_at(deadline, notified).await {
                         Ok(()) => {}
@@ -2402,6 +2489,109 @@ mod tests {
                 .all(|unit_id| unit_id.as_deref() == Some(SOURCE_RUNTIME_UNIT_ID)),
             "source pump must publish events through the source runtime unit lane"
         );
+    }
+
+    #[tokio::test]
+    async fn source_pump_partitions_mixed_group_batch_by_event_route_scope() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let source = Arc::new(
+            FSMetaSource::new(
+                SourceConfig {
+                    roots: vec![
+                        test_root("nfs1", nfs1.clone()),
+                        test_root("nfs2", nfs2.clone()),
+                    ],
+                    host_object_grants: vec![
+                        test_export("node-a::nfs1", nfs1),
+                        test_export("node-a::nfs2", nfs2),
+                    ],
+                    ..SourceConfig::default()
+                },
+                NodeId("node-a".to_string()),
+            )
+            .expect("build source"),
+        );
+        source
+            .update_event_route_scopes_with_failure(std::collections::BTreeMap::from([
+                (
+                    "nfs1".to_string(),
+                    EventRouteScopeProjection {
+                        generation: 7,
+                        route_scope: "node-b".to_string(),
+                    },
+                ),
+                (
+                    "nfs2".to_string(),
+                    EventRouteScopeProjection {
+                        generation: 6,
+                        route_scope: "node-c".to_string(),
+                    },
+                ),
+            ]))
+            .expect("install event route scopes");
+
+        let events = ["node-a::nfs1", "node-a::nfs2", "node-a::nfs1"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, origin)| {
+                Event::new(
+                    EventMetadata {
+                        origin_id: NodeId(origin.to_string()),
+                        timestamp_us: index as u64 + 1,
+                        logical_ts: None,
+                        correlation_id: None,
+                        ingress_auth: None,
+                        trace: None,
+                    },
+                    bytes::Bytes::from(format!("record-{index}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let boundary = Arc::new(LoopbackPublishBoundary::default());
+        let target: Arc<dyn ChannelIoSubset> = boundary.clone();
+        let mut handle = start_source_pump_with_stream(
+            futures_util::stream::iter(vec![events]),
+            Arc::new(StdMutex::new(target)),
+            Arc::new(StdMutex::new(PublishedBatchStats::default())),
+            Some(source.clone()),
+            "node-a".to_string(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), &mut handle)
+            .await
+            .expect("partitioned source pump timed out")
+            .expect("partitioned source pump task failed");
+
+        let channels = boundary.channels.lock().await;
+        let node_b = channels
+            .get(&events_stream_route_for_scope("node-b").0)
+            .expect("nfs1 owner route batch");
+        let node_c = channels
+            .get(&events_stream_route_for_scope("node-c").0)
+            .expect("nfs2 owner route batch");
+        assert_eq!(
+            node_b
+                .iter()
+                .map(|event| event.metadata().origin_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node-a::nfs1", "node-a::nfs1"]
+        );
+        assert_eq!(
+            node_c
+                .iter()
+                .map(|event| event.metadata().origin_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node-a::nfs2"]
+        );
+        assert!(
+            !channels.contains_key(&events_stream_route_for_scope("node-a").0),
+            "resolved groups must not fall back to the source-node event route"
+        );
+        drop(channels);
+        source.close().await.expect("close source");
     }
 
     #[tokio::test]
@@ -2939,6 +3129,56 @@ mod tests {
                         ),
                     });
                 }
+            }
+            self.inner.statecell_write(ctx, request).await
+        }
+
+        async fn statecell_watch(
+            &self,
+            ctx: BoundaryContext,
+            request: StateCellWatchRequest,
+        ) -> Result<KernelResultEnvelope> {
+            self.inner.statecell_watch(ctx, request).await
+        }
+    }
+
+    struct BlockAfterInitialLogicalRootsWriteBoundary {
+        inner: Arc<dyn StateBoundary>,
+        logical_roots_writes: AtomicUsize,
+    }
+
+    impl BlockAfterInitialLogicalRootsWriteBoundary {
+        fn new(inner: Arc<dyn StateBoundary>) -> Self {
+            Self {
+                inner,
+                logical_roots_writes: AtomicUsize::new(0),
+            }
+        }
+
+        fn logical_roots_write_count(&self) -> usize {
+            self.logical_roots_writes.load(Ordering::Acquire)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateBoundary for BlockAfterInitialLogicalRootsWriteBoundary {
+        async fn statecell_read(
+            &self,
+            ctx: BoundaryContext,
+            request: StateCellReadRequest,
+        ) -> Result<KernelResultEnvelope> {
+            self.inner.statecell_read(ctx, request).await
+        }
+
+        async fn statecell_write(
+            &self,
+            ctx: BoundaryContext,
+            request: StateCellWriteRequest,
+        ) -> Result<KernelResultEnvelope> {
+            if request.handle.cell_id == "fs-meta.logical-roots.runtime.exec.source"
+                && self.logical_roots_writes.fetch_add(1, Ordering::AcqRel) > 0
+            {
+                return std::future::pending().await;
             }
             self.inner.statecell_write(ctx, request).await
         }
@@ -4054,7 +4294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_source_control_spawns_owned_external_scoped_rescan_route() {
+    async fn worker_source_control_leaves_external_scoped_rescan_routes_to_app_proxy() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -4155,11 +4395,11 @@ mod tests {
             .expect("send local scoped source rescan request");
 
         let local_reply = boundary
-            .recv_route(&format!("{local_route}:reply"), 1000)
+            .recv_route(&format!("{local_route}:reply"), 100)
             .await;
         assert!(
-            matches!(local_reply, Ok(ref events) if events.iter().any(|event| event.metadata().origin_id.0 == "node-a-123")),
-            "source worker runtime must own its externally addressed scoped source-rescan route: {local_reply:?}"
+            matches!(local_reply, Err(CnxError::Timeout)),
+            "worker-backed source must leave its local externally addressed scoped source-rescan route to the app proxy: {local_reply:?}"
         );
 
         boundary
@@ -4198,7 +4438,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_source_control_spawns_owned_external_scoped_status_route() {
+    async fn worker_source_control_leaves_external_scoped_status_routes_to_app_proxy() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -4299,16 +4539,11 @@ mod tests {
             .expect("send local scoped source status request");
 
         let local_reply = boundary
-            .recv_route(&format!("{local_status_route}:reply"), 1000)
-            .await
-            .expect("source worker runtime should reply on its scoped source-status route");
+            .recv_route(&format!("{local_status_route}:reply"), 100)
+            .await;
         assert!(
-            local_reply.iter().any(|event| {
-                event.metadata().origin_id.0 == "node-a-123"
-                    && rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes())
-                        .is_ok()
-            }),
-            "source worker runtime must own its externally addressed scoped source-status route: {local_reply:?}"
+            matches!(local_reply, Err(CnxError::Timeout)),
+            "worker-backed source must leave its local externally addressed scoped source-status route to the app proxy: {local_reply:?}"
         );
 
         boundary
@@ -4377,7 +4612,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_rearm_source_rescan_endpoints_surfaces_owned_external_ready_proof() {
+    async fn worker_rearm_source_rescan_endpoints_does_not_claim_app_proxy_ready_proof() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -4466,15 +4701,26 @@ mod tests {
             panic!("observability request should return live source snapshot");
         };
 
-        let ready = format!(
-            "ready unit=runtime.exec.source route={scoped_route} generation=1777507000123 scopes=[\"nfs1=>nfs1\"]"
+        let activation = format!(
+            "activate unit=runtime.exec.source route={scoped_route} generation=1777507000123 scopes=[\"nfs1=>node-a::nfs1\"]"
         );
         assert!(
             snapshot
                 .last_control_frame_signals_by_node
                 .get("node-a")
-                .is_some_and(|signals| signals.iter().any(|signal| signal == &ready)),
-            "source worker observability must claim its owned scoped source-rescan readiness: expected={ready} control={:?}",
+                .is_some_and(|signals| signals.iter().any(|signal| signal == &activation)),
+            "source worker observability must preserve accepted scoped activation evidence: expected={activation} control={:?}",
+            snapshot.last_control_frame_signals_by_node
+        );
+        assert!(
+            snapshot
+                .last_control_frame_signals_by_node
+                .get("node-a")
+                .is_none_or(|signals| !signals.iter().any(|signal| {
+                    signal.contains("ready unit=runtime.exec.source")
+                        && signal.contains(&format!("route={scoped_route}"))
+                })),
+            "worker-backed source must not fabricate app-proxy receive-armed proof: {:?}",
             snapshot.last_control_frame_signals_by_node
         );
 
@@ -4650,7 +4896,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_start_repairs_control_stream_continuity_even_when_pump_task_is_alive() {
+    async fn propagated_logical_roots_ack_without_rewriting_authoritative_statecell() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_watch_scan_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![
+                test_export("node-a::nfs1", nfs1.clone()),
+                test_export("node-a::nfs2", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let state = Arc::new(Mutex::new(SourceWorkerState {
+            source: None,
+            pending_init: None,
+            pump_task: None,
+            pump_boundary: None,
+            runtime_endpoint_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        }));
+        let mut session = SourceWorkerSession {
+            state,
+            deferred_after_reply: Vec::new(),
+        };
+        let boundary = Arc::new(LoopbackPublishBoundary::default());
+        let state_boundary = Arc::new(BlockAfterInitialLogicalRootsWriteBoundary::new(
+            in_memory_state_boundary(),
+        ));
+        let context = WorkerSessionContext::new(boundary.clone(), boundary, state_boundary.clone());
+
+        session
+            .on_init(NodeId("node-a-propagated-roots".to_string()), cfg, &context)
+            .await
+            .expect("init source worker session");
+        session
+            .on_start(&context)
+            .await
+            .expect("start source worker session");
+        assert_eq!(
+            state_boundary.logical_roots_write_count(),
+            1,
+            "worker bootstrap owns only the initial absent-cell seed write"
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            session.handle_request(
+                SourceWorkerRequest::ApplyPropagatedLogicalRoots {
+                    roots: vec![
+                        test_watch_scan_root("nfs1", nfs1),
+                        test_watch_scan_root("nfs2", nfs2),
+                    ],
+                    generation: 2,
+                    defer_scan_audit: true,
+                },
+                &context,
+            ),
+        )
+        .await
+        .expect("propagated roots must not wait for the blocked authority write")
+        .expect("handle propagated logical roots request");
+        assert!(matches!(
+            response,
+            WorkerLoopControl::Continue(SourceWorkerResponse::Ack)
+        ));
+        assert_eq!(
+            state_boundary.logical_roots_write_count(),
+            1,
+            "roots-control follower apply must not rewrite authoritative StateCell"
+        );
+
+        let generation = session
+            .handle_request(
+                SourceWorkerRequest::LogicalRootsGenerationSnapshot,
+                &context,
+            )
+            .await
+            .expect("logical roots generation snapshot");
+        assert!(matches!(
+            generation,
+            WorkerLoopControl::Continue(SourceWorkerResponse::LogicalRootsGeneration(2))
+        ));
+
+        session
+            .on_close(&context)
+            .await
+            .expect("close source worker session");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_start_repairs_worker_owned_control_stream_continuity_without_binding_app_routes()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -4718,18 +5059,22 @@ mod tests {
             .expect("activate source control stream routes");
         let first_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let saw_roots = first_boundary.recv_count(&roots_control_route) > 0;
             let saw_rescan = first_boundary.recv_count(&rescan_control_route) > 0;
-            if saw_roots && saw_rescan {
+            if saw_rescan {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < first_deadline,
-                "first bootstrap should start source control stream recv loops after activation before continuity-repair check: counts={:?}",
+                "first bootstrap should start its worker-owned source control stream recv loop after activation before continuity-repair check: counts={:?}",
                 first_boundary.recv_counts_snapshot()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert_eq!(
+            first_boundary.recv_count(&roots_control_route),
+            0,
+            "worker-backed source must leave roots-control receive ownership to the app proxy"
+        );
 
         let pump_task = state
             .pump_task
@@ -4751,18 +5096,22 @@ mod tests {
 
         let second_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let roots_count = second_boundary.recv_count(&roots_control_route);
             let rescan_count = second_boundary.recv_count(&rescan_control_route);
-            if roots_count > 0 && rescan_count > 0 {
+            if rescan_count > 0 {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < second_deadline,
-                "second bootstrap must refresh source control stream recv continuity even when pump_task stays alive; roots_count={roots_count} rescan_count={rescan_count} counts={:?}",
+                "second bootstrap must refresh worker-owned source control stream recv continuity even when pump_task stays alive; rescan_count={rescan_count} counts={:?}",
                 second_boundary.recv_counts_snapshot()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert_eq!(
+            second_boundary.recv_count(&roots_control_route),
+            0,
+            "worker-backed source continuity repair must not acquire the app-owned roots-control route"
+        );
 
         stop_source_runtime(&mut state).await;
     }

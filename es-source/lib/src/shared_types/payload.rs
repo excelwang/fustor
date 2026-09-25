@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use source_kit::SourceCapabilityReport;
 
 use super::EsSourceCursor;
 
@@ -11,6 +12,7 @@ pub enum EsSourcePayload {
     Batch(EsSourceBatch),
     Fields(EsFieldCatalog),
     Probe(EsProbeStatus),
+    Status(EsSourceStatus),
     Error(EsSourceErrorPayload),
 }
 
@@ -18,6 +20,8 @@ pub enum EsSourcePayload {
 pub struct EsSourceBatch {
     pub object_ref: String,
     pub index: String,
+    #[serde(default)]
+    pub source_revision: String,
     #[serde(default)]
     pub documents: Vec<EsDocumentEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,6 +83,20 @@ pub struct EsProbeStatus {
     pub cluster_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EsSourceStatus {
+    pub node_id: String,
+    pub fetch_route: String,
+    pub status_route: String,
+    pub configured_endpoints: usize,
+    pub active_grants: usize,
+    pub ready: bool,
+    #[serde(default)]
+    pub capabilities: SourceCapabilityReport,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

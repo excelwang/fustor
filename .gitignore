@@ -1,5 +1,7 @@
 /target
 **/target
+__pycache__/
+*.py[cod]
 /tests/fixtures/app-test-runtime/Cargo.lock
 .fsmeta-local
 cluster-out
@@ -10,8 +12,6 @@ fsmeta-demo-monitoring-roots-5group.json
 fs-meta/docs/examples/demo-env.local.sh
 fs-meta/docs/examples/*.local.env
 fs-meta/docs/examples/*monitoring-roots*.local.json
-.cargo/config.toml
-
 fs-meta.query-keys.json
 .tmp/
 .tmp-target-status-owner/
@@ -27,3 +27,18 @@ fs-meta.query-keys.json
 !.codex/skills/fs-meta-cross-repo-gate/references/*.md
 !.codex/skills/fs-meta-cross-repo-gate/scripts/
 !.codex/skills/fs-meta-cross-repo-gate/scripts/collect_official_node_logs.sh
+
+# Private deployment and local development state (never publication inputs)
+.codex/
+.claude/
+.env
+.env.*
+!.env.example
+!.env.sample
+/private/
+/evidence/
+/outputs/
+/docs/research/
+/docs/evidence/
+__pycache__/
+*.pyc

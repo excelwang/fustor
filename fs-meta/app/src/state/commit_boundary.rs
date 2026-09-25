@@ -18,6 +18,10 @@ impl CommitBoundary {
         self.authority.append(op, detail.into());
     }
 
+    pub(crate) async fn flush(&self) -> std::io::Result<()> {
+        self.authority.flush().await
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.authority.len()

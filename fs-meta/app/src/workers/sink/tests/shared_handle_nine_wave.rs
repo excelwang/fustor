@@ -1026,7 +1026,10 @@ async fn shared_sink_handle_later_nine_wave_survives_predecessor_fail_closed_cle
     std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
 
     let cfg = SourceConfig {
-        roots: vec![sink_worker_root("nfs1", &nfs1)],
+        roots: vec![
+            sink_worker_root("nfs1", &nfs1),
+            sink_worker_root("nfs2", &nfs2),
+        ],
         host_object_grants: vec![
             sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
             sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
@@ -1239,7 +1242,10 @@ async fn shared_sink_handle_later_nine_wave_reacquires_worker_after_predecessor_
     std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
 
     let cfg = SourceConfig {
-        roots: vec![sink_worker_root("nfs1", &nfs1)],
+        roots: vec![
+            sink_worker_root("nfs1", &nfs1),
+            sink_worker_root("nfs2", &nfs2),
+        ],
         host_object_grants: vec![
             sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
             sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
