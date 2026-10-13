@@ -80,22 +80,22 @@ fn all_root_specs() -> String {
 #[test]
 fn fustor_has_one_l2_and_traceable_l3_categories() {
     let expected = [
-        "specs/L0-VISION.md",
-        "specs/L1-CONTRACTS.md",
-        "specs/L2-ARCHITECTURE.md",
-        "specs/L3-RUNTIME/interfaces.md",
-        "specs/L3-RUNTIME/algorithms.md",
-        "specs/L3-RUNTIME/workflows.md",
-        "specs/L3-RUNTIME/decisions.md",
+        ("specs/L0-VISION.md", "0.6.0"),
+        ("specs/L1-CONTRACTS.md", "0.6.2"),
+        ("specs/L2-ARCHITECTURE.md", "0.6.1"),
+        ("specs/L3-RUNTIME/interfaces.md", "0.5.2"),
+        ("specs/L3-RUNTIME/algorithms.md", "0.5.0"),
+        ("specs/L3-RUNTIME/workflows.md", "0.5.0"),
+        ("specs/L3-RUNTIME/decisions.md", "0.5.0"),
     ];
-    for path in expected {
+    for (path, version) in expected {
         assert!(
             repo_root().join(path).is_file(),
             "missing formal spec: {path}"
         );
         assert!(
-            read(path).contains("version: 0.5.0"),
-            "spec is not on v0.5: {path}"
+            read(path).lines().any(|line| line == format!("version: {version}")),
+            "unexpected formal spec version: {path}"
         );
     }
 
@@ -127,12 +127,14 @@ fn l1_contracts_are_atomic_traceable_and_testable() {
         .lines()
         .filter(|line| line.starts_with("- **") && line.contains("**: System "))
         .count();
-    assert_eq!(contract_count, 45, "unexpected L1 contract count");
+    assert_eq!(contract_count, 51, "unexpected L1 contract count");
     assert_eq!(spec.matches("> Responsibility:").count(), contract_count);
     assert_eq!(spec.matches("> Verification:").count(), contract_count);
     assert_eq!(spec.matches("> Covers L0:").count(), contract_count);
 
     for section in [
+        "CONTRACTS.NATIVE_CONFIGURATION",
+        "CONTRACTS.INSPECTION",
         "CONTRACTS.SOURCE",
         "CONTRACTS.SOURCE_PROJECTION",
         "CONTRACTS.DATA_VIEW",
@@ -141,6 +143,20 @@ fn l1_contracts_are_atomic_traceable_and_testable() {
         "CONTRACTS.NON_GOALS",
     ] {
         assert!(spec.contains(section), "missing L1 section: {section}");
+    }
+    for contract in [
+        "NATIVE_SOURCE_CONFIGURATION",
+        "CATALOG_METADATA",
+        "NATIVE_INSPECTION_PARITY",
+        "ONE_SHOT_INSPECTION",
+        "PASSIVE_BUDGET_ESTIMATE",
+        "NATIVE_READ_AUTHORIZATION",
+    ] {
+        assert_eq!(
+            spec.lines().filter(|line| line.starts_with(&format!("- **{contract}**:"))).count(),
+            1,
+            "native configuration/inspection contract must appear exactly once: {contract}"
+        );
     }
 }
 
